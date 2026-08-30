@@ -1,10 +1,14 @@
 #include "guest_memory.hpp"
 #include "ppu_interpreter.hpp"
+#include "ppu_elf_loader.hpp"
 
 #include <array>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
+#include <iterator>
+#include <vector>
 
 int main()
 {
@@ -51,5 +55,31 @@ int main()
     assert(ppu.result_register == 70);
     assert(ppu.loaded_register == 70);
     assert(ppu.stored_value == 70);
+
+    std::ifstream fixture(std::string{RPCS3_SOURCE_DIR} + "/bin/test/ppu_thread.elf", std::ios::binary | std::ios::ate);
+    assert(fixture);
+    const auto fixture_size = fixture.tellg();
+    assert(fixture_size > 0);
+    fixture.seekg(0);
+    std::vector<std::byte> fixture_bytes(static_cast<std::size_t>(fixture_size));
+    fixture.read(reinterpret_cast<char*>(fixture_bytes.data()), fixture_size);
+    assert(fixture);
+
+    guest_memory elf_memory;
+    const auto loaded = rpcs3::web::load_ppu_elf(fixture_bytes, elf_memory);
+    assert(loaded);
+    assert(loaded.entry == 0x0001022c);
+    assert(loaded.toc == 0x00038b50);
+    assert(loaded.segments == 2);
+    assert(elf_memory.map(0xd0000000, 2 * 1024 * 1024, page_access::read_write));
+    rpcs3::web::ppu_interpreter elf_interpreter(elf_memory);
+    elf_interpreter.state().pc = loaded.entry;
+    elf_interpreter.state().gpr[1] = 0xd0200000;
+    elf_interpreter.state().gpr[2] = loaded.toc;
+    elf_interpreter.run(1000);
+    assert(elf_interpreter.state().instructions == 38);
+    assert(elf_interpreter.state().stop_reason == rpcs3::web::ppu_stop_reason::hle_call);
+    assert(elf_interpreter.state().pc == 0x00025c5c);
+    assert(elf_interpreter.state().ctr == 0x39800000);
     return 0;
 }

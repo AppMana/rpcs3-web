@@ -144,6 +144,11 @@ namespace rpcs3::web
         return true;
     }
 
+    bool guest_memory::has_range_access(std::uint32_t address, std::size_t size, page_access access) const
+    {
+        return check_range(address, size, access);
+    }
+
     std::size_t guest_memory::mapped_pages() const
     {
         return m_mapped_pages;

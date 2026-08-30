@@ -52,6 +52,20 @@ export type CoreProbeResult = {
   ppuResult?: number;
   ppuLoadedResult?: number;
   ppuSupportedOpcodes?: number;
+  elfProbe?: ElfProbeResult;
+  detail: string;
+};
+
+export type ElfProbeResult = {
+  loaded: boolean;
+  testMask?: number;
+  segments?: number;
+  entry?: number;
+  instructions?: number;
+  stopReason?: number;
+  pc?: number;
+  lastOpcode?: number;
+  target?: number;
   detail: string;
 };
 

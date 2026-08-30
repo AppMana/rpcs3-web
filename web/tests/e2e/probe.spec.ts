@@ -14,15 +14,24 @@ test("publishes a machine-readable capability report", async ({ page }) => {
   expect(report.coreProbe?.memoryTestMask).toBe(0);
   expect(report.coreProbe?.mappedPages).toBe(5);
   expect(report.coreProbe?.residentPages).toBe(2);
-  expect(report.coreProbe?.abiVersion).toBe(2);
+  expect(report.coreProbe?.abiVersion).toBe(4);
   expect(report.coreProbe?.ppuTestMask).toBe(0);
   expect(report.coreProbe?.ppuInstructions).toBe(46);
   expect(report.coreProbe?.ppuResult).toBe(70);
   expect(report.coreProbe?.ppuLoadedResult).toBe(70);
-  expect(report.coreProbe?.ppuSupportedOpcodes).toBe(28);
+  expect(report.coreProbe?.ppuSupportedOpcodes).toBe(33);
+  expect(report.coreProbe?.elfProbe?.loaded).toBe(true);
+  expect(report.coreProbe?.elfProbe?.testMask).toBe(0);
+  expect(report.coreProbe?.elfProbe?.segments).toBe(2);
+  expect(report.coreProbe?.elfProbe?.entry).toBe(0x1022c);
+  expect(report.coreProbe?.elfProbe?.instructions).toBe(38);
+  expect(report.coreProbe?.elfProbe?.stopReason).toBe(5);
+  expect(report.coreProbe?.elfProbe?.pc).toBe(0x25c5c);
+  expect(report.coreProbe?.elfProbe?.target).toBe(0x39800000);
 
   const repeated = await page.evaluate(async () => window.__rpcs3Web.runSmokeTest());
   expect(repeated.coreProbe?.memoryTestMask).toBe(0);
   expect(repeated.coreProbe?.ppuTestMask).toBe(0);
+  expect(repeated.coreProbe?.elfProbe?.testMask).toBe(0);
   await expect(page.locator("#evidence")).toContainText('"schemaVersion": 1');
 });

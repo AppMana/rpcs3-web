@@ -6,6 +6,7 @@ endif()
 
 add_library(rpcs3_web_guest_memory STATIC
     guest_memory.cpp
+    ppu_elf_loader.cpp
     ppu_interpreter.cpp
     ppu_smoke.cpp
 )
@@ -31,11 +32,13 @@ if(EMSCRIPTEN)
         "-sINITIAL_MEMORY=67108864"
         "-sMAXIMUM_MEMORY=536870912"
         "-sPTHREAD_POOL_SIZE=2"
-        "-sEXPORTED_FUNCTIONS=['_rpcs3_web_probe_abi_version','_rpcs3_web_probe_memory','_rpcs3_web_probe_mapped_pages','_rpcs3_web_probe_resident_pages','_rpcs3_web_probe_ppu','_rpcs3_web_probe_ppu_steps','_rpcs3_web_probe_ppu_result','_rpcs3_web_probe_ppu_loaded','_rpcs3_web_probe_ppu_supported_opcodes']"
+        "-sEXPORTED_RUNTIME_METHODS=['HEAPU8']"
+        "-sEXPORTED_FUNCTIONS=['_malloc','_free','_rpcs3_web_probe_abi_version','_rpcs3_web_probe_memory','_rpcs3_web_probe_mapped_pages','_rpcs3_web_probe_resident_pages','_rpcs3_web_probe_ppu','_rpcs3_web_probe_ppu_steps','_rpcs3_web_probe_ppu_result','_rpcs3_web_probe_ppu_loaded','_rpcs3_web_probe_ppu_supported_opcodes','_rpcs3_web_probe_elf','_rpcs3_web_probe_elf_loaded','_rpcs3_web_probe_elf_segments','_rpcs3_web_probe_elf_entry','_rpcs3_web_probe_elf_steps','_rpcs3_web_probe_elf_stop_reason','_rpcs3_web_probe_elf_pc','_rpcs3_web_probe_elf_last_opcode','_rpcs3_web_probe_elf_target']"
     )
 else()
     include(CTest)
     add_executable(rpcs3_web_guest_memory_tests tests/guest_memory_test.cpp)
     target_link_libraries(rpcs3_web_guest_memory_tests PRIVATE rpcs3_web_guest_memory)
+    target_compile_definitions(rpcs3_web_guest_memory_tests PRIVATE RPCS3_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../..")
     add_test(NAME rpcs3_web_guest_memory_tests COMMAND rpcs3_web_guest_memory_tests)
 endif()

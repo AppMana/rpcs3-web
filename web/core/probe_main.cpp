@@ -1,5 +1,6 @@
 #include "guest_memory.hpp"
 #include "ppu_interpreter.hpp"
+#include "ppu_elf_loader.hpp"
 
 #include <array>
 #include <cstddef>
@@ -17,11 +18,13 @@ namespace
 {
     std::unique_ptr<rpcs3::web::guest_memory> memory;
     rpcs3::web::ppu_smoke_result ppu_result;
+    rpcs3::web::ppu_elf_load_result elf_result;
+    rpcs3::web::ppu_state elf_state;
 }
 
 RPCS3_WEB_EXPORT int rpcs3_web_probe_abi_version()
 {
-    return 2;
+    return 4;
 }
 
 RPCS3_WEB_EXPORT int rpcs3_web_probe_memory()
@@ -77,6 +80,68 @@ RPCS3_WEB_EXPORT int rpcs3_web_probe_ppu_loaded()
 RPCS3_WEB_EXPORT int rpcs3_web_probe_ppu_supported_opcodes()
 {
     return static_cast<int>(rpcs3::web::ppu_interpreter::supported_instruction_count);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_elf(const unsigned char* data, int size, int instruction_limit)
+{
+    elf_result = {};
+    elf_state = {};
+    if (!data || size <= 0 || instruction_limit <= 0) return 1;
+    auto memory = std::make_unique<rpcs3::web::guest_memory>();
+    elf_result = rpcs3::web::load_ppu_elf(
+        std::span{reinterpret_cast<const std::byte*>(data), static_cast<std::size_t>(size)}, *memory);
+    if (!elf_result) return 2;
+
+    constexpr std::uint32_t stack_base = 0xd0000000;
+    constexpr std::uint32_t stack_size = 2 * 1024 * 1024;
+    if (!memory->map(stack_base, stack_size, rpcs3::web::page_access::read_write)) return 4;
+    rpcs3::web::ppu_interpreter interpreter(*memory);
+    interpreter.state().pc = elf_result.entry;
+    interpreter.state().gpr[1] = static_cast<std::uint64_t>(stack_base) + stack_size;
+    interpreter.state().gpr[2] = elf_result.toc;
+    interpreter.run(static_cast<std::size_t>(instruction_limit));
+    elf_state = interpreter.state();
+    return elf_state.instructions == 0 ? 8 : 0;
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_elf_loaded()
+{
+    return elf_result ? 1 : 0;
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_elf_segments()
+{
+    return static_cast<int>(elf_result.segments);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_elf_entry()
+{
+    return static_cast<int>(elf_result.entry);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_elf_steps()
+{
+    return static_cast<int>(elf_state.instructions);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_elf_stop_reason()
+{
+    return static_cast<int>(elf_state.stop_reason);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_elf_pc()
+{
+    return static_cast<int>(elf_state.pc);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_elf_last_opcode()
+{
+    return static_cast<int>(elf_state.last_opcode);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_elf_target()
+{
+    return static_cast<int>(elf_state.ctr);
 }
 
 int main()

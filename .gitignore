@@ -122,6 +122,7 @@ CMakeLists.txt.user
 /web/test-results/
 /web/device-evidence/
 /web/public/core/
+/web/public/fixtures/
 
 # macOS
 .DS_Store

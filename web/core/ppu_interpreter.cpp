@@ -80,7 +80,8 @@ namespace rpcs3::web
         if ((m_state.pc & 3) != 0) return stop(ppu_stop_reason::memory_fault);
 
         std::uint32_t op = 0;
-        if (!m_memory.load_be(m_state.pc, op)) return stop(ppu_stop_reason::memory_fault);
+        if (!m_memory.has_range_access(m_state.pc, sizeof(op), page_access::execute) || !m_memory.load_be(m_state.pc, op))
+            return stop(ppu_stop_reason::memory_fault);
         m_state.last_opcode = op;
         ++m_state.instructions;
 
@@ -145,6 +146,21 @@ namespace rpcs3::web
                 if (branch_condition(rt, ra)) m_state.pc = static_cast<std::uint32_t>(target) & ~3u;
                 return ppu_stop_reason::running;
             }
+            if (((op >> 1) & 0x3ff) == 528) // bcctr
+            {
+                const std::uint32_t target = static_cast<std::uint32_t>(m_state.ctr) & ~3u;
+                if ((op & 1) != 0) m_state.lr = m_state.pc;
+                if (branch_condition(rt, ra))
+                {
+                    if (!m_memory.has_range_access(target, sizeof(std::uint32_t), page_access::execute))
+                    {
+                        m_state.pc = current_pc;
+                        return stop(ppu_stop_reason::hle_call);
+                    }
+                    m_state.pc = target;
+                }
+                return ppu_stop_reason::running;
+            }
             break;
         case 24: // ori
             m_state.gpr[ra] = m_state.gpr[rt] | static_cast<std::uint16_t>(op);
@@ -159,11 +175,46 @@ namespace rpcs3::web
             m_state.gpr[ra] = m_state.gpr[rt] & static_cast<std::uint16_t>(op);
             set_cr(0, static_cast<std::int64_t>(m_state.gpr[ra]), 0);
             return ppu_stop_reason::running;
+        case 29: // andis.
+            m_state.gpr[ra] = m_state.gpr[rt] & (static_cast<std::uint64_t>(static_cast<std::uint16_t>(op)) << 16);
+            set_cr(0, static_cast<std::int64_t>(m_state.gpr[ra]), 0);
+            return ppu_stop_reason::running;
+        case 30: // rotate-left-doubleword immediate family
+        {
+            const std::uint32_t selector = (op >> 1) & 15;
+            if (selector <= 1) // rldicl / clrldi
+            {
+                const std::uint32_t shift = (((op >> 1) & 1) << 5) | ((op >> 11) & 31);
+                const std::uint32_t mask_begin = (((op >> 5) & 1) << 5) | ((op >> 6) & 31);
+                m_state.gpr[ra] = std::rotl(m_state.gpr[rt], static_cast<int>(shift)) & (~std::uint64_t{0} >> mask_begin);
+                if ((op & 1) != 0) set_cr(0, static_cast<std::int64_t>(m_state.gpr[ra]), 0);
+                return ppu_stop_reason::running;
+            }
+            break;
+        }
         case 31:
         {
             const std::uint32_t xo = (op >> 1) & 0x3ff;
             switch (xo)
             {
+            case 0: // cmp
+            {
+                const std::uint32_t field = (op >> 23) & 7;
+                const bool is_64_bit = ((op >> 21) & 1) != 0;
+                const std::int64_t left = is_64_bit ? static_cast<std::int64_t>(m_state.gpr[ra]) : static_cast<std::int32_t>(m_state.gpr[ra]);
+                const std::int64_t right = is_64_bit ? static_cast<std::int64_t>(m_state.gpr[rb]) : static_cast<std::int32_t>(m_state.gpr[rb]);
+                set_cr(field, left, right);
+                return ppu_stop_reason::running;
+            }
+            case 32: // cmpl
+            {
+                const std::uint32_t field = (op >> 23) & 7;
+                const bool is_64_bit = ((op >> 21) & 1) != 0;
+                const std::uint64_t left = is_64_bit ? m_state.gpr[ra] : static_cast<std::uint32_t>(m_state.gpr[ra]);
+                const std::uint64_t right = is_64_bit ? m_state.gpr[rb] : static_cast<std::uint32_t>(m_state.gpr[rb]);
+                set_cr_unsigned(field, left, right);
+                return ppu_stop_reason::running;
+            }
             case 40: // subf
                 m_state.gpr[rt] = m_state.gpr[rb] - m_state.gpr[ra];
                 return ppu_stop_reason::running;

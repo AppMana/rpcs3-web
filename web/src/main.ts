@@ -59,6 +59,12 @@ function renderReport(report: CapabilityReport): void {
           detail: `${core.ppuInstructions ?? 0} guest instructions · result ${core.ppuResult ?? "?"} · ${core.ppuSupportedOpcodes ?? 0} opcodes`,
         }
       : { state: "unsupported", detail: "compiled core not loaded" }],
+    ["RPCS3 PPU ELF fixture", core?.elfProbe?.loaded
+      ? {
+          state: core.elfProbe.testMask === 0 && (core.elfProbe.instructions ?? 0) > 0 ? "passed" : "failed",
+          detail: core.elfProbe.detail,
+        }
+      : { state: "unsupported", detail: core?.elfProbe?.detail ?? "fixture unavailable" }],
   ];
   document.querySelector<HTMLElement>("#summary")!.innerHTML = checks.map(([label, result]) => row(label, result)).join("");
   document.querySelector<HTMLElement>("#evidence")!.textContent = JSON.stringify(report, null, 2);

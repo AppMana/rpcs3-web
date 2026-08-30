@@ -48,6 +48,7 @@ namespace rpcs3::web
 
         bool read(std::uint32_t address, std::span<std::byte> output) const;
         bool write(std::uint32_t address, std::span<const std::byte> input);
+        [[nodiscard]] bool has_range_access(std::uint32_t address, std::size_t size, page_access access) const;
 
         template <typename T>
         bool load_be(std::uint32_t address, T& output) const

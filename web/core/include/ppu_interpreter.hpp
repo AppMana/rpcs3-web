@@ -15,6 +15,7 @@ namespace rpcs3::web
         unsupported_instruction,
         memory_fault,
         instruction_limit,
+        hle_call,
     };
 
     struct ppu_state
@@ -39,7 +40,7 @@ namespace rpcs3::web
         ppu_stop_reason step();
         ppu_stop_reason run(std::size_t instruction_limit);
 
-        static constexpr std::uint32_t supported_instruction_count = 28;
+        static constexpr std::uint32_t supported_instruction_count = 33;
 
     private:
         bool effective_address(std::uint32_t ra, std::int64_t displacement, std::uint32_t& address) const;

@@ -117,7 +117,7 @@ namespace rpcs3::web
             m_state.gpr[rt] = (ra == 0 ? 0 : m_state.gpr[ra]) + static_cast<std::uint64_t>(static_cast<std::int64_t>(immediate));
             return ppu_stop_reason::running;
         case 15: // addis
-            m_state.gpr[rt] = (ra == 0 ? 0 : m_state.gpr[ra]) + static_cast<std::uint64_t>(static_cast<std::int64_t>(immediate) << 16);
+            m_state.gpr[rt] = (ra == 0 ? 0 : m_state.gpr[ra]) + static_cast<std::uint64_t>(static_cast<std::int64_t>(immediate) * 65536);
             return ppu_stop_reason::running;
         case 16: // bc
         {

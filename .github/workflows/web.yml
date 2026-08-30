@@ -18,6 +18,8 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-24.04
+    env:
+      BASE_PATH: /rpcs3-web/
     defaults:
       run:
         working-directory: web
@@ -36,8 +38,6 @@ jobs:
       - run: npm run build:core
       - run: npm test
       - run: npm run build
-        env:
-          BASE_PATH: /rpcs3-web/
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
       - uses: actions/upload-pages-artifact@v3

@@ -17,7 +17,7 @@ if(EMSCRIPTEN)
     add_executable(rpcs3_web_probe probe_main.cpp)
     target_link_libraries(rpcs3_web_probe PRIVATE rpcs3_web_guest_memory)
     set_target_properties(rpcs3_web_probe PROPERTIES
-        OUTPUT_NAME "rpcs3-web-probe"
+        OUTPUT_NAME "rpcs3-web-probe-v4"
         SUFFIX ".mjs"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/web/public/core"
     )

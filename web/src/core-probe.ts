@@ -22,6 +22,10 @@ type ProbeModule = {
   _rpcs3_web_probe_elf_pc(): number;
   _rpcs3_web_probe_elf_last_opcode(): number;
   _rpcs3_web_probe_elf_target(): number;
+  _rpcs3_web_probe_elf_hle_calls(): number;
+  _rpcs3_web_probe_elf_hle_nid(): number;
+  _rpcs3_web_probe_elf_syscalls(): number;
+  _rpcs3_web_probe_elf_last_syscall(): number;
 };
 
 type ProbeFactory = (options?: Record<string, unknown>) => Promise<ProbeModule>;
@@ -38,7 +42,7 @@ async function runElfProbe(module: ProbeModule): Promise<ElfProbeResult> {
     let testMask: number;
     try {
       module.HEAPU8.set(image, pointer);
-      testMask = module._rpcs3_web_probe_elf(pointer, image.byteLength, 1000);
+      testMask = module._rpcs3_web_probe_elf(pointer, image.byteLength, 100_000);
     } finally {
       module._free(pointer);
     }
@@ -46,9 +50,13 @@ async function runElfProbe(module: ProbeModule): Promise<ElfProbeResult> {
     const instructions = module._rpcs3_web_probe_elf_steps();
     const stopReason = module._rpcs3_web_probe_elf_stop_reason();
     const pc = module._rpcs3_web_probe_elf_pc() >>> 0;
-    const stoppedAt = stopReason === 2 ? (pc - 4) >>> 0 : pc;
+    const stoppedAt = stopReason === 1 || stopReason === 2 ? (pc - 4) >>> 0 : pc;
     const lastOpcode = module._rpcs3_web_probe_elf_last_opcode() >>> 0;
     const target = module._rpcs3_web_probe_elf_target() >>> 0;
+    const hleCalls = module._rpcs3_web_probe_elf_hle_calls();
+    const hleNid = module._rpcs3_web_probe_elf_hle_nid() >>> 0;
+    const syscalls = module._rpcs3_web_probe_elf_syscalls();
+    const lastSyscall = module._rpcs3_web_probe_elf_last_syscall();
     return {
       loaded,
       testMask,
@@ -59,8 +67,12 @@ async function runElfProbe(module: ProbeModule): Promise<ElfProbeResult> {
       pc,
       lastOpcode,
       target,
+      hleCalls,
+      hleNid,
+      syscalls,
+      lastSyscall,
       detail: loaded
-        ? `${instructions} instructions; ${stopReasons[stopReason] ?? `stop ${stopReason}`} at 0x${stoppedAt.toString(16)} (opcode 0x${lastOpcode.toString(16)}, target 0x${target.toString(16)})`
+        ? `${instructions} instructions, ${hleCalls} HLE calls / ${syscalls} syscalls; ${stopReasons[stopReason] ?? `stop ${stopReason}`} at 0x${stoppedAt.toString(16)} (opcode 0x${lastOpcode.toString(16)}, target 0x${target.toString(16)})`
         : `ELF load failed with mask 0x${testMask.toString(16)}`,
     };
   } catch (error) {
@@ -69,7 +81,7 @@ async function runElfProbe(module: ProbeModule): Promise<ElfProbeResult> {
 }
 
 export async function runCoreProbe(): Promise<CoreProbeResult> {
-  const coreAsset = "rpcs3-web-probe-v4";
+  const coreAsset = "rpcs3-web-probe-v5";
   const url = `${import.meta.env.BASE_URL}core/${coreAsset}.mjs`;
   try {
     const imported = await import(/* @vite-ignore */ url) as { default?: ProbeFactory };

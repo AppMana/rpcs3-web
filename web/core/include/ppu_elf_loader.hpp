@@ -5,9 +5,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
+#include <vector>
 
 namespace rpcs3::web
 {
+    struct ppu_import_stub
+    {
+        std::string module;
+        std::uint32_t nid = 0;
+        std::uint32_t stub_address = 0;
+        std::uint32_t call_address = 0;
+    };
+
     enum class ppu_elf_error : std::uint8_t
     {
         none,
@@ -29,6 +39,10 @@ namespace rpcs3::web
         std::uint32_t segments = 0;
         std::uint32_t mapped_pages = 0;
         std::uint64_t file_bytes = 0;
+        std::uint32_t tls_address = 0;
+        std::uint32_t tls_file_size = 0;
+        std::uint32_t tls_memory_size = 0;
+        std::vector<ppu_import_stub> imports;
 
         [[nodiscard]] explicit operator bool() const { return error == ppu_elf_error::none; }
     };

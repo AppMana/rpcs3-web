@@ -2,7 +2,7 @@ name: Web bring-up
 
 on:
   push:
-    branches: [web/main, master]
+    branches: [master]
   pull_request:
   workflow_dispatch:
 

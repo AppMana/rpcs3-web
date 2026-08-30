@@ -12,6 +12,12 @@ namespace rpcs3::web
             const std::uint64_t sign = std::uint64_t{1} << (bits - 1);
             return static_cast<std::int64_t>((value ^ sign) - sign);
         }
+
+        constexpr std::uint64_t rotate_mask(std::uint32_t begin, std::uint32_t end)
+        {
+            const std::uint64_t mask = ~std::uint64_t{0} << (~(end - begin) & 63);
+            return (mask >> (begin & 63)) | (mask << ((64 - begin) & 63));
+        }
     }
 
     ppu_interpreter::ppu_interpreter(guest_memory& memory)
@@ -27,6 +33,18 @@ namespace rpcs3::web
     const ppu_state& ppu_interpreter::state() const
     {
         return m_state;
+    }
+
+    void ppu_interpreter::set_hle_handler(hle_handler handler, void* context)
+    {
+        m_hle_handler = handler;
+        m_hle_context = context;
+    }
+
+    void ppu_interpreter::set_syscall_handler(syscall_handler handler, void* context)
+    {
+        m_syscall_handler = handler;
+        m_syscall_context = context;
     }
 
     ppu_stop_reason ppu_interpreter::stop(ppu_stop_reason reason)
@@ -130,6 +148,8 @@ namespace rpcs3::web
             return ppu_stop_reason::running;
         }
         case 17: // sc
+            if (m_syscall_handler && m_syscall_handler(m_state, m_memory, static_cast<std::uint32_t>(m_state.gpr[11]), m_syscall_context))
+                return ppu_stop_reason::running;
             return stop(ppu_stop_reason::syscall);
         case 18: // b
         {
@@ -154,6 +174,8 @@ namespace rpcs3::web
                 {
                     if (!m_memory.has_range_access(target, sizeof(std::uint32_t), page_access::execute))
                     {
+                        if (m_hle_handler && m_hle_handler(m_state, m_memory, current_pc, m_hle_context))
+                            return ppu_stop_reason::running;
                         m_state.pc = current_pc;
                         return stop(ppu_stop_reason::hle_call);
                     }
@@ -162,6 +184,17 @@ namespace rpcs3::web
                 return ppu_stop_reason::running;
             }
             break;
+        case 21: // rlwinm (also clrlwi/srwi aliases)
+        {
+            const std::uint32_t shift = (op >> 11) & 31;
+            const std::uint32_t mask_begin = (op >> 6) & 31;
+            const std::uint32_t mask_end = (op >> 1) & 31;
+            const std::uint32_t rotated = std::rotl(static_cast<std::uint32_t>(m_state.gpr[rt]), static_cast<int>(shift));
+            const std::uint64_t duplicated = (static_cast<std::uint64_t>(rotated) << 32) | rotated;
+            m_state.gpr[ra] = duplicated & rotate_mask(32 + mask_begin, 32 + mask_end);
+            if ((op & 1) != 0) set_cr(0, static_cast<std::int64_t>(m_state.gpr[ra]), 0);
+            return ppu_stop_reason::running;
+        }
         case 24: // ori
             m_state.gpr[ra] = m_state.gpr[rt] | static_cast<std::uint16_t>(op);
             return ppu_stop_reason::running;
@@ -221,6 +254,9 @@ namespace rpcs3::web
             case 266: // add
                 m_state.gpr[rt] = m_state.gpr[ra] + m_state.gpr[rb];
                 return ppu_stop_reason::running;
+            case 316: // xor
+                m_state.gpr[ra] = m_state.gpr[rt] ^ m_state.gpr[rb];
+                return ppu_stop_reason::running;
             case 339: // mfspr
             {
                 const std::uint32_t spr = ((op >> 16) & 31) | ((op >> 6) & 0x3e0);
@@ -242,6 +278,12 @@ namespace rpcs3::web
             }
             case 986: // extsw
                 m_state.gpr[ra] = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(m_state.gpr[rt])));
+                return ppu_stop_reason::running;
+            case 922: // extsh
+                m_state.gpr[ra] = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int16_t>(m_state.gpr[rt])));
+                return ppu_stop_reason::running;
+            case 824: // srawi
+                m_state.gpr[ra] = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(m_state.gpr[rt])) >> rb);
                 return ppu_stop_reason::running;
             default:
                 break;
@@ -275,6 +317,14 @@ namespace rpcs3::web
             std::uint32_t address = 0;
             const std::array value{static_cast<std::byte>(m_state.gpr[rt] & 0xff)};
             if (!effective_address(ra, immediate, address) || !m_memory.write(address, value)) return stop(ppu_stop_reason::memory_fault);
+            return ppu_stop_reason::running;
+        }
+        case 40: // lhz
+        {
+            std::uint32_t address = 0;
+            std::uint16_t value = 0;
+            if (!effective_address(ra, immediate, address) || !m_memory.load_be(address, value)) return stop(ppu_stop_reason::memory_fault);
+            m_state.gpr[rt] = value;
             return ppu_stop_reason::running;
         }
         case 58: // ld, ldu, lwa

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iterator>
+#include <ranges>
 #include <vector>
 
 int main()
@@ -71,6 +72,14 @@ int main()
     assert(loaded.entry == 0x0001022c);
     assert(loaded.toc == 0x00038b50);
     assert(loaded.segments == 2);
+    assert(loaded.tls_address == 0x00030e0c);
+    assert(loaded.tls_file_size == 0);
+    assert(loaded.tls_memory_size == 0x84);
+    assert(loaded.imports.size() == 17);
+    const auto tls_import = std::ranges::find_if(loaded.imports, [](const auto& item) { return item.nid == 0x744680a2; });
+    assert(tls_import != loaded.imports.end());
+    assert(tls_import->module == "sysPrxForUser");
+    assert(tls_import->call_address == 0x00025c5c);
     assert(elf_memory.map(0xd0000000, 2 * 1024 * 1024, page_access::read_write));
     rpcs3::web::ppu_interpreter elf_interpreter(elf_memory);
     elf_interpreter.state().pc = loaded.entry;

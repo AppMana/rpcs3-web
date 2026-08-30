@@ -39,8 +39,12 @@ namespace rpcs3::web
         [[nodiscard]] const ppu_state& state() const;
         ppu_stop_reason step();
         ppu_stop_reason run(std::size_t instruction_limit);
+        using hle_handler = bool(*)(ppu_state&, guest_memory&, std::uint32_t, void*);
+        void set_hle_handler(hle_handler handler, void* context);
+        using syscall_handler = bool(*)(ppu_state&, guest_memory&, std::uint32_t, void*);
+        void set_syscall_handler(syscall_handler handler, void* context);
 
-        static constexpr std::uint32_t supported_instruction_count = 33;
+        static constexpr std::uint32_t supported_instruction_count = 38;
 
     private:
         bool effective_address(std::uint32_t ra, std::int64_t displacement, std::uint32_t& address) const;
@@ -51,6 +55,10 @@ namespace rpcs3::web
 
         guest_memory& m_memory;
         ppu_state m_state;
+        hle_handler m_hle_handler = nullptr;
+        void* m_hle_context = nullptr;
+        syscall_handler m_syscall_handler = nullptr;
+        void* m_syscall_context = nullptr;
     };
 
     struct ppu_smoke_result

@@ -66,6 +66,10 @@ export type ElfProbeResult = {
   pc?: number;
   lastOpcode?: number;
   target?: number;
+  hleCalls?: number;
+  hleNid?: number;
+  syscalls?: number;
+  lastSyscall?: number;
   detail: string;
 };
 

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <string>
 
 namespace rpcs3::web
 {
@@ -32,6 +33,32 @@ namespace rpcs3::web
             if ((flags & 2) != 0) access = access | page_access::write;
             if ((flags & 1) != 0) access = access | page_access::execute;
             return access;
+        }
+
+        std::string image_string(std::span<const std::byte> image, std::uint64_t offset, std::size_t limit)
+        {
+            std::string output;
+            while (offset < image.size() && output.size() < limit)
+            {
+                const char character = static_cast<char>(std::to_integer<std::uint8_t>(image[static_cast<std::size_t>(offset++)]));
+                if (character == '\0') break;
+                output.push_back(character);
+            }
+            return output;
+        }
+
+        std::string guest_string(const guest_memory& memory, std::uint32_t address, std::size_t limit)
+        {
+            std::string output;
+            for (std::size_t index = 0; index < limit; ++index)
+            {
+                std::array<std::byte, 1> byte{};
+                if (!memory.read(address + static_cast<std::uint32_t>(index), byte)) return {};
+                const char character = static_cast<char>(std::to_integer<std::uint8_t>(byte[0]));
+                if (character == '\0') return output;
+                output.push_back(character);
+            }
+            return {};
         }
     }
 
@@ -129,12 +156,121 @@ namespace rpcs3::web
             result.file_bytes += file_size;
         }
 
+        // Record TLS metadata even though PT_TLS does not create a separate mapping.
+        for (std::uint32_t index = 0; index < program_count; ++index)
+        {
+            const std::uint64_t header = program_offset + static_cast<std::uint64_t>(index) * program_entry_size;
+            std::uint32_t kind = 0;
+            std::uint64_t virtual_address = 0;
+            std::uint64_t file_size = 0;
+            std::uint64_t memory_size = 0;
+            if (!read_be(image, header, kind) || !read_be(image, header + 16, virtual_address) ||
+                !read_be(image, header + 32, file_size) || !read_be(image, header + 40, memory_size))
+            {
+                result.error = ppu_elf_error::invalid_program_header;
+                return result;
+            }
+            if (kind == 7)
+            {
+                if (virtual_address > std::numeric_limits<std::uint32_t>::max() ||
+                    file_size > std::numeric_limits<std::uint32_t>::max() || memory_size > std::numeric_limits<std::uint32_t>::max())
+                {
+                    result.error = ppu_elf_error::address_out_of_range;
+                    return result;
+                }
+                result.tls_address = static_cast<std::uint32_t>(virtual_address);
+                result.tls_file_size = static_cast<std::uint32_t>(file_size);
+                result.tls_memory_size = static_cast<std::uint32_t>(memory_size);
+            }
+        }
+
         if (entry_descriptor > std::numeric_limits<std::uint32_t>::max() ||
             !memory.load_be(static_cast<std::uint32_t>(entry_descriptor), result.entry) ||
             !memory.load_be(static_cast<std::uint32_t>(entry_descriptor + 4), result.toc))
         {
             result.error = ppu_elf_error::invalid_entry;
             return result;
+        }
+
+        // Parse Sony's 44-byte import records from .lib.stub. This turns the
+        // terminal bctr address back into a module/NID pair for the HLE layer.
+        std::uint64_t section_offset = 0;
+        std::uint16_t section_entry_size = 0;
+        std::uint16_t section_count = 0;
+        std::uint16_t string_section_index = 0;
+        if (!read_be(image, 40, section_offset) || !read_be(image, 58, section_entry_size) ||
+            !read_be(image, 60, section_count) || !read_be(image, 62, string_section_index) ||
+            section_entry_size < 64 || string_section_index >= section_count ||
+            section_offset > image.size() || static_cast<std::uint64_t>(section_entry_size) * section_count > image.size() - section_offset)
+        {
+            result.error = ppu_elf_error::invalid_program_header;
+            return result;
+        }
+
+        std::uint64_t string_offset = 0;
+        std::uint64_t string_size = 0;
+        const std::uint64_t string_header = section_offset + static_cast<std::uint64_t>(string_section_index) * section_entry_size;
+        if (!read_be(image, string_header + 24, string_offset) || !read_be(image, string_header + 32, string_size) ||
+            string_offset > image.size() || string_size > image.size() - string_offset)
+        {
+            result.error = ppu_elf_error::invalid_program_header;
+            return result;
+        }
+
+        for (std::uint32_t section = 0; section < section_count; ++section)
+        {
+            const std::uint64_t header = section_offset + static_cast<std::uint64_t>(section) * section_entry_size;
+            std::uint32_t name_index = 0;
+            std::uint64_t data_offset = 0;
+            std::uint64_t data_size = 0;
+            if (!read_be(image, header, name_index) || !read_be(image, header + 24, data_offset) || !read_be(image, header + 32, data_size))
+            {
+                result.error = ppu_elf_error::invalid_program_header;
+                return result;
+            }
+            if (name_index >= string_size || image_string(image, string_offset + name_index, 64) != ".lib.stub") continue;
+            if (data_offset > image.size() || data_size > image.size() - data_offset)
+            {
+                result.error = ppu_elf_error::invalid_program_header;
+                return result;
+            }
+
+            std::uint64_t cursor = data_offset;
+            const std::uint64_t end = data_offset + data_size;
+            while (cursor < end)
+            {
+                const std::uint32_t record_size = std::to_integer<std::uint8_t>(image[static_cast<std::size_t>(cursor)]);
+                std::uint16_t function_count = 0;
+                std::uint32_t module_address = 0;
+                std::uint32_t nid_address = 0;
+                std::uint32_t stub_table_address = 0;
+                if (record_size < 28 || cursor + record_size > end || !read_be(image, cursor + 6, function_count) ||
+                    !read_be(image, cursor + 16, module_address) || !read_be(image, cursor + 20, nid_address) ||
+                    !read_be(image, cursor + 24, stub_table_address))
+                {
+                    result.error = ppu_elf_error::invalid_program_header;
+                    return result;
+                }
+                const std::string module = guest_string(memory, module_address, 64);
+                if (module.empty())
+                {
+                    result.error = ppu_elf_error::invalid_program_header;
+                    return result;
+                }
+                for (std::uint32_t function = 0; function < function_count; ++function)
+                {
+                    std::uint32_t nid = 0;
+                    std::uint32_t stub = 0;
+                    if (!memory.load_be(nid_address + function * 4, nid) || !memory.load_be(stub_table_address + function * 4, stub))
+                    {
+                        result.error = ppu_elf_error::invalid_program_header;
+                        return result;
+                    }
+                    result.imports.push_back({module, nid, stub, stub + 0x1c});
+                }
+                cursor += record_size;
+            }
+            break;
         }
         return result;
     }

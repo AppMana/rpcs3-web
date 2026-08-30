@@ -1,0 +1,31 @@
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #f5f7ff;
+  background: #090b12;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradient(circle at 80% 0%, #16284a 0, transparent 38rem), #090b12; }
+button { font: inherit; }
+header, main, footer { width: min(1120px, calc(100% - 32px)); margin-inline: auto; }
+header { padding: max(64px, env(safe-area-inset-top)) 0 32px; }
+.eyebrow { color: #77aaff; font-size: .78rem; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; }
+h1 { margin: 8px 0; font-size: clamp(2.5rem, 8vw, 5.8rem); line-height: .95; letter-spacing: -.055em; }
+.lede { max-width: 720px; color: #aeb8d1; font-size: 1.1rem; line-height: 1.6; }
+button { border: 0; border-radius: 999px; padding: 12px 18px; color: #07101d; background: #77aaff; font-weight: 800; }
+main { display: grid; gap: 20px; padding-bottom: 44px; }
+.visual, .summary, details { border: 1px solid #28344b; border-radius: 18px; background: rgba(13, 18, 30, .86); overflow: hidden; }
+.visual canvas { display: block; width: 100%; aspect-ratio: 16 / 9; background: #070912; }
+.visual div { display: flex; justify-content: space-between; padding: 14px 18px; color: #aeb8d1; }
+.summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.check { display: grid; grid-template-columns: 1fr auto; gap: 6px 14px; padding: 18px; border-bottom: 1px solid #202a3d; }
+.check small { grid-column: 1 / -1; color: #8490a9; overflow-wrap: anywhere; }
+.check strong { font-size: .72rem; letter-spacing: .08em; text-transform: uppercase; }
+.passed { color: #6ee7a8; }
+.failed { color: #ff7b86; }
+.unsupported { color: #f7c66b; }
+details { padding: 18px; }
+summary { cursor: pointer; font-weight: 750; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #b9c5de; font-size: .78rem; line-height: 1.55; }
+footer { color: #6e7890; padding: 8px 0 max(32px, env(safe-area-inset-bottom)); font-size: .85rem; }

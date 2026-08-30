@@ -1,0 +1,39 @@
+cmake_minimum_required(VERSION 3.28)
+
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(rpcs3_web_core LANGUAGES CXX)
+endif()
+
+add_library(rpcs3_web_guest_memory STATIC
+    guest_memory.cpp
+)
+target_include_directories(rpcs3_web_guest_memory PUBLIC include)
+target_compile_features(rpcs3_web_guest_memory PUBLIC cxx_std_23)
+
+if(EMSCRIPTEN)
+    add_executable(rpcs3_web_probe probe_main.cpp)
+    target_link_libraries(rpcs3_web_probe PRIVATE rpcs3_web_guest_memory)
+    set_target_properties(rpcs3_web_probe PROPERTIES
+        OUTPUT_NAME "rpcs3-web-probe"
+        SUFFIX ".mjs"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/web/public/core"
+    )
+    target_compile_options(rpcs3_web_probe PRIVATE -pthread)
+    target_link_options(rpcs3_web_probe PRIVATE
+        -pthread
+        "-sMODULARIZE=1"
+        "-sEXPORT_ES6=1"
+        "-sEXPORT_NAME=createRpcs3WebProbe"
+        "-sENVIRONMENT=web,worker"
+        "-sALLOW_MEMORY_GROWTH=1"
+        "-sINITIAL_MEMORY=67108864"
+        "-sMAXIMUM_MEMORY=536870912"
+        "-sPTHREAD_POOL_SIZE=2"
+        "-sEXPORTED_FUNCTIONS=['_rpcs3_web_probe_abi_version','_rpcs3_web_probe_memory','_rpcs3_web_probe_mapped_pages','_rpcs3_web_probe_resident_pages']"
+    )
+else()
+    include(CTest)
+    add_executable(rpcs3_web_guest_memory_tests tests/guest_memory_test.cpp)
+    target_link_libraries(rpcs3_web_guest_memory_tests PRIVATE rpcs3_web_guest_memory)
+    add_test(NAME rpcs3_web_guest_memory_tests COMMAND rpcs3_web_guest_memory_tests)
+endif()

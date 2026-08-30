@@ -1,0 +1,58 @@
+name: Web bring-up
+
+on:
+  push:
+    branches: [web/main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: rpcs3-web-pages
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.8
+          actions-cache-folder: emsdk-cache
+      - run: npm ci
+      - run: npm run build:core
+      - run: npm test
+      - run: npm run build
+        env:
+          BASE_PATH: /rpcs3-web/
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: web/dist
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: verify
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Deploy experimental test page
+        id: deployment
+        uses: actions/deploy-pages@v4

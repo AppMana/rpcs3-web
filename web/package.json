@@ -1,0 +1,32 @@
+{
+  "name": "rpcs3-web-probe",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Mobile Safari capability and runtime bring-up harness for RPCS3.",
+  "scripts": {
+    "prepare:assets": "node scripts/stage-coi.mjs",
+    "postinstall": "npm run prepare:assets",
+    "dev": "vite --host 0.0.0.0",
+    "build": "npm run prepare:assets && tsc --noEmit && vite build",
+    "build:core": "bash scripts/build-core.sh",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "check": "npm test && npm run build"
+  },
+  "dependencies": {
+    "coi-serviceworker": "0.1.7"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "@types/node": "24.3.0",
+    "@webgpu/types": "0.1.64",
+    "typescript": "5.9.2",
+    "vite": "7.3.6",
+    "vitest": "3.2.7"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

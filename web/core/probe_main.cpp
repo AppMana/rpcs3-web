@@ -1,4 +1,5 @@
 #include "guest_memory.hpp"
+#include "ppu_interpreter.hpp"
 
 #include <array>
 #include <cstddef>
@@ -15,11 +16,12 @@
 namespace
 {
     std::unique_ptr<rpcs3::web::guest_memory> memory;
+    rpcs3::web::ppu_smoke_result ppu_result;
 }
 
 RPCS3_WEB_EXPORT int rpcs3_web_probe_abi_version()
 {
-    return 1;
+    return 2;
 }
 
 RPCS3_WEB_EXPORT int rpcs3_web_probe_memory()
@@ -49,6 +51,32 @@ RPCS3_WEB_EXPORT int rpcs3_web_probe_mapped_pages()
 RPCS3_WEB_EXPORT int rpcs3_web_probe_resident_pages()
 {
     return memory ? static_cast<int>(memory->resident_pages()) : 0;
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_ppu()
+{
+    ppu_result = rpcs3::web::run_ppu_smoke();
+    return static_cast<int>(ppu_result.failure_mask);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_ppu_steps()
+{
+    return static_cast<int>(ppu_result.instructions);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_ppu_result()
+{
+    return static_cast<int>(ppu_result.result_register);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_ppu_loaded()
+{
+    return static_cast<int>(ppu_result.loaded_register);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_ppu_supported_opcodes()
+{
+    return static_cast<int>(rpcs3::web::ppu_interpreter::supported_instruction_count);
 }
 
 int main()

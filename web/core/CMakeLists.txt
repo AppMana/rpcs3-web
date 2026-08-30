@@ -6,6 +6,8 @@ endif()
 
 add_library(rpcs3_web_guest_memory STATIC
     guest_memory.cpp
+    ppu_interpreter.cpp
+    ppu_smoke.cpp
 )
 target_include_directories(rpcs3_web_guest_memory PUBLIC include)
 target_compile_features(rpcs3_web_guest_memory PUBLIC cxx_std_23)
@@ -29,7 +31,7 @@ if(EMSCRIPTEN)
         "-sINITIAL_MEMORY=67108864"
         "-sMAXIMUM_MEMORY=536870912"
         "-sPTHREAD_POOL_SIZE=2"
-        "-sEXPORTED_FUNCTIONS=['_rpcs3_web_probe_abi_version','_rpcs3_web_probe_memory','_rpcs3_web_probe_mapped_pages','_rpcs3_web_probe_resident_pages']"
+        "-sEXPORTED_FUNCTIONS=['_rpcs3_web_probe_abi_version','_rpcs3_web_probe_memory','_rpcs3_web_probe_mapped_pages','_rpcs3_web_probe_resident_pages','_rpcs3_web_probe_ppu','_rpcs3_web_probe_ppu_steps','_rpcs3_web_probe_ppu_result','_rpcs3_web_probe_ppu_loaded','_rpcs3_web_probe_ppu_supported_opcodes']"
     )
 else()
     include(CTest)

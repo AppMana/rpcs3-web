@@ -53,6 +53,12 @@ function renderReport(report: CapabilityReport): void {
     ["Sparse core probe", core?.loaded
       ? { state: core.memoryTestMask === 0 ? "passed" : "failed", detail: core.detail }
       : { state: "unsupported", detail: core?.detail ?? "not built" }],
+    ["PPU guest execution", core?.loaded
+      ? {
+          state: core.ppuTestMask === 0 ? "passed" : "failed",
+          detail: `${core.ppuInstructions ?? 0} guest instructions · result ${core.ppuResult ?? "?"} · ${core.ppuSupportedOpcodes ?? 0} opcodes`,
+        }
+      : { state: "unsupported", detail: "compiled core not loaded" }],
   ];
   document.querySelector<HTMLElement>("#summary")!.innerHTML = checks.map(([label, result]) => row(label, result)).join("");
   document.querySelector<HTMLElement>("#evidence")!.textContent = JSON.stringify(report, null, 2);

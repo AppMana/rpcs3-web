@@ -1,4 +1,5 @@
 #include "guest_memory.hpp"
+#include "ppu_interpreter.hpp"
 
 #include <array>
 #include <cassert>
@@ -42,5 +43,13 @@ int main()
     assert(memory.unmap(0x00012000, guest_memory::page_size));
     assert(!memory.read(0x00012000, output));
     assert(!memory.map(0xfffff000, 2 * guest_memory::page_size, page_access::read));
+
+    const auto ppu = rpcs3::web::run_ppu_smoke();
+    assert(ppu.failure_mask == 0);
+    assert(ppu.stop_reason == rpcs3::web::ppu_stop_reason::syscall);
+    assert(ppu.instructions == 46);
+    assert(ppu.result_register == 70);
+    assert(ppu.loaded_register == 70);
+    assert(ppu.stored_value == 70);
     return 0;
 }

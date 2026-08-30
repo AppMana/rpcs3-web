@@ -47,6 +47,11 @@ export type CoreProbeResult = {
   memoryTestMask?: number;
   mappedPages?: number;
   residentPages?: number;
+  ppuTestMask?: number;
+  ppuInstructions?: number;
+  ppuResult?: number;
+  ppuLoadedResult?: number;
+  ppuSupportedOpcodes?: number;
   detail: string;
 };
 

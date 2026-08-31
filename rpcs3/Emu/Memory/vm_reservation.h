@@ -254,8 +254,13 @@ namespace vm
 	template <bool Ack = false, typename T, typename F>
 	inline SAFE_BUFFERS(auto) light_op(T& data, F op)
 	{
-		// Optimized real ptr -> vm ptr conversion, simply UB if out of range
+		// Optimized real ptr -> vm ptr conversion. Wasm32 uses the reverse page
+		// table because guest memory is no longer one fixed host alias.
+#ifdef RPCS3_WEB
+		const u32 addr = static_cast<u32>(vm::get_addr(&data));
+#else
 		const u32 addr = static_cast<u32>(reinterpret_cast<const u8*>(&data) - g_base_addr);
+#endif
 
 		// Use "super" pointer to prevent access violation handling during atomic op
 		const auto sptr = vm::get_super_ptr<T>(addr);

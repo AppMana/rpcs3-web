@@ -214,10 +214,16 @@ s32 _ConvertStr(s32 src_code, const void *src, s32 src_len, s32 dst_code, void *
 	s32 retValue = ConversionOK;
 	iconv_t ict = iconv_open(dstCode, srcCode);
 	usz srcLen = src_len;
+	// POSIX leaves iconv's input parameter non-const even though the input
+	// bytes are not modified. Keep the mutable cursor local instead of
+	// casting the address of the const RPCS3 API argument (which Clang/Wasm
+	// correctly rejects as casting away a pointer qualifier).
+	char* src_ptr = const_cast<char*>(static_cast<const char*>(src));
 	if (dst)
 	{
 		usz dstLen = *dst_len;
-		usz ictd = iconv(ict, utils::bless<char*>(&src), &srcLen, utils::bless<char*>(&dst), &dstLen);
+		char* dst_ptr = static_cast<char*>(dst);
+		usz ictd = iconv(ict, &src_ptr, &srcLen, &dst_ptr, &dstLen);
 		*dst_len -= dstLen;
 		if (ictd == umax)
 		{
@@ -240,9 +246,9 @@ s32 _ConvertStr(s32 src_code, const void *src, s32 src_len, s32 dst_code, void *
 		char buf[16];
 		while (srcLen > 0)
 		{
-			//char *bufPtr = buf;
+			char* buf_ptr = buf;
 			usz bufLeft = sizeof(buf);
-			usz ictd = iconv(ict, utils::bless<char*>(&src), &srcLen, utils::bless<char*>(&dst), &bufLeft);
+			usz ictd = iconv(ict, &src_ptr, &srcLen, &buf_ptr, &bufLeft);
 			*dst_len += sizeof(buf) - bufLeft;
 			if (ictd == umax && errno != E2BIG)
 			{

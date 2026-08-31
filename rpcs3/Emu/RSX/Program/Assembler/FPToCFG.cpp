@@ -9,6 +9,12 @@
 #include <util/v128.hpp>
 #include <span>
 
+#if defined(ARCH_WASM32)
+// Emscripten lowers the SSE2 intrinsic surface used by this existing RSX
+// half-word shuffle directly to Wasm SIMD.
+#include <emmintrin.h>
+#endif
+
 #if defined(ARCH_ARM64)
 #if !defined(_MSC_VER)
 #pragma GCC diagnostic push

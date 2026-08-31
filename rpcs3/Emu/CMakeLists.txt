@@ -55,6 +55,14 @@ target_include_directories(rpcs3_emu
         ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 
+if(RPCS3_WEB)
+	# Emscripten maps the SSE intrinsic API used by RPCS3's mature interpreter
+	# vector helpers to Wasm SIMD instructions.  This does not enable any x86
+	# JIT backend.
+	target_compile_options(rpcs3_emu PRIVATE -msimd128 -msse4.1)
+	target_compile_definitions(rpcs3_emu PRIVATE RPCS3_WEB_INTERPRETER_ONLY=1)
+endif()
+
 target_include_directories(rpcs3_emu
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty
@@ -69,7 +77,6 @@ target_sources(rpcs3_emu PRIVATE
     ../util/video_provider.cpp
     ../util/logs.cpp
     ../util/yaml.cpp
-    ../util/vm_native.cpp
     ../util/dyn_lib.cpp
     ../util/sysinfo.cpp
     ../util/cpu_stats.cpp
@@ -80,8 +87,6 @@ target_sources(rpcs3_emu PRIVATE
     ../../Utilities/Config.cpp
     ../../Utilities/date_time.cpp
     ../../Utilities/File.cpp
-    ../../Utilities/JITASM.cpp
-    ../../Utilities/JITLLVM.cpp
     ../../Utilities/LUrlParser.cpp
     ../../Utilities/mutex.cpp
     ../../Utilities/rXml.cpp
@@ -93,6 +98,27 @@ target_sources(rpcs3_emu PRIVATE
     ../../Utilities/Thread.cpp
     ../../Utilities/version.cpp
 )
+
+if(RPCS3_WEB)
+	target_sources(rpcs3_emu PRIVATE
+		../util/vm_web.cpp
+		../rpcs3_version.cpp
+		../Input/mouse_gyro_handler.cpp
+		../Input/pad_thread.cpp
+		../Input/product_info.cpp
+		../Input/ps_move_config.cpp
+		../Input/ps_move_tracker.cpp
+		Io/libusb_web.cpp)
+else()
+	target_sources(rpcs3_emu PRIVATE ../util/vm_native.cpp)
+endif()
+
+if(NOT RPCS3_WEB)
+	target_sources(rpcs3_emu PRIVATE
+		../../Utilities/JITASM.cpp
+		../../Utilities/JITLLVM.cpp
+	)
+endif()
 if(APPLE)
     target_sources(rpcs3_emu PRIVATE
         ../../darwin/util/sysinfo_darwin.mm
@@ -150,9 +176,14 @@ target_sources(rpcs3_emu PRIVATE
     Audio/audio_utils.cpp
     Audio/AudioDumper.cpp
     Audio/AudioBackend.cpp
-    Audio/Cubeb/CubebBackend.cpp
-    Audio/Cubeb/cubeb_enumerator.cpp
 )
+
+if(NOT RPCS3_WEB)
+	target_sources(rpcs3_emu PRIVATE
+		Audio/Cubeb/CubebBackend.cpp
+		Audio/Cubeb/cubeb_enumerator.cpp
+	)
+endif()
 
 if(USE_FAUDIO)
     find_package(SDL3)
@@ -187,14 +218,10 @@ target_sources(rpcs3_emu PRIVATE
     Cell/PPUInterpreter.cpp
     Cell/PPUModule.cpp
     Cell/PPUThread.cpp
-    Cell/PPUTranslator.cpp
     Cell/RawSPUThread.cpp
     Cell/SPUAnalyser.cpp
-    Cell/SPUASMJITRecompiler.cpp
     Cell/SPUDisAsm.cpp
     Cell/SPUInterpreter.cpp
-    Cell/SPUCommonRecompiler.cpp
-    Cell/SPULLVMRecompiler.cpp
     Cell/SPUThread.cpp
     Cell/lv2/lv2.cpp
     Cell/lv2/sys_bdemu.cpp
@@ -391,6 +418,17 @@ target_sources(rpcs3_emu PRIVATE
     Cell/Modules/libfs_utility_init.cpp
 )
 
+if(RPCS3_WEB)
+	target_sources(rpcs3_emu PRIVATE Cell/SPUWebRuntime.cpp)
+else()
+	target_sources(rpcs3_emu PRIVATE
+		Cell/PPUTranslator.cpp
+		Cell/SPUASMJITRecompiler.cpp
+		Cell/SPUCommonRecompiler.cpp
+		Cell/SPULLVMRecompiler.cpp
+	)
+endif()
+
 if(NOT MSVC)
     set_source_files_properties(Cell/PPUTranslator.cpp PROPERTIES
         COMPILE_FLAGS -fno-rtti
@@ -583,7 +621,15 @@ target_sources(rpcs3_emu PRIVATE
     RSX/rsx_vertex_data.cpp
 )
 
-if(NOT ANDROID AND NOT APPLE)
+if(RPCS3_WEB)
+    target_sources(rpcs3_emu PRIVATE
+        RSX/WG/WebGPUCommand.cpp
+        RSX/WG/WebGPUHost.cpp
+        RSX/WG/WebGPUGSRender.cpp
+    )
+endif()
+
+if(NOT ANDROID AND NOT APPLE AND NOT RPCS3_WEB)
     target_sources(rpcs3_emu PRIVATE
         RSX/GL/GLCommonDecompiler.cpp
         RSX/GL/GLCompute.cpp

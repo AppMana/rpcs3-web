@@ -1942,6 +1942,13 @@ auto gen_ghc_cpp_trampoline(ppu_intrp_func_t fn_target)
 	};
 }
 
+#elif defined(RPCS3_WEB_INTERPRETER_ONLY)
+
+ppu_intrp_func_t gen_ghc_cpp_trampoline(ppu_intrp_func_t fn_target)
+{
+	return fn_target;
+}
+
 #else
 #error "Not implemented!"
 #endif
@@ -1976,8 +1983,13 @@ std::vector<ppu_intrp_func_t>& ppu_function_manager::access(bool ghc)
 
 	static std::vector<ppu_intrp_func_t> list_ghc
 	{
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+		list[0],
+		list[1],
+#else
 		build_function_asm<ppu_intrp_func_t>("ppu_unregistered", gen_ghc_cpp_trampoline(list[0])),
 		build_function_asm<ppu_intrp_func_t>("ppu_return", gen_ghc_cpp_trampoline(list[1])),
+#endif
 	};
 
 	return ghc ? list_ghc : list;
@@ -1990,7 +2002,11 @@ u32 ppu_function_manager::add_function(ppu_intrp_func_t function)
 
 	list.push_back(function);
 
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+	list2.push_back(function);
+#else
 	list2.push_back(build_function_asm<ppu_intrp_func_t>("", gen_ghc_cpp_trampoline(function)));
+#endif
 
 	return ::size32(list) - 1;
 }

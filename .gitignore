@@ -121,6 +121,7 @@ CMakeLists.txt.user
 /web/playwright-report/
 /web/test-results/
 /web/device-evidence/
+/web/device-runtime-evidence/
 /web/public/core/
 /web/public/fixtures/
 

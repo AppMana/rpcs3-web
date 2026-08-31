@@ -3,9 +3,12 @@
 
 #include <qglobal.h>
 
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
 #if QT_CONFIG(permissions)
+#define RPCS3_QT_PERMISSIONS
 #include <QApplication>
 #include <QPermissions>
+#endif
 #endif
 
 LOG_CHANNEL(gui_log, "GUI");
@@ -17,7 +20,7 @@ namespace gui
 	{
 		void check_microphone_permission()
 		{
-#if QT_CONFIG(permissions)
+#ifdef RPCS3_QT_PERMISSIONS
 			const QMicrophonePermission permission;
 			switch (qApp->checkPermission(permission))
 			{
@@ -40,7 +43,7 @@ namespace gui
 
 		bool check_camera_permission(void* obj, std::function<void()> repeat_callback, std::function<void()> denied_callback)
 		{
-#if QT_CONFIG(permissions)
+#ifdef RPCS3_QT_PERMISSIONS
 			const QCameraPermission permission;
 			switch (qApp->checkPermission(permission))
 			{

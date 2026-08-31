@@ -14,7 +14,11 @@ struct cfg_root : cfg::node
 	{
 		node_core(cfg::node* _this) : cfg::node(_this, "Core") {}
 
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+		cfg::_enum<ppu_decoder_type> ppu_decoder{ this, "PPU Decoder", ppu_decoder_type::_static };
+#else
 		cfg::_enum<ppu_decoder_type> ppu_decoder{ this, "PPU Decoder", ppu_decoder_type::llvm };
+#endif
 		cfg::_int<1, 8> ppu_threads{ this, "PPU Threads", 2 }; // Amount of PPU threads running simultaneously (must be 2)
 		cfg::_bool ppu_debug{ this, "PPU Debug" };
 		cfg::_bool ppu_call_history{ this, "PPU Calling History" }; // Enable PPU calling history recording
@@ -24,7 +28,11 @@ struct cfg_root : cfg::node
 		cfg::_bool llvm_precompilation{ this, "LLVM Precompilation", true };
 		cfg::_enum<thread_scheduler_mode> thread_scheduler{this, "Thread Scheduler Mode", thread_scheduler_mode::os};
 		cfg::_bool set_daz_and_ftz{ this, "Set DAZ and FTZ", false };
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+		cfg::_enum<spu_decoder_type> spu_decoder{ this, "SPU Decoder", spu_decoder_type::_static };
+#else
 		cfg::_enum<spu_decoder_type> spu_decoder{ this, "SPU Decoder", spu_decoder_type::llvm };
+#endif
 		cfg::uint<0, 100> spu_reservation_busy_waiting_percentage{ this, "SPU Reservation Busy Waiting Percentage 1", 100, true };
 		cfg::_bool spu_reservation_busy_waiting_enabled{ this, "SPU Reservation Busy Waiting Enabled", false, true };
 		cfg::uint<0, 100> spu_getllar_busy_waiting_percentage{ this, "SPU GETLLAR Busy Waiting Percentage", 100, true };
@@ -113,7 +121,9 @@ struct cfg_root : cfg::node
 	{
 		node_video(cfg::node* _this) : cfg::node(_this, "Video") {}
 
-#if defined(HAVE_VULKAN)
+#if defined(RPCS3_WEB)
+		cfg::_enum<video_renderer> renderer{ this, "Renderer", video_renderer::webgpu };
+#elif defined(HAVE_VULKAN)
 		cfg::_enum<video_renderer> renderer{ this, "Renderer", video_renderer::vulkan };
 #else
 		cfg::_enum<video_renderer> renderer{ this, "Renderer", video_renderer::opengl };

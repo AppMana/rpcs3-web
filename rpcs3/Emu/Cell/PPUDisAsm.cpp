@@ -36,7 +36,8 @@ u32 PPUDisAsm::disasm(u32 pc)
 
 	dump_pc = pc;
 	be_t<u32> op{};
-	std::memcpy(&op, m_offset + pc, 4);
+	const u8* op_ptr = m_offset == vm::g_sudo_addr ? vm::get_super_ptr<const u8>(pc) : m_offset + pc;
+	std::memcpy(&op, op_ptr, 4);
 	m_op = op;
 
 	(this->*(s_ppu_disasm.decode(m_op)))({ m_op });
@@ -62,6 +63,12 @@ u32 PPUDisAsm::disasm(u32 pc)
 
 std::pair<const void*, usz> PPUDisAsm::get_memory_span() const
 {
+#ifdef RPCS3_WEB
+	if (m_offset == vm::g_sudo_addr)
+	{
+		return {vm::get_super_ptr<const u8>(m_start_pc), 4096 - (m_start_pc & 0xfff)};
+	}
+#endif
 	return {m_offset + m_start_pc, (1ull << 32) - m_start_pc};
 }
 
@@ -101,7 +108,9 @@ std::pair<PPUDisAsm::const_op, u64> PPUDisAsm::try_get_const_op_gpr_value(u32 re
 
 	for (u32 i = pc; i >= m_start_pc && (m_offset != vm::g_sudo_addr || vm::check_addr(i, vm::page_executable));)
 	{
-		const u32 opcode = *reinterpret_cast<const be_t<u32>*>(m_offset + i);
+		const u32 opcode = *(m_offset == vm::g_sudo_addr
+			? vm::get_super_ptr<const be_t<u32>>(i)
+			: reinterpret_cast<const be_t<u32>*>(m_offset + i));
 		const ppu_opcode_t op{ opcode };
 
 		const auto type = s_ppu_itype.decode(opcode);

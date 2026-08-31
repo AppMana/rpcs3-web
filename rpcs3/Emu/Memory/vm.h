@@ -36,6 +36,26 @@ namespace vm
 	extern u8* const g_free_addr;
 	extern u8 g_reservations[65536 / 128 * 64];
 
+#ifdef RPCS3_WEB
+	// Browser Wasm32 cannot reserve RPCS3's native 4/8 GiB host aliases.
+	// Translate the PS3's u32 address space through 4 KiB forward/reverse page
+	// tables into compact, demand-allocated WebAssembly linear memory.
+	extern std::array<u8*, 0x100000> g_web_pages;
+	extern std::array<u32, 0x100000> g_web_reverse_pages;
+	void web_map(u32 addr, u32 size, u8* host_ptr);
+	void web_unmap(u32 addr, u32 size);
+
+	inline u8* web_base(u32 addr) noexcept
+	{
+		if (u8* page = g_web_pages[addr >> 12])
+		{
+			return page + (addr & 0xfff);
+		}
+
+		return nullptr;
+	}
+#endif
+
 	static constexpr u64 g_exec_addr_seg_offset = 0x2'0000'0000ULL;
 
 	struct writer_lock;
@@ -227,6 +247,17 @@ namespace vm
 	// Super memory is allowed as well
 	inline std::pair<vm::addr_t, bool> try_get_addr(const void* real_ptr)
 	{
+#ifdef RPCS3_WEB
+		const uptr ptr = reinterpret_cast<uptr>(real_ptr);
+		const u32 page = g_web_reverse_pages[ptr >> 12];
+
+		if (page)
+		{
+			return {vm::addr_t{((page - 1) << 12) | (ptr & 0xfff)}, true};
+		}
+
+		return {};
+#else
 		const std::make_unsigned_t<std::ptrdiff_t> diff = static_cast<const u8*>(real_ptr) - g_base_addr;
 
 		if (diff <= u64{u32{umax}} * 2 + 1)
@@ -235,12 +266,17 @@ namespace vm
 		}
 
 		return {};
+#endif
 	}
 
 	// Unsafe convert host ptr to PS3 VM address (clamp with 4GiB alignment assumption)
 	inline vm::addr_t get_addr(const void* ptr)
 	{
+#ifdef RPCS3_WEB
+		return try_get_addr(ptr).first;
+#else
 		return vm::addr_t{static_cast<u32>(uptr(ptr))};
+#endif
 	}
 
 	template<typename T> requires (std::is_integral_v<decltype(+T{})> && (sizeof(+T{}) > 4 || std::is_signed_v<decltype(+T{})>))
@@ -259,12 +295,20 @@ namespace vm
 	template <typename T> requires (std::is_integral_v<decltype(+T{})>)
 	inline void* base(T addr)
 	{
+#ifdef RPCS3_WEB
+		return web_base(static_cast<u32>(vm::cast(addr)));
+#else
 		return g_base_addr + static_cast<u32>(vm::cast(addr));
+#endif
 	}
 
 	inline const u8& read8(u32 addr)
 	{
+#ifdef RPCS3_WEB
+		return *web_base(addr);
+#else
 		return g_base_addr[addr];
+#endif
 	}
 
 #ifdef RPCS3_HAS_MEMORY_BREAKPOINTS
@@ -273,7 +317,11 @@ namespace vm
 	inline void write8(u32 addr, u8 value)
 #endif
 	{
+#ifdef RPCS3_WEB
+		*web_base(addr) = value;
+#else
 		g_base_addr[addr] = value;
+#endif
 
 #ifdef RPCS3_HAS_MEMORY_BREAKPOINTS
 		if (ppu && g_breakpoint_handler.HasBreakpoint(addr, breakpoint_types::bp_write))
@@ -306,7 +354,11 @@ namespace vm
 		template <typename T = u8>
 		inline to_be_t<T>* get_super_ptr(u32 addr)
 		{
+#ifdef RPCS3_WEB
+			return reinterpret_cast<to_be_t<T>*>(web_base(addr));
+#else
 			return reinterpret_cast<to_be_t<T>*>(g_sudo_addr + addr);
+#endif
 		}
 
 		inline const be_t<u16>& read16(u32 addr)

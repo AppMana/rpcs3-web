@@ -5,6 +5,8 @@
 #include <QIcon>
 #include <QWidget>
 
+#include <set>
+
 class game_list_base
 {
 public:

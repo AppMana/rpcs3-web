@@ -1225,8 +1225,9 @@ void package_reader::extract_worker()
 						}
 
 						ensure(available_buffer_size >= block_size);
+						ensure(available_buffer_size <= u64{usz{umax}});
 
-						const usz advance_size = decrypt(entry.file_offset + pos, block_size, is_psp ? PKG_AES_KEY2 : m_dec_key.data(), std::span<u8>{static_cast<u8*>(ptr) + read_size, available_buffer_size});
+						const usz advance_size = decrypt(entry.file_offset + pos, block_size, is_psp ? PKG_AES_KEY2 : m_dec_key.data(), std::span<u8>{static_cast<u8*>(ptr) + read_size, static_cast<usz>(available_buffer_size)});
 
 						if (!advance_size)
 						{

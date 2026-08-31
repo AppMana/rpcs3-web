@@ -20,6 +20,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <unordered_set>
 
 class config_database;
 class game_list_table;

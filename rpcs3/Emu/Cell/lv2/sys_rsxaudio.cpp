@@ -2010,6 +2010,9 @@ void rsxaudio_periodic_tmr::sched_timer()
 	{
 		ensure(CancelWaitableTimer(timer_handle));
 	}
+#elif defined(__EMSCRIPTEN__)
+	browser_timer_interval = interval;
+	browser_timer_cv.notify_all();
 #elif defined(__linux__)
 	const time_t secs = interval / 1'000'000;
 	const long nsecs = (interval - secs * 1'000'000) * 1000;
@@ -2041,6 +2044,13 @@ void rsxaudio_periodic_tmr::cancel_timer_unlocked()
 	{
 		ensure(SetEvent(cancel_event));
 	}
+#elif defined(__EMSCRIPTEN__)
+	browser_timer_interval = 0;
+	if (in_wait)
+	{
+		browser_timer_canceled = true;
+		browser_timer_cv.notify_all();
+	}
 #elif defined(__linux__)
 	const itimerspec tspec{};
 	ensure(timerfd_settime(timer_handle, 0, &tspec, nullptr) == 0);
@@ -2070,6 +2080,8 @@ void rsxaudio_periodic_tmr::reset_cancel_flag()
 {
 #if defined(_WIN32)
 	ensure(ResetEvent(cancel_event));
+#elif defined(__EMSCRIPTEN__)
+	browser_timer_canceled = false;
 #elif defined(__linux__)
 	u64 tmp_buf{};
 	[[maybe_unused]] const auto nread = read(cancel_event, &tmp_buf, sizeof(tmp_buf));
@@ -2085,6 +2097,8 @@ rsxaudio_periodic_tmr::rsxaudio_periodic_tmr()
 #if defined(_WIN32)
 	ensure(cancel_event = CreateEvent(nullptr, false, false, nullptr));
 	ensure(timer_handle = CreateWaitableTimer(nullptr, false, nullptr));
+#elif defined(__EMSCRIPTEN__)
+	// Browser worker threads use the condition-variable timer below.
 #elif defined(__linux__)
 	timer_handle = timerfd_create(CLOCK_MONOTONIC, 0);
 	ensure((epoll_fd = epoll_create(2)) >= 0);
@@ -2117,6 +2131,8 @@ rsxaudio_periodic_tmr::~rsxaudio_periodic_tmr()
 #if defined(_WIN32)
 	CloseHandle(timer_handle);
 	CloseHandle(cancel_event);
+#elif defined(__EMSCRIPTEN__)
+	// No native timer handles are owned by the browser backend.
 #elif defined(__linux__)
 	close(epoll_fd);
 	close(timer_handle);
@@ -2130,6 +2146,53 @@ rsxaudio_periodic_tmr::~rsxaudio_periodic_tmr()
 
 rsxaudio_periodic_tmr::wait_result rsxaudio_periodic_tmr::wait(const std::function<void()> &callback)
 {
+#if defined(__EMSCRIPTEN__)
+	std::unique_lock lock(mutex);
+
+	if (in_wait || !callback)
+	{
+		return wait_result::INVALID_PARAM;
+	}
+
+	in_wait = true;
+	bool wait_canceled = false;
+
+	if (!zero_period)
+	{
+		if (browser_timer_interval)
+		{
+			wait_canceled = browser_timer_cv.wait_for(lock, std::chrono::microseconds(browser_timer_interval), [this]
+			{
+				return browser_timer_canceled;
+			});
+		}
+		else
+		{
+			browser_timer_cv.wait(lock, [this]
+			{
+				return browser_timer_canceled;
+			});
+			wait_canceled = true;
+		}
+	}
+	else
+	{
+		zero_period = false;
+	}
+
+	in_wait = false;
+
+	if (wait_canceled)
+	{
+		reset_cancel_flag();
+		sched_timer();
+		return wait_result::TIMER_CANCELED;
+	}
+
+	callback();
+	sched_timer();
+	return wait_result::SUCCESS;
+#else
 	std::unique_lock lock(mutex);
 
 	if (in_wait || !callback)
@@ -2256,6 +2319,7 @@ rsxaudio_periodic_tmr::wait_result rsxaudio_periodic_tmr::wait(const std::functi
 	callback();
 	sched_timer();
 	return wait_result::SUCCESS;
+#endif
 }
 
 u64 rsxaudio_periodic_tmr::get_rel_next_time()

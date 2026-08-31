@@ -4,9 +4,22 @@
 #include "util/v128.hpp"
 #include "util/sysinfo.hpp"
 #include "util/asm.hpp"
+
+// Emscripten implements the SSE intrinsic surface on top of Wasm SIMD.  The
+// static PPU/SPU interpreters use RPCS3's gv_* SIMD helpers, while the asmjit
+// operand overloads are never selected in the browser build.  Reuse that
+// mature intrinsic implementation without pretending that the Wasm host is
+// an x86 machine outside this header.
+#if defined(ARCH_WASM32)
+#define RPCS3_SIMD_WASM_X86_COMPAT 1
+#define ARCH_X64 1
+#endif
+
 #include "Utilities/JIT.h"
 
-#if defined(ARCH_X64)
+#if defined(RPCS3_SIMD_WASM_X86_COMPAT)
+#include <immintrin.h>
+#elif defined(ARCH_X64)
 #ifdef _MSC_VER
 #include <intrin.h>
 #else
@@ -547,7 +560,14 @@ namespace asmjit
 
 		return vec_type{src1.id()};
 	}
+#if defined(RPCS3_SIMD_WASM_X86_COMPAT)
+// The browser interpreter uses the concrete v128 overloads, never asmjit
+// operands. Keep templates containing the builder-only branch well-formed
+// without exposing x86 code generation to the Wasm translation unit.
+#define FOR_X64(...) do { utils::trap(); } while (0)
+#else
 #define FOR_X64(f, ...) do { using enum asmjit::x86::Inst::Id; return asmjit::f(__VA_ARGS__); } while (0)
+#endif
 #elif defined(ARCH_ARM64)
 #define FOR_X64(...) do { fmt::throw_exception("Unimplemented for this architecture!"); } while (0)
 #endif
@@ -564,7 +584,9 @@ inline asmjit::vec_type gv_gts32(A&&, B&&);
 
 inline void gv_set_zeroing_denormals()
 {
-#if defined(ARCH_X64)
+#if defined(RPCS3_SIMD_WASM_X86_COMPAT)
+	// Wasm floating point has no MXCSR-equivalent denormal mode.
+#elif defined(ARCH_X64)
 	u32 cr = _mm_getcsr();
 	cr = (cr & ~_MM_FLUSH_ZERO_MASK) | _MM_FLUSH_ZERO_ON;
 	cr = (cr & ~_MM_DENORMALS_ZERO_MASK) | _MM_DENORMALS_ZERO_ON;
@@ -582,7 +604,9 @@ inline void gv_set_zeroing_denormals()
 
 inline void gv_unset_zeroing_denormals()
 {
-#if defined(ARCH_X64)
+#if defined(RPCS3_SIMD_WASM_X86_COMPAT)
+	// See gv_set_zeroing_denormals().
+#elif defined(ARCH_X64)
 	u32 cr = _mm_getcsr();
 	cr = (cr & ~_MM_FLUSH_ZERO_MASK) | _MM_FLUSH_ZERO_OFF;
 	cr = (cr & ~_MM_DENORMALS_ZERO_MASK) | _MM_DENORMALS_ZERO_OFF;
@@ -602,7 +626,9 @@ inline bool g_use_avx = utils::has_avx();
 
 inline void gv_zeroupper()
 {
-#if defined(ARCH_X64)
+#if defined(RPCS3_SIMD_WASM_X86_COMPAT)
+	return;
+#elif defined(ARCH_X64)
 	if (!g_use_avx)
 		return;
 #if defined(_M_X64) && defined(_MSC_VER)
@@ -1031,7 +1057,7 @@ inline v128 gv_sar64(const v128& a, u32 count)
 		count = 63;
 #if defined(__AVX512VL__)
 	return _mm_srai_epi64(a, count);
-#elif defined(__SSE2__) && !defined(_M_X64)
+#elif defined(__SSE2__) && !defined(_M_X64) && !defined(RPCS3_SIMD_WASM_X86_COMPAT)
 	return static_cast<__v2di>(a) >> count;
 #elif defined(ARCH_ARM64)
 	return vshlq_s64(a, vdupq_n_s64(0 - count));
@@ -2283,7 +2309,7 @@ namespace utils
 	}
 }
 
-#if defined(ARCH_X64)
+#if defined(ARCH_X64) && !defined(RPCS3_SIMD_WASM_X86_COMPAT)
 template <uint Mode>
 const auto sse41_roundf = build_function_asm<__m128(*)(__m128)>("sse41_roundf", [](native_asm& c, native_args&)
 {
@@ -3278,4 +3304,9 @@ inline v128 gv_to_be32(const v128& vec)
 #pragma clang diagnostic pop
 #elif defined(__GNUC__)
 #pragma GCC diagnostic pop
+#endif
+
+#if defined(RPCS3_SIMD_WASM_X86_COMPAT)
+#undef ARCH_X64
+#undef RPCS3_SIMD_WASM_X86_COMPAT
 #endif

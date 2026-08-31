@@ -46,6 +46,9 @@ enum class video_renderer
 	null,
 	opengl,
 	vulkan,
+#ifdef RPCS3_WEB
+	webgpu,
+#endif
 };
 
 enum class audio_renderer

@@ -19,6 +19,8 @@ using Window  = unsigned long;
 using display_handle_t = HWND;
 #elif defined(__APPLE__)
 using display_handle_t = void*; // NSView
+#elif defined(RPCS3_WEB)
+using display_handle_t = void*; // Browser canvas is owned by the JS host.
 #else
 #include <variant>
 using display_handle_t = std::variant<

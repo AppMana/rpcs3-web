@@ -4,6 +4,9 @@
 #include "downloader.h"
 #include "Emu/system_config.h"
 
+#include <QJsonDocument>
+#include <QJsonParseError>
+
 LOG_CHANNEL(gui_log, "GUI");
 
 config_database::config_database(QWidget* parent)

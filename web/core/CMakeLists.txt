@@ -11,6 +11,13 @@ add_library(rpcs3_web_guest_memory STATIC
     ppu_interpreter.cpp
     ppu_smoke.cpp
 )
+
+add_library(rpcs3_webgpu_command STATIC
+    ../../rpcs3/Emu/RSX/WG/WebGPUCommand.cpp
+    ../../rpcs3/Emu/RSX/WG/WebGPUHost.cpp
+)
+target_include_directories(rpcs3_webgpu_command PUBLIC ../..)
+target_compile_features(rpcs3_webgpu_command PUBLIC cxx_std_23)
 target_include_directories(rpcs3_web_guest_memory PUBLIC include)
 target_compile_features(rpcs3_web_guest_memory PUBLIC cxx_std_23)
 
@@ -45,6 +52,20 @@ else()
         target_compile_options(rpcs3_web_guest_memory_tests PRIVATE -UNDEBUG)
     endif()
     add_test(NAME rpcs3_web_guest_memory_tests COMMAND rpcs3_web_guest_memory_tests)
+
+    add_executable(rpcs3_webgpu_command_tests tests/webgpu_command_test.cpp)
+    target_link_libraries(rpcs3_webgpu_command_tests PRIVATE rpcs3_webgpu_command)
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        target_compile_options(rpcs3_webgpu_command_tests PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME rpcs3_webgpu_command_tests COMMAND rpcs3_webgpu_command_tests)
+
+    add_executable(rpcs3_webgpu_host_tests tests/webgpu_host_test.cpp)
+    target_link_libraries(rpcs3_webgpu_host_tests PRIVATE rpcs3_webgpu_command)
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        target_compile_options(rpcs3_webgpu_host_tests PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME rpcs3_webgpu_host_tests COMMAND rpcs3_webgpu_host_tests)
 
     add_executable(rpcs3_web_fixture_runner fixture_runner.cpp)
     target_link_libraries(rpcs3_web_fixture_runner PRIVATE rpcs3_web_guest_memory)

@@ -1,0 +1,161 @@
+#include "WebGPUHost.h"
+
+#include "WebGPUCommand.h"
+
+#include <algorithm>
+#include <cstring>
+#include <limits>
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#define RPCS3_WEB_EXPORT EMSCRIPTEN_KEEPALIVE
+#else
+#define RPCS3_WEB_EXPORT
+#endif
+
+namespace rsx::webgpu
+{
+	command_queue::command_queue(std::size_t byte_limit)
+		: m_byte_limit(std::max<std::size_t>(byte_limit, 1))
+	{}
+
+	bool command_queue::push(std::vector<std::byte> packet)
+	{
+		if (!draw_packet_view(packet).valid())
+		{
+			return false;
+		}
+
+		std::lock_guard lock(m_mutex);
+		if (packet.size() > m_byte_limit || packet.size() > m_byte_limit - m_queued_bytes)
+		{
+			++m_dropped_packets;
+			return false;
+		}
+
+		m_queued_bytes += packet.size();
+		m_packets.emplace_back(std::move(packet));
+		return true;
+	}
+
+	std::uint32_t command_queue::front_size() const
+	{
+		std::lock_guard lock(m_mutex);
+		if (m_packets.empty())
+		{
+			return 0;
+		}
+		return static_cast<std::uint32_t>(m_packets.front().size());
+	}
+
+	std::uint32_t command_queue::copy_front(std::span<std::byte> destination) const
+	{
+		std::lock_guard lock(m_mutex);
+		if (m_packets.empty())
+		{
+			return 0;
+		}
+
+		const auto& packet = m_packets.front();
+		const auto required = static_cast<std::uint32_t>(packet.size());
+		if (destination.size() < packet.size())
+		{
+			return required;
+		}
+
+		std::memcpy(destination.data(), packet.data(), packet.size());
+		return required;
+	}
+
+	bool command_queue::pop_front()
+	{
+		std::lock_guard lock(m_mutex);
+		if (m_packets.empty())
+		{
+			return false;
+		}
+
+		m_queued_bytes -= m_packets.front().size();
+		m_packets.pop_front();
+		return true;
+	}
+
+	std::uint32_t command_queue::packet_count() const
+	{
+		std::lock_guard lock(m_mutex);
+		return static_cast<std::uint32_t>(m_packets.size());
+	}
+
+	std::uint64_t command_queue::queued_bytes() const
+	{
+		std::lock_guard lock(m_mutex);
+		return m_queued_bytes;
+	}
+
+	std::uint64_t command_queue::dropped_packets() const
+	{
+		std::lock_guard lock(m_mutex);
+		return m_dropped_packets;
+	}
+
+	void command_queue::clear()
+	{
+		std::lock_guard lock(m_mutex);
+		m_packets.clear();
+		m_queued_bytes = 0;
+	}
+
+	command_queue& host_command_queue()
+	{
+		static command_queue queue;
+		return queue;
+	}
+}
+
+extern "C"
+{
+	RPCS3_WEB_EXPORT std::uint32_t rpcs3_webgpu_packet_abi()
+	{
+		return rsx::webgpu::draw_packet_abi;
+	}
+
+	RPCS3_WEB_EXPORT std::uint32_t rpcs3_webgpu_packet_count()
+	{
+		return rsx::webgpu::host_command_queue().packet_count();
+	}
+
+	RPCS3_WEB_EXPORT std::uint32_t rpcs3_webgpu_front_size()
+	{
+		return rsx::webgpu::host_command_queue().front_size();
+	}
+
+	RPCS3_WEB_EXPORT std::uint32_t rpcs3_webgpu_copy_front(void* destination, std::uint32_t capacity)
+	{
+		if (!destination && capacity)
+		{
+			return 0;
+		}
+		return rsx::webgpu::host_command_queue().copy_front(
+			{static_cast<std::byte*>(destination), capacity});
+	}
+
+	RPCS3_WEB_EXPORT std::uint32_t rpcs3_webgpu_pop_front()
+	{
+		return rsx::webgpu::host_command_queue().pop_front() ? 1u : 0u;
+	}
+
+	RPCS3_WEB_EXPORT std::uint64_t rpcs3_webgpu_queued_bytes()
+	{
+		return rsx::webgpu::host_command_queue().queued_bytes();
+	}
+
+	RPCS3_WEB_EXPORT std::uint64_t rpcs3_webgpu_dropped_packets()
+	{
+		return rsx::webgpu::host_command_queue().dropped_packets();
+	}
+
+	RPCS3_WEB_EXPORT void rpcs3_webgpu_clear()
+	{
+		rsx::webgpu::host_command_queue().clear();
+	}
+}

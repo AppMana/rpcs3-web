@@ -6,11 +6,11 @@
 #include <QCamera>
 #include <QDialog>
 #include <QMediaCaptureSession>
-#include <QVideoFrameInput>
 
 #include <mutex>
 
 #ifdef HAVE_SDL3
+#include <QVideoFrameInput>
 #ifndef _MSC_VER
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wold-style-cast"

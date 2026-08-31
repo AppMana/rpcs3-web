@@ -205,11 +205,11 @@ pkg_install_dialog::pkg_install_dialog(const QStringList& paths, bool from_boot,
 	QLabel* label = new QLabel(tr("Would you like to precompile caches and install shortcuts to the installed software?"));
 
 	QCheckBox* precompile_check = new QCheckBox(tr("Precompile caches"));
-	connect(precompile_check, &QCheckBox::checkStateChanged, this, [this](Qt::CheckState state){ m_precompile_caches = state != Qt::CheckState::Unchecked; });
+	connect(precompile_check, &QCheckBox::toggled, this, [this](bool checked){ m_precompile_caches = checked; });
 	precompile_check->setChecked(true);
 
 	QCheckBox* desk_check = new QCheckBox(tr("Add desktop shortcut(s)"));
-	connect(desk_check, &QCheckBox::checkStateChanged, this, [this](Qt::CheckState state){ m_create_desktop_shortcuts = state != Qt::CheckState::Unchecked; });
+	connect(desk_check, &QCheckBox::toggled, this, [this](bool checked){ m_create_desktop_shortcuts = checked; });
 
 #ifdef _WIN32
 	QCheckBox* quick_check = new QCheckBox(tr("Add Start menu shortcut(s)"));
@@ -218,7 +218,7 @@ pkg_install_dialog::pkg_install_dialog(const QStringList& paths, bool from_boot,
 #else
 	QCheckBox* quick_check = new QCheckBox(tr("Add launcher shortcut(s)"));
 #endif
-	connect(quick_check, &QCheckBox::checkStateChanged, this, [this](Qt::CheckState state){ m_create_app_shortcut = state != Qt::CheckState::Unchecked; });
+	connect(quick_check, &QCheckBox::toggled, this, [this](bool checked){ m_create_app_shortcut = checked; });
 
 	QVBoxLayout* vbox = new QVBoxLayout;
 	vbox->addWidget(description);
@@ -233,7 +233,7 @@ pkg_install_dialog::pkg_install_dialog(const QStringList& paths, bool from_boot,
 	{
 		const bool steam_running = gui::utils::steam_shortcut::is_steam_running();
 		QCheckBox* steam_check = new QCheckBox(steam_running ? tr("Add Steam Shortcut(s) (Steam must be closed)") : tr("Add Steam shortcut(s)"));
-		connect(steam_check, &QCheckBox::checkStateChanged, this, [this](Qt::CheckState state){ m_create_steam_shortcut = state != Qt::CheckState::Unchecked; });
+		connect(steam_check, &QCheckBox::toggled, this, [this](bool checked){ m_create_steam_shortcut = checked; });
 		steam_check->setEnabled(!steam_running);
 
 		vbox->addWidget(steam_check);

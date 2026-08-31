@@ -1,10 +1,12 @@
 #include "stdafx.h"
 #include "mouse_gyro_handler.h"
 
+#ifndef RPCS3_WEB
 #include <QEvent>
 #include <QMouseEvent>
 #include <QWheelEvent>
 #include <QWindow>
+#endif
 
 #include <algorithm>
 
@@ -64,6 +66,12 @@ void mouse_gyro_handler::set_gyro_y(s32 steps)
 
 void mouse_gyro_handler::handle_event(QEvent* ev, const QWindow& win)
 {
+#ifdef RPCS3_WEB
+	// Pointer events are consumed by the browser input adapter. Keep this Qt
+	// entry point link-compatible without dereferencing its opaque Qt types.
+	(void)ev;
+	(void)win;
+#else
 	if (!m_enabled)
 		return;
 
@@ -126,6 +134,7 @@ void mouse_gyro_handler::handle_event(QEvent* ev, const QWindow& win)
 		break;
 	}
 	}
+#endif
 }
 
 void mouse_gyro_handler::apply_gyro(const std::shared_ptr<Pad>& pad)

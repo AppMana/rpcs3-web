@@ -159,7 +159,7 @@ namespace gui
 	const gui_save ib_skip_version = gui_save(main_window, "infoBoxSkipVersion",       "");
 	const gui_save ib_pkg_success  = gui_save(main_window, "infoBoxEnabledInstallPKG", true);
 	const gui_save ib_pup_success  = gui_save(main_window, "infoBoxEnabledInstallPUP", true);
-	const gui_save ib_show_welcome = gui_save(main_window, "infoBoxEnabledWelcome",    true);
+	const gui_save ib_show_welcome = gui_save(main_window, "infoBoxEnabledWelcome",    false);
 	const gui_save ib_confirm_exit = gui_save(main_window, "confirmationBoxExitGame",  true);
 	const gui_save ib_confirm_boot = gui_save(main_window, "confirmationBoxBootGame",  true);
 	const gui_save ib_obsolete_cfg = gui_save(main_window, "confirmationObsoleteCfg",  true);

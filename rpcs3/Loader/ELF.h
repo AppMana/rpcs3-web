@@ -376,7 +376,11 @@ public:
 					if (hdr.p_offset <= shdr.sh_offset && shdr.sh_offset + shdr.sh_size <= hdr.p_offset + hdr.p_filesz)
 					{
 						const auto& prog = ::at32(progs, p_index);
-						shdrs.back().bin_view = {prog.bin.data() + shdr.sh_offset - hdr.p_offset, shdr.sh_size};
+						const auto section_offset = shdr.sh_offset - hdr.p_offset;
+						if (section_offset <= prog.bin.size() && shdr.sh_size <= prog.bin.size() - section_offset)
+						{
+							shdrs.back().bin_view = {prog.bin.data() + static_cast<usz>(section_offset), static_cast<usz>(shdr.sh_size)};
+						}
 					}
 				}
 

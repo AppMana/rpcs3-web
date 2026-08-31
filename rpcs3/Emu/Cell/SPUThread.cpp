@@ -19,6 +19,7 @@
 
 #include "Emu/Cell/SPUDisAsm.h"
 #include "Emu/Cell/SPUAnalyser.h"
+#include "Emu/Cell/SPUInterpreter.h"
 #include "Emu/Cell/SPUThread.h"
 #include "Emu/Cell/SPURecompiler.h"
 #include "Emu/Cell/timers.hpp"
@@ -27,6 +28,7 @@
 
 #include <cmath>
 #include <cfenv>
+#include <csetjmp>
 #include <thread>
 #include <shared_mutex>
 #include <span>
@@ -55,6 +57,10 @@ const u32 spu_frest_fraction_lut[32] =
 	0x2AA9BE, 0x2A85AC, 0x23D59A, 0x23BD8E, 0x1D8576, 0x1D8576, 0x17AD5A, 0x17AD5A,
 	0x124543, 0x124543, 0x0D392D, 0x0D392D, 0x08851A, 0x08851A, 0x041D07, 0x041D07
 };
+
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+extern void spu_web_set_escape_context(std::jmp_buf* context) noexcept;
+#endif
 
 const u32 spu_frest_exponent_lut[256] =
 {
@@ -1576,6 +1582,34 @@ void spu_thread::cpu_task()
 	}
 	else
 	{
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+		// Browser execution calls the existing static interpreter table directly;
+		// no generated gateway, dispatcher mirror or executable memory is needed.
+		const auto& table = g_fxo->get<spu_interpreter_rt>();
+
+		allow_interrupts_in_cpu_work = true;
+		std::jmp_buf escape_context;
+		spu_web_set_escape_context(&escape_context);
+		while (true)
+		{
+			if (setjmp(escape_context))
+			{
+				continue;
+			}
+
+			if (state) [[unlikely]]
+			{
+				if (check_state())
+					break;
+			}
+
+			const u32 op = _ref<be_t<u32>>(pc);
+			if (table.decode(op)(*this, {op}))
+				pc += 4;
+		}
+		spu_web_set_escape_context(nullptr);
+		allow_interrupts_in_cpu_work = false;
+#else
 		ensure(spu_runtime::g_interpreter);
 
 		allow_interrupts_in_cpu_work = true;
@@ -1592,6 +1626,7 @@ void spu_thread::cpu_task()
 		}
 
 		allow_interrupts_in_cpu_work = false;
+#endif
 	}
 
 	if (spurs_addr != invalid_spurs)
@@ -1740,6 +1775,12 @@ enum : s64
 
 spu_thread::~spu_thread()
 {
+#ifdef RPCS3_WEB
+	// Wasm32 cannot create five fixed aliases of the same local-store pages.
+	// The static interpreter masks LS addresses explicitly and uses the shm's
+	// single compact backing, which is released by shm itself.
+	return;
+#else
 	// Unmap LS and its mirrors
 	for (s64 ls_offs = 0 - SIGNED_LS_SIZE * 2; ls_offs <= SIGNED_LS_SIZE * 2; ls_offs += SIGNED_LS_SIZE)
 	{
@@ -1747,10 +1788,15 @@ spu_thread::~spu_thread()
 	}
 
 	utils::memory_release(ls - SIGNED_LS_SIZE * 3, SIGNED_LS_SIZE * 7);
+#endif
 }
 
 u8* spu_thread::map_ls(utils::shm& shm, void* ptr)
 {
+#ifdef RPCS3_WEB
+	(void)ptr;
+	return ensure(shm.map_self());
+#else
 	const auto ls = ptr ? static_cast<u8*>(ptr) : static_cast<u8*>(ensure(utils::memory_reserve(SIGNED_LS_SIZE * 7, nullptr, true))) + SIGNED_LS_SIZE * 3;
 
 	vm::writer_lock mlock;
@@ -1776,13 +1822,19 @@ u8* spu_thread::map_ls(utils::shm& shm, void* ptr)
 	}
 
 	return ls;
+#endif
 }
 
 void spu_thread::init_spu_decoder()
 {
 	ensure(!jit);
 
-#if !defined(ARCH_X64) && !defined(ARCH_ARM64)
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+	if (g_cfg.core.spu_decoder != spu_decoder_type::_static)
+	{
+		fmt::throw_exception("Browser SPU backend requires the static interpreter");
+	}
+#elif !defined(ARCH_X64) && !defined(ARCH_ARM64)
 #error "Unimplemented"
 #else
 	const spu_decoder_type spu_decoder = g_cfg.core.spu_decoder;
@@ -1819,7 +1871,11 @@ spu_thread::spu_thread(lv2_spu_group* group, u32 index, std::string_view name, u
 	, index(index)
 	, thread_type(group ? spu_type::threaded : is_isolated ? spu_type::isolated : spu_type::raw)
 	, shm(std::make_shared<utils::shm>(SPU_LS_SIZE))
+#ifdef RPCS3_WEB
+	, ls(ensure(shm->map_self()))
+#else
 	, ls(static_cast<u8*>(utils::memory_reserve(SPU_LS_SIZE * 7, nullptr, true)) + SPU_LS_SIZE * 3)
+#endif
 	, option(option)
 	, lv2_id(lv2_id)
 	, spu_tname(make_single<std::string>(name))
@@ -1828,7 +1884,9 @@ spu_thread::spu_thread(lv2_spu_group* group, u32 index, std::string_view name, u
 
 	if (g_cfg.core.mfc_debug)
 	{
+#ifndef RPCS3_WEB
 		utils::memory_commit(vm::g_stat_addr + vm_offset(), SPU_LS_SIZE);
+#endif
 		mfc_history.resize(max_mfc_dump_idx);
 	}
 
@@ -1890,7 +1948,9 @@ spu_thread::spu_thread(utils::serial& ar, lv2_spu_group* group)
 
 	if (g_cfg.core.mfc_debug)
 	{
+#ifndef RPCS3_WEB
 		utils::memory_commit(vm::g_stat_addr + vm_offset(), SPU_LS_SIZE);
+#endif
 		mfc_history.resize(max_mfc_dump_idx);
 	}
 
@@ -3746,7 +3806,7 @@ bool spu_thread::do_mfc(bool can_escape, bool must_finish)
 
 		if ((args.cmd & ~0xc) == MFC_BARRIER_CMD)
 		{
-			if (&args - mfc_queue <= removed)
+			if (static_cast<usz>(&args - mfc_queue) <= removed)
 			{
 				// Remove barrier-class command if it's the first in the queue
 				atomic_fence_seq_cst();

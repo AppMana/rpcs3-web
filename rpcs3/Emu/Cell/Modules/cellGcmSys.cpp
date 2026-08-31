@@ -389,10 +389,28 @@ u32 g_defaultCommandBufferBegin, g_defaultCommandBufferFragmentCount;
 // Called by cellGcmInit
 error_code _cellGcmInitBody(ppu_thread& ppu, vm::pptr<CellGcmContextData> context, u32 cmdSize, u32 ioSize, u32 ioAddress)
 {
+	// This HLE call allocates and maps VM ranges before it reaches the sys_rsx
+	// helpers which normally add the wait state. A PPU registered with the VM
+	// passive-lock protocol must advertise that it is safe for a writer here.
+	ppu.state += cpu_flag::wait;
 	cellGcmSys.warning("_cellGcmInitBody(context=**0x%x, cmdSize=0x%x, ioSize=0x%x, ioAddress=0x%x)", context, cmdSize, ioSize, ioAddress);
+#ifdef RPCS3_WEB
+	std::fprintf(stderr, "RPCS3 Web GCM init: entered cmd=0x%x io=0x%x address=0x%x\n", cmdSize, ioSize, ioAddress);
+#endif
 
 	auto& gcm_cfg = g_fxo->get<gcm_config>();
+#ifdef RPCS3_WEB
+	const bool gcmio_acquired = gcm_cfg.gcmio_mutex.try_lock();
+	std::fprintf(stderr, "RPCS3 Web GCM init: gcmio_mutex fast-path acquired=%d free=%d lockable=%d waiters=%d\n",
+		gcmio_acquired, gcm_cfg.gcmio_mutex.is_free(), gcm_cfg.gcmio_mutex.is_lockable(), gcm_cfg.gcmio_mutex.has_waiters());
+	if (!gcmio_acquired)
+	{
+		gcm_cfg.gcmio_mutex.lock();
+	}
+	std::lock_guard lock(gcm_cfg.gcmio_mutex, std::adopt_lock);
+#else
 	std::lock_guard lock(gcm_cfg.gcmio_mutex);
+#endif
 
 	gcm_cfg.current_config.ioAddress = 0;
 	gcm_cfg.current_config.localAddress = 0;
@@ -405,6 +423,9 @@ error_code _cellGcmInitBody(ppu_thread& ppu, vm::pptr<CellGcmContextData> contex
 		gcm_cfg.local_addr = rsx::constants::local_mem_base;
 		vm::falloc(gcm_cfg.local_addr, gcm_cfg.local_size, vm::video);
 	}
+#ifdef RPCS3_WEB
+	std::fprintf(stderr, "RPCS3 Web GCM init: local memory mapped\n");
+#endif
 
 	cellGcmSys.warning("*** local memory(addr=0x%x, size=0x%x)", gcm_cfg.local_addr, gcm_cfg.local_size);
 
@@ -426,12 +447,21 @@ error_code _cellGcmInitBody(ppu_thread& ppu, vm::pptr<CellGcmContextData> contex
 	render->local_mem_size = gcm_cfg.local_size;
 
 	ensure(sys_rsx_device_map(ppu, vm::var<u64>{}, vm::null, 0x8) == CELL_OK);
+#ifdef RPCS3_WEB
+	std::fprintf(stderr, "RPCS3 Web GCM init: RSX device mapped\n");
+#endif
 	ensure(sys_rsx_context_allocate(ppu, vm::var<u32>{}, vm::var<u64>{}, vm::var<u64>{}, vm::var<u64>{}, 0, gcm_cfg.system_mode) == CELL_OK);
+#ifdef RPCS3_WEB
+	std::fprintf(stderr, "RPCS3 Web GCM init: RSX context allocated\n");
+#endif
 
 	if (gcmMapEaIoAddress(ppu, ioAddress, 0, ioSize, false) != CELL_OK)
 	{
 		return CELL_GCM_ERROR_FAILURE;
 	}
+#ifdef RPCS3_WEB
+	std::fprintf(stderr, "RPCS3 Web GCM init: EA/IO mapped\n");
+#endif
 
 	gcm_cfg.current_config.ioSize = ioSize;
 	gcm_cfg.current_config.ioAddress = ioAddress;
@@ -470,6 +500,9 @@ error_code _cellGcmInitBody(ppu_thread& ppu, vm::pptr<CellGcmContextData> contex
 	render->intr_thread = idm::get_unlocked<named_thread<ppu_thread>>(static_cast<u32>(*_tid));
 	render->intr_thread->state -= cpu_flag::stop;
 	thread_ctrl::notify(*render->intr_thread);
+#ifdef RPCS3_WEB
+	std::fprintf(stderr, "RPCS3 Web GCM init: complete\n");
+#endif
 
 	return CELL_OK;
 }

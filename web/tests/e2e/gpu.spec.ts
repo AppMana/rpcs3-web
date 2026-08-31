@@ -11,7 +11,8 @@ test("renders a sustained Tetris session through headless hardware WebGPU", asyn
   expect(status.draws).toBeGreaterThanOrEqual(9);
   expect(status.vertices).toBeGreaterThanOrEqual(36);
   expect(status.format).toBeTruthy();
-  expect(status.adapter).toMatch(/NVIDIA|vulkan|discrete/i);
+  expect(status.adapter).not.toMatch(/SwiftShader|llvmpipe|software|CPU/i);
+  expect(status.adapter).toMatch(/NVIDIA|AMD|Intel|discrete|integrated/i);
   expect(status.frameHash).toBeGreaterThan(0);
   expect(status.changedPixels).toBeGreaterThan(100);
   expect(status.clearPixels).toBeGreaterThan(100);

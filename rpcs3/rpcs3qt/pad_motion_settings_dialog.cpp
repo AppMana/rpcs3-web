@@ -99,10 +99,10 @@ pad_motion_settings_dialog::pad_motion_settings_dialog(QDialog* parent, std::sha
 			m_shifts[i]->setRange(config->shift.min, config->shift.max);
 			m_shifts[i]->setValue(config->shift.get());
 
-			connect(m_mirrors[i], &QCheckBox::checkStateChanged, this, [this, i](Qt::CheckState state)
+			connect(m_mirrors[i], &QCheckBox::toggled, this, [this, i](bool checked)
 			{
 				std::lock_guard lock(m_config_mutex);
-				m_config_entries[i]->mirrored.set(state != Qt::Unchecked);
+				m_config_entries[i]->mirrored.set(checked);
 			});
 
 			connect(m_shifts[i], &QSpinBox::valueChanged, this, [this, i](int value)

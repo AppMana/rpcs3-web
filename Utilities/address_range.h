@@ -583,15 +583,18 @@ namespace utils
 
 namespace std
 {
-	static_assert(sizeof(usz) >= 2 * sizeof(u32), "usz must be at least twice the size of u32");
-
 	template <>
 	struct hash<utils::address_range32>
 	{
 		usz operator()(const utils::address_range32& k) const
 		{
-			// we can guarantee a unique hash since our type is 64 bits and usz as well
-			return (usz{ k.start } << 32) | usz{ k.end };
+#ifdef ARCH_WASM32
+			// Wasm32 cannot preserve the native backend's collision-free 64-bit key,
+			// but the container only requires a stable hash, not uniqueness.
+			return (usz{k.start} * 0x9e3779b1u) ^ usz{k.end};
+#else
+			return (usz{k.start} << 32) | usz{k.end};
+#endif
 		}
 	};
 }

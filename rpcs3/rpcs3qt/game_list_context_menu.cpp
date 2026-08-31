@@ -823,7 +823,7 @@ void game_list_context_menu::show_single_selection_context_menu(const game_info&
 	});
 	connect(copy_info, &QAction::triggered, this, [name, serial = QString::fromStdString(serial)]
 	{
-		QApplication::clipboard()->setText(name % QStringLiteral(" [") % serial % QStringLiteral("]"));
+		QApplication::clipboard()->setText(name + QStringLiteral(" [") + serial + QStringLiteral("]"));
 	});
 	connect(copy_name, &QAction::triggered, this, [name]
 	{

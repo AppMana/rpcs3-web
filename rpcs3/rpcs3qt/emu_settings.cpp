@@ -466,11 +466,19 @@ void emu_settings::EnhanceCheckBox(QCheckBox* checkbox, emu_settings_type type)
 		m_broken_types.insert(type);
 	}
 
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
 	connect(checkbox, &QCheckBox::checkStateChanged, this, [type, this](Qt::CheckState val)
 	{
 		const std::string str = val != Qt::Unchecked ? "true" : "false";
 		SetSetting(type, str);
 	});
+#else
+	connect(checkbox, &QCheckBox::stateChanged, this, [type, this](int val)
+	{
+		const std::string str = val != Qt::Unchecked ? "true" : "false";
+		SetSetting(type, str);
+	});
+#endif
 
 	connect(this, &emu_settings::RestoreDefaultsSignal, checkbox, [def, checkbox]()
 	{

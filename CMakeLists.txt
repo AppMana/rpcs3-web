@@ -63,7 +63,17 @@ option(USE_LTO "Use LTO for building" ON)
 option(BUILD_RPCS3_TESTS "Build RPCS3 unit tests." OFF)
 option(RUN_RPCS3_TESTS "Run RPCS3 unit tests. Requires BUILD_RPCS3_TESTS" OFF)
 option(USE_GAMEMODE "Choose whether to enable GameMode features or not." ON)
-option(RPCS3_WEB "Build the experimental browser runtime instead of the native application." OFF)
+option(RPCS3_WEB "Build the full RPCS3 emulation core with browser host backends." OFF)
+option(RPCS3_WEB_PROBE "Build the standalone browser capability probe." OFF)
+
+if(RPCS3_WEB_PROBE)
+    if(NOT EMSCRIPTEN)
+        message(FATAL_ERROR "RPCS3_WEB_PROBE requires the Emscripten toolchain (configure with emcmake).")
+    endif()
+
+    add_subdirectory(web/core)
+    return()
+endif()
 
 if(RPCS3_WEB)
     if(NOT EMSCRIPTEN)
@@ -71,8 +81,22 @@ if(RPCS3_WEB)
     endif()
 
     add_compile_definitions(RPCS3_WEB=1)
-    add_subdirectory(web/core)
-    return()
+    set(WITH_LLVM OFF CACHE BOOL "LLVM JIT is unavailable in the browser" FORCE)
+    set(BUILD_LLVM OFF CACHE BOOL "LLVM JIT is unavailable in the browser" FORCE)
+    set(USE_VULKAN OFF CACHE BOOL "Use the WebGPU RSX backend" FORCE)
+    set(USE_SDL OFF CACHE BOOL "Browser input is supplied by the host" FORCE)
+    set(USE_FAUDIO OFF CACHE BOOL "Browser audio is supplied by the host" FORCE)
+    set(USE_LIBEVDEV OFF CACHE BOOL "Browser input is supplied by the host" FORCE)
+    set(USE_GAMEMODE OFF CACHE BOOL "GameMode is not applicable in a browser" FORCE)
+    set(USE_DISCORD_RPC OFF CACHE BOOL "Discord RPC is not part of the browser core" FORCE)
+    set(USE_LTO OFF CACHE BOOL "Keep browser development links incremental" FORCE)
+
+    # RPCS3's execution model is intrinsically multi-threaded (PPU, SPU, RSX,
+    # audio and service threads).  Emscripten only exposes the pthread and C++
+    # synchronization APIs when every participating translation unit is built
+    # for shared Wasm memory.
+    add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-pthread>")
+    add_link_options(-pthread)
 endif()
 
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/buildfiles/cmake")
@@ -100,7 +124,7 @@ if(MSVC)
     add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/MP>")
 endif()
 
-if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT RPCS3_WEB)
     message(FATAL_ERROR "RPCS3 can only be compiled on 64-bit platforms.")
 endif()
 

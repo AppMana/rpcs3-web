@@ -364,7 +364,9 @@ inline void ppu_cr_set(ppu_thread& ppu, u32 field, bool le, bool gt, bool eq, bo
 
 	if (g_cfg.core.ppu_debug) [[unlikely]]
 	{
+#ifndef RPCS3_WEB
 		*reinterpret_cast<u32*>(vm::g_stat_addr + ppu.cia) |= *reinterpret_cast<u32*>(ppu.cr.bits + field * 4);
+#endif
 	}
 }
 
@@ -386,7 +388,9 @@ void ppu_set_cr(ppu_thread& ppu, u32 field, bool le, bool gt, bool eq, bool so)
 
 	if constexpr (((Flags == set_cr_stats) || ...))
 	{
+#ifndef RPCS3_WEB
 		*reinterpret_cast<u32*>(vm::g_stat_addr + ppu.cia) |= *reinterpret_cast<u32*>(ppu.cr.bits + field * 4);
+#endif
 	}
 }
 
@@ -439,7 +443,9 @@ void ppu_set_fpcc(ppu_thread& ppu, f64 a, f64 b, u64 cr_field = 1)
 
 			if (g_cfg.core.ppu_debug) [[unlikely]]
 			{
+#ifndef RPCS3_WEB
 				*reinterpret_cast<u32*>(vm::g_stat_addr + ppu.cia) |= data;
+#endif
 			}
 		}
 	}
@@ -6466,6 +6472,12 @@ auto FCTIW()
 		d = std::bit_cast<f64, s64>(_mm_cvtsi128_si32(res));
 	#elif defined(ARCH_ARM64)
 		d = std::bit_cast<f64, s64>(!(b == b) ? INT32_MIN : vqmovnd_s64(std::bit_cast<f64>(vrndi_f64(std::bit_cast<float64x1_t>(b)))));
+	#else
+		const f64 value = std::nearbyint(b);
+		const s64 result = std::isnan(value) || value <= -0x1p31 ? INT32_MIN
+			: value >= 0x1p31 ? INT32_MAX
+			: static_cast<s32>(value);
+		d = std::bit_cast<f64>(result);
 	#endif
 		ppu_set_fpcc<Flags...>(ppu, 0., 0.); // undefined (TODO)
 	};
@@ -6487,6 +6499,12 @@ auto FCTIWZ()
 		d = std::bit_cast<f64, s64>(_mm_cvtsi128_si32(res));
 	#elif defined(ARCH_ARM64)
 		d = std::bit_cast<f64, s64>(!(b == b) ? INT32_MIN : vqmovnd_s64(std::bit_cast<s64>(vcvt_s64_f64(std::bit_cast<float64x1_t>(b)))));
+	#else
+		const f64 value = std::trunc(b);
+		const s64 result = std::isnan(value) || value <= -0x1p31 ? INT32_MIN
+			: value >= 0x1p31 ? INT32_MAX
+			: static_cast<s32>(value);
+		d = std::bit_cast<f64>(result);
 	#endif
 		ppu_set_fpcc<Flags...>(ppu, 0., 0.); // undefined (TODO)
 	};
@@ -6746,6 +6764,12 @@ auto FCTID()
 		d = std::bit_cast<f64>(_mm_cvtsi128_si64(res));
 	#elif defined(ARCH_ARM64)
 		d = std::bit_cast<f64, s64>(!(b == b) ? f64{INT64_MIN} : std::bit_cast<f64>(vrndi_f64(std::bit_cast<float64x1_t>(b))));
+	#else
+		const f64 value = std::nearbyint(b);
+		const s64 result = std::isnan(value) || value <= -0x1p63 ? INT64_MIN
+			: value >= 0x1p63 ? INT64_MAX
+			: static_cast<s64>(value);
+		d = std::bit_cast<f64>(result);
 	#endif
 		ppu_set_fpcc<Flags...>(ppu, 0., 0.); // undefined (TODO)
 	};
@@ -6767,6 +6791,12 @@ auto FCTIDZ()
 		d = std::bit_cast<f64>(_mm_cvtsi128_si64(res));
 	#elif defined(ARCH_ARM64)
 		d = std::bit_cast<f64>(!(b == b) ? int64x1_t{INT64_MIN} : vcvt_s64_f64(std::bit_cast<float64x1_t>(b)));
+	#else
+		const f64 value = std::trunc(b);
+		const s64 result = std::isnan(value) || value <= -0x1p63 ? INT64_MIN
+			: value >= 0x1p63 ? INT64_MAX
+			: static_cast<s64>(value);
+		d = std::bit_cast<f64>(result);
 	#endif
 		ppu_set_fpcc<Flags...>(ppu, 0., 0.); // undefined (TODO)
 	};

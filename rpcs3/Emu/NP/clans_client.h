@@ -1,6 +1,8 @@
 #pragma once
 
+#ifndef RPCS3_WEB
 #include <curl/curl.h>
+#endif
 #include <pugixml.hpp>
 
 #include <Emu/Cell/Modules/sceNpClans.h>
@@ -70,7 +72,9 @@ namespace clan
 	{
 	private:
 
+#ifndef RPCS3_WEB
 		static size_t curl_write_callback(void* data, size_t size, size_t nmemb, void* clientp);
+#endif
 		SceNpClansError send_request(u32 reqId, ClanRequestAction action, ClanManagerOperationType type, const pugi::xml_document& xml_body, pugi::xml_document& out_response);
 
 		/// @brief Forge and get a V2.1 Ticket for clan operations

@@ -572,8 +572,10 @@ namespace stx
 			return r;
 		}
 
-		// Random checks which may fail on invalid pointer
-		ensure((r.d()->refs++ - 1) >> 58 == 0);
+		// Random checks which may fail on an invalid pointer. Keep the upper six
+		// bits clear on both 64-bit hosts and Wasm32 instead of assuming usz has
+		// at least 59 bits.
+		ensure((r.d()->refs++ - 1) <= (usz{umax} >> 6));
 		return r;
 	}
 
@@ -587,6 +589,9 @@ namespace stx
 			uptr ptr{};
 			u32 is_non_null{};
 			u32 ref_ctr{};
+#ifdef ARCH_WASM32
+			u32 padding{};
+#endif
 		};
 
 		mutable atomic_t<fat_ptr> m_val{fat_ptr{}};

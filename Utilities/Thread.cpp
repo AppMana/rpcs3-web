@@ -10,6 +10,10 @@
 #include "Utilities/JIT.h"
 #include <cfenv>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten/stack.h>
+#endif
+
 #ifdef ARCH_ARM64
 #include "Emu/CPU/Backends/AArch64/AArch64Signal.h"
 #endif
@@ -136,7 +140,11 @@ std::string dump_useful_thread_info()
 #ifndef _WIN32
 bool IsDebuggerPresent()
 {
-#if defined(__APPLE__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#if defined(__EMSCRIPTEN__)
+	// Browser developer tools do not expose a synchronous debugger-attached
+	// query to WebAssembly.
+	return false;
+#elif defined(__APPLE__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
 	int mib[] = {
 		CTL_KERN,
 		KERN_PROC,
@@ -2518,6 +2526,13 @@ const bool s_exception_handler_set = []() -> bool
 	return true;
 }();
 
+#elif defined(__EMSCRIPTEN__)
+
+// Wasm cannot install a native fault-context handler or resume a faulting
+// instruction after mutating registers. The web VM backend performs explicit
+// guest-address validation instead.
+const bool s_exception_handler_set = true;
+
 #else
 
 static void signal_handler(int /*sig*/, siginfo_t* info, void* uct) noexcept
@@ -2754,6 +2769,11 @@ void thread_base::start()
 		v |= static_cast<u32>(thread_state::created);
 	});
 
+#ifdef __EMSCRIPTEN__
+	const auto web_thread_name = m_tname.load();
+	std::fprintf(stderr, "RPCS3 Web pthread start: %s\n", web_thread_name ? web_thread_name->c_str() : "<unnamed>");
+#endif
+
 #ifdef _WIN32
 	m_thread = ::_beginthreadex(nullptr, 0, entry_point, this, CREATE_SUSPENDED, nullptr);
 	ensure(m_thread);
@@ -2799,6 +2819,8 @@ void thread_base::initialize(void (*error_cb)())
 	[[maybe_unused]] u64 new_tid = 0;
 #elif defined(ANDROID)
 	const u64 new_tid = pthread_self();
+#elif defined(__EMSCRIPTEN__)
+	const u64 new_tid = static_cast<u64>(pthread_self());
 #else
 	const u64 new_tid = reinterpret_cast<u64>(pthread_self());
 #endif
@@ -2873,7 +2895,11 @@ void thread_base::set_name(std::string name)
 	}();
 #endif
 
-#if defined(__APPLE__)
+#if defined(__EMSCRIPTEN__)
+	// Web Workers have host-visible names assigned by the JS worker runtime,
+	// but Emscripten does not currently provide pthread_setname_np.
+	(void)name;
+#elif defined(__APPLE__)
 	name.resize(std::min<usz>(15, name.size()));
 	pthread_setname_np(name.c_str());
 #elif defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
@@ -3253,6 +3279,8 @@ thread_base::~thread_base() noexcept
 		CloseHandle(handle0);
 #elif defined(ANDROID)
 		pthread_join(m_thread.load(), nullptr);
+#elif defined(__EMSCRIPTEN__)
+		pthread_join(static_cast<pthread_t>(m_thread.load()), nullptr);
 #else
 		pthread_join(reinterpret_cast<pthread_t>(m_thread.load()), nullptr);
 #endif
@@ -3327,8 +3355,10 @@ u64 thread_base::get_cycles()
 #else
 	clockid_t _clock;
 	struct timespec thread_time;
-#ifdef ANDROID
+#if defined(ANDROID)
 	pthread_t thread_id = handle;
+#elif defined(__EMSCRIPTEN__)
+	pthread_t thread_id = static_cast<pthread_t>(handle);
 #else
 	pthread_t thread_id = reinterpret_cast<pthread_t>(handle);
 #endif
@@ -3820,7 +3850,11 @@ u64 thread_ctrl::get_affinity_mask(thread_class group)
 
 void thread_ctrl::set_native_priority(int priority)
 {
-#ifdef _WIN32
+#if defined(__EMSCRIPTEN__)
+	// Browsers intentionally do not expose native scheduler priorities. RPCS3's
+	// own queues and synchronization still determine emulation ordering.
+	(void)priority;
+#elif defined(_WIN32)
 	HANDLE _this_thread = GetCurrentThread();
 	INT native_priority = THREAD_PRIORITY_NORMAL;
 
@@ -3985,6 +4019,11 @@ std::pair<void*, usz> thread_ctrl::get_thread_stack()
 	GetCurrentThreadStackLimits(&_min, &_max);
 	const usz ssize = _max - _min;
 	const auto saddr = reinterpret_cast<void*>(_min);
+#elif defined(__EMSCRIPTEN__)
+	const uptr stack_base = emscripten_stack_get_base();
+	const uptr stack_end = emscripten_stack_get_end();
+	void* saddr = reinterpret_cast<void*>(stack_end);
+	usz ssize = stack_base >= stack_end ? stack_base - stack_end : 0;
 #else
 	void* saddr = 0;
 	usz ssize = 0;

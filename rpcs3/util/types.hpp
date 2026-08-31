@@ -15,7 +15,9 @@
 #include <source_location>
 #include <new>
 
-#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || defined(__x86_64__) || defined(__amd64__)
+#if defined(__wasm32__)
+#define ARCH_WASM32 1
+#elif defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || defined(__x86_64__) || defined(__amd64__)
 #define ARCH_X64 1
 #elif defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
 #define ARCH_ARM64 1

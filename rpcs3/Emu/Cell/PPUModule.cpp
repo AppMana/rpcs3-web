@@ -2214,8 +2214,6 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 
 			const bool already_loaded = ar && vm::check_addr(addr, vm::page_readable, size);
 
-			_seg.ptr = vm::base(addr);
-
 			if (virtual_load)
 			{
 				// Leave additional room for the analyser so it can safely access beyond limit a bit
@@ -2252,6 +2250,15 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 			}())
 			{
 				ppu_loader.error("ppu_load_exec(): vm::falloc() failed (addr=0x%x, memsz=0x%x)", addr, size);
+				return false;
+			}
+
+			// Native RPCS3 can form its fixed 4-GiB alias before falloc().  The
+			// Web backend obtains compact backing during falloc(), so resolve the
+			// host pointer only after the guest range is mapped.
+			if (!virtual_load && !(_seg.ptr = vm::base(addr)))
+			{
+				ppu_loader.error("ppu_load_exec(): mapped segment has no host backing (addr=0x%x, memsz=0x%x)", addr, size);
 				return false;
 			}
 
@@ -2584,6 +2591,25 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 
 	// Initialize process
 	std::vector<shared_ptr<lv2_prx>> loaded_modules;
+
+	// A browser build cannot discover or redistribute a desktop firmware
+	// installation.  When no user-provided dev_flash is mounted, use RPCS3's
+	// existing HLE modules for homebrew instead of selecting firmware SPRXes.
+#ifdef RPCS3_WEB
+	if (!virtual_load && !fs::is_file(vfs::get("/dev_flash/") + "sys/external/liblv2.sprx"))
+	{
+		std::set<std::string> hle_libraries = g_cfg.core.libraries_control.get_set();
+		extern const std::map<std::string_view, int> g_prx_list;
+
+		for (const auto& [name, _] : g_prx_list)
+		{
+			hle_libraries.erase(std::string{name} + ":lle");
+			hle_libraries.emplace(std::string{name} + ":hle");
+		}
+
+		g_cfg.core.libraries_control.set_set(std::move(hle_libraries));
+	}
+#endif
 
 	// Module list to load at startup
 	std::set<std::string> load_libs;
@@ -2927,8 +2953,6 @@ std::pair<shared_ptr<lv2_overlay>, CellError> ppu_load_overlay(const ppu_exec_ob
 
 			const bool already_loaded = !!ar; // Unimplemented optimization for savestates
 
-			_seg.ptr = vm::base(addr);
-
 			if (virtual_load)
 			{
 				// Leave additional room for the analyser so it can safely access beyond limit a bit
@@ -2959,6 +2983,12 @@ std::pair<shared_ptr<lv2_overlay>, CellError> ppu_load_overlay(const ppu_exec_ob
 
 				// TODO: Check error code, maybe disallow more than one overlay instance completely
 				return {null_ptr, CELL_EBUSY};
+			}
+
+			if (!virtual_load && !(_seg.ptr = vm::base(addr)))
+			{
+				ppu_loader.error("ppu_load_overlay(): mapped segment has no host backing (addr=0x%x, memsz=0x%x)", addr, size);
+				return {null_ptr, CELL_EABORT};
 			}
 
 			// Store only LOAD segments (TODO)

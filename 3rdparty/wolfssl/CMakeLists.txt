@@ -7,7 +7,11 @@ else()
 	set(WOLFSSL_TLS13 ON CACHE INTERNAL "" FORCE)
 	set(WOLFSSL_SHA3 ON CACHE INTERNAL "")
 	set(WOLFSSL_SHAKE256 ON CACHE INTERNAL "")
-	set(WOLFSSL_BASE64_ENCODE OFF CACHE INTERNAL "")
+	if(RPCS3_WEB)
+		set(WOLFSSL_BASE64_ENCODE ON CACHE INTERNAL "" FORCE)
+	else()
+		set(WOLFSSL_BASE64_ENCODE OFF CACHE INTERNAL "")
+	endif()
 	set(WOLFSSL_DES3 ON CACHE INTERNAL "")
 	set(WOLFSSL_PWDBASED ON CACHE INTERNAL "")
 	set(WOLFSSL_FAST_MATH ON CACHE INTERNAL "")
@@ -21,5 +25,9 @@ else()
 
 	add_subdirectory(wolfssl EXCLUDE_FROM_ALL)
 
-	target_compile_definitions(wolfssl PUBLIC WOLFSSL_DES_ECB HAVE_WRITE_DUP FP_MAX_BITS=8192 WOLFSSL_USE_OPTIONS_H)
+	target_compile_definitions(wolfssl PUBLIC WOLFSSL_DES_ECB HAVE_WRITE_DUP FP_MAX_BITS=8192)
+	# Consumers load the generated feature header. Defining this while compiling
+	# wolfSSL itself is explicitly diagnosed by wolfSSL because BUILDING_WOLFSSL
+	# already selects the generated configuration.
+	target_compile_definitions(wolfssl INTERFACE WOLFSSL_USE_OPTIONS_H)
 endif()

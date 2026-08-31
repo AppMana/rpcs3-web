@@ -143,10 +143,17 @@ anaglyph_settings_dialog::anaglyph_settings_dialog(QWidget* parent, std::shared_
 	apply_button->setEnabled(current_mode == stereo_render_mode_options::anaglyph_custom);
 
 	QCheckBox* live_preview_cb = new QCheckBox(tr("Live Preview"));
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
 	connect(live_preview_cb, &QCheckBox::checkStateChanged, this, [this](Qt::CheckState state)
 	{
 		stereo_config::s_live_preview_enabled = state == Qt::CheckState::Checked;
 	});
+#else
+	connect(live_preview_cb, &QCheckBox::stateChanged, this, [this](int state)
+	{
+		stereo_config::s_live_preview_enabled = state == Qt::Checked;
+	});
+#endif
 
 	QComboBox* combo = new QComboBox(this);
 	combo->addItem(tr("Disabled"), static_cast<int>(stereo_render_mode_options::disabled));

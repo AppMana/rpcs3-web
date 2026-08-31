@@ -126,7 +126,7 @@ bool dmux_pamf_base::output_queue::push(const access_unit_chunk& au_chunk, const
 bool dmux_pamf_base::output_queue::prepare_next_au(u32 au_max_size)
 {
 	// LLE always checks the distance between the end of the buffer and the back pointer, even if the back pointer is wrapped around and there are unconsumed access units behind it
-	if (std::to_address(buffer.end()) - back < au_max_size)
+	if (static_cast<u32>(std::to_address(buffer.end()) - back) < au_max_size)
 	{
 		// Can't wrap the back pointer around again as long as there are unconsumed access units behind it
 		if (wrap_pos != buffer.data())

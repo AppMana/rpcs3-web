@@ -32,7 +32,9 @@ ps_move_tracker<DiagnosticsEnabled>::ps_move_tracker()
 	m_vc_attr.green_gain = 1.0f;
 	m_vc_attr.blue_gain = 1.0f;
 
+#ifndef RPCS3_WEB
 	init_workers();
+#endif
 }
 
 template <bool DiagnosticsEnabled>

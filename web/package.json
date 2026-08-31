@@ -10,11 +10,16 @@
     "dev": "vite --host 0.0.0.0",
     "build": "npm run prepare:assets && tsc --noEmit && vite build",
     "build:core": "bash scripts/build-core.sh",
+    "build:runtime": "bash scripts/build-rpcs3-core.sh",
+    "compare:frame": "node scripts/compare-native-webgpu-frame.mjs",
     "preview": "vite preview --host 0.0.0.0",
     "test": "vitest run",
     "test:e2e": "playwright test",
     "test:e2e:gpu": "playwright test --config playwright.gpu.config.ts",
+    "test:units:browser": "npm run build && playwright test browser-units.spec.ts",
     "device:wip": "node scripts/run-wip-device.mjs",
+    "device:runtime": "node scripts/run-full-runtime-device.mjs",
+    "device:units": "node scripts/run-unit-device.mjs",
     "check": "npm test && npm run build"
   },
   "dependencies": {
@@ -23,7 +28,9 @@
   "devDependencies": {
     "@playwright/test": "1.62.1",
     "@types/node": "24.3.0",
+    "@types/pngjs": "^6.0.5",
     "@webgpu/types": "0.1.64",
+    "pngjs": "^7.0.0",
     "typescript": "5.9.2",
     "vite": "7.3.6",
     "vitest": "3.2.7"

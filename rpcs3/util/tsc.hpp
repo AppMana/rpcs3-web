@@ -22,6 +22,9 @@ namespace utils
 		return __rdtsc();
 #elif defined(ARCH_X64)
 		return __builtin_ia32_rdtsc();
+#elif defined(ARCH_WASM32)
+		return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
 #else
 #error "Missing utils::get_tsc() implementation"
 #endif

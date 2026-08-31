@@ -131,18 +131,22 @@ try {
     if (ready) break;
     await delay(250);
   }
-  const gameBeforeInput = JSON.parse(await connection.evaluate("JSON.stringify(window.__rpcs3Web.gameStatus())"));
+  const gameBeforeInput = JSON.parse(await connection.evaluate(
+    "JSON.stringify(window.__rpcs3Web?.gameStatus?.() ?? { state: 'unavailable', detail: 'This deployed build does not expose gameStatus' })",
+  ));
   if (gameBeforeInput.state === "running") {
     await connection.evaluate(`window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight" }))`);
     const inputDeadline = Date.now() + timeoutMs;
     while (Date.now() < inputDeadline) {
-      const flips = Number(await connection.evaluate("window.__rpcs3Web.gameStatus().flips || 0"));
+      const flips = Number(await connection.evaluate("window.__rpcs3Web?.gameStatus?.()?.flips || 0"));
       if (flips >= (gameBeforeInput.flips ?? 0) + 30) break;
       await delay(250);
     }
     await connection.evaluate(`window.dispatchEvent(new KeyboardEvent("keyup", { key: "ArrowRight" }))`);
   }
-  const gameAfterInput = JSON.parse(await connection.evaluate("JSON.stringify(window.__rpcs3Web.gameStatus())"));
+  const gameAfterInput = JSON.parse(await connection.evaluate(
+    "JSON.stringify(window.__rpcs3Web?.gameStatus?.() ?? { state: 'unavailable', detail: 'This deployed build does not expose gameStatus' })",
+  ));
   await connection.evaluate(`document.querySelector("#game-preview")?.scrollIntoView({ block: "center" })`);
   await delay(250);
   const viewport = JSON.parse(await connection.evaluate("JSON.stringify({width: innerWidth, height: innerHeight})"));

@@ -1,4 +1,34 @@
-#if defined(__SSE2__) || defined(_M_X64)
+#if defined(__EMSCRIPTEN__)
+
+#include "aesni.h"
+
+// Emscripten's x86-intrinsic compatibility layer targets Wasm SIMD, but it
+// cannot assemble the x86 AES-NI implementation below. Returning no feature
+// support keeps RPCS3 on the complete portable AES implementation in aes.cpp.
+int aesni_supports(unsigned int)
+{
+	return 0;
+}
+
+int aesni_crypt_ecb(aes_context*, int, const unsigned char[16], unsigned char[16])
+{
+	return -1;
+}
+
+void aesni_gcm_mult(unsigned char[16], const unsigned char[16], const unsigned char[16])
+{
+}
+
+void aesni_inverse_key(unsigned char*, const unsigned char*, int)
+{
+}
+
+int aesni_setkey_enc(unsigned char*, const unsigned char*, size_t)
+{
+	return -1;
+}
+
+#elif defined(__SSE2__) || defined(_M_X64)
 
 /*
  *  AES-NI support functions

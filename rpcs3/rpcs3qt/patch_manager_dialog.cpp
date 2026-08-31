@@ -95,7 +95,10 @@ patch_manager_dialog::patch_manager_dialog(std::shared_ptr<gui_settings> gui_set
 	connect(ui->patch_tree, &QTreeWidget::currentItemChanged, this, &patch_manager_dialog::handle_item_selected);
 	connect(ui->patch_tree, &QTreeWidget::itemChanged, this, &patch_manager_dialog::handle_item_changed);
 	connect(ui->patch_tree, &QTreeWidget::customContextMenuRequested, this, &patch_manager_dialog::handle_custom_context_menu_requested);
-	connect(ui->cb_owned_games_only, &QCheckBox::checkStateChanged, this, &patch_manager_dialog::handle_show_owned_games_only);
+	connect(ui->cb_owned_games_only, &QCheckBox::toggled, this, [this](bool checked)
+	{
+		handle_show_owned_games_only(checked ? Qt::CheckState::Checked : Qt::CheckState::Unchecked);
+	});
 	connect(ui->configurable_selector, &QComboBox::currentIndexChanged, this, [this](int index)
 	{
 		if (index >= 0)

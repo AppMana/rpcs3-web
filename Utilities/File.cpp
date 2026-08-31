@@ -2166,6 +2166,10 @@ std::string fs::get_executable_path()
 		std::vector<wchar_t> buffer(size);
 		GetModuleFileNameW(nullptr, buffer.data(), size);
 		return wchar_to_utf8(buffer.data());
+#elif defined(__EMSCRIPTEN__)
+		// The browser has neither /proc/self/exe nor an AppImage environment.
+		// Give the existing RPCS3 path/config machinery a stable MEMFS identity.
+		return "/rpcs3/bin/rpcs3-web";
 #elif defined(__APPLE__)
 		char bin_path[PATH_MAX];
 		uint32_t bin_path_size = sizeof(bin_path);

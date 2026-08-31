@@ -12,6 +12,8 @@
 #include "Emu/Audio/AudioBackend.h"
 #include "Emu/Audio/audio_resampler.h"
 
+#include <condition_variable>
+
 #if defined(unix) || defined(__unix) || defined(__unix__)
 // For BSD detection
 #include <sys/param.h>
@@ -181,7 +183,7 @@ struct lv2_rsxaudio final : lv2_obj
 
 	rsxaudio_shmem* get_rw_shared_page() const
 	{
-		return reinterpret_cast<rsxaudio_shmem*>(vm::g_sudo_addr + u32{shmem});
+		return vm::get_super_ptr<rsxaudio_shmem>(u32{shmem});
 	}
 };
 
@@ -257,6 +259,10 @@ private:
 #if defined(_WIN32)
 	HANDLE cancel_event{};
 	HANDLE timer_handle{};
+#elif defined(__EMSCRIPTEN__)
+	std::condition_variable_any browser_timer_cv{};
+	u64 browser_timer_interval = 0;
+	bool browser_timer_canceled = false;
 #elif defined(__linux__)
 	int cancel_event{};
 	int timer_handle{};

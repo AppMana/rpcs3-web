@@ -2,10 +2,47 @@
 #include "upnp_handler.h"
 #include "util/logs.hpp"
 
+#ifndef RPCS3_WEB
 #include <miniwget.h>
 #include <upnpcommands.h>
+#endif
 
 LOG_CHANNEL(upnp_log, "UPNP");
+
+#ifdef RPCS3_WEB
+
+upnp_handler::~upnp_handler()
+{
+	std::lock_guard lock(m_mutex);
+	m_bindings.clear();
+	m_active = false;
+}
+
+void upnp_handler::upnp_enable()
+{
+	std::lock_guard lock(m_mutex);
+	m_active = false;
+	upnp_log.notice("UPnP port mapping is unavailable in the browser sandbox");
+}
+
+void upnp_handler::add_port_redir(const std::string&, u16, std::string_view)
+{
+}
+
+void upnp_handler::remove_port_redir(u16, std::string_view)
+{
+}
+
+void upnp_handler::remove_port_redir_external(u16, std::string_view, bool)
+{
+}
+
+bool upnp_handler::is_active() const
+{
+	return false;
+}
+
+#else
 
 upnp_handler::~upnp_handler()
 {
@@ -188,3 +225,5 @@ bool upnp_handler::is_active() const
 {
 	return m_active;
 }
+
+#endif

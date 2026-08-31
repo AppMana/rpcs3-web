@@ -329,7 +329,9 @@ void gui_application::Init()
 		connect(this, &gui_application::OnEnableDiscEject, m_main_window, &main_window::OnEnableDiscEject);
 		connect(this, &gui_application::OnEnableDiscInsert, m_main_window, &main_window::OnEnableDiscInsert);
 
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
 		connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this, [this](){ OnChangeStyleSheetRequest(); });
+#endif
 
 		m_main_window->Init();
 	}

@@ -69,8 +69,10 @@ namespace utils
 
 	constexpr u32 popcnt128(const u128& v)
 	{
-#ifdef _MSC_VER
+#if defined(_MSC_VER)
 		return std::popcount(v.lo) + std::popcount(v.hi);
+#elif defined(ARCH_WASM32)
+		return std::popcount(static_cast<u64>(v)) + std::popcount(static_cast<u64>(v >> 64));
 #else
 		return std::popcount(v);
 #endif
@@ -158,6 +160,10 @@ namespace utils
 			return std::countr_zero(arg.hi) + 64u;
 		else
 			return std::countr_zero(arg.lo);
+#elif defined(ARCH_WASM32)
+		if (const u64 low = static_cast<u64>(arg))
+			return std::countr_zero(low);
+		return std::countr_zero(static_cast<u64>(arg >> 64)) + 64u;
 #else
 		return std::countr_zero(arg);
 #endif
@@ -170,6 +176,10 @@ namespace utils
 			return std::countl_zero(arg.hi);
 		else
 			return std::countl_zero(arg.lo) + 64;
+#elif defined(ARCH_WASM32)
+		if (const u64 high = static_cast<u64>(arg >> 64))
+			return std::countl_zero(high);
+		return std::countl_zero(static_cast<u64>(arg)) + 64u;
 #else
 		return std::countl_zero(arg);
 #endif
@@ -181,6 +191,8 @@ namespace utils
 		__asm__ volatile("isb" ::: "memory");
 #elif defined(ARCH_X64)
 		_mm_pause();
+#elif defined(ARCH_WASM32)
+		std::atomic_signal_fence(std::memory_order_seq_cst);
 #else
 #error "Missing utils::pause() implementation"
 #endif
@@ -485,7 +497,7 @@ namespace utils
 #endif
 	}
 
-	inline void trap()
+	[[noreturn]] inline void trap()
 	{
 #ifdef _M_X64
 		__debugbreak();
@@ -493,6 +505,8 @@ namespace utils
 		__asm__ volatile("int3");
 #elif defined(ARCH_ARM64)
 		__asm__ volatile("brk 0x42");
+#elif defined(ARCH_WASM32)
+		__builtin_trap();
 #else
 #error "Missing utils::trap() implementation"
 #endif

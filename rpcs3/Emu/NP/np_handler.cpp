@@ -654,6 +654,15 @@ namespace np
 			// nph_log.notice("Determined Ethernet address to be %s", ether_to_string(ether_address));
 			return true;
 		}
+#elif defined(RPCS3_WEB)
+		// Browsers deliberately do not expose the host NIC's MAC address. Use
+		// RPCS3's existing PSID-derived console identity rule, with the local
+		// administration bit set, instead of inventing a host interface.
+		const u128 psid = g_cfg.sys.console_psid;
+		memcpy(ether_address.data(), &psid, ether_address.size());
+		ether_address[0] &= 0xFE;
+		ether_address[0] |= 0x02;
+		return true;
 #else
 		ifreq ifr;
 		ifconf ifc;

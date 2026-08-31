@@ -1,6 +1,7 @@
 add_library(3rdparty_qt6 INTERFACE)
 
-set(QT_MIN_VER 6.7.0)
+set(RPCS3_QT_MIN_VERSION "6.7.0" CACHE STRING "Minimum Qt version required by the desktop frontend")
+set(QT_MIN_VER "${RPCS3_QT_MIN_VERSION}")
 
 find_package(Qt6 ${QT_MIN_VER} CONFIG COMPONENTS Widgets Concurrent Multimedia MultimediaWidgets Svg SvgWidgets)
 if(WIN32)

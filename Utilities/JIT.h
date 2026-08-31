@@ -51,6 +51,12 @@ using native_args = std::array<asmjit::x86::Gp, 4>;
 #elif defined(ARCH_ARM64)
 using native_asm = asmjit::a64::Assembler;
 using native_args = std::array<asmjit::a64::Gp, 4>;
+#elif defined(ARCH_WASM32)
+// Type-only compatibility for headers shared with the static interpreters.
+// Browser builds never instantiate or execute asmjit code; their PPU/SPU
+// dispatch backends call RPCS3's existing interpreter tables directly.
+using native_asm = asmjit::x86::Assembler;
+using native_args = std::array<asmjit::x86::Gp, 4>;
 #endif
 
 void jit_announce(uptr func, usz size, std::string_view name);
@@ -488,6 +494,10 @@ inline FT build_function_asm(std::string_view name, F&& builder, ::jit_runtime* 
 	args[1] = a64::x1;
 	args[2] = a64::x2;
 	args[3] = a64::x3;
+#elif defined(ARCH_WASM32)
+	// Only keeps the dependent template well-formed. Browser source files must
+	// not instantiate build_function_asm.
+	native_args args{};
 #endif
 
 	Asm compiler(&code);

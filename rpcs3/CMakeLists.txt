@@ -10,7 +10,7 @@ include(CheckFunctionExists)
 
 set(CMAKE_CXX_STANDARD 23)
 
-if(UNIX AND NOT APPLE AND NOT ANDROID)
+if(UNIX AND NOT APPLE AND NOT ANDROID AND NOT RPCS3_WEB)
     add_compile_definitions(DATADIR="${CMAKE_INSTALL_FULL_DATADIR}/rpcs3")
     # Optionally enable X11 for window management
     find_package(X11)
@@ -23,7 +23,7 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
     endif()
 endif()
 
-if (NOT ANDROID)
+if (NOT ANDROID AND NOT RPCS3_WEB)
     # Qt
     # finds Qt libraries and setups custom commands for MOC and UIC
     # Must be done here because generated MOC and UIC targets cant
@@ -34,11 +34,97 @@ endif()
 # subdirectories
 add_subdirectory(Emu)
 
-if (NOT ANDROID)
+if (NOT ANDROID AND NOT RPCS3_WEB)
     add_subdirectory(rpcs3qt)
 endif()
 
 gen_git_version(${CMAKE_CURRENT_SOURCE_DIR})
+
+if(RPCS3_WEB)
+	add_executable(rpcs3_web_runtime
+		${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_main.cpp)
+	target_link_libraries(rpcs3_web_runtime PRIVATE
+		rpcs3_emu
+		3rdparty::fusion)
+	set_target_properties(rpcs3_web_runtime PROPERTIES
+		OUTPUT_NAME "rpcs3-web"
+		SUFFIX ".mjs")
+	target_link_options(rpcs3_web_runtime PRIVATE
+		-pthread
+		"-Wl,--error-limit=0"
+		"-sMODULARIZE=1"
+		"-sEXPORT_ES6=1"
+		"-sEXPORT_NAME=createRPCS3"
+		"-sENVIRONMENT=web,worker"
+		"-sALLOW_MEMORY_GROWTH=1"
+		"-sMAXIMUM_MEMORY=2147483648"
+		"-sINITIAL_MEMORY=536870912"
+		"-sSTACK_SIZE=8388608"
+		"-sPTHREAD_POOL_SIZE=16"
+		"-sNO_EXIT_RUNTIME=1"
+		"-sFORCE_FILESYSTEM=1"
+		"-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8','PThread']"
+		"-sEXPORTED_FUNCTIONS=['_main','_malloc','_free']"
+		"-sASSERTIONS=1"
+		"-g1"
+		"--profiling-funcs"
+		"-sWASM_BIGINT=1")
+
+	# Compile the original low-dependency RPCS3 GoogleTest sources to Wasm.  The
+	# project already carries this GoogleTest copy through yaml-cpp, which keeps
+	# the browser lane offline and pinned to the same dependency as native builds.
+	set(RPCS3_WEB_GTEST_ROOT
+		"${CMAKE_SOURCE_DIR}/3rdparty/yaml-cpp/yaml-cpp/test/googletest-1.13.0/googletest")
+	add_library(rpcs3_web_gtest STATIC
+		"${RPCS3_WEB_GTEST_ROOT}/src/gtest-all.cc")
+	target_include_directories(rpcs3_web_gtest
+		PUBLIC "${RPCS3_WEB_GTEST_ROOT}/include"
+		PRIVATE "${RPCS3_WEB_GTEST_ROOT}")
+
+	add_executable(rpcs3_web_unit_tests
+		${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_unit_main.cpp
+		${CMAKE_SOURCE_DIR}/Utilities/StrFmt.cpp
+		Emu/RSX/Program/Assembler/FPASM.cpp
+		Emu/RSX/Program/Assembler/FPOpcodes.cpp
+		Emu/RSX/Program/Assembler/FPToCFG.cpp
+		Emu/RSX/Program/Assembler/Passes/FP/RegisterAnnotationPass.cpp
+		Emu/RSX/Program/Assembler/Passes/FP/RegisterDependencyPass.cpp
+		tests/test_bit_set.cpp
+		tests/test_address_range.cpp
+		tests/test_fmt.cpp
+		tests/test_pair.cpp
+		tests/test_rsx_cfg.cpp
+		tests/test_rsx_fp_asm.cpp
+		tests/test_tuple.cpp
+		tests/test_simple_array.cpp
+		tests/test_types_util.cpp)
+	target_link_libraries(rpcs3_web_unit_tests PRIVATE rpcs3_web_gtest)
+	target_include_directories(rpcs3_web_unit_tests PRIVATE
+		${CMAKE_SOURCE_DIR}
+		${CMAKE_CURRENT_SOURCE_DIR})
+	# GoogleTest intentionally accepts differently signed operands. RPCS3's
+	# global -Werror policy would otherwise reject its comparison helper before
+	# the tests can execute in the browser.
+	target_compile_options(rpcs3_web_unit_tests PRIVATE
+		-msimd128
+		-msse4.1
+		-Wno-error=sign-compare)
+	set_target_properties(rpcs3_web_unit_tests PROPERTIES
+		OUTPUT_NAME "rpcs3-web-units"
+		SUFFIX ".mjs")
+	target_link_options(rpcs3_web_unit_tests PRIVATE
+		"-sMODULARIZE=1"
+		"-sEXPORT_ES6=1"
+		"-sEXPORT_NAME=createRPCS3Units"
+		"-sENVIRONMENT=web,worker"
+		"-sALLOW_MEMORY_GROWTH=1"
+		"-sINITIAL_MEMORY=33554432"
+		"-sMAXIMUM_MEMORY=536870912"
+		"-sNO_EXIT_RUNTIME=1"
+		"-sASSERTIONS=1"
+		"-sWASM_BIGINT=1")
+    return()
+endif()
 
 if (NOT ANDROID)
     # Build rpcs3_lib
@@ -81,7 +167,7 @@ if (NOT ANDROID)
 
     # Unix display manager
     if(X11_FOUND)
-        target_link_libraries(rpcs3_lib PRIVATE X11::X11 xkbcommon-x11)
+        target_link_libraries(rpcs3_lib PRIVATE X11::X11 xkbcommon-x11 xkbcommon)
     elseif(USE_VULKAN AND UNIX AND NOT WAYLAND_FOUND AND NOT APPLE AND NOT ANDROID)
         # Wayland has been checked in 3rdparty/CMakeLists.txt already.
         message(FATAL_ERROR "RPCS3 requires either X11 or Wayland (or both) for Vulkan.")

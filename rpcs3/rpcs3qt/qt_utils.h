@@ -191,16 +191,17 @@ namespace gui
 		// Convert a timestamp to a readable string
 		QString format_timestamp(s64 time, const QString& fmt = "yyyy-MM-dd HH:mm:ss");
 
-		static inline Qt::ColorScheme color_scheme()
-		{
-			// use the QGuiApplication's properties to report the default GUI color scheme
-			return QGuiApplication::styleHints()->colorScheme();
-		}
-
 		static inline bool dark_mode_active()
 		{
 			// "true" if the default GUI color scheme is dark. "false" otherwise
-			return color_scheme() == Qt::ColorScheme::Dark;
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+			return QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark;
+#else
+			// QStyleHints::colorScheme was added in Qt 6.5. Ubuntu 24.04
+			// ships Qt 6.4, where the application palette is the equivalent
+			// source of truth for this cosmetic decision.
+			return QGuiApplication::palette().color(QPalette::Window).lightness() < 128;
+#endif
 		}
 
 		// Loads an icon from an (ISO) archive file.

@@ -7,7 +7,7 @@
 #define DBGHELP_TRANSLATE_TCHAR
 #include <DbgHelp.h>
 #include <codecvt>
-#else
+#elif !defined(__EMSCRIPTEN__)
 #include <execinfo.h>
 #endif
 
@@ -140,6 +140,18 @@ namespace utils
 		}
 
 		return result;
+	}
+#elif defined(__EMSCRIPTEN__)
+	std::vector<void*> get_backtrace(int)
+	{
+		// Browser builds do not expose native return addresses. JavaScript/Wasm
+		// stack text is reported by the browser's uncaught-exception path instead.
+		return {};
+	}
+
+	std::vector<std::string> get_backtrace_symbols(const std::vector<void*>&)
+	{
+		return {};
 	}
 #else
 	std::vector<void*> get_backtrace(int max_depth)

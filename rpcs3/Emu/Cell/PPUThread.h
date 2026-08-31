@@ -9,6 +9,8 @@
 #include "util/logs.hpp"
 #include "util/v128.hpp"
 
+#include <cstring>
+
 LOG_CHANNEL(ppu_log, "PPU");
 
 enum class ppu_cmd : u32
@@ -92,8 +94,10 @@ struct cmd64
 
 	template <typename T, typename T2 = std::common_type_t<T>>
 	cmd64(const T& value)
-		: m_data(std::bit_cast<u64, T2>(value))
 	{
+		static_assert(sizeof(T2) <= sizeof(m_data));
+		const T2 converted = value;
+		std::memcpy(&m_data, &converted, sizeof(converted));
 	}
 
 	template <typename T1, typename T2>
@@ -110,7 +114,10 @@ struct cmd64
 	template <typename T>
 	T as() const
 	{
-		return std::bit_cast<T>(m_data);
+		static_assert(sizeof(T) <= sizeof(m_data));
+		T result{};
+		std::memcpy(&result, &m_data, sizeof(result));
+		return result;
 	}
 
 	template <typename T>

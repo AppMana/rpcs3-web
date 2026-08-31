@@ -128,6 +128,7 @@ void fmt_class_string<clan::ClanRequestAction>::format(std::string& out, u64 arg
 
 namespace clan
 {
+#ifndef RPCS3_WEB
 	size_t clans_client::curl_write_callback(void* data, size_t size, size_t nmemb, void* clientp)
 	{
 		const size_t realsize = size * nmemb;
@@ -139,11 +140,18 @@ namespace clan
 
 		return realsize;
 	}
+#endif
 
 	struct clan_request_ctx
 	{
 		clan_request_ctx()
 		{
+#ifdef RPCS3_WEB
+			// Browser HTTP is asynchronous and subject to Fetch/CORS policy.  Keep
+			// the PS3-facing clans implementation intact, but do not pretend the
+			// synchronous libcurl transport exists until it has a browser adapter.
+			backend_ready = false;
+#else
 			curl = curl_easy_init();
 
 			if (!curl)
@@ -154,18 +162,25 @@ namespace clan
 
 			CURLcode err = curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
 			if (err != CURLE_OK) clan_log.error("curl_easy_setopt(CURLOPT_SSL_OPTIONS): %s", curl_easy_strerror(err));
+#endif
 		}
 
 		~clan_request_ctx()
 		{
+#ifndef RPCS3_WEB
 			if (curl)
 			{
 				curl_easy_cleanup(curl);
 				curl = nullptr;
 			}
+#endif
 		}
 
+#ifdef RPCS3_WEB
+		bool backend_ready = false;
+#else
 		CURL* curl = nullptr;
+#endif
 
 		// TODO: this was arbitrarily chosen -- see if there's a real amount
 		static constexpr u32 SCE_NP_CLANS_MAX_CTX_NUM = 16;
@@ -201,7 +216,13 @@ namespace clan
 		}
 
 		const auto ctx = idm::get_unlocked<clan_request_ctx>(id);
-		if (!ctx || !ctx->curl)
+		if (!ctx
+#ifdef RPCS3_WEB
+			|| !ctx->backend_ready
+#else
+			|| !ctx->curl
+#endif
+		)
 		{
 			idm::remove<clan_request_ctx>(id);
 			return SceNpClansError::SCE_NP_CLANS_ERROR_NOT_INITIALIZED;
@@ -222,6 +243,14 @@ namespace clan
 
 	SceNpClansError clans_client::send_request(u32 req_id, ClanRequestAction action, ClanManagerOperationType op_type, const pugi::xml_document& xml_body, pugi::xml_document& out_response)
 	{
+#ifdef RPCS3_WEB
+		static_cast<void>(req_id);
+		static_cast<void>(action);
+		static_cast<void>(op_type);
+		static_cast<void>(xml_body);
+		static_cast<void>(out_response);
+		return SCE_NP_CLANS_ERROR_SERVICE_UNAVAILABLE;
+#else
 		auto ctx = idm::get_unlocked<clan_request_ctx>(req_id);
 
 		if (!ctx || !ctx->curl)
@@ -309,6 +338,7 @@ namespace clan
 			return static_cast<SceNpClansError>(0x80022800 | std::stoul(result_str, nullptr, 16));
 
 		return SCE_NP_CLANS_SUCCESS;
+#endif
 	}
 
 	std::string clans_client::get_clan_ticket(np::np_handler& nph)

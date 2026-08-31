@@ -110,6 +110,13 @@ namespace logs
 		// Channel prefix (added to every log message)
 		const char* const name;
 
+#ifdef ARCH_WASM32
+		// message encodes its severity and owning channel in its low address bits.
+		// Keep the native 64-bit channel layout when WebAssembly uses 32-bit
+		// pointers so that those deliberately packed offsets remain unchanged.
+		const u32 wasm_pointer_padding{};
+#endif
+
 		// The lowest logging level enabled for this channel (used for early filtering)
 		atomic_t<level> enabled;
 

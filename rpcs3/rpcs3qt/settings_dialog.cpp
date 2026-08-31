@@ -568,7 +568,7 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 			ui->gb_anaglyph_settings->setEnabled(stereo_allowed && stereo_enabled);
 		};
 		connect(ui->resBox, &QComboBox::currentIndexChanged, this, [enable_3D_modes](int){ enable_3D_modes(); });
-		connect(ui->stereoRenderEnabled, &QCheckBox::checkStateChanged, this, [enable_3D_modes](Qt::CheckState){ enable_3D_modes(); });
+		connect(ui->stereoRenderEnabled, &QCheckBox::toggled, this, [enable_3D_modes](bool){ enable_3D_modes(); });
 		connect(ui->pb_anaglyph_settings, &QAbstractButton::clicked, [this]()
 		{
 			anaglyph_settings_dialog* dlg = new anaglyph_settings_dialog(this, m_emu_settings);
@@ -1303,7 +1303,7 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 	if (game)
 		ui->gb_DiskCacheClearing->setDisabled(true);
 	else
-		connect(ui->enableCacheClearing, &QCheckBox::checkStateChanged, ui->maximumCacheSize, &QSlider::setEnabled);
+		connect(ui->enableCacheClearing, &QCheckBox::toggled, ui->maximumCacheSize, &QSlider::setEnabled);
 
 	// Date Time Edit Box
 	m_emu_settings->EnhanceDateTimeEdit(ui->console_time_edit, emu_settings_type::ConsoleTimeOffset, tr("dd MMM yyyy HH:mm"), true, true, 15000);
@@ -1431,9 +1431,9 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 
 	ui->mfcDelayCommand->setChecked(m_emu_settings->GetSetting(emu_settings_type::MFCCommandsShuffling) == "1");
 	SubscribeTooltip(ui->mfcDelayCommand, tooltips.settings.mfc_delay_command);
-	connect(ui->mfcDelayCommand, &QCheckBox::checkStateChanged, [&](Qt::CheckState val)
+	connect(ui->mfcDelayCommand, &QCheckBox::toggled, [&](bool checked)
 	{
-		const std::string str = val != Qt::Unchecked ? "1" : "0";
+		const std::string str = checked ? "1" : "0";
 		m_emu_settings->SetSetting(emu_settings_type::MFCCommandsShuffling, str);
 	});
 

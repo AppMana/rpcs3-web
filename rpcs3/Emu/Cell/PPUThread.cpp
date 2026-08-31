@@ -58,6 +58,7 @@
 #include <span>
 #include <optional>
 #include <charconv>
+#include <unordered_map>
 
 #include "util/asm.hpp"
 #include "util/vm.hpp"
@@ -153,6 +154,14 @@ void fmt_class_string<typename ppu_thread::syscall_history_t>::format(std::strin
 extern const ppu_decoder<ppu_itype> g_ppu_itype{};
 extern const ppu_decoder<ppu_iname> g_ppu_iname{};
 
+#ifdef RPCS3_WEB
+// Low-frequency progress telemetry for the browser host.  This is deliberately
+// batched in the interpreter loop so acceptance diagnostics do not put an
+// atomic operation on every guest instruction.
+atomic_t<u64> g_ppu_web_instruction_count{0};
+atomic_t<u32> g_ppu_web_last_pc{0};
+#endif
+
 template <>
 bool serialize<ppu_thread::cr_bits>(utils::serial& ar, typename ppu_thread::cr_bits& o)
 {
@@ -181,6 +190,7 @@ static void ppu_break(ppu_thread&, ppu_opcode_t, be_t<u32>*, ppu_intrp_func*);
 
 extern void do_cell_atomic_128_store(u32 addr, const void* to_write);
 
+#if !defined(RPCS3_WEB_INTERPRETER_ONLY)
 const auto ppu_gateway = build_function_asm<void(*)(ppu_thread*)>("ppu_gateway", [](native_asm& c, auto& args)
 {
 	// Gateway for PPU, converts from native to GHC calling convention, also saves RSP value for escape
@@ -466,8 +476,28 @@ const auto ppu_recompiler_fallback_ghc = build_function_asm<void(*)(ppu_thread& 
 	c.embedUInt64(reinterpret_cast<u64>(ppu_escape));
 });
 #endif
+#else
+namespace
+{
+	[[noreturn]] void ppu_web_gateway(ppu_thread*)
+	{
+		utils::trap();
+	}
+
+	[[noreturn]] void ppu_web_escape(ppu_thread*)
+	{
+		utils::trap();
+	}
+}
+
+const auto ppu_gateway = &ppu_web_gateway;
+void (*const ppu_escape)(ppu_thread*) = &ppu_web_escape;
+void ppu_recompiler_fallback(ppu_thread& ppu);
+const auto ppu_recompiler_fallback_ghc = static_cast<void(*)(ppu_thread&)>(nullptr);
+#endif
 
 // Get pointer to executable cache
+#if !defined(RPCS3_WEB_INTERPRETER_ONLY)
 static inline u8* ppu_ptr(u32 addr)
 {
 	return vm::g_exec_addr + u64{addr} * 2;
@@ -477,11 +507,52 @@ static inline u8* ppu_seg_ptr(u32 addr)
 {
 	return vm::g_exec_addr + vm::g_exec_addr_seg_offset + (addr >> 1);
 }
+#endif
 
+static ppu_intrp_func_t ppu_cache(u32 addr);
+
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+namespace
+{
+	shared_mutex s_ppu_web_dispatch_mutex;
+	std::unordered_map<u32, ppu_intrp_func_t> s_ppu_web_dispatch_overrides;
+}
+
+static inline ppu_intrp_func_t ppu_read(u32 addr)
+{
+	{
+		reader_lock lock(s_ppu_web_dispatch_mutex);
+		if (const auto found = s_ppu_web_dispatch_overrides.find(addr); found != s_ppu_web_dispatch_overrides.end())
+		{
+			return found->second;
+		}
+	}
+	return ppu_cache(addr);
+}
+
+static inline void ppu_write(u32 addr, ppu_intrp_func_t function)
+{
+	std::lock_guard lock(s_ppu_web_dispatch_mutex);
+	if (function)
+	{
+		s_ppu_web_dispatch_overrides.insert_or_assign(addr, function);
+	}
+	else
+	{
+		s_ppu_web_dispatch_overrides.erase(addr);
+	}
+}
+#else
 static inline ppu_intrp_func_t ppu_read(u32 addr)
 {
 	return read_from_ptr_unsafe<ppu_intrp_func_t>(ppu_ptr(addr));
 }
+
+static inline void ppu_write(u32 addr, ppu_intrp_func_t function)
+{
+	write_to_ptr_unsafe<ppu_intrp_func_t>(ppu_ptr(addr), function);
+}
+#endif
 
 // Get interpreter cache value
 static ppu_intrp_func_t ppu_cache(u32 addr)
@@ -505,7 +576,7 @@ static void ppu_fallback(ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, p
 {
 	const auto _pc = vm::get_addr(this_op);
 	const auto _fn = ppu_cache(_pc);
-	write_to_ptr_unsafe<ppu_intrp_func_t>(ppu_ptr(_pc), _fn);
+	ppu_write(_pc, _fn);
 	return _fn(ppu, op, this_op, next_fn);
 }
 
@@ -774,6 +845,12 @@ extern void ppu_register_range(u32 addr, u32 size)
 	size = utils::align(size + addr % 0x10000, 0x10000);
 	addr &= -0x10000;
 
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+	// Browser dispatch decodes directly from guest memory. There is no 8-GiB
+	// host function-pointer alias and no relocation-segment mirror to commit.
+	ensure(vm::page_protect(addr, size, 0, vm::page_executable));
+	return;
+#else
 	// Register executable range at
 	utils::memory_commit(ppu_ptr(addr), u64{size} * 2, utils::protection::rw);
 	ensure(vm::page_protect(addr, size, 0, vm::page_executable));
@@ -805,6 +882,7 @@ extern void ppu_register_range(u32 addr, u32 size)
 		addr += 4;
 		size -= 4;
 	}
+#endif
 }
 
 static void ppu_far_jump(ppu_thread&, ppu_opcode_t, be_t<u32>*, ppu_intrp_func*);
@@ -814,7 +892,7 @@ extern void ppu_register_function_at(u32 addr, u32 size, ppu_intrp_func_t ptr = 
 	// Initialize specific function
 	if (ptr)
 	{
-		write_to_ptr_unsafe<uptr>(ppu_ptr(addr), std::bit_cast<uptr>(ptr));
+		ppu_write(addr, ptr);
 		return;
 	}
 
@@ -833,6 +911,12 @@ extern void ppu_register_function_at(u32 addr, u32 size, ppu_intrp_func_t ptr = 
 		return;
 	}
 
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+	// Decoded instructions are not cached by address in Wasm. Preserve an
+	// explicit hook if one exists; ordinary code observes guest writes on the
+	// next dispatch automatically.
+	return;
+#else
 	size = utils::align<u32>(size + addr % 4, 4);
 	addr &= -4;
 
@@ -841,12 +925,13 @@ extern void ppu_register_function_at(u32 addr, u32 size, ppu_intrp_func_t ptr = 
 	{
 		if (auto old = ppu_read(addr); old != ppu_break && old != ppu_far_jump)
 		{
-			write_to_ptr_unsafe<ppu_intrp_func_t>(ppu_ptr(addr), ppu_cache(addr));
+			ppu_write(addr, ppu_cache(addr));
 		}
 
 		addr += 4;
 		size -= 4;
 	}
+#endif
 }
 
 extern void ppu_register_function_at(u32 addr, u32 size, u64 ptr)
@@ -939,7 +1024,9 @@ struct ppu_far_jumps_t
 
 	std::map<u32, all_info_t> vals;
 	std::pair<u32, u32> vals_range{0, 0};
+#if !defined(RPCS3_WEB_INTERPRETER_ONLY)
 	::jit_runtime rt;
+#endif
 
 	mutable shared_mutex mutex;
 
@@ -1038,6 +1125,9 @@ struct ppu_far_jumps_t
 			return nullptr;
 		}
 
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+		it->second.func = &ppu_far_jump;
+#else
 		if (!it->second.func)
 		{
 			it->second.func = build_function_asm<ppu_intrp_func_t>("", [&](native_asm& c, auto& args)
@@ -1064,6 +1154,7 @@ struct ppu_far_jumps_t
 #endif
 			}, &rt);
 		}
+#endif
 
 		return it->second.func;
 	}
@@ -1270,7 +1361,7 @@ extern bool ppu_breakpoint(u32 addr, bool is_adding)
 			return false;
 		}
 
-		write_to_ptr_unsafe<ppu_intrp_func_t>(ppu_ptr(addr), breakpoint);
+		ppu_write(addr, breakpoint);
 		return true;
 	}
 
@@ -1279,7 +1370,7 @@ extern bool ppu_breakpoint(u32 addr, bool is_adding)
 		return false;
 	}
 
-	write_to_ptr_unsafe<ppu_intrp_func_t>(ppu_ptr(addr), func_original);
+	ppu_write(addr, func_original);
 	return true;
 }
 
@@ -1316,7 +1407,7 @@ extern bool ppu_patch(u32 addr, u32 value)
 	{
 		if (auto old = ppu_read(addr); old != ppu_break && old != ppu_fallback)
 		{
-			write_to_ptr_unsafe<ppu_intrp_func_t>(ppu_ptr(addr), ppu_cache(addr));
+			ppu_write(addr, ppu_cache(addr));
 		}
 	}
 
@@ -2580,7 +2671,9 @@ void ppu_thread::cpu_task()
 				return;
 			}
 
+#if !defined(RPCS3_WEB_INTERPRETER_ONLY)
 			spu_cache::initialize();
+#endif
 
 #ifdef ARCH_ARM64
 			// Flush all cache lines after potentially writing executable code
@@ -2754,8 +2847,13 @@ void ppu_thread::exec_task()
 		return;
 	}
 
-	const auto cache = vm::g_exec_addr;
 	const auto mem_ = vm::g_base_addr;
+
+#ifdef RPCS3_WEB
+	u32 web_progress_batch = 0;
+	bool web_reported_zero_pc = false;
+	g_ppu_web_last_pc = cia;
+#endif
 
 	while (true)
 	{
@@ -2766,10 +2864,34 @@ void ppu_thread::exec_task()
 
 		gv_zeroupper();
 
-		// Execute instruction (may be step; execute only one instruction if state)
+		// Execute instruction (may be step; execute only one instruction if state).
+		// Wasm cannot reserve RPCS3's native 8-GiB address-indexed function table.
+		// Decode through the existing interpreter table and return after one
+		// instruction, keeping host stack usage bounded and guest addressing u32.
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+		const u32 web_instruction_pc = cia;
+		const auto op = vm::_ptr<u32>(web_instruction_pc);
+		g_ppu_web_last_pc = web_instruction_pc;
+		const auto fn = ppu_read(cia);
+		fn(*this, {*op}, op, &ppu_ret);
+		if (!web_reported_zero_pc && cia == 0 && web_instruction_pc != 0)
+		{
+			web_reported_zero_pc = true;
+			std::fprintf(stderr,
+				"RPCS3 Web PPU reached zero: from=0x%08x op=0x%08x lr=0x%08llx ctr=0x%08llx r2=0x%08llx r12=0x%08llx\n",
+				web_instruction_pc, static_cast<u32>(*op), lr, ctr, gpr[2], gpr[12]);
+		}
+		if (++web_progress_batch == 256)
+		{
+			g_ppu_web_instruction_count += web_progress_batch;
+			web_progress_batch = 0;
+		}
+#else
 		const auto op = reinterpret_cast<be_t<u32>*>(mem_ + u64{cia});
+		const auto cache = vm::g_exec_addr;
 		const auto fn = reinterpret_cast<ppu_intrp_func*>(cache + u64{cia} * 2);
 		fn->fn(*this, {*op}, op, state ? &ppu_ret : fn + 1);
+#endif
 	}
 }
 
@@ -2921,7 +3043,7 @@ ppu_thread::ppu_thread(utils::serial& ar)
 			cmd_list
 			({
 				{ ppu_cmd::ptr_call, 0 },
-				std::bit_cast<u64>(&ppu_interrupt_thread_entry)
+				&ppu_interrupt_thread_entry
 			});
 		}
 	};
@@ -2981,13 +3103,12 @@ ppu_thread::ppu_thread(utils::serial& ar)
 		{
 			cmd_list
 			({
-				{ppu_cmd::ptr_call, 0}, +[](ppu_thread&) -> bool
+				{ppu_cmd::ptr_call, 0}, +[](ppu_thread&, ppu_opcode_t, be_t<u32>*, ppu_intrp_func*)
 				{
 					while (!Emu.IsStopped() && !g_fxo->get<init_pushed>().inited)
 					{
 						thread_ctrl::wait_on(g_fxo->get<init_pushed>().inited, 0);
 					}
-					return false;
 				}
 			});
 		}
@@ -2999,12 +3120,11 @@ ppu_thread::ppu_thread(utils::serial& ar)
 			cmd_push({ppu_cmd::initialize, 0});
 			cmd_list
 			({
-				{ppu_cmd::ptr_call, 0}, +[](ppu_thread&) -> bool
+				{ppu_cmd::ptr_call, 0}, +[](ppu_thread&, ppu_opcode_t, be_t<u32>*, ppu_intrp_func*)
 				{
 					auto& inited = g_fxo->get<init_pushed>().inited;
 					inited = 1;
 					inited.notify_all();
-					return true;
 				}
 			});
 		}
@@ -3015,7 +3135,7 @@ ppu_thread::ppu_thread(utils::serial& ar)
 			({
 				{ppu_cmd::ptr_call, 0},
 
-				+[](ppu_thread& ppu) -> bool
+				+[](ppu_thread& ppu, ppu_opcode_t, be_t<u32>*, ppu_intrp_func*)
 				{
 					const u32 op = vm::read32(ppu.cia);
 					const auto& table = g_fxo->get<ppu_interpreter_rt>();
@@ -3026,7 +3146,6 @@ ppu_thread::ppu_thread(utils::serial& ar)
 
 					ppu.optional_savestate_state->clear(); // Reset to writing state
 					ppu.loaded_from_savestate = false;
-					return true;
 				}
 			});
 
@@ -3201,6 +3320,12 @@ be_t<u64>* ppu_thread::get_stack_arg(s32 i, u64 align)
 
 void ppu_thread::fast_call(u32 addr, u64 rtoc, bool is_thread_entry)
 {
+#ifdef RPCS3_WEB
+	if (is_thread_entry)
+	{
+		std::fprintf(stderr, "RPCS3 Web PPU entry: addr=0x%08x rtoc=0x%08llx\n", addr, rtoc);
+	}
+#endif
 	const auto old_cia = cia;
 	const auto old_rtoc = gpr[2];
 	const auto old_lr = lr;
@@ -4685,7 +4810,9 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 					_main.name = ' '; // Make ppu_finalize work
 					Emu.ConfigurePPUCache();
 					ppu_initialize(_main, false, file_size);
+#if !defined(RPCS3_WEB_INTERPRETER_ONLY)
 					spu_cache::initialize(false);
+#endif
 					ppu_finalize(_main, true);
 					_main = {};
 					g_fxo->get<spu_cache>() = std::move(current_cache);
@@ -4901,7 +5028,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 			if (g_cfg.core.ppu_debug && func.size && func.toc != umax && !ppu_get_far_jump(func.addr))
 			{
 				ppu_toc[func.addr] = func.toc;
-				write_to_ptr_unsafe<ppu_intrp_func_t>(ppu_ptr(func.addr), &ppu_check_toc);
+				ppu_write(func.addr, &ppu_check_toc);
 			}
 		}
 
@@ -5923,7 +6050,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		{
 			if (*inst_ptr == ppu_instructions::BLR() && reinterpret_cast<uptr>(ppu_read(addr)) == reinterpret_cast<uptr>(ppu_recompiler_fallback_ghc))
 			{
-				write_to_ptr_unsafe<ppu_intrp_func_t>(ppu_ptr(addr), BLR_func);
+				ppu_write(addr, BLR_func);
 			}
 		}
 	}

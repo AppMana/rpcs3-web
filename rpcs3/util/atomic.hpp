@@ -205,7 +205,7 @@ namespace atomic_wait
 		constexpr void set(lf_queue<T2>& var, std::nullptr_t = nullptr)
 		{
 			static_assert(Index < Max);
-			static_assert(sizeof(var) == sizeof(uptr) * 2);
+			static_assert(sizeof(var) >= sizeof(uptr) * 2);
 
 			m_info[Index].data = std::bit_cast<char*>(&var.get_wait_atomic().raw());
 			m_info[Index].old = 0;
@@ -215,7 +215,7 @@ namespace atomic_wait
 		constexpr void set(stx::atomic_ptr<T2>& var, std::nullptr_t = nullptr)
 		{
 			static_assert(Index < Max);
-			static_assert(sizeof(var) == sizeof(uptr) * 2);
+			static_assert(sizeof(var) >= sizeof(uptr) * 2);
 
 			m_info[Index].data = std::bit_cast<char*>(&var.get_wait_atomic().raw());
 			m_info[Index].old = 0;
@@ -238,6 +238,13 @@ namespace atomic_wait
 
 namespace utils
 {
+#ifdef ARCH_WASM32
+	void atomic_load16_web(void* out, const void* src) noexcept;
+	void atomic_store16_web(void* dest, const void* value) noexcept;
+	bool atomic_compare_exchange16_web(void* dest, void* expected, const void* desired) noexcept;
+	void atomic_exchange16_web(void* out, void* dest, const void* value) noexcept;
+#endif
+
 	// RDTSC with adjustment for being unique
 	u64 get_unique_tsc();
 }
@@ -901,7 +908,44 @@ struct atomic_storage<T, 8> : atomic_storage<T, 0>
 template <typename T>
 struct atomic_storage<T, 16> : atomic_storage<T, 0>
 {
-#if defined(_M_X64) && defined(_MSC_VER)
+#if defined(ARCH_WASM32)
+	// WebAssembly threads expose atomic operations only up to 64 bits. RPCS3
+	// also needs a small number of 128-bit atomics, so serialize those through
+	// a hashed mutex pool instead of relying on missing libatomic helpers.
+	static inline T load(const T& dest)
+	{
+		T result;
+		utils::atomic_load16_web(&result, &dest);
+		return result;
+	}
+
+	static inline T observe(const T& dest)
+	{
+		return load(dest);
+	}
+
+	static inline bool compare_exchange(T& dest, T& comp, T exch)
+	{
+		return utils::atomic_compare_exchange16_web(&dest, &comp, &exch);
+	}
+
+	static inline T exchange(T& dest, T value)
+	{
+		T result;
+		utils::atomic_exchange16_web(&result, &dest, &value);
+		return result;
+	}
+
+	static inline void store(T& dest, T value)
+	{
+		utils::atomic_store16_web(&dest, &value);
+	}
+
+	static inline void release(T& dest, T value)
+	{
+		utils::atomic_store16_web(&dest, &value);
+	}
+#elif defined(_M_X64) && defined(_MSC_VER)
 	static inline T load(const T& dest)
 	{
 		atomic_fence_acquire();

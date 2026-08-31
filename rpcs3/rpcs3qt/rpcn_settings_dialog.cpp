@@ -696,7 +696,7 @@ rpcn_confirm_delete_dialog::rpcn_confirm_delete_dialog(QWidget* parent)
 
 	connect(edit_for_delete, &QLineEdit::textChanged, this, [btn_yes](const QString& text)
 		{
-			btn_yes->setEnabled(text == g_cfg_rpcn.get_npid());
+			btn_yes->setEnabled(text == QString::fromStdString(g_cfg_rpcn.get_npid()));
 		});
 
 	connect(btn_box, &QDialogButtonBox::accepted, this, [this]()

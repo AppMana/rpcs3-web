@@ -26,6 +26,7 @@ extern bool is_memory_compatible_for_copy_from_executable_optimization(u32 addr,
 
 namespace vm
 {
+#ifndef RPCS3_WEB
 	static u8* memory_reserve_4GiB(void* _addr, u64 size = 0x100000000, bool is_memory_mapping = false)
 	{
 		for (u64 addr = reinterpret_cast<u64>(_addr) + 0x100000000; addr < 0x8000'0000'0000; addr += 0x100000000)
@@ -56,6 +57,67 @@ namespace vm
 
 	// For SPU
 	u8* const g_free_addr = g_stat_addr + 0x1'0000'0000;
+#else
+	// These are identity markers for legacy code which distinguishes RPCS3's
+	// desktop aliases by pointer equality. No guest access may add an address
+	// to them on Web; vm::base/get_super_ptr use the page tables below.
+	alignas(16) static u8 g_web_alias_markers[5]{};
+	u8* const g_base_addr = &g_web_alias_markers[0];
+	u8* const g_sudo_addr = &g_web_alias_markers[1];
+	u8* const g_exec_addr = &g_web_alias_markers[2];
+	static u8* const g_hook_addr = &g_web_alias_markers[3];
+	u8* const g_stat_addr = &g_web_alias_markers[4];
+	u8* const g_free_addr = &g_web_alias_markers[4];
+
+	std::array<u8*, 0x100000> g_web_pages{};
+	std::array<u32, 0x100000> g_web_reverse_pages{};
+
+	void web_map(u32 addr, u32 size, u8* host_ptr)
+	{
+		ensure(host_ptr);
+		ensure((addr | size | reinterpret_cast<uptr>(host_ptr)) % 4096 == 0);
+
+		for (u32 offset = 0; offset < size; offset += 4096)
+		{
+			const u32 guest_page = (addr + offset) >> 12;
+			u8* host_page = host_ptr + offset;
+			const u32 host_page_index = reinterpret_cast<uptr>(host_page) >> 12;
+
+			ensure(!g_web_pages[guest_page] || g_web_pages[guest_page] == host_page);
+			g_web_pages[guest_page] = host_page;
+
+			// Shared guest aliases can point at the same backing. Keep the first
+			// address as the canonical reverse translation.
+			if (!g_web_reverse_pages[host_page_index])
+			{
+				g_web_reverse_pages[host_page_index] = guest_page + 1;
+			}
+		}
+	}
+
+	void web_unmap(u32 addr, u32 size)
+	{
+		ensure((addr | size) % 4096 == 0);
+
+		for (u32 offset = 0; offset < size; offset += 4096)
+		{
+			const u32 guest_page = (addr + offset) >> 12;
+			u8* host_page = std::exchange(g_web_pages[guest_page], nullptr);
+
+			if (!host_page)
+			{
+				continue;
+			}
+
+			const u32 host_page_index = reinterpret_cast<uptr>(host_page) >> 12;
+
+			if (g_web_reverse_pages[host_page_index] == guest_page + 1)
+			{
+				g_web_reverse_pages[host_page_index] = 0;
+			}
+		}
+	}
+#endif
 
 	// Reservation stats
 	alignas(4096) u8 g_reservations[65536 / 128 * 64]{0};
@@ -829,6 +891,15 @@ namespace vm
 			return true;
 		};
 
+		#ifdef RPCS3_WEB
+		// Each guest allocation owns compact Wasm backing. Stack guard storage is
+		// retained around the visible mapping so diagnostics and savestates keep
+		// their existing layout, while access is rejected by g_pages.
+		ensure(shm);
+		const u32 guard_size = bflags & stack_guarded ? 4096 : 0;
+		u8* const backing = ensure(shm->map_self());
+		web_map(addr - guard_size, size + guard_size * 2, backing);
+		#else
 		if (is_noop)
 		{
 		}
@@ -844,7 +915,9 @@ namespace vm
 		{
 			fmt::throw_exception("Memory mapping failed (addr=0x%x, size=0x%x, flags=0x%x): %s", addr, size, flags, map_error);
 		}
+		#endif
 
+		#ifndef RPCS3_WEB
 		if (flags & page_executable && !is_noop)
 		{
 			// TODO (dead code)
@@ -855,6 +928,7 @@ namespace vm
 				utils::memory_commit(g_stat_addr + addr, size);
 			}
 		}
+		#endif
 
 		for (u32 i = addr / 4096; i < addr / 4096 + size / 4096; i++)
 		{
@@ -932,7 +1006,7 @@ namespace vm
 					if ((old_val ^ start_value) & (page_readable | page_writable))
 					{
 						const auto protection = start_value & page_writable ? utils::protection::rw : (start_value & page_readable ? utils::protection::ro : utils::protection::no);
-						utils::memory_protect(g_base_addr + start * 4096, page_size, protection);
+						utils::memory_protect(vm::base(start * 4096), page_size, protection);
 					}
 
 					range_lock->release(0);
@@ -1017,6 +1091,9 @@ namespace vm
 		ppu_remove_hle_instructions(addr, size);
 
 		// Actually unmap memory
+#ifdef RPCS3_WEB
+		web_unmap(addr, size);
+#else
 		if (is_block_termination && (!shm || is_noop))
 		{
 			// We can skip it if the block is freed
@@ -1047,6 +1124,7 @@ namespace vm
 				utils::memory_decommit(g_stat_addr + addr, size);
 			}
 		}
+#endif
 
 		range_lock->release(0);
 		return size;
@@ -1111,7 +1189,26 @@ namespace vm
 
 	bool falloc(u32 addr, u32 size, memory_location_t location, const std::shared_ptr<utils::shm>* src)
 	{
+#ifdef RPCS3_WEB
+		const bool web_large_allocation = size >= 128 * 1024 * 1024;
+		if (web_large_allocation)
+		{
+			const auto* cpu = get_current_cpu_thread();
+			std::fprintf(stderr, "RPCS3 Web VM falloc dispatch: addr=0x%x size=0x%x exclusive=0x%llx ranges=0x%llx cpu_state=0x%llx tls_lock=%d\n",
+				addr, size,
+				static_cast<unsigned long long>(g_range_lock_bits[1].load()),
+				static_cast<unsigned long long>(g_range_lock_bits[0].load()),
+				static_cast<unsigned long long>(cpu ? static_cast<bs_t<cpu_flag>::under>(cpu->state.load()) : 0),
+				g_tls_locked != nullptr);
+		}
+#endif
 		const auto block = get(location, addr);
+#ifdef RPCS3_WEB
+		if (web_large_allocation)
+		{
+			std::fprintf(stderr, "RPCS3 Web VM falloc dispatch: location resolved=%d\n", block != nullptr);
+		}
+#endif
 
 		if (!block)
 		{
@@ -1144,7 +1241,7 @@ namespace vm
 		ensure(addr % 4096 == 0);
 		ensure(size % 4096 == 0);
 
-		if (!utils::memory_lock(g_sudo_addr + addr, size))
+		if (!utils::memory_lock(vm::get_super_ptr(addr), size))
 		{
 			vm_log.error("Failed to lock sudo memory (addr=0x%x, size=0x%x). Consider increasing your system limits.", addr, size);
 		}
@@ -1246,8 +1343,8 @@ namespace vm
 			};
 
 			const u32 enda = addr + size - 4096;
-			fill64(g_sudo_addr + addr, "STACKGRD"_u64, 4096 / sizeof(u64));
-			fill64(g_sudo_addr + enda, "UNDERFLO"_u64, 4096 / sizeof(u64));
+			fill64(vm::get_super_ptr(addr), "STACKGRD"_u64, 4096 / sizeof(u64));
+			fill64(vm::get_super_ptr(enda), "UNDERFLO"_u64, 4096 / sizeof(u64));
 		}
 
 		// Add entry
@@ -1287,6 +1384,10 @@ namespace vm
 		, size(size)
 		, flags(process_block_flags(flags))
 	{
+		// Desktop RPCS3 sparsely maps an entire address-location backing here.
+		// On Web, leaving m_common empty makes each actual guest allocation own
+		// a compact shm buffer, avoiding 256 MiB reservations for empty regions.
+#ifndef RPCS3_WEB
 		if (this->flags & preallocated)
 		{
 			std::string map_error;
@@ -1312,6 +1413,7 @@ namespace vm
 				fmt::throw_exception("Memory mapping failed (addr=0x%x, size=0x%x, flags=0x%x): %s", addr, size, flags, map_error);
 			}
 		}
+#endif
 	}
 
 	bool block_t::unmap(std::vector<std::pair<u64, u64>>* unmapped)
@@ -1438,6 +1540,10 @@ namespace vm
 
 	bool block_t::falloc(u32 addr, const u32 orig_size, const std::shared_ptr<utils::shm>* src, u64 flags)
 	{
+#ifdef RPCS3_WEB
+		const bool web_large_allocation = orig_size >= 128 * 1024 * 1024;
+		if (web_large_allocation) std::fprintf(stderr, "RPCS3 Web VM falloc: begin addr=0x%x size=0x%x\n", addr, orig_size);
+#endif
 		if (!src)
 		{
 			// Use the block's flags (excpet for protection)
@@ -1482,6 +1588,9 @@ namespace vm
 		}
 
 		vm::writer_lock lock;
+#ifdef RPCS3_WEB
+		if (web_large_allocation) std::fprintf(stderr, "RPCS3 Web VM falloc: writer lock acquired\n");
+#endif
 
 		if (!is_valid())
 		{
@@ -1493,6 +1602,9 @@ namespace vm
 		{
 			return false;
 		}
+#ifdef RPCS3_WEB
+		if (web_large_allocation) std::fprintf(stderr, "RPCS3 Web VM falloc: mapped\n");
+#endif
 
 		return true;
 	}
@@ -1547,8 +1659,12 @@ namespace vm
 			// Clear stack guards
 			if (flags & stack_guarded)
 			{
-				std::memset(g_sudo_addr + addr - 4096, 0, 4096);
-				std::memset(g_sudo_addr + addr + size, 0, 4096);
+				std::memset(vm::get_super_ptr(addr - 4096), 0, 4096);
+				std::memset(vm::get_super_ptr(addr + size), 0, 4096);
+#ifdef RPCS3_WEB
+				web_unmap(addr - 4096, 4096);
+				web_unmap(addr + size, 4096);
+#endif
 			}
 
 			// Remove entry
@@ -1790,12 +1906,14 @@ namespace vm
 		, size(ar)
 		, flags(ar)
 	{
+#ifndef RPCS3_WEB
 		if (flags & preallocated)
 		{
 			m_common = std::make_shared<utils::shm>(size, fmt::format("_block_x%08x", addr));
 			m_common->map_critical(vm::base(addr), this->flags & page_size_4k && utils::get_page_size() > 4096 ? utils::protection::rw : utils::protection::no);
 			m_common->map_critical(vm::get_super_ptr(addr));
 		}
+#endif
 
 		std::shared_ptr<utils::shm> null_shm;
 
@@ -2102,7 +2220,7 @@ namespace vm
 	{
 		if (vm::check_addr(addr, is_write ? page_writable : page_readable, size))
 		{
-			void* src = vm::g_sudo_addr + addr;
+			void* src = vm::get_super_ptr(addr);
 			void* dst = ptr;
 
 			if (is_write)
@@ -2211,6 +2329,11 @@ namespace vm
 
 		void init()
 		{
+#ifdef RPCS3_WEB
+			vm_log.notice("Guest memory uses sparse 4 KiB Wasm32 translation tables (no 4/8 GiB host aliases)");
+			std::memset(&g_web_pages, 0, sizeof(g_web_pages));
+			std::memset(&g_web_reverse_pages, 0, sizeof(g_web_reverse_pages));
+#else
 			vm_log.notice("Guest memory bases address ranges:\n"
 			"vm::g_base_addr = %p - %p\n"
 			"vm::g_sudo_addr = %p - %p\n"
@@ -2224,6 +2347,7 @@ namespace vm
 			g_hook_addr, g_hook_addr + 0x800000000 - 1,
 			g_stat_addr, g_stat_addr + 0xffff'ffff,
 			g_reservations, g_reservations + sizeof(g_reservations) - 1);
+#endif
 
 			std::memset(&g_pages, 0, sizeof(g_pages));
 
@@ -2243,10 +2367,12 @@ namespace vm
 			std::memset(g_range_lock_set, 0, sizeof(g_range_lock_set));
 			std::memset(g_range_lock_bits, 0, sizeof(g_range_lock_bits));
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(RPCS3_WEB)
 			utils::memory_release(g_hook_addr, 0x800000000);
 #endif
+#ifndef RPCS3_WEB
 			ensure(s_hook.map(g_hook_addr, utils::protection::rw, true));
+#endif
 		}
 	}
 
@@ -2267,6 +2393,7 @@ namespace vm
 			g_locations.clear();
 		}
 
+#ifndef RPCS3_WEB
 		utils::memory_decommit(g_exec_addr, 0x200000000);
 		utils::memory_decommit(g_stat_addr, 0x100000000);
 
@@ -2275,6 +2402,10 @@ namespace vm
 		ensure(utils::memory_reserve(0x800000000, g_hook_addr));
 #else
 		utils::memory_decommit(g_hook_addr, 0x800000000);
+#endif
+#else
+		std::memset(&g_web_pages, 0, sizeof(g_web_pages));
+		std::memset(&g_web_reverse_pages, 0, sizeof(g_web_reverse_pages));
 #endif
 
 		std::memset(g_range_lock_set, 0, sizeof(g_range_lock_set));

@@ -50,6 +50,51 @@ static bool has_waitv()
 #include <array>
 #include <random>
 #include <climits>
+#include <mutex>
+
+#ifdef ARCH_WASM32
+namespace utils
+{
+	static std::mutex& atomic16_mutex(const void* ptr) noexcept
+	{
+		static std::mutex locks[256];
+		return locks[(reinterpret_cast<uptr>(ptr) >> 4) & 255];
+	}
+
+	void atomic_load16_web(void* out, const void* src) noexcept
+	{
+		std::lock_guard lock(atomic16_mutex(src));
+		std::memcpy(out, src, 16);
+	}
+
+	void atomic_store16_web(void* dest, const void* value) noexcept
+	{
+		std::lock_guard lock(atomic16_mutex(dest));
+		std::memcpy(dest, value, 16);
+	}
+
+	bool atomic_compare_exchange16_web(void* dest, void* expected, const void* desired) noexcept
+	{
+		std::lock_guard lock(atomic16_mutex(dest));
+
+		if (std::memcmp(dest, expected, 16) == 0)
+		{
+			std::memcpy(dest, desired, 16);
+			return true;
+		}
+
+		std::memcpy(expected, dest, 16);
+		return false;
+	}
+
+	void atomic_exchange16_web(void* out, void* dest, const void* value) noexcept
+	{
+		std::lock_guard lock(atomic16_mutex(dest));
+		std::memcpy(out, dest, 16);
+		std::memcpy(dest, value, 16);
+	}
+}
+#endif
 
 #ifdef __linux__
 #include <pthread.h>

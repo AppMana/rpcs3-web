@@ -658,7 +658,17 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 	rsx::simple_array<vk::viewable_image*> calibration_src;
 
 	const bool has_overlay = (m_overlay_manager && m_overlay_manager->has_visible());
-	const bool user_asked_for_screenshot = g_user_asked_for_screenshot.exchange(false);
+	// Let the desktop renderer serve as a deterministic image oracle for the web
+	// backend without automating a keyboard shortcut. This still uses RPCS3's
+	// normal Vulkan readback and screenshot path.
+	static const u64 automated_capture_frame = []
+	{
+		const char* value = ::getenv("RPCS3_WEB_CAPTURE_FRAME");
+		return value && *value ? std::strtoull(value, nullptr, 10) : 0;
+	}();
+	static u64 presented_frame_count = 0;
+	const bool automated_screenshot = image_to_flip && automated_capture_frame && ++presented_frame_count == automated_capture_frame;
+	const bool user_asked_for_screenshot = g_user_asked_for_screenshot.exchange(false) || automated_screenshot;
 	const bool user_is_recording = (g_recording_mode != recording_mode::stopped && m_frame->can_consume_frame());
 	const bool need_media_capture = user_asked_for_screenshot || user_is_recording;
 

@@ -127,6 +127,8 @@ bool utils::has_rtm()
 	return g_value;
 #elif defined(ARCH_ARM64)
 	return false;
+#else
+	return false;
 #endif
 }
 
@@ -252,6 +254,8 @@ bool utils::has_invariant_tsc()
 	return g_value;
 #elif defined(ARCH_ARM64)
 	return true;
+#else
+	return false;
 #endif
 }
 
@@ -262,6 +266,8 @@ bool utils::has_fma3()
 	return g_value;
 #elif defined(ARCH_ARM64)
 	return true;
+#else
+	return false;
 #endif
 }
 
@@ -1110,12 +1116,19 @@ u32 utils::get_thread_count()
 {
 	static const u32 g_count = []()
 	{
+#ifdef RPCS3_WEB
+		// Browsers report the host's logical core count, but RPCS3 uses this
+		// value to create native worker groups. Keep parallel jobs within the
+		// deliberately bounded Wasm pthread pool; emulation threads are separate.
+		return 4u;
+#else
 #ifdef _WIN32
 		::SYSTEM_INFO sysInfo;
 		::GetNativeSystemInfo(&sysInfo);
 		return sysInfo.dwNumberOfProcessors;
 #else
 		return ::sysconf(_SC_NPROCESSORS_ONLN);
+#endif
 #endif
 	}();
 
@@ -1144,6 +1157,8 @@ u32 utils::get_cpu_family()
 	return g_value;
 #elif defined(ARCH_ARM64)
 	return 0;
+#else
+	return 0;
 #endif
 }
 
@@ -1169,6 +1184,8 @@ u32 utils::get_cpu_model()
 
 	return g_value;
 #elif defined(ARCH_ARM64)
+	return 0;
+#else
 	return 0;
 #endif
 }

@@ -440,7 +440,9 @@ void Emulator::Init()
 		logged_llvm = true;
 	}
 
+#if !defined(RPCS3_WEB_INTERPRETER_ONLY)
 	jit_runtime::initialize();
+#endif
 
 	const std::string emu_dir = rpcs3::utils::get_emu_dir();
 	auto make_path_verbose = [&](const std::string& path, bool must_exist_outside_emu_dir)
@@ -932,11 +934,13 @@ bool Emulator::BootRsxCapture(const std::string& path)
 	vm::init();
 	g_fxo->init(false);
 
+#ifndef RPCS3_WEB
 	// Initialize progress dialog
 	g_fxo->init<named_thread<progress_dialog_server>>();
 
 	// Initialize performance monitor
 	g_fxo->init<named_thread<perf_monitor>>();
+#endif
 
 	// PS3 'executable'
 	m_state = system_state::ready;
@@ -986,11 +990,13 @@ bool Emulator::BootBigPictureMode()
 	vm::init();
 	g_fxo->init(false);
 
+#ifndef RPCS3_WEB
 	// Initialize progress dialog
 	g_fxo->init<named_thread<progress_dialog_server>>();
 
 	// Initialize performance monitor
 	g_fxo->init<named_thread<perf_monitor>>();
+#endif
 
 	// No PS3 executable is loaded. GSRender/pad_thread only exist to host the Big Picture Mode overlay.
 	m_state = system_state::ready;
@@ -2019,7 +2025,9 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 					return;
 				}
 
+#if !defined(RPCS3_WEB_INTERPRETER_ONLY)
 				spu_cache::initialize(false);
+#endif
 
 				// Exit "process"
 				CallFromMainThread([this]
@@ -2274,11 +2282,13 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 			sys_log.notice("Disk: %s, Dir: %s", vfs::get("/dev_bdvd"), m_game_dir);
 		}
 
+#ifndef RPCS3_WEB
 		// Initialize progress dialog
 		g_fxo->init<named_thread<progress_dialog_server>>();
 
 		// Initialize performance monitor
 		g_fxo->init<named_thread<perf_monitor>>();
+#endif
 
 		const std::string disc_sfo_dir = vfs::get("/dev_bdvd/PS3_GAME/PARAM.SFO");
 
@@ -3115,6 +3125,7 @@ void Emulator::Resume()
 	// Print and reset debug data collected
 	if (g_cfg.core.ppu_decoder == ppu_decoder_type::_static && g_cfg.core.ppu_debug)
 	{
+#ifndef RPCS3_WEB
 		PPUDisAsm dis_asm(cpu_disasm_mode::dump, vm::g_sudo_addr);
 
 		std::string dump;
@@ -3142,6 +3153,7 @@ void Emulator::Resume()
 		{
 			ppu_log.notice("[RESUME] Dumping instruction stats:%s", dump);
 		}
+#endif
 	}
 
 	// Try to resume
@@ -4165,7 +4177,9 @@ void Emulator::Kill(bool allow_autoexit, bool savestate, savestate_stage* save_s
 			*stop_watchdog = thread_state::finished;
 			static_cast<void>(init_mtx->reset());
 
+#if !defined(RPCS3_WEB_INTERPRETER_ONLY)
 			jit_runtime::finalize();
+#endif
 
 			perf_stat_base::report();
 

@@ -30,7 +30,9 @@ u32 RSXDisAsm::disasm(u32 pc)
 			if (pc == umax) return false;
 		}
 
-		m_op = *reinterpret_cast<const atomic_be_t<u32>*>(m_offset + pc);
+		m_op = *(m_offset == vm::g_sudo_addr
+			? vm::get_super_ptr<const atomic_be_t<u32>>(pc)
+			: reinterpret_cast<const atomic_be_t<u32>*>(m_offset + pc));
 		return true;
 	};
 
@@ -159,6 +161,12 @@ u32 RSXDisAsm::disasm(u32 pc)
 
 std::pair<const void*, usz> RSXDisAsm::get_memory_span() const
 {
+#ifdef RPCS3_WEB
+	if (m_offset == vm::g_sudo_addr)
+	{
+		return {vm::get_super_ptr<const u8>(m_start_pc), 4096 - (m_start_pc & 0xfff)};
+	}
+#endif
 	return {m_offset + m_start_pc, (1ull << 32) - m_start_pc};
 }
 

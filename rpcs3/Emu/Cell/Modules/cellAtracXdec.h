@@ -197,6 +197,13 @@ struct AtracXdecDecoder
 	AVPacket* packet = nullptr;
 	AVFrame* frame = nullptr;
 
+#ifdef RPCS3_WEB
+	// This HLE-private structure is allocated inside guest memory and its size
+	// is part of RPCS3's module ABI. Preserve the 64-bit host-pointer layout on
+	// Wasm32; the browser backend still uses the real native pointer members.
+	u32 web_host_pointer_padding[4]{};
+#endif
+
 	u8 spurs_stuff[84]; // 120 bytes on LLE, pointers to CellSpurs, CellSpursTaskset, etc.
 
 	be_t<u32> spurs_task_id;  // CellSpursTaskId

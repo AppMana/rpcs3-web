@@ -18,6 +18,8 @@ namespace utils
 		T* result;
 		__asm__("mov %0, %1" : "=r" (result) : "r" (ptr) : "memory");
 		return result;
+#elif defined(ARCH_WASM32)
+		return reinterpret_cast<T*>(ptr);
 #else
 #error "Missing utils::bless() implementation"
 #endif

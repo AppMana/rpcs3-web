@@ -643,6 +643,12 @@ u64 iso_file_encrypted::read_at(u64 offset, void* buffer, u64 size)
 		return 0;
 	}
 
+	if (max_size > u64{usz{umax}})
+	{
+		iso_log.error("read_at: %s: request exceeds host addressable buffer size (%llu)", m_meta.name, max_size);
+		return 0;
+	}
+
 	const u64 total_size = this->size();
 	const u64 archive_first_offset = file_offset(offset);
 	const u64 archive_last_offset = archive_first_offset + max_size - 1;
@@ -684,7 +690,7 @@ u64 iso_file_encrypted::read_at(u64 offset, void* buffer, u64 size)
 
 	u64 total_read = m_file.read_at(first_sec.address_aligned, &reinterpret_cast<u8*>(aligned_buf)[first_sec.offset_aligned], first_sec.size_aligned);
 
-	m_dec->decrypt(first_sec.address_aligned, {&reinterpret_cast<u8*>(aligned_buf)[first_sec.offset_aligned], first_sec.size_aligned}, m_meta.name);
+	m_dec->decrypt(first_sec.address_aligned, {&reinterpret_cast<u8*>(aligned_buf)[first_sec.offset_aligned], static_cast<usz>(first_sec.size_aligned)}, m_meta.name);
 	std::memcpy(buffer, &reinterpret_cast<u8*>(aligned_buf)[first_sec.offset], first_sec.size);
 
 	const u64 sector_count = (last_sec.lba_address - first_sec.lba_address) / ISO_SECTOR_SIZE + 1;
@@ -721,7 +727,7 @@ u64 iso_file_encrypted::read_at(u64 offset, void* buffer, u64 size)
 
 			total_read += m_file.read_at(first_sec.lba_address + ISO_SECTOR_SIZE, &reinterpret_cast<u8*>(buffer)[first_sec.size], inner_sector_size);
 
-			m_dec->decrypt(first_sec.lba_address + ISO_SECTOR_SIZE, {&reinterpret_cast<u8*>(buffer)[first_sec.size], inner_sector_size}, m_meta.name);
+			m_dec->decrypt(first_sec.lba_address + ISO_SECTOR_SIZE, {&reinterpret_cast<u8*>(buffer)[first_sec.size], static_cast<usz>(inner_sector_size)}, m_meta.name);
 		}
 		else
 		{
@@ -754,7 +760,7 @@ u64 iso_file_encrypted::read_at(u64 offset, void* buffer, u64 size)
 
 	total_read += m_file.read_at(last_sec.address_aligned, aligned_buf, last_sec.size_aligned);
 
-	m_dec->decrypt(last_sec.address_aligned, {reinterpret_cast<u8*>(aligned_buf), last_sec.size_aligned}, m_meta.name);
+	m_dec->decrypt(last_sec.address_aligned, {reinterpret_cast<u8*>(aligned_buf), static_cast<usz>(last_sec.size_aligned)}, m_meta.name);
 	std::memcpy(&reinterpret_cast<u8*>(buffer)[max_size - last_sec.size], aligned_buf, last_sec.size);
 
 	//

@@ -108,7 +108,7 @@ async function findPage(predicate) {
   throw new Error(`No inspectable Safari page matched ${destination.href}`);
 }
 
-const initial = await findPage((page) => page.url.startsWith("http"));
+const initial = await findPage((page) => page.title !== "ServiceWorker" && !page.url.startsWith("safari-web-extension:"));
 let connection = await new WebKitConnection(initial.page.webSocketDebuggerUrl).open();
 await connection.evaluate(`location.assign(${JSON.stringify(destination.href)})`);
 connection.close();
@@ -121,7 +121,30 @@ try {
     if (await connection.evaluate("Boolean(window.__rpcs3Web && window.__rpcs3Web.status !== 'probing')")) break;
     await delay(250);
   }
-  const report = await connection.evaluate("window.__rpcs3Web.runSmokeTest()", true);
+  const report = await connection.evaluate(`(async () =>
+    window.__rpcs3Web.capabilities() ?? await window.__rpcs3Web.runSmokeTest())()`, true);
+  while (Date.now() < deadline) {
+    const ready = await connection.evaluate(`(() => {
+      const status = window.__rpcs3Web?.gameStatus();
+      return status?.state === "running" && (status.flips ?? 0) >= 30;
+    })()`);
+    if (ready) break;
+    await delay(250);
+  }
+  const gameBeforeInput = JSON.parse(await connection.evaluate("JSON.stringify(window.__rpcs3Web.gameStatus())"));
+  if (gameBeforeInput.state === "running") {
+    await connection.evaluate(`window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight" }))`);
+    const inputDeadline = Date.now() + timeoutMs;
+    while (Date.now() < inputDeadline) {
+      const flips = Number(await connection.evaluate("window.__rpcs3Web.gameStatus().flips || 0"));
+      if (flips >= (gameBeforeInput.flips ?? 0) + 30) break;
+      await delay(250);
+    }
+    await connection.evaluate(`window.dispatchEvent(new KeyboardEvent("keyup", { key: "ArrowRight" }))`);
+  }
+  const gameAfterInput = JSON.parse(await connection.evaluate("JSON.stringify(window.__rpcs3Web.gameStatus())"));
+  await connection.evaluate(`document.querySelector("#game-preview")?.scrollIntoView({ block: "center" })`);
+  await delay(250);
   const viewport = JSON.parse(await connection.evaluate("JSON.stringify({width: innerWidth, height: innerHeight})"));
   const snapshot = await connection.command("Page.snapshotRect", {
     x: 0,
@@ -138,11 +161,22 @@ try {
     device: { name: navigated.device.deviceName, osVersion: navigated.device.deviceOSVersion },
     url: destination.href,
     report,
+    gameBeforeInput,
+    gameAfterInput,
   };
   await writeFile(path.join(outputDirectory, "report.json"), `${JSON.stringify(evidence, null, 2)}\n`);
   if (image) await writeFile(path.join(outputDirectory, "page.png"), Buffer.from(image, "base64"));
   console.log(JSON.stringify(evidence, null, 2));
-  if (!report?.coreProbe?.loaded || report.coreProbe.memoryTestMask !== 0 || report.coreProbe.ppuTestMask !== 0) process.exitCode = 1;
+  const gamePassed = gameBeforeInput.state === "running"
+    && (gameBeforeInput.flips ?? 0) >= 30
+    && (gameBeforeInput.draws ?? 0) >= 9
+    && (gameBeforeInput.vertices ?? 0) >= 36
+    && (gameBeforeInput.changedPixels ?? 0) > 100
+    && (gameBeforeInput.clearPixels ?? 0) > 100
+    && (gameBeforeInput.expectedSamples ?? 0) >= 4
+    && gameBeforeInput.matchedSamples === gameBeforeInput.expectedSamples
+    && (gameAfterInput.activeCenterX ?? -Infinity) > (gameBeforeInput.activeCenterX ?? Infinity) + 0.02;
+  if (!report?.coreProbe?.loaded || report.coreProbe.memoryTestMask !== 0 || report.coreProbe.ppuTestMask !== 0 || !gamePassed) process.exitCode = 1;
 } finally {
   connection.close();
 }

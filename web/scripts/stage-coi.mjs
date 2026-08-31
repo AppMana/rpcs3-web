@@ -20,3 +20,7 @@ await copyFile(
   path.join(root, "..", "bin", "test", "gs_gcm_basic_triangle.elf"),
   path.join(fixtureOutput, "gs_gcm_basic_triangle.elf"),
 );
+await copyFile(
+  path.join(root, "..", "bin", "test", "gs_gcm_tetris.elf"),
+  path.join(fixtureOutput, "gs_gcm_tetris.elf"),
+);

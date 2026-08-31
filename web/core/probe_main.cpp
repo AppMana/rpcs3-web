@@ -23,11 +23,13 @@ namespace
     rpcs3::web::ppu_elf_load_result elf_result;
     rpcs3::web::ppu_state elf_state;
     rpcs3::web::ppu_hle_context hle_context;
+    std::unique_ptr<rpcs3::web::guest_memory> session_memory;
+    std::unique_ptr<rpcs3::web::ppu_interpreter> session_interpreter;
 }
 
 RPCS3_WEB_EXPORT int rpcs3_web_probe_abi_version()
 {
-    return 6;
+    return 7;
 }
 
 RPCS3_WEB_EXPORT int rpcs3_web_probe_memory()
@@ -91,38 +93,65 @@ RPCS3_WEB_EXPORT int rpcs3_web_probe_elf(const unsigned char* data, int size, in
     elf_state = {};
     hle_context = {};
     if (!data || size <= 0 || instruction_limit <= 0) return 1;
-    auto memory = std::make_unique<rpcs3::web::guest_memory>();
+    session_interpreter.reset();
+    session_memory = std::make_unique<rpcs3::web::guest_memory>();
     elf_result = rpcs3::web::load_ppu_elf(
-        std::span{reinterpret_cast<const std::byte*>(data), static_cast<std::size_t>(size)}, *memory);
+        std::span{reinterpret_cast<const std::byte*>(data), static_cast<std::size_t>(size)}, *session_memory);
     if (!elf_result) return 2;
 
     constexpr std::uint32_t stack_base = 0xd0000000;
     constexpr std::uint32_t stack_size = 2 * 1024 * 1024;
-    if (!memory->map(stack_base, stack_size, rpcs3::web::page_access::read_write)) return 4;
+    if (!session_memory->map(stack_base, stack_size, rpcs3::web::page_access::read_write)) return 4;
     constexpr std::uint32_t launch_data = 0x50000000;
-    if (!memory->map(launch_data, rpcs3::web::guest_memory::page_size, rpcs3::web::page_access::read_write)) return 4;
-    rpcs3::web::ppu_interpreter interpreter(*memory);
-    interpreter.state().pc = elf_result.entry;
-    interpreter.state().gpr[1] = static_cast<std::uint64_t>(stack_base) + stack_size;
-    interpreter.state().gpr[2] = elf_result.toc;
-    interpreter.state().gpr[3] = 0;
-    interpreter.state().gpr[4] = launch_data;
-    interpreter.state().gpr[5] = launch_data + 0x100;
-    interpreter.state().gpr[6] = 0;
-    interpreter.state().gpr[7] = 1;
-    interpreter.state().gpr[8] = elf_result.tls_address;
-    interpreter.state().gpr[9] = elf_result.tls_file_size;
-    interpreter.state().gpr[10] = elf_result.tls_memory_size;
-    interpreter.state().gpr[11] = elf_result.entry_descriptor;
-    interpreter.state().gpr[12] = elf_result.malloc_page_size;
+    if (!session_memory->map(launch_data, rpcs3::web::guest_memory::page_size, rpcs3::web::page_access::read_write)) return 4;
+    session_interpreter = std::make_unique<rpcs3::web::ppu_interpreter>(*session_memory);
+    auto& state = session_interpreter->state();
+    state.pc = elf_result.entry;
+    state.gpr[1] = static_cast<std::uint64_t>(stack_base) + stack_size;
+    state.gpr[2] = elf_result.toc;
+    state.gpr[3] = 0;
+    state.gpr[4] = launch_data;
+    state.gpr[5] = launch_data + 0x100;
+    state.gpr[6] = 0;
+    state.gpr[7] = 1;
+    state.gpr[8] = elf_result.tls_address;
+    state.gpr[9] = elf_result.tls_file_size;
+    state.gpr[10] = elf_result.tls_memory_size;
+    state.gpr[11] = elf_result.entry_descriptor;
+    state.gpr[12] = elf_result.malloc_page_size;
     hle_context.elf = &elf_result;
-    interpreter.set_hle_handler(&rpcs3::web::handle_minimal_ppu_hle, &hle_context);
-    interpreter.set_syscall_handler(&rpcs3::web::handle_minimal_ppu_syscall, &hle_context);
-    while (interpreter.state().stop_reason == rpcs3::web::ppu_stop_reason::running &&
-        interpreter.state().instructions < static_cast<std::size_t>(instruction_limit) && hle_context.gcm_flip_count == 0)
-        interpreter.step();
-    elf_state = interpreter.state();
+    session_interpreter->set_hle_handler(&rpcs3::web::handle_minimal_ppu_hle, &hle_context);
+    session_interpreter->set_syscall_handler(&rpcs3::web::handle_minimal_ppu_syscall, &hle_context);
+    while (state.stop_reason == rpcs3::web::ppu_stop_reason::running &&
+        state.instructions < static_cast<std::size_t>(instruction_limit) && hle_context.gcm_flip_count == 0)
+        session_interpreter->step();
+    elf_state = state;
     return elf_state.instructions == 0 ? 8 : 0;
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_session_run_until_flip(int instruction_limit)
+{
+    if (!session_interpreter || instruction_limit <= 0) return 3;
+    auto& state = session_interpreter->state();
+    if (state.stop_reason != rpcs3::web::ppu_stop_reason::running) return 2;
+    const std::uint32_t starting_flip = hle_context.gcm_flip_count;
+    const std::uint64_t end = state.instructions + static_cast<std::uint64_t>(instruction_limit);
+    while (state.stop_reason == rpcs3::web::ppu_stop_reason::running && state.instructions < end &&
+        hle_context.gcm_flip_count == starting_flip)
+        session_interpreter->step();
+    elf_state = state;
+    if (hle_context.gcm_flip_count != starting_flip) return 0;
+    return state.stop_reason == rpcs3::web::ppu_stop_reason::running ? 1 : 2;
+}
+
+RPCS3_WEB_EXPORT void rpcs3_web_session_set_pad(int digital1, int digital2, int left_x, int left_y, int right_x, int right_y)
+{
+    hle_context.pad_digital1 = static_cast<std::uint16_t>(digital1);
+    hle_context.pad_digital2 = static_cast<std::uint16_t>(digital2);
+    hle_context.pad_left_x = static_cast<std::uint8_t>(left_x);
+    hle_context.pad_left_y = static_cast<std::uint8_t>(left_y);
+    hle_context.pad_right_x = static_cast<std::uint8_t>(right_x);
+    hle_context.pad_right_y = static_cast<std::uint8_t>(right_y);
 }
 
 RPCS3_WEB_EXPORT int rpcs3_web_probe_elf_loaded()
@@ -198,6 +227,43 @@ RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_command_words()
 RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_vertex_count()
 {
     return static_cast<int>(hle_context.gcm_vertices.size());
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_draw_count()
+{
+    return static_cast<int>(hle_context.gcm_draws.size());
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_draw_primitive(int draw)
+{
+    if (draw < 0 || static_cast<std::size_t>(draw) >= hle_context.gcm_draws.size()) return 0;
+    return static_cast<int>(hle_context.gcm_draws[static_cast<std::size_t>(draw)].primitive);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_draw_vertex_count(int draw)
+{
+    if (draw < 0 || static_cast<std::size_t>(draw) >= hle_context.gcm_draws.size()) return 0;
+    return static_cast<int>(hle_context.gcm_draws[static_cast<std::size_t>(draw)].vertices.size());
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_draw_vertex_component(int draw, int vertex, int component)
+{
+    if (draw < 0 || static_cast<std::size_t>(draw) >= hle_context.gcm_draws.size() || component < 0 || component > 3) return 0;
+    const auto& item = hle_context.gcm_draws[static_cast<std::size_t>(draw)].vertices;
+    if (vertex < 0 || static_cast<std::size_t>(vertex) >= item.size()) return 0;
+    const float values[]{item[static_cast<std::size_t>(vertex)].x, item[static_cast<std::size_t>(vertex)].y,
+        item[static_cast<std::size_t>(vertex)].z, item[static_cast<std::size_t>(vertex)].w};
+    return static_cast<int>(std::bit_cast<std::uint32_t>(values[component]));
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_draw_vertex_color(int draw, int vertex)
+{
+    if (draw < 0 || static_cast<std::size_t>(draw) >= hle_context.gcm_draws.size()) return 0;
+    const auto& items = hle_context.gcm_draws[static_cast<std::size_t>(draw)].vertices;
+    if (vertex < 0 || static_cast<std::size_t>(vertex) >= items.size()) return 0;
+    const auto& color = items[static_cast<std::size_t>(vertex)].color;
+    return static_cast<int>((static_cast<std::uint32_t>(color[0]) << 24) | (static_cast<std::uint32_t>(color[1]) << 16) |
+        (static_cast<std::uint32_t>(color[2]) << 8) | color[3]);
 }
 
 RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_width()

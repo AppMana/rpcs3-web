@@ -15,9 +15,32 @@ h1 { margin: 8px 0; font-size: clamp(2.5rem, 8vw, 5.8rem); line-height: .95; let
 .lede { max-width: 720px; color: #aeb8d1; font-size: 1.1rem; line-height: 1.6; }
 button { border: 0; border-radius: 999px; padding: 12px 18px; color: #07101d; background: #77aaff; font-weight: 800; }
 main { display: grid; gap: 20px; padding-bottom: 44px; }
-.visual, .summary, details { border: 1px solid #28344b; border-radius: 18px; background: rgba(13, 18, 30, .86); overflow: hidden; }
+.visual, .game, .summary, details { border: 1px solid #28344b; border-radius: 18px; background: rgba(13, 18, 30, .86); overflow: hidden; }
 .visual canvas { display: block; width: 100%; aspect-ratio: 16 / 9; background: #070912; }
 .visual div { display: flex; justify-content: space-between; padding: 14px 18px; color: #aeb8d1; }
+.game-heading, .game-status { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 14px 18px; color: #aeb8d1; }
+.game-heading div { display: grid; gap: 3px; }
+.game-heading strong { color: #f5f7ff; }
+.game-screen { display: grid; background: #070912; }
+.game-screen canvas, .game-screen img { display: block; grid-area: 1 / 1; width: 100%; aspect-ratio: 16 / 9; }
+.game-screen img:not([src]) { display: none; }
+.game-status small { color: #8490a9; text-align: right; }
+.controls { display: flex; justify-content: space-between; align-items: center; padding: 8px 18px 20px; touch-action: none; user-select: none; }
+.controls button { min-width: 56px; min-height: 56px; padding: 0; color: #eaf1ff; background: #273651; box-shadow: inset 0 -3px 0 #172238; }
+.dpad { display: grid; grid-template-columns: repeat(3, 56px); grid-template-rows: repeat(2, 56px); gap: 5px; }
+.dpad button:first-child { grid-column: 2; }
+.dpad button:nth-child(2) { grid-column: 1; grid-row: 2; }
+.dpad button:nth-child(3) { grid-column: 2; grid-row: 2; }
+.dpad button:nth-child(4) { grid-column: 3; grid-row: 2; }
+.controls .start { min-width: 78px; min-height: 38px; font-size: .7rem; }
+.controls .cross { border-radius: 50%; background: #385a9a; font-size: 2rem; }
+@media (max-width: 600px) {
+  .game-heading, .game-status { align-items: flex-start; flex-direction: column; }
+  .game-status small { text-align: left; }
+  .controls { padding-inline: 10px; }
+  .dpad { grid-template-columns: repeat(3, 48px); grid-template-rows: repeat(2, 48px); }
+  .controls button { min-width: 48px; min-height: 48px; }
+}
 .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
 .check { display: grid; grid-template-columns: 1fr auto; gap: 6px 14px; padding: 18px; border-bottom: 1px solid #202a3d; }
 .check small { grid-column: 1 / -1; color: #8490a9; overflow-wrap: anywhere; }

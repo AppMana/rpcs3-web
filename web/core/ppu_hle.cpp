@@ -54,6 +54,61 @@ namespace rpcs3::web
             return true;
         }
 
+        if (found->module == "sys_io")
+        {
+            if (found->nid == 0x1cf98800) // cellPadInit
+            {
+                const std::uint32_t requested = static_cast<std::uint32_t>(state.gpr[3]);
+                if (requested == 0 || requested > 127)
+                    state.gpr[3] = 0x80121102u;
+                else
+                {
+                    context->pad_initialized = true;
+                    context->pad_max_connect = requested;
+                    state.gpr[3] = 0;
+                }
+            }
+            else if (found->nid == 0xa703a51d) // cellPadGetInfo2
+            {
+                if (!context->pad_initialized) state.gpr[3] = 0x80121104u;
+                else
+                {
+                    const std::uint32_t output = static_cast<std::uint32_t>(state.gpr[3]);
+                    std::array<std::byte, 124> info{};
+                    if (!memory.write(output, info) || !memory.store_be(output, std::min(context->pad_max_connect, 7u)) ||
+                        !memory.store_be(output + 4, 1u) || !memory.store_be(output + 12, 1u) ||
+                        !memory.store_be(output + 68, 0x1fu) || !memory.store_be(output + 96, 0u))
+                        return false;
+                    state.gpr[3] = 0;
+                }
+            }
+            else if (found->nid == 0x8b72cda1) // cellPadGetData
+            {
+                if (!context->pad_initialized) state.gpr[3] = 0x80121104u;
+                else if (state.gpr[3] != 0) state.gpr[3] = 0x80121107u;
+                else
+                {
+                    const std::uint32_t output = static_cast<std::uint32_t>(state.gpr[4]);
+                    std::array<std::byte, 132> data{};
+                    if (!memory.write(output, data) || !memory.store_be(output, 8u) ||
+                        !memory.store_be(output + 8, context->pad_digital1) || !memory.store_be(output + 10, context->pad_digital2) ||
+                        !memory.store_be(output + 12, static_cast<std::uint16_t>(context->pad_right_x)) ||
+                        !memory.store_be(output + 14, static_cast<std::uint16_t>(context->pad_right_y)) ||
+                        !memory.store_be(output + 16, static_cast<std::uint16_t>(context->pad_left_x)) ||
+                        !memory.store_be(output + 18, static_cast<std::uint16_t>(context->pad_left_y)))
+                        return false;
+                    state.gpr[3] = 0;
+                }
+            }
+            else
+            {
+                return false;
+            }
+            state.pc = static_cast<std::uint32_t>(state.lr);
+            ++context->calls;
+            return true;
+        }
+
         if (found->module == "cellGcmSys")
         {
             const auto complete = [&]()
@@ -76,7 +131,7 @@ namespace rpcs3::web
                     return false;
 
                 const std::uint32_t begin = context->gcm_io_address + 4096;
-                const std::uint32_t end = context->gcm_io_address + 32 * 1024 - 4;
+                const std::uint32_t end = context->gcm_io_address + command_size - 4;
                 if (!memory.store_be(context->gcm_context_address, begin) ||
                     !memory.store_be(context->gcm_context_address + 4, end) ||
                     !memory.store_be(context->gcm_context_address + 8, begin) ||
@@ -200,7 +255,11 @@ namespace rpcs3::web
 
                 std::array<std::uint32_t, 16> vertex_formats{};
                 std::array<std::uint32_t, 16> vertex_offsets{};
+                std::array<std::array<float, 4>, 468> transform_constants{};
+                std::array<bool, 468> transform_constant_valid{};
+                std::uint32_t transform_constant_load = 0;
                 context->gcm_vertices.clear();
+                context->gcm_draws.clear();
                 for (std::size_t cursor = 0; cursor < context->gcm_command_words.size();)
                 {
                     const std::uint32_t header = context->gcm_command_words[cursor++];
@@ -228,6 +287,20 @@ namespace rpcs3::web
                         else if (method >= 0x1680 && method < 0x16c0)
                         {
                             vertex_offsets[(method - 0x1680) / 4] = value;
+                        }
+                        else if (method == 0x1efc)
+                        {
+                            transform_constant_load = value;
+                        }
+                        else if (method >= 0x1f00 && method < 0x1f80)
+                        {
+                            const std::uint32_t component = (method - 0x1f00) / 4;
+                            const std::uint32_t constant = transform_constant_load + component / 4;
+                            if (constant < transform_constants.size())
+                            {
+                                transform_constants[constant][component % 4] = std::bit_cast<float>(value);
+                                transform_constant_valid[constant] = true;
+                            }
                         }
                         else if (method == 0x1814)
                         {
@@ -260,6 +333,10 @@ namespace rpcs3::web
                                 continue;
                             const std::uint32_t position_base = decode_address(vertex_offsets[position_attribute]);
                             const std::uint32_t color_base = decode_address(vertex_offsets[color_attribute]);
+                            ppu_hle_context::gcm_draw draw{.primitive = context->gcm_primitive};
+                            const bool simple_dp4_program = std::ranges::all_of(
+                                transform_constant_valid.begin() + 256, transform_constant_valid.begin() + 260,
+                                [](bool valid) { return valid; });
                             for (std::uint32_t vertex_index = 0; vertex_index < vertex_count; ++vertex_index)
                             {
                                 ppu_hle_context::gcm_vertex vertex;
@@ -274,22 +351,42 @@ namespace rpcs3::web
                                 if (!memory.read(color_base + (first + vertex_index) * color_stride, color)) return false;
                                 for (std::size_t color_index = 0; color_index < color.size(); ++color_index)
                                     vertex.color[color_index] = std::to_integer<std::uint8_t>(color[color_index]);
+                                if (simple_dp4_program)
+                                {
+                                    const std::array input{vertex.x, vertex.y, vertex.z, vertex.w};
+                                    std::array<float, 4> output{};
+                                    for (std::size_t row = 0; row < output.size(); ++row)
+                                    {
+                                        for (std::size_t column = 0; column < input.size(); ++column)
+                                            output[row] += input[column] * transform_constants[256 + row][column];
+                                    }
+                                    vertex.x = output[0];
+                                    vertex.y = output[1];
+                                    vertex.z = output[2];
+                                    vertex.w = output[3];
+                                }
                                 context->gcm_vertices.push_back(vertex);
+                                draw.vertices.push_back(vertex);
                             }
+                            context->gcm_draws.push_back(std::move(draw));
                         }
                         if (!non_incrementing) method += 4;
                     }
                 }
                 context->gcm_last_flip_id = static_cast<std::uint32_t>(state.gpr[4]);
-                context->gcm_command_cursor = current;
                 const auto& display = context->gcm_display_buffers[context->gcm_last_flip_id & 7];
                 if (display.width != 0) context->gcm_frame_width = display.width;
                 if (display.height != 0) context->gcm_frame_height = display.height;
                 context->gcm_flip_status = 0;
                 ++context->gcm_flip_count;
                 if (!memory.store_be(context->gcm_control_address, current - context->gcm_io_address) ||
-                    !memory.store_be(context->gcm_control_address + 4, current - context->gcm_io_address))
+                    !memory.store_be(context->gcm_control_address + 4, current - context->gcm_io_address) ||
+                    !memory.store_be(guest_context + 8, begin))
                     return false;
+                // The browser renderer consumes the captured FIFO synchronously. Reclaim the
+                // command segment at this flip boundary instead of invoking the SDK's native
+                // RSX-ring callback, whose function descriptor is not available in HLE mode.
+                context->gcm_command_cursor = begin;
                 state.gpr[3] = 0;
                 return complete();
             }

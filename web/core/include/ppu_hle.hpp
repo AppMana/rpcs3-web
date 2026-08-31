@@ -38,6 +38,11 @@ namespace rpcs3::web
             float w = 1;
             std::array<std::uint8_t, 4> color{};
         };
+        struct gcm_draw
+        {
+            std::uint32_t primitive = 0;
+            std::vector<gcm_vertex> vertices;
+        };
 
         const ppu_elf_load_result* elf = nullptr;
         std::uint32_t calls = 0;
@@ -69,6 +74,15 @@ namespace rpcs3::web
         std::uint32_t gcm_frame_width = 0;
         std::uint32_t gcm_frame_height = 0;
         std::vector<gcm_vertex> gcm_vertices;
+        std::vector<gcm_draw> gcm_draws;
+        bool pad_initialized = false;
+        std::uint32_t pad_max_connect = 0;
+        std::uint16_t pad_digital1 = 0;
+        std::uint16_t pad_digital2 = 0;
+        std::uint8_t pad_left_x = 128;
+        std::uint8_t pad_left_y = 128;
+        std::uint8_t pad_right_x = 128;
+        std::uint8_t pad_right_y = 128;
     };
 
     bool handle_minimal_ppu_hle(ppu_state& state, guest_memory& memory, std::uint32_t call_address, void* context);

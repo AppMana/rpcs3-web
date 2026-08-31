@@ -14,12 +14,12 @@ test("publishes a machine-readable capability report", async ({ page }) => {
   expect(report.coreProbe?.memoryTestMask).toBe(0);
   expect(report.coreProbe?.mappedPages).toBe(5);
   expect(report.coreProbe?.residentPages).toBe(2);
-  expect(report.coreProbe?.abiVersion).toBe(6);
+  expect(report.coreProbe?.abiVersion).toBe(7);
   expect(report.coreProbe?.ppuTestMask).toBe(0);
   expect(report.coreProbe?.ppuInstructions).toBe(46);
   expect(report.coreProbe?.ppuResult).toBe(70);
   expect(report.coreProbe?.ppuLoadedResult).toBe(70);
-  expect(report.coreProbe?.ppuSupportedOpcodes).toBe(88);
+  expect(report.coreProbe?.ppuSupportedOpcodes).toBe(92);
   expect(["passed", "unsupported"]).toContain(report.worker.guestHomebrew.state);
   expect(report.worker.guestFrame?.fixture).toBe("gs_gcm_basic_triangle.elf");
   expect(report.worker.guestFrame?.flips).toBe(1);

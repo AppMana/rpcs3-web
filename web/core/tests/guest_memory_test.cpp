@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <fstream>
 #include <iterator>
 #include <ranges>
@@ -57,6 +58,25 @@ int main()
     assert(ppu.result_register == 70);
     assert(ppu.loaded_register == 70);
     assert(ppu.stored_value == 70);
+
+    guest_memory arithmetic_memory;
+    assert(arithmetic_memory.map(0x00010000, guest_memory::page_size, page_access::read_write));
+    constexpr std::uint32_t mulhw = (31u << 26) | (5u << 21) | (3u << 16) | (4u << 11) | (75u << 1);
+    assert(arithmetic_memory.store_be<std::uint32_t>(0x00010000, mulhw));
+    constexpr std::uint32_t srawi = (31u << 26) | (3u << 21) | (6u << 16) | (2u << 11) | (824u << 1);
+    constexpr std::uint32_t addze = (31u << 26) | (7u << 21) | (6u << 16) | (202u << 1);
+    assert(arithmetic_memory.store_be<std::uint32_t>(0x00010004, srawi));
+    assert(arithmetic_memory.store_be<std::uint32_t>(0x00010008, addze));
+    assert(arithmetic_memory.store_be<std::uint32_t>(0x0001000c, (17u << 26) | 2u));
+    assert(arithmetic_memory.protect(0x00010000, guest_memory::page_size, page_access::read_execute));
+    rpcs3::web::ppu_interpreter arithmetic_interpreter(arithmetic_memory);
+    arithmetic_interpreter.state().pc = 0x00010000;
+    arithmetic_interpreter.state().gpr[3] = 0xffffffff92492493ull;
+    arithmetic_interpreter.state().gpr[4] = 0x2b8628af;
+    arithmetic_interpreter.run(4);
+    assert(arithmetic_interpreter.state().gpr[5] == 0xffffffffed58c9feull);
+    assert(arithmetic_interpreter.state().gpr[6] == 0xffffffffe4924924ull);
+    assert(arithmetic_interpreter.state().gpr[7] == 0xffffffffe4924925ull);
 
     std::ifstream fixture(std::string{RPCS3_SOURCE_DIR} + "/bin/test/ppu_thread.elf", std::ios::binary | std::ios::ate);
     assert(fixture);
@@ -134,8 +154,65 @@ int main()
     assert(triangle_hle.gcm_frame_width == 1280);
     assert(triangle_hle.gcm_frame_height == 720);
     assert(triangle_hle.gcm_vertices.size() == 3);
-    assert(triangle_hle.gcm_vertices[0].x == -1.f && triangle_hle.gcm_vertices[0].y == -1.f);
-    assert(triangle_hle.gcm_vertices[1].x == 1.f && triangle_hle.gcm_vertices[1].y == -1.f);
-    assert(triangle_hle.gcm_vertices[2].x == -1.f && triangle_hle.gcm_vertices[2].y == 1.f);
+    assert(triangle_hle.gcm_draws.size() == 1);
+    assert(triangle_hle.gcm_vertices[0].x == -0.5625f && triangle_hle.gcm_vertices[0].y == -1.f && triangle_hle.gcm_vertices[0].w == 5.f);
+    assert(triangle_hle.gcm_vertices[1].x == 0.5625f && triangle_hle.gcm_vertices[1].y == -1.f && triangle_hle.gcm_vertices[1].w == 5.f);
+    assert(triangle_hle.gcm_vertices[2].x == -0.5625f && triangle_hle.gcm_vertices[2].y == 1.f && triangle_hle.gcm_vertices[2].w == 5.f);
+
+    std::ifstream tetris_fixture(std::string{RPCS3_SOURCE_DIR} + "/bin/test/gs_gcm_tetris.elf", std::ios::binary | std::ios::ate);
+    assert(tetris_fixture);
+    const auto tetris_size = tetris_fixture.tellg();
+    assert(tetris_size > 0);
+    tetris_fixture.seekg(0);
+    std::vector<std::byte> tetris_bytes(static_cast<std::size_t>(tetris_size));
+    tetris_fixture.read(reinterpret_cast<char*>(tetris_bytes.data()), tetris_size);
+    assert(tetris_fixture);
+
+    guest_memory tetris_memory;
+    const auto tetris = rpcs3::web::load_ppu_elf(tetris_bytes, tetris_memory);
+    assert(tetris);
+    assert(tetris_memory.map(0xd0000000, 2 * 1024 * 1024, page_access::read_write));
+    assert(tetris_memory.map(0x50000000, guest_memory::page_size, page_access::read_write));
+    rpcs3::web::ppu_interpreter tetris_interpreter(tetris_memory);
+    auto& tetris_state = tetris_interpreter.state();
+    tetris_state.pc = tetris.entry;
+    tetris_state.gpr[1] = 0xd0200000;
+    tetris_state.gpr[2] = tetris.toc;
+    tetris_state.gpr[4] = 0x50000000;
+    tetris_state.gpr[5] = 0x50000100;
+    tetris_state.gpr[7] = 1;
+    tetris_state.gpr[8] = tetris.tls_address;
+    tetris_state.gpr[9] = tetris.tls_file_size;
+    tetris_state.gpr[10] = tetris.tls_memory_size;
+    tetris_state.gpr[11] = tetris.entry_descriptor;
+    tetris_state.gpr[12] = tetris.malloc_page_size;
+    rpcs3::web::ppu_hle_context tetris_hle{.elf = &tetris};
+    tetris_interpreter.set_hle_handler(&rpcs3::web::handle_minimal_ppu_hle, &tetris_hle);
+    tetris_interpreter.set_syscall_handler(&rpcs3::web::handle_minimal_ppu_syscall, &tetris_hle);
+    while (tetris_state.stop_reason == rpcs3::web::ppu_stop_reason::running &&
+        tetris_state.instructions < 250'000 && tetris_hle.gcm_flip_count == 0)
+        tetris_interpreter.step();
+    assert(tetris_hle.gcm_flip_count == 1);
+    assert(tetris_hle.gcm_command_words.size() == 454);
+    assert(tetris_hle.gcm_draws.size() == 9);
+    constexpr std::array<std::uint32_t, 9> expected_primitives{3, 8, 8, 8, 8, 3, 3, 3, 3};
+    for (std::size_t draw = 0; draw < expected_primitives.size(); ++draw)
+    {
+        assert(tetris_hle.gcm_draws[draw].primitive == expected_primitives[draw]);
+        assert(tetris_hle.gcm_draws[draw].vertices.size() == 4);
+    }
+    const auto& first_block = tetris_hle.gcm_draws[1].vertices;
+    assert(std::abs(first_block[0].x - 2.8875f) < 0.0001f);
+    assert(std::abs(first_block[0].y - 3.8f) < 0.0001f);
+    assert(std::abs(first_block[0].w - 5.f) < 0.0001f);
+    assert((first_block[0].color == std::array<std::uint8_t, 4>{24, 57, 43, 0}));
+    while (tetris_state.stop_reason == rpcs3::web::ppu_stop_reason::running && tetris_state.instructions < 1'000'000)
+        tetris_interpreter.step();
+    assert(tetris_state.stop_reason == rpcs3::web::ppu_stop_reason::running);
+    assert(tetris_hle.pad_initialized);
+    assert(tetris_hle.gcm_flip_count >= 50);
+    assert(tetris_hle.gcm_command_words.size() > 100);
+    assert(tetris_hle.gcm_draws.size() == 9);
+    assert(tetris_hle.gcm_vertices.size() == 36);
     return 0;
 }

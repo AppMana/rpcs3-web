@@ -332,6 +332,15 @@ namespace rpcs3::web
                 }
                 return ppu_stop_reason::running;
             }
+            case 202: // addze
+            {
+                const std::uint64_t source = m_state.gpr[ra];
+                const std::uint64_t carry = m_state.xer_ca ? 1 : 0;
+                m_state.gpr[rt] = source + carry;
+                m_state.xer_ca = carry != 0 && m_state.gpr[rt] == 0;
+                if ((op & 1) != 0) set_cr(0, static_cast<std::int64_t>(m_state.gpr[rt]), 0);
+                return ppu_stop_reason::running;
+            }
             case 151: // stwx
             {
                 const std::uint64_t effective = (ra == 0 ? 0 : m_state.gpr[ra]) + m_state.gpr[rb];
@@ -365,6 +374,14 @@ namespace rpcs3::web
                     static_cast<std::int32_t>(m_state.gpr[rb]));
                 if ((op & 1) != 0) set_cr(0, static_cast<std::int64_t>(m_state.gpr[rt]), 0);
                 return ppu_stop_reason::running;
+            case 75: // mulhw
+            {
+                const std::int64_t product = static_cast<std::int64_t>(static_cast<std::int32_t>(m_state.gpr[ra])) *
+                    static_cast<std::int64_t>(static_cast<std::int32_t>(m_state.gpr[rb]));
+                m_state.gpr[rt] = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(product >> 32)));
+                if ((op & 1) != 0) set_cr(0, static_cast<std::int64_t>(m_state.gpr[rt]), 0);
+                return ppu_stop_reason::running;
+            }
             case 19: // mfcr
             {
                 std::uint32_t packed = 0;
@@ -436,6 +453,22 @@ namespace rpcs3::web
                 if ((op & 1) != 0) set_cr(0, static_cast<std::int64_t>(m_state.gpr[rt]), 0);
                 return ppu_stop_reason::running;
             }
+            case 457: // divdu
+            {
+                const std::uint64_t divisor = m_state.gpr[rb];
+                m_state.gpr[rt] = divisor == 0 ? 0 : m_state.gpr[ra] / divisor;
+                if ((op & 1) != 0) set_cr(0, static_cast<std::int64_t>(m_state.gpr[rt]), 0);
+                return ppu_stop_reason::running;
+            }
+            case 489: // divd
+            {
+                const std::int64_t dividend = static_cast<std::int64_t>(m_state.gpr[ra]);
+                const std::int64_t divisor = static_cast<std::int64_t>(m_state.gpr[rb]);
+                m_state.gpr[rt] = divisor == 0 || (dividend == std::numeric_limits<std::int64_t>::min() && divisor == -1)
+                    ? 0 : static_cast<std::uint64_t>(dividend / divisor);
+                if ((op & 1) != 0) set_cr(0, static_cast<std::int64_t>(m_state.gpr[rt]), 0);
+                return ppu_stop_reason::running;
+            }
             case 467: // mtspr
             {
                 const std::uint32_t spr = ((op >> 16) & 31) | ((op >> 6) & 0x3e0);
@@ -472,8 +505,14 @@ namespace rpcs3::web
                 if ((op & 1) != 0) set_cr(0, static_cast<std::int64_t>(m_state.gpr[ra]), 0);
                 return ppu_stop_reason::running;
             case 824: // srawi
-                m_state.gpr[ra] = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(m_state.gpr[rt])) >> rb);
+            {
+                const std::int32_t source = static_cast<std::int32_t>(m_state.gpr[rt]);
+                const std::uint32_t discarded_mask = rb == 0 ? 0 : (std::uint32_t{1} << rb) - 1;
+                m_state.gpr[ra] = static_cast<std::uint64_t>(static_cast<std::int64_t>(source >> rb));
+                m_state.xer_ca = source < 0 && (static_cast<std::uint32_t>(source) & discarded_mask) != 0;
+                if ((op & 1) != 0) set_cr(0, static_cast<std::int64_t>(m_state.gpr[ra]), 0);
                 return ppu_stop_reason::running;
+            }
             case 826: // sradi, shift 0..31
             case 827: // sradi, shift 32..63
             {

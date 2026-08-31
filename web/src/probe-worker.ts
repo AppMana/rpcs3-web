@@ -82,7 +82,7 @@ function floatFromBits(bits: number): number {
 }
 
 async function renderGuestTriangle(device?: GPUDevice, context?: GPUCanvasContext, format?: GPUTextureFormat): Promise<GuestFrameResult> {
-  const asset = "rpcs3-web-probe-v6";
+  const asset = "rpcs3-web-probe-v7";
   const imported = await import(/* @vite-ignore */ `${import.meta.env.BASE_URL}core/${asset}.mjs`) as { default?: GuestProbeFactory };
   if (typeof imported.default !== "function") throw new Error("guest core factory is unavailable");
   const module = await imported.default({ locateFile: (name: string) => `${import.meta.env.BASE_URL}core/${name}` });
@@ -224,7 +224,11 @@ async function probeWebGpu(canvas?: OffscreenCanvas) {
     };
   }
 
-  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  let adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  if (!adapter) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    adapter = await navigator.gpu.requestAdapter();
+  }
   if (!adapter) {
     const guest = await probeGuestWithoutGpu("requestAdapter returned null");
     return {

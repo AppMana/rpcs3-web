@@ -27,6 +27,7 @@ namespace rpcs3::web
         std::uint32_t pc = 0;
         std::uint64_t lr = 0;
         std::uint64_t ctr = 0;
+        bool xer_ca = false;
         std::uint64_t instructions = 0;
         std::uint32_t last_opcode = 0;
         ppu_stop_reason stop_reason = ppu_stop_reason::running;
@@ -46,7 +47,7 @@ namespace rpcs3::web
         using syscall_handler = bool(*)(ppu_state&, guest_memory&, std::uint32_t, void*);
         void set_syscall_handler(syscall_handler handler, void* context);
 
-        static constexpr std::uint32_t supported_instruction_count = 88;
+        static constexpr std::uint32_t supported_instruction_count = 92;
 
     private:
         bool effective_address(std::uint32_t ra, std::int64_t displacement, std::uint32_t& address) const;

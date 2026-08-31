@@ -39,6 +39,26 @@ export type GuestFrameResult = {
   height: number;
 };
 
+export type GameStatus = {
+  state: "idle" | "loading" | "running" | "failed" | "stopped";
+  detail?: string;
+  flips?: number;
+  instructions?: number;
+  hleCalls?: number;
+  commandWords?: number;
+  draws?: number;
+  vertices?: number;
+  format?: string;
+  adapter?: string;
+  frameHash?: number;
+  changedPixels?: number;
+  clearPixels?: number;
+  expectedSamples?: number;
+  matchedSamples?: number;
+  activeCenterX?: number;
+  activeCenterY?: number;
+};
+
 export type CapabilityReport = {
   schemaVersion: 1;
   runId: string;
@@ -93,6 +113,9 @@ export type Rpcs3WebApi = {
   capabilities: () => CapabilityReport | undefined;
   runSmokeTest: () => Promise<CapabilityReport>;
   exportEvidence: () => CapabilityReport | undefined;
+  startTetris: () => Promise<GameStatus>;
+  stopTetris: () => void;
+  gameStatus: () => GameStatus;
 };
 
 declare global {

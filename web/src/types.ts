@@ -20,9 +20,23 @@ export type WorkerProbeResult = {
   opfs: CheckResult;
   webGpu: CheckResult;
   offscreenWebGpu: CheckResult;
+  guestHomebrew: CheckResult;
+  guestFrame?: GuestFrameResult;
   gpuFeatures: string[];
   gpuLimits: GpuLimits;
   errors: string[];
+};
+
+export type GuestFrameResult = {
+  fixture: string;
+  instructions: number;
+  hleCalls: number;
+  flips: number;
+  commandWords: number;
+  vertices: number;
+  primitive: number;
+  width: number;
+  height: number;
 };
 
 export type CapabilityReport = {

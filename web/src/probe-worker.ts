@@ -2,7 +2,7 @@
 /// <reference types="@webgpu/types" />
 
 import { runDynamicWasmProbe } from "./wasm-probes";
-import type { CheckResult, GpuLimits, WorkerProbeResult } from "./types";
+import type { CheckResult, GpuLimits, GuestFrameResult, WorkerProbeResult } from "./types";
 
 type ProbeRequest = { type: "probe"; canvas?: OffscreenCanvas };
 
@@ -55,11 +55,170 @@ function selectedLimits(limits: GPUSupportedLimits): GpuLimits {
   };
 }
 
+type GuestProbeModule = {
+  HEAPU8: Uint8Array;
+  _malloc(size: number): number;
+  _free(pointer: number): void;
+  _rpcs3_web_probe_elf(data: number, size: number, instructionLimit: number): number;
+  _rpcs3_web_probe_elf_steps(): number;
+  _rpcs3_web_probe_elf_hle_calls(): number;
+  _rpcs3_web_probe_gcm_flip_count(): number;
+  _rpcs3_web_probe_gcm_command_words(): number;
+  _rpcs3_web_probe_gcm_vertex_count(): number;
+  _rpcs3_web_probe_gcm_width(): number;
+  _rpcs3_web_probe_gcm_height(): number;
+  _rpcs3_web_probe_gcm_clear_color(): number;
+  _rpcs3_web_probe_gcm_primitive(): number;
+  _rpcs3_web_probe_gcm_vertex_component(vertex: number, component: number): number;
+  _rpcs3_web_probe_gcm_vertex_color(vertex: number): number;
+};
+
+type GuestProbeFactory = (options?: Record<string, unknown>) => Promise<GuestProbeModule>;
+
+function floatFromBits(bits: number): number {
+  const view = new DataView(new ArrayBuffer(4));
+  view.setUint32(0, bits >>> 0, true);
+  return view.getFloat32(0, true);
+}
+
+async function renderGuestTriangle(device?: GPUDevice, context?: GPUCanvasContext, format?: GPUTextureFormat): Promise<GuestFrameResult> {
+  const asset = "rpcs3-web-probe-v6";
+  const imported = await import(/* @vite-ignore */ `${import.meta.env.BASE_URL}core/${asset}.mjs`) as { default?: GuestProbeFactory };
+  if (typeof imported.default !== "function") throw new Error("guest core factory is unavailable");
+  const module = await imported.default({ locateFile: (name: string) => `${import.meta.env.BASE_URL}core/${name}` });
+  const response = await fetch(`${import.meta.env.BASE_URL}fixtures/gs_gcm_basic_triangle.elf`);
+  if (!response.ok) throw new Error(`homebrew fixture fetch returned ${response.status}`);
+  const image = new Uint8Array(await response.arrayBuffer());
+  const pointer = module._malloc(image.byteLength);
+  if (!pointer) throw new Error("homebrew Wasm allocation failed");
+  let result: number;
+  try {
+    module.HEAPU8.set(image, pointer);
+    result = module._rpcs3_web_probe_elf(pointer, image.byteLength, 100_000);
+  } finally {
+    module._free(pointer);
+  }
+
+  const flips = module._rpcs3_web_probe_gcm_flip_count();
+  const vertexCount = module._rpcs3_web_probe_gcm_vertex_count();
+  const commandWords = module._rpcs3_web_probe_gcm_command_words();
+  const primitive = module._rpcs3_web_probe_gcm_primitive();
+  if (result !== 0 || flips < 1 || commandWords < 1 || vertexCount < 3 || primitive !== 5) {
+    throw new Error(`guest frame incomplete (result=${result}, flips=${flips}, words=${commandWords}, vertices=${vertexCount}, primitive=${primitive})`);
+  }
+  const frame: GuestFrameResult = {
+    fixture: "gs_gcm_basic_triangle.elf",
+    instructions: module._rpcs3_web_probe_elf_steps(),
+    hleCalls: module._rpcs3_web_probe_elf_hle_calls(),
+    flips,
+    commandWords,
+    vertices: vertexCount,
+    primitive,
+    width: module._rpcs3_web_probe_gcm_width(),
+    height: module._rpcs3_web_probe_gcm_height(),
+  };
+
+  const vertices = new Float32Array(vertexCount * 8);
+  for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+    const base = vertex * 8;
+    for (let component = 0; component < 4; component += 1) {
+      vertices[base + component] = floatFromBits(module._rpcs3_web_probe_gcm_vertex_component(vertex, component));
+    }
+    const packed = module._rpcs3_web_probe_gcm_vertex_color(vertex) >>> 0;
+    const raw0 = (packed >>> 24) & 0xff;
+    const raw1 = (packed >>> 16) & 0xff;
+    const raw2 = (packed >>> 8) & 0xff;
+    vertices[base + 4] = raw1 / 255;
+    vertices[base + 5] = raw2 / 255;
+    vertices[base + 6] = raw0 / 255;
+    vertices[base + 7] = 1;
+  }
+  if (!device || !context || !format) return frame;
+
+  const shader = device.createShaderModule({
+    label: "PS3 GCM homebrew translation",
+    code: `
+      struct VertexOut {
+        @builtin(position) position: vec4f,
+        @location(0) color: vec4f,
+      };
+      @vertex fn vertex_main(@location(0) position: vec4f, @location(1) color: vec4f) -> VertexOut {
+        var output: VertexOut;
+        output.position = vec4f(position.xy, 0.5, position.w);
+        output.color = color;
+        return output;
+      }
+      @fragment fn fragment_main(input: VertexOut) -> @location(0) vec4f {
+        return vec4f(input.color.rgb, 1.0);
+      }
+    `,
+  });
+  const compilation = await shader.getCompilationInfo();
+  const shaderErrors = compilation.messages.filter(({ type }) => type === "error");
+  if (shaderErrors.length > 0) throw new Error(shaderErrors.map(({ message: detail }) => detail).join("; "));
+  const pipeline = device.createRenderPipeline({
+    layout: "auto",
+    vertex: {
+      module: shader,
+      entryPoint: "vertex_main",
+      buffers: [{
+        arrayStride: 32,
+        attributes: [
+          { shaderLocation: 0, offset: 0, format: "float32x4" },
+          { shaderLocation: 1, offset: 16, format: "float32x4" },
+        ],
+      }],
+    },
+    fragment: { module: shader, entryPoint: "fragment_main", targets: [{ format }] },
+    primitive: { topology: "triangle-list" },
+  });
+  const vertexBuffer = device.createBuffer({ size: vertices.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(vertexBuffer, 0, vertices);
+  const clear = module._rpcs3_web_probe_gcm_clear_color() >>> 0;
+  const encoder = device.createCommandEncoder({ label: "translated PS3 frame" });
+  const renderPass = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: context.getCurrentTexture().createView(),
+      clearValue: {
+        r: ((clear >>> 16) & 0xff) / 255,
+        g: ((clear >>> 8) & 0xff) / 255,
+        b: (clear & 0xff) / 255,
+        a: 1,
+      },
+      loadOp: "clear",
+      storeOp: "store",
+    }],
+  });
+  renderPass.setPipeline(pipeline);
+  renderPass.setVertexBuffer(0, vertexBuffer);
+  renderPass.draw(vertexCount);
+  renderPass.end();
+  device.queue.submit([encoder.finish()]);
+  await device.queue.onSubmittedWorkDone();
+  vertexBuffer.destroy();
+
+  return frame;
+}
+
+async function probeGuestWithoutGpu(reason: string) {
+  try {
+    const guestFrame = await renderGuestTriangle();
+    return {
+      guestHomebrew: unsupported(`${reason}; guest PPU/GCM frame decoded without presentation`),
+      guestFrame,
+    };
+  } catch (error) {
+    return { guestHomebrew: fail(message(error)), guestFrame: undefined };
+  }
+}
+
 async function probeWebGpu(canvas?: OffscreenCanvas) {
   if (!("gpu" in navigator)) {
+    const guest = await probeGuestWithoutGpu("WebGPU is unavailable");
     return {
       webGpu: unsupported("WorkerNavigator.gpu is unavailable"),
       offscreenWebGpu: unsupported("WebGPU is unavailable"),
+      ...guest,
       gpuFeatures: [] as string[],
       gpuLimits: {} as GpuLimits,
     };
@@ -67,9 +226,11 @@ async function probeWebGpu(canvas?: OffscreenCanvas) {
 
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
   if (!adapter) {
+    const guest = await probeGuestWithoutGpu("requestAdapter returned null");
     return {
       webGpu: fail("requestAdapter returned null"),
       offscreenWebGpu: fail("no adapter for canvas"),
+      ...guest,
       gpuFeatures: [] as string[],
       gpuLimits: {} as GpuLimits,
     };
@@ -83,6 +244,7 @@ async function probeWebGpu(canvas?: OffscreenCanvas) {
     return {
       webGpu: pass("worker adapter and device created"),
       offscreenWebGpu: unsupported("no OffscreenCanvas was transferred"),
+      guestHomebrew: unsupported("no OffscreenCanvas was transferred"),
       gpuFeatures: features,
       gpuLimits: limits,
     };
@@ -94,6 +256,7 @@ async function probeWebGpu(canvas?: OffscreenCanvas) {
     return {
       webGpu: pass("worker adapter and device created"),
       offscreenWebGpu: fail("OffscreenCanvas.getContext('webgpu') returned null"),
+      guestHomebrew: fail("OffscreenCanvas WebGPU context is unavailable"),
       gpuFeatures: features,
       gpuLimits: limits,
     };
@@ -122,6 +285,7 @@ async function probeWebGpu(canvas?: OffscreenCanvas) {
     return {
       webGpu: pass("worker adapter and device created"),
       offscreenWebGpu: fail(shaderErrors.map(({ message }) => message).join("; ")),
+      guestHomebrew: fail("WebGPU shader setup failed"),
       gpuFeatures: features,
       gpuLimits: limits,
     };
@@ -148,9 +312,21 @@ async function probeWebGpu(canvas?: OffscreenCanvas) {
   device.queue.submit([encoder.finish()]);
   await device.queue.onSubmittedWorkDone();
 
+  let guestFrame: GuestFrameResult | undefined;
+  let guestHomebrew: CheckResult;
+  try {
+    guestFrame = await renderGuestTriangle(device, context, format);
+    guestHomebrew = pass(`${guestFrame.instructions} PPU instructions → ${guestFrame.commandWords} GCM words → ${guestFrame.vertices} WebGPU vertices`);
+  } catch (error) {
+    guestHomebrew = fail(message(error));
+  }
+  device.destroy();
+
   return {
     webGpu: pass("worker adapter and device created"),
-    offscreenWebGpu: pass(`rendered a triangle as ${format}`),
+    offscreenWebGpu: pass(`rendered through ${format}`),
+    guestHomebrew,
+    guestFrame,
     gpuFeatures: features,
     gpuLimits: limits,
   };
@@ -196,6 +372,7 @@ scope.addEventListener("message", async (event: MessageEvent<ProbeRequest>) => {
     gpu = {
       webGpu: fail(detail),
       offscreenWebGpu: fail(detail),
+      guestHomebrew: fail(detail),
       gpuFeatures: [] as string[],
       gpuLimits: {} as GpuLimits,
     };

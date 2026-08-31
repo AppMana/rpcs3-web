@@ -11,6 +11,7 @@ function workerFailure(detail: string): WorkerProbeResult {
     opfs: failed,
     webGpu: failed,
     offscreenWebGpu: failed,
+    guestHomebrew: failed,
     gpuFeatures: [],
     gpuLimits: {},
     errors: [detail],

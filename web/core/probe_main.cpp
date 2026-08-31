@@ -4,6 +4,7 @@
 #include "ppu_hle.hpp"
 
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -26,7 +27,7 @@ namespace
 
 RPCS3_WEB_EXPORT int rpcs3_web_probe_abi_version()
 {
-    return 5;
+    return 6;
 }
 
 RPCS3_WEB_EXPORT int rpcs3_web_probe_memory()
@@ -112,10 +113,14 @@ RPCS3_WEB_EXPORT int rpcs3_web_probe_elf(const unsigned char* data, int size, in
     interpreter.state().gpr[8] = elf_result.tls_address;
     interpreter.state().gpr[9] = elf_result.tls_file_size;
     interpreter.state().gpr[10] = elf_result.tls_memory_size;
+    interpreter.state().gpr[11] = elf_result.entry_descriptor;
+    interpreter.state().gpr[12] = elf_result.malloc_page_size;
     hle_context.elf = &elf_result;
     interpreter.set_hle_handler(&rpcs3::web::handle_minimal_ppu_hle, &hle_context);
     interpreter.set_syscall_handler(&rpcs3::web::handle_minimal_ppu_syscall, &hle_context);
-    interpreter.run(static_cast<std::size_t>(instruction_limit));
+    while (interpreter.state().stop_reason == rpcs3::web::ppu_stop_reason::running &&
+        interpreter.state().instructions < static_cast<std::size_t>(instruction_limit) && hle_context.gcm_flip_count == 0)
+        interpreter.step();
     elf_state = interpreter.state();
     return elf_state.instructions == 0 ? 8 : 0;
 }
@@ -178,6 +183,57 @@ RPCS3_WEB_EXPORT int rpcs3_web_probe_elf_syscalls()
 RPCS3_WEB_EXPORT int rpcs3_web_probe_elf_last_syscall()
 {
     return static_cast<int>(hle_context.last_syscall);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_flip_count()
+{
+    return static_cast<int>(hle_context.gcm_flip_count);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_command_words()
+{
+    return static_cast<int>(hle_context.gcm_command_words.size());
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_vertex_count()
+{
+    return static_cast<int>(hle_context.gcm_vertices.size());
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_width()
+{
+    return static_cast<int>(hle_context.gcm_frame_width);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_height()
+{
+    return static_cast<int>(hle_context.gcm_frame_height);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_clear_color()
+{
+    return static_cast<int>(hle_context.gcm_clear_color);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_primitive()
+{
+    return static_cast<int>(hle_context.gcm_primitive);
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_vertex_component(int vertex, int component)
+{
+    if (vertex < 0 || static_cast<std::size_t>(vertex) >= hle_context.gcm_vertices.size() || component < 0 || component > 3) return 0;
+    const auto& item = hle_context.gcm_vertices[static_cast<std::size_t>(vertex)];
+    const float values[]{item.x, item.y, item.z, item.w};
+    return static_cast<int>(std::bit_cast<std::uint32_t>(values[component]));
+}
+
+RPCS3_WEB_EXPORT int rpcs3_web_probe_gcm_vertex_color(int vertex)
+{
+    if (vertex < 0 || static_cast<std::size_t>(vertex) >= hle_context.gcm_vertices.size()) return 0;
+    const auto& color = hle_context.gcm_vertices[static_cast<std::size_t>(vertex)].color;
+    return static_cast<int>((static_cast<std::uint32_t>(color[0]) << 24) | (static_cast<std::uint32_t>(color[1]) << 16) |
+        (static_cast<std::uint32_t>(color[2]) << 8) | color[3]);
 }
 
 int main()

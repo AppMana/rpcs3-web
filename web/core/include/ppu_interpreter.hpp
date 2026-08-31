@@ -21,6 +21,8 @@ namespace rpcs3::web
     struct ppu_state
     {
         std::array<std::uint64_t, 32> gpr{};
+        std::array<std::uint64_t, 32> fpr{};
+        std::array<std::array<std::byte, 16>, 32> vr{};
         std::array<bool, 32> cr{};
         std::uint32_t pc = 0;
         std::uint64_t lr = 0;
@@ -44,7 +46,7 @@ namespace rpcs3::web
         using syscall_handler = bool(*)(ppu_state&, guest_memory&, std::uint32_t, void*);
         void set_syscall_handler(syscall_handler handler, void* context);
 
-        static constexpr std::uint32_t supported_instruction_count = 38;
+        static constexpr std::uint32_t supported_instruction_count = 88;
 
     private:
         bool effective_address(std::uint32_t ra, std::int64_t displacement, std::uint32_t& address) const;

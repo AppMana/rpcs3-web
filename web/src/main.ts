@@ -21,19 +21,19 @@ function baseMarkup(): string {
   return `
     <header>
       <p class="eyebrow">RPCS3 · Wasm · WebGPU · Mobile Safari</p>
-      <h1>PS3 browser bring-up</h1>
-      <p class="lede">A local execution probe for the pieces RPCS3 needs before the first PPU instruction or RSX draw can run in Safari.</p>
-      <button id="run-probe">Run capability probe</button>
+      <h1>PS3 homebrew in Safari</h1>
+      <p class="lede">This runs a real PS3 SDK homebrew ELF locally, interprets its PPU code, captures its RSX/GCM FIFO, and translates the first guest draw to WebGPU.</p>
+      <button id="run-probe">Run PS3 homebrew</button>
     </header>
     <main>
       <section class="visual">
         <canvas id="gpu-canvas" width="768" height="432" aria-label="Worker WebGPU output"></canvas>
-        <div><span>Worker WebGPU output</span><strong id="visual-state">waiting</strong></div>
+        <div><span>Guest PPU → GCM → WebGPU</span><strong id="visual-state">waiting</strong></div>
       </section>
       <section id="summary" class="summary"><p>Run the probe to collect evidence from this browser.</p></section>
       <details><summary>Evidence JSON</summary><pre id="evidence">No evidence yet.</pre></details>
     </main>
-    <footer>No cloud streaming. The triangle, storage test, and Wasm modules execute on this device.</footer>
+    <footer>No cloud streaming and no prerecorded frame. Geometry and colors come from the connected homebrew ELF executing on this device.</footer>
   `;
 }
 
@@ -50,6 +50,7 @@ function renderReport(report: CapabilityReport): void {
     ["Worker OPFS", worker.opfs],
     ["Worker WebGPU", worker.webGpu],
     ["Offscreen WebGPU", worker.offscreenWebGpu],
+    ["PS3 homebrew → GCM → WebGPU", worker.guestHomebrew],
     ["Sparse core probe", core?.loaded
       ? { state: core.memoryTestMask === 0 ? "passed" : "failed", detail: core.detail }
       : { state: "unsupported", detail: core?.detail ?? "not built" }],
@@ -68,7 +69,7 @@ function renderReport(report: CapabilityReport): void {
   ];
   document.querySelector<HTMLElement>("#summary")!.innerHTML = checks.map(([label, result]) => row(label, result)).join("");
   document.querySelector<HTMLElement>("#evidence")!.textContent = JSON.stringify(report, null, 2);
-  document.querySelector<HTMLElement>("#visual-state")!.textContent = worker.offscreenWebGpu.state;
+  document.querySelector<HTMLElement>("#visual-state")!.textContent = worker.guestHomebrew.state;
 }
 
 async function collectAndRender(): Promise<CapabilityReport> {
@@ -84,6 +85,7 @@ async function collectAndRender(): Promise<CapabilityReport> {
     report.worker.worker.state === "passed",
     report.worker.webGpu.state === "passed",
     report.worker.offscreenWebGpu.state === "passed",
+    report.worker.guestHomebrew.state === "passed",
   ];
   status = hardFailures.every(Boolean) ? "passed" : "failed";
   renderReport(report);

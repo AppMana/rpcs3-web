@@ -16,3 +16,7 @@ await copyFile(
   path.join(root, "..", "bin", "test", "ppu_thread.elf"),
   path.join(fixtureOutput, "ppu_thread.elf"),
 );
+await copyFile(
+  path.join(root, "..", "bin", "test", "gs_gcm_basic_triangle.elf"),
+  path.join(fixtureOutput, "gs_gcm_basic_triangle.elf"),
+);

@@ -34,6 +34,7 @@ namespace rpcs3::web
     struct ppu_elf_load_result
     {
         ppu_elf_error error = ppu_elf_error::none;
+        std::uint32_t entry_descriptor = 0;
         std::uint32_t entry = 0;
         std::uint32_t toc = 0;
         std::uint32_t segments = 0;
@@ -42,6 +43,11 @@ namespace rpcs3::web
         std::uint32_t tls_address = 0;
         std::uint32_t tls_file_size = 0;
         std::uint32_t tls_memory_size = 0;
+        std::uint32_t sdk_version = 0xffffffffu;
+        std::int32_t primary_priority = 1001;
+        std::uint32_t primary_stack_size = 0x00100000;
+        std::uint32_t malloc_page_size = 0x00100000;
+        std::uint32_t ppc_segment = 0;
         std::vector<ppu_import_stub> imports;
 
         [[nodiscard]] explicit operator bool() const { return error == ppu_elf_error::none; }

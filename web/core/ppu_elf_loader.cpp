@@ -191,6 +191,40 @@ namespace rpcs3::web
             result.error = ppu_elf_error::invalid_entry;
             return result;
         }
+        result.entry_descriptor = static_cast<std::uint32_t>(entry_descriptor);
+
+        // PT_LOOS+1 carries the optional process parameters. Most SDK samples
+        // omit it and rely on lv2 defaults, notably the 1 MiB malloc page size
+        // delivered to the entry point in r12.
+        for (std::uint32_t index = 0; index < program_count; ++index)
+        {
+            const std::uint64_t header = program_offset + static_cast<std::uint64_t>(index) * program_entry_size;
+            std::uint32_t kind = 0;
+            std::uint64_t file_offset = 0;
+            std::uint64_t file_size = 0;
+            if (!read_be(image, header, kind) || !read_be(image, header + 8, file_offset) || !read_be(image, header + 32, file_size))
+            {
+                result.error = ppu_elf_error::invalid_program_header;
+                return result;
+            }
+            if (kind != 0x60000001 || file_size == 0) continue;
+
+            std::uint32_t size = 0;
+            std::uint32_t magic_value = 0;
+            std::uint32_t priority = 0;
+            if (file_size < 32 || file_offset > image.size() || file_size > image.size() - file_offset ||
+                !read_be(image, file_offset, size) || !read_be(image, file_offset + 4, magic_value) ||
+                !read_be(image, file_offset + 12, result.sdk_version) || !read_be(image, file_offset + 16, priority) ||
+                !read_be(image, file_offset + 20, result.primary_stack_size) ||
+                !read_be(image, file_offset + 24, result.malloc_page_size) || !read_be(image, file_offset + 28, result.ppc_segment) ||
+                size < 32 || magic_value != 0x13bcc5f6)
+            {
+                result.error = ppu_elf_error::invalid_program_header;
+                return result;
+            }
+            result.primary_priority = static_cast<std::int32_t>(priority);
+            break;
+        }
 
         // Parse Sony's 44-byte import records from .lib.stub. This turns the
         // terminal bctr address back into a module/NID pair for the HLE layer.

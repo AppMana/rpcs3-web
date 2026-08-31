@@ -81,7 +81,7 @@ async function runElfProbe(module: ProbeModule): Promise<ElfProbeResult> {
 }
 
 export async function runCoreProbe(): Promise<CoreProbeResult> {
-  const coreAsset = "rpcs3-web-probe-v5";
+  const coreAsset = "rpcs3-web-probe-v6";
   const url = `${import.meta.env.BASE_URL}core/${coreAsset}.mjs`;
   try {
     const imported = await import(/* @vite-ignore */ url) as { default?: ProbeFactory };

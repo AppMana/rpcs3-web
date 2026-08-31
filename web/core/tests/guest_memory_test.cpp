@@ -1,6 +1,7 @@
 #include "guest_memory.hpp"
 #include "ppu_interpreter.hpp"
 #include "ppu_elf_loader.hpp"
+#include "ppu_hle.hpp"
 
 #include <array>
 #include <cassert>
@@ -70,11 +71,14 @@ int main()
     const auto loaded = rpcs3::web::load_ppu_elf(fixture_bytes, elf_memory);
     assert(loaded);
     assert(loaded.entry == 0x0001022c);
+    assert(loaded.entry_descriptor == 0x000301c0);
     assert(loaded.toc == 0x00038b50);
     assert(loaded.segments == 2);
     assert(loaded.tls_address == 0x00030e0c);
     assert(loaded.tls_file_size == 0);
     assert(loaded.tls_memory_size == 0x84);
+    assert(loaded.primary_stack_size == 0x00100000);
+    assert(loaded.malloc_page_size == 0x00100000);
     assert(loaded.imports.size() == 17);
     const auto tls_import = std::ranges::find_if(loaded.imports, [](const auto& item) { return item.nid == 0x744680a2; });
     assert(tls_import != loaded.imports.end());
@@ -90,5 +94,48 @@ int main()
     assert(elf_interpreter.state().stop_reason == rpcs3::web::ppu_stop_reason::hle_call);
     assert(elf_interpreter.state().pc == 0x00025c5c);
     assert(elf_interpreter.state().ctr == 0x39800000);
+
+    std::ifstream triangle_fixture(std::string{RPCS3_SOURCE_DIR} + "/bin/test/gs_gcm_basic_triangle.elf", std::ios::binary | std::ios::ate);
+    assert(triangle_fixture);
+    const auto triangle_size = triangle_fixture.tellg();
+    assert(triangle_size > 0);
+    triangle_fixture.seekg(0);
+    std::vector<std::byte> triangle_bytes(static_cast<std::size_t>(triangle_size));
+    triangle_fixture.read(reinterpret_cast<char*>(triangle_bytes.data()), triangle_size);
+    assert(triangle_fixture);
+
+    guest_memory triangle_memory;
+    const auto triangle = rpcs3::web::load_ppu_elf(triangle_bytes, triangle_memory);
+    assert(triangle);
+    assert(triangle_memory.map(0xd0000000, 2 * 1024 * 1024, page_access::read_write));
+    assert(triangle_memory.map(0x50000000, guest_memory::page_size, page_access::read_write));
+    rpcs3::web::ppu_interpreter triangle_interpreter(triangle_memory);
+    auto& triangle_state = triangle_interpreter.state();
+    triangle_state.pc = triangle.entry;
+    triangle_state.gpr[1] = 0xd0200000;
+    triangle_state.gpr[2] = triangle.toc;
+    triangle_state.gpr[4] = 0x50000000;
+    triangle_state.gpr[5] = 0x50000100;
+    triangle_state.gpr[7] = 1;
+    triangle_state.gpr[8] = triangle.tls_address;
+    triangle_state.gpr[9] = triangle.tls_file_size;
+    triangle_state.gpr[10] = triangle.tls_memory_size;
+    triangle_state.gpr[11] = triangle.entry_descriptor;
+    triangle_state.gpr[12] = triangle.malloc_page_size;
+    rpcs3::web::ppu_hle_context triangle_hle{.elf = &triangle};
+    triangle_interpreter.set_hle_handler(&rpcs3::web::handle_minimal_ppu_hle, &triangle_hle);
+    triangle_interpreter.set_syscall_handler(&rpcs3::web::handle_minimal_ppu_syscall, &triangle_hle);
+    while (triangle_state.stop_reason == rpcs3::web::ppu_stop_reason::running &&
+        triangle_state.instructions < 100000 && triangle_hle.gcm_flip_count == 0)
+        triangle_interpreter.step();
+    assert(triangle_hle.gcm_flip_count == 1);
+    assert(triangle_hle.gcm_command_words.size() == 140);
+    assert(triangle_hle.gcm_primitive == 5);
+    assert(triangle_hle.gcm_frame_width == 1280);
+    assert(triangle_hle.gcm_frame_height == 720);
+    assert(triangle_hle.gcm_vertices.size() == 3);
+    assert(triangle_hle.gcm_vertices[0].x == -1.f && triangle_hle.gcm_vertices[0].y == -1.f);
+    assert(triangle_hle.gcm_vertices[1].x == 1.f && triangle_hle.gcm_vertices[1].y == -1.f);
+    assert(triangle_hle.gcm_vertices[2].x == -1.f && triangle_hle.gcm_vertices[2].y == 1.f);
     return 0;
 }

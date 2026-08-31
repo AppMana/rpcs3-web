@@ -34,6 +34,10 @@
 #include "Utilities/Thread.h"
 #include "util/atomic.hpp"
 
+#ifdef RPCS3_WEB
+#include <atomic>
+#endif
+
 LOG_CHANNEL(sys_log, "SYS");
 
 extern void pad_state_notify_state_change(usz index, u32 state);
@@ -55,6 +59,164 @@ namespace rsx
 {
 	void set_native_ui_flip();
 }
+
+#ifdef RPCS3_WEB
+namespace web_pad
+{
+	struct state
+	{
+		u32 digital1 = 0;
+		u32 digital2 = 0;
+		u8 left_x = 128;
+		u8 left_y = 128;
+		u8 right_x = 128;
+		u8 right_y = 128;
+	};
+
+	static std::atomic<u32> s_sequence{0};
+	static std::atomic<u32> s_digital1{0};
+	static std::atomic<u32> s_digital2{0};
+	static std::atomic<u32> s_sticks{0x80808080u};
+
+	void set_state(u32 digital1, u32 digital2, u32 left_x, u32 left_y, u32 right_x, u32 right_y)
+	{
+		s_sequence.fetch_add(1, std::memory_order_acq_rel);
+		s_digital1.store(digital1, std::memory_order_relaxed);
+		s_digital2.store(digital2, std::memory_order_relaxed);
+		s_sticks.store((std::min(left_x, 255u) << 24) | (std::min(left_y, 255u) << 16) |
+			(std::min(right_x, 255u) << 8) | std::min(right_y, 255u), std::memory_order_relaxed);
+		s_sequence.fetch_add(1, std::memory_order_release);
+	}
+
+	static state get_state()
+	{
+		state result;
+		u32 sticks = 0;
+		for (;;)
+		{
+			const u32 before = s_sequence.load(std::memory_order_acquire);
+			if (before & 1)
+			{
+				continue;
+			}
+			result.digital1 = s_digital1.load(std::memory_order_relaxed);
+			result.digital2 = s_digital2.load(std::memory_order_relaxed);
+			sticks = s_sticks.load(std::memory_order_relaxed);
+			const u32 after = s_sequence.load(std::memory_order_acquire);
+			if (before == after && !(after & 1))
+			{
+				break;
+			}
+		}
+
+		result.left_x = static_cast<u8>(sticks >> 24);
+		result.left_y = static_cast<u8>(sticks >> 16);
+		result.right_x = static_cast<u8>(sticks >> 8);
+		result.right_y = static_cast<u8>(sticks);
+		return result;
+	}
+}
+
+class web_pad_handler final : public PadHandlerBase
+{
+public:
+	web_pad_handler()
+		: PadHandlerBase(pad_handler::keyboard)
+	{
+		m_name_string = "Web keyboard and touch";
+		m_max_devices = 1;
+		b_has_pressure_intensity_button = false;
+		b_has_analog_limiter_button = false;
+	}
+
+	void init_config(cfg_pad* cfg) override
+	{
+		if (cfg)
+		{
+			cfg->from_default();
+		}
+	}
+
+	std::vector<pad_list_entry> list_devices() override
+	{
+		return {pad_list_entry(std::string(pad::keyboard_device_name), false)};
+	}
+
+	bool bindPadToDevice(std::shared_ptr<Pad> pad) override
+	{
+		if (!pad || pad->m_player_id != 0)
+		{
+			return false;
+		}
+
+		pad->Init(CELL_PAD_STATUS_DISCONNECTED,
+			CELL_PAD_CAPABILITY_PS3_CONFORMITY | CELL_PAD_CAPABILITY_PRESS_MODE | CELL_PAD_CAPABILITY_HP_ANALOG_STICK,
+			CELL_PAD_DEV_TYPE_STANDARD, CELL_PAD_PCLASS_TYPE_STANDARD, 0, 0, 0, 100);
+
+		const auto add_button = [&pad](u32 offset, u32 code)
+		{
+			pad->m_buttons.emplace_back(offset, std::vector<std::set<u32>>{}, code);
+		};
+
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL1, CELL_PAD_CTRL_UP);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL1, CELL_PAD_CTRL_DOWN);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL1, CELL_PAD_CTRL_LEFT);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL1, CELL_PAD_CTRL_RIGHT);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL1, CELL_PAD_CTRL_START);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL1, CELL_PAD_CTRL_SELECT);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL1, CELL_PAD_CTRL_L3);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL1, CELL_PAD_CTRL_R3);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL1, CELL_PAD_CTRL_PS);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL2, CELL_PAD_CTRL_SQUARE);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL2, CELL_PAD_CTRL_CROSS);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL2, CELL_PAD_CTRL_CIRCLE);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL2, CELL_PAD_CTRL_TRIANGLE);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL2, CELL_PAD_CTRL_L1);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL2, CELL_PAD_CTRL_L2);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL2, CELL_PAD_CTRL_R1);
+		add_button(CELL_PAD_BTN_OFFSET_DIGITAL2, CELL_PAD_CTRL_R2);
+
+		pad->m_sticks[0].m_offset = CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X;
+		pad->m_sticks[1].m_offset = CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y;
+		pad->m_sticks[2].m_offset = CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X;
+		pad->m_sticks[3].m_offset = CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y;
+		pad->m_sensors[0] = AnalogSensor(CELL_PAD_BTN_OFFSET_SENSOR_X, 0, false, 0, DEFAULT_MOTION_X);
+		pad->m_sensors[1] = AnalogSensor(CELL_PAD_BTN_OFFSET_SENSOR_Y, 0, false, 0, DEFAULT_MOTION_Y);
+		pad->m_sensors[2] = AnalogSensor(CELL_PAD_BTN_OFFSET_SENSOR_Z, 0, false, 0, DEFAULT_MOTION_Z);
+		pad->m_sensors[3] = AnalogSensor(CELL_PAD_BTN_OFFSET_SENSOR_G, 0, false, 0, DEFAULT_MOTION_G);
+
+		m_bindings.emplace_back(std::move(pad), nullptr, nullptr);
+		return true;
+	}
+
+	void process() override
+	{
+		const web_pad::state current = web_pad::get_state();
+		connected_devices = m_bindings.empty() ? 0 : 1;
+
+		for (pad_ensemble& binding : m_bindings)
+		{
+			Pad& pad = *binding.pad;
+			if (!pad.is_connected())
+			{
+				pad.m_port_status |= CELL_PAD_STATUS_CONNECTED | CELL_PAD_STATUS_ASSIGN_CHANGES;
+			}
+
+			for (Button& button : pad.m_buttons)
+			{
+				const u32 buttons = button.m_offset == CELL_PAD_BTN_OFFSET_DIGITAL1 ? current.digital1 : current.digital2;
+				button.m_pressed = (buttons & button.m_outKeyCode) != 0;
+				button.m_value = button.m_pressed ? 255 : 0;
+			}
+
+			pad.m_sticks[0].m_value = current.left_x;
+			pad.m_sticks[1].m_value = current.left_y;
+			pad.m_sticks[2].m_value = current.right_x;
+			pad.m_sticks[3].m_value = current.right_y;
+		}
+	}
+};
+#endif
 
 struct pad_setting
 {
@@ -179,7 +341,9 @@ void pad_thread::Init()
 		{
 			if (handler_type == pad_handler::keyboard)
 			{
-#if !defined(ANDROID) && !defined(RPCS3_WEB)
+#if defined(RPCS3_WEB)
+				cur_pad_handler = std::make_shared<web_pad_handler>();
+#elif !defined(ANDROID)
 				keyptr = std::make_shared<keyboard_pad_handler>();
 				keyptr->moveToThread(static_cast<QThread*>(m_curthread));
 				keyptr->SetTargetWindow(static_cast<QWindow*>(m_curwindow));
@@ -859,15 +1023,16 @@ std::shared_ptr<PadHandlerBase> pad_thread::GetHandler(pad_handler type)
 	case pad_handler::null:
 		return std::make_shared<NullPadHandler>();
 	case pad_handler::keyboard:
-#if defined(ANDROID) || defined(RPCS3_WEB)
+#if defined(RPCS3_WEB)
+		return std::make_shared<web_pad_handler>();
+#elif defined(ANDROID)
 		return std::make_shared<NullPadHandler>();
 #else
 		return std::make_shared<keyboard_pad_handler>();
 #endif
 #ifdef RPCS3_WEB
-	// Native HID handlers require host device APIs. Browser controller input is
-	// installed by the Web Gamepad adapter; until then these configurations
-	// remain explicitly disconnected through RPCS3's NullPadHandler.
+	// Native HID handlers require host device APIs and remain disconnected. The
+	// Web keyboard/touch handler above is the portable Player 1 input path.
 	case pad_handler::ds3:
 	case pad_handler::ds4:
 	case pad_handler::dualsense:

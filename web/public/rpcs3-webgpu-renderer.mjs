@@ -1,4 +1,4 @@
-import { PacketKind, SectionKind } from "./rpcs3-webgpu-packet.mjs";
+import { PacketFlag, PacketKind, SectionKind } from "./rpcs3-webgpu-packet.mjs";
 
 let activePresentation;
 
@@ -350,15 +350,38 @@ function drawVertexOrder(packet) {
   });
 }
 
-function translateDraw(packet) {
-  // RPCS3's shared BufferUtils expands non-native quads/fans/polygons to a
-  // triangle index list before the WG packet is published. Preserve that
-  // mature path instead of independently redefining the primitive winding.
-  const triangleList = packet.primitive === 5 || Boolean(packet.flags & 4);
-  if (packet.kind !== PacketKind.draw || !triangleList) {
-    throw new Error(`current WebGPU draw closure requires an RSX triangle list or an RPCS3-expanded primitive (kind=${packet.kind}, primitive=${packet.primitive}, flags=0x${packet.flags.toString(16)})`);
+function primitiveTopology(packet) {
+  const expanded = Boolean(packet.flags & PacketFlag.primitiveExpanded);
+  switch (packet.primitive) {
+  case 1: return "point-list";
+  case 2: return "line-list";
+  case 3:
+    if (!expanded) throw new Error("RSX line loops must include their closing index");
+    return "line-strip";
+  case 4: return "line-strip";
+  case 5: return "triangle-list";
+  case 6: return "triangle-strip";
+  case 7:
+  case 8:
+  case 10:
+    if (!expanded) throw new Error(`RSX primitive ${packet.primitive} must be expanded to triangles`);
+    return "triangle-list";
+  case 9:
+    // RPCS3's native GL path lowers quad strips to the equivalent triangle
+    // strip ordering, which WebGPU supports directly.
+    return "triangle-strip";
+  default:
+    throw new Error(`unsupported RSX primitive ${packet.primitive}`);
   }
-  const allowedFlags = 1 | 2 | 4;
+}
+
+function translateDraw(packet) {
+  if (packet.kind !== PacketKind.draw) throw new Error(`packet ${packet.sequence} is not an RSX draw`);
+  // RPCS3's shared BufferUtils has already expanded line loops, fans, quads,
+  // and polygons. Select the WebGPU topology for that mature output instead
+  // of independently rebuilding guest primitive winding here.
+  const topology = primitiveTopology(packet);
+  const allowedFlags = PacketFlag.indexed | PacketFlag.primitiveExpanded | PacketFlag.usesFragmentTextures;
   if (packet.flags & ~allowedFlags) throw new Error(`WebGPU draw closure cannot translate packet flags 0x${packet.flags.toString(16)}`);
   const descriptors = readVertexDescriptors(packet);
   const vertexOrder = drawVertexOrder(packet);
@@ -382,7 +405,7 @@ function translateDraw(packet) {
   }
   const fragment = compileFragmentProgram(packet);
   if (fragment.textured && packet.textures.length === 0) throw new Error("RSX fragment program samples a texture without a payload");
-  return { output, fragment, vertexOpcodes: [...vertexOpcodeSet].sort((a, b) => a - b), fragmentOpcodes: fragment.opcodes };
+  return { output, fragment, topology, vertexOpcodes: [...vertexOpcodeSet].sort((a, b) => a - b), fragmentOpcodes: fragment.opcodes };
 }
 
 function clearValue(packet) {
@@ -586,13 +609,14 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   const depthStates = drawPackets.map(depthState);
   const targetStates = drawPackets.map(renderTargetState);
   const translatedAt = performance.now();
+  const pipelineCache = prepared.pipelineCache ??= new Map();
+  let pipelineCacheHits = 0;
+  let pipelineCacheMisses = 0;
   const resources = translated.map((draw, index) => {
     const declarations = draw.fragment.textured
       ? "@group(0) @binding(0) var rsxTexture0: texture_2d<f32>; @group(0) @binding(1) var rsxSampler0: sampler;"
       : "";
-    const shader = device.createShaderModule({
-      label: `RPCS3 translated RSX program ${index}`,
-      code: `
+    const shaderCode = `
       ${declarations}
       struct VertexOut {
         @builtin(position) position: vec4f,
@@ -613,35 +637,50 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       @fragment fn fragment_main(input: VertexOut) -> @location(0) vec4f {
         ${draw.fragment.code}
       }
-    `,
-    });
-    const pipeline = device.createRenderPipeline({
-      label: `RPCS3 RSX WebGPU pipeline ${index}`,
-      layout: "auto",
-      vertex: {
-        module: shader,
-        entryPoint: "vertex_main",
-        buffers: [{
-          arrayStride: 48,
-          attributes: [
-            { shaderLocation: 0, offset: 0, format: "float32x4" },
-            { shaderLocation: 1, offset: 16, format: "float32x4" },
-            { shaderLocation: 2, offset: 32, format: "float32x4" },
-          ],
-        }],
-      },
-      fragment: {
-        module: shader,
-        entryPoint: "fragment_main",
-        targets: [{ format, blend: targetStates[index].blend, writeMask: targetStates[index].writeMask }],
-      },
-      primitive: { topology: "triangle-list", cullMode: "none" },
-      depthStencil: {
-        format: "depth24plus",
-        depthWriteEnabled: depthStates[index].writeEnabled,
-        depthCompare: depthStates[index].comparison,
-      },
-    });
+    `;
+    const pipelineKey = JSON.stringify([
+      shaderCode,
+      format,
+      draw.topology,
+      depthStates[index],
+      targetStates[index].blend,
+      targetStates[index].writeMask,
+    ]);
+    let pipeline = pipelineCache.get(pipelineKey);
+    if (pipeline) {
+      pipelineCacheHits += 1;
+    } else {
+      pipelineCacheMisses += 1;
+      const shader = device.createShaderModule({ label: `RPCS3 translated RSX program ${index}`, code: shaderCode });
+      pipeline = device.createRenderPipeline({
+        label: `RPCS3 RSX WebGPU pipeline ${index}`,
+        layout: "auto",
+        vertex: {
+          module: shader,
+          entryPoint: "vertex_main",
+          buffers: [{
+            arrayStride: 48,
+            attributes: [
+              { shaderLocation: 0, offset: 0, format: "float32x4" },
+              { shaderLocation: 1, offset: 16, format: "float32x4" },
+              { shaderLocation: 2, offset: 32, format: "float32x4" },
+            ],
+          }],
+        },
+        fragment: {
+          module: shader,
+          entryPoint: "fragment_main",
+          targets: [{ format, blend: targetStates[index].blend, writeMask: targetStates[index].writeMask }],
+        },
+        primitive: { topology: draw.topology, cullMode: "none" },
+        depthStencil: {
+          format: "depth24plus",
+          depthWriteEnabled: depthStates[index].writeEnabled,
+          depthCompare: depthStates[index].comparison,
+        },
+      });
+      pipelineCache.set(pipelineKey, pipeline);
+    }
     const buffer = device.createBuffer({ size: draw.output.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(buffer, 0, draw.output.buffer, draw.output.byteOffset, draw.output.byteLength);
     let textureResource;
@@ -682,55 +721,64 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     pass.draw(translated[index].output.length / 12);
   }
   pass.end();
-  const bytesPerRow = Math.ceil((canvas.width * 4) / 256) * 256;
-  const readback = device.createBuffer({
+  const readbackEnabled = options.readback !== false;
+  const bytesPerRow = readbackEnabled ? Math.ceil((canvas.width * 4) / 256) * 256 : 0;
+  const readback = readbackEnabled ? device.createBuffer({
     size: bytesPerRow * canvas.height,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-  });
-  encoder.copyTextureToBuffer({ texture }, { buffer: readback, bytesPerRow, rowsPerImage: canvas.height },
-    { width: canvas.width, height: canvas.height });
+  }) : undefined;
+  if (readback) {
+    encoder.copyTextureToBuffer({ texture }, { buffer: readback, bytesPerRow, rowsPerImage: canvas.height },
+      { width: canvas.width, height: canvas.height });
+  }
   device.queue.submit([encoder.finish()]);
   await device.queue.onSubmittedWorkDone();
-  await readback.mapAsync(GPUMapMode.READ);
+  if (readback) await readback.mapAsync(GPUMapMode.READ);
   const readbackReadyAt = performance.now();
-  const pixels = new Uint8Array(readback.getMappedRange());
+  const pixels = readback ? new Uint8Array(readback.getMappedRange()) : undefined;
   const bgra = format.startsWith("bgra");
-  const rgba = options.captureRgba ? new Uint8Array(canvas.width * canvas.height * 4) : undefined;
-  let changedPixels = 0;
-  let clearPixels = 0;
-  let frameHash = 2166136261;
+  const rgba = readback && options.captureRgba ? new Uint8Array(canvas.width * canvas.height * 4) : undefined;
+  let changedPixels;
+  let clearPixels;
+  let frameHash;
   let changedMinX = canvas.width;
   let changedMinY = canvas.height;
   let changedMaxX = -1;
   let changedMaxY = -1;
-  for (let y = 0; y < canvas.height; y += 1) {
-    for (let x = 0; x < canvas.width; x += 1) {
-      const offset = y * bytesPerRow + x * 4;
-      const red = pixels[offset + (bgra ? 2 : 0)];
-      const green = pixels[offset + 1];
-      const blue = pixels[offset + (bgra ? 0 : 2)];
-      const alpha = pixels[offset + 3];
-      const isClear = red === clear.bytes[0] && green === clear.bytes[1] && blue === clear.bytes[2] && alpha === clear.bytes[3];
-      clearPixels += isClear ? 1 : 0;
-      changedPixels += isClear ? 0 : 1;
-      if (!isClear) {
-        changedMinX = Math.min(changedMinX, x);
-        changedMinY = Math.min(changedMinY, y);
-        changedMaxX = Math.max(changedMaxX, x);
-        changedMaxY = Math.max(changedMaxY, y);
+  if (pixels) {
+    changedPixels = 0;
+    clearPixels = 0;
+    frameHash = 2166136261;
+    for (let y = 0; y < canvas.height; y += 1) {
+      for (let x = 0; x < canvas.width; x += 1) {
+        const offset = y * bytesPerRow + x * 4;
+        const red = pixels[offset + (bgra ? 2 : 0)];
+        const green = pixels[offset + 1];
+        const blue = pixels[offset + (bgra ? 0 : 2)];
+        const alpha = pixels[offset + 3];
+        const isClear = red === clear.bytes[0] && green === clear.bytes[1] && blue === clear.bytes[2] && alpha === clear.bytes[3];
+        clearPixels += isClear ? 1 : 0;
+        changedPixels += isClear ? 0 : 1;
+        if (!isClear) {
+          changedMinX = Math.min(changedMinX, x);
+          changedMinY = Math.min(changedMinY, y);
+          changedMaxX = Math.max(changedMaxX, x);
+          changedMaxY = Math.max(changedMaxY, y);
+        }
+        if (rgba) rgba.set([red, green, blue, alpha], (y * canvas.width + x) * 4);
+        frameHash = Math.imul(frameHash ^ red, 16777619);
+        frameHash = Math.imul(frameHash ^ green, 16777619);
+        frameHash = Math.imul(frameHash ^ blue, 16777619);
+        frameHash = Math.imul(frameHash ^ alpha, 16777619);
       }
-      if (rgba) rgba.set([red, green, blue, alpha], (y * canvas.width + x) * 4);
-      frameHash = Math.imul(frameHash ^ red, 16777619);
-      frameHash = Math.imul(frameHash ^ green, 16777619);
-      frameHash = Math.imul(frameHash ^ blue, 16777619);
-      frameHash = Math.imul(frameHash ^ alpha, 16777619);
     }
+    readback.unmap();
+    readback.destroy();
+    frameHash >>>= 0;
   }
-  readback.unmap();
-  readback.destroy();
   const readbackScannedAt = performance.now();
 
-  if (typeof globalThis.requestAnimationFrame === "function") {
+  if (options.replayPresentation !== false && typeof globalThis.requestAnimationFrame === "function") {
     // WebGPU canvas textures are not retained bitmaps. Keep presenting the
     // most recent RSX frame until a newer frame replaces it, just as the live
     // emulator loop will. This is presentation scheduling only: guest/RSX
@@ -757,12 +805,17 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     };
     activePresentation = presentation;
     presentation.animationFrame = globalThis.requestAnimationFrame(present);
-  } else {
+  } else if (options.retainResources === false) {
     resources.forEach(({ buffer, textureResource }) => {
       buffer.destroy();
       textureResource?.texture.destroy();
     });
     depthTexture.destroy();
+  } else {
+    // Interactive presentation submits once per actual guest flip. Retain the
+    // resources until the next guest frame replaces them, without a browser
+    // animation timer or a texture readback in the hot path.
+    activePresentation = { cancelled: false, animationFrame: undefined, resources, depthTexture };
   }
   const info = adapter.info ?? {};
   return {
@@ -783,8 +836,8 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     })),
     changedPixels,
     clearPixels,
-    frameHash: frameHash >>> 0,
-    changedBounds: changedMaxX < 0 ? null : { minX: changedMinX, minY: changedMinY, maxX: changedMaxX, maxY: changedMaxY },
+    frameHash,
+    changedBounds: !pixels || changedMaxX < 0 ? null : { minX: changedMinX, minY: changedMinY, maxX: changedMaxX, maxY: changedMaxY },
     timings: {
       translateMs: translatedAt - renderStartedAt,
       resourceAndPipelineMs: resourcesReadyAt - translatedAt,
@@ -792,6 +845,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       readbackScanMs: readbackScannedAt - readbackReadyAt,
       totalMs: readbackScannedAt - renderStartedAt,
     },
+    pipelineCache: { hits: pipelineCacheHits, misses: pipelineCacheMisses, size: pipelineCache.size },
     rgbaBase64: rgba ? base64(rgba) : undefined,
   };
 }

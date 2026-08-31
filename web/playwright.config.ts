@@ -8,6 +8,7 @@ export default defineConfig({
   testIgnore: [
     "frame-oracle.spec.ts",
     "gpu.spec.ts",
+    "playable-tetris.spec.ts",
     "presentation.spec.ts",
     "runtime-cube-correctness.spec.ts",
     "runtime-cube.spec.ts",

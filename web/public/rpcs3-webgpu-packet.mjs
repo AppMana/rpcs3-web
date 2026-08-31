@@ -4,6 +4,14 @@ export const DRAW_PACKET_HEADER_SIZE = 192;
 export const TEXTURE_PACKET_RECORD_SIZE = 48;
 
 export const PacketKind = Object.freeze({ draw: 1, clear: 2, flip: 3 });
+export const PacketFlag = Object.freeze({
+  indexed: 1 << 0,
+  primitiveExpanded: 1 << 1,
+  usesFragmentTextures: 1 << 2,
+  usesVertexTextures: 1 << 3,
+  texturePayloadPending: 1 << 4,
+  skipped: 1 << 5,
+});
 export const SectionKind = Object.freeze({
   registers: 0,
   vertexProgram: 1,

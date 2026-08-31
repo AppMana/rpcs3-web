@@ -112,3 +112,10 @@ namespace pad
 		handler->SetIntercepted(intercepted);
 	}
 }
+
+#ifdef RPCS3_WEB
+namespace web_pad
+{
+	void set_state(u32 digital1, u32 digital2, u32 left_x, u32 left_y, u32 right_x, u32 right_y);
+}
+#endif

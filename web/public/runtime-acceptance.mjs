@@ -8,6 +8,12 @@ let activeWorker;
 // reference to be collected can clear the compositor surface even though the
 // submitted texture readback was correct.
 let activeGpu;
+let currentPad = { digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 };
+
+function setPad(state = {}) {
+  currentPad = { ...currentPad, ...state };
+  activeWorker?.postMessage({ type: "pad", state: currentPad });
+}
 
 function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
   if (active) return active;
@@ -93,6 +99,7 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       fixture,
       returnPackets: Boolean(options.render),
       debugAddresses: Array.isArray(options.debugAddresses) ? options.debugAddresses : [],
+      pad: options.pad ?? currentPad,
     });
   }).finally(() => { active = undefined; });
   return active;
@@ -107,4 +114,4 @@ function stop() {
   activeGpu = undefined;
 }
 
-window.__rpcs3Runtime = { run, stop };
+window.__rpcs3Runtime = { run, stop, setPad };

@@ -122,6 +122,8 @@ CMakeLists.txt.user
 /web/test-results/
 /web/device-evidence/
 /web/device-runtime-evidence/
+/web/device-runtime-evidence-*/
+/web/device-tetris-evidence-*/
 /web/public/core/
 /web/public/fixtures/
 

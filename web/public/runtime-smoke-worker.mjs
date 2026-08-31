@@ -9,6 +9,7 @@ let bootStartedAt = 0;
 let fixtureBytes = 0;
 let frameSequence = 0;
 let debugAddresses = [];
+let padState = { digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 };
 
 function detail(error) {
   return error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ""}` : String(error);
@@ -16,6 +17,20 @@ function detail(error) {
 
 function debugRead32(address) {
   return module.ccall("rpcs3_web_debug_read32", "number", ["number"], [address]) >>> 0;
+}
+
+function applyPadState(next = {}) {
+  padState = {
+    digital1: Number(next.digital1 ?? padState.digital1) >>> 0,
+    digital2: Number(next.digital2 ?? padState.digital2) >>> 0,
+    leftX: Math.max(0, Math.min(255, Number(next.leftX ?? padState.leftX))) >>> 0,
+    leftY: Math.max(0, Math.min(255, Number(next.leftY ?? padState.leftY))) >>> 0,
+    rightX: Math.max(0, Math.min(255, Number(next.rightX ?? padState.rightX))) >>> 0,
+    rightY: Math.max(0, Math.min(255, Number(next.rightY ?? padState.rightY))) >>> 0,
+  };
+  module?.ccall("rpcs3_web_set_pad", null,
+    ["number", "number", "number", "number", "number", "number"],
+    [padState.digital1, padState.digital2, padState.leftX, padState.leftY, padState.rightX, padState.rightY]);
 }
 
 async function captureFrame(type) {
@@ -39,9 +54,10 @@ async function captureFrame(type) {
       if (packet.kind === PacketKind.flip) break;
     }
     if (flipPacketCount !== 0) break;
-    // This is bounded acceptance polling, not guest or presentation pacing.
-    // RPCS3's PPU and RSX pthreads continue running independently.
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    // Yield so pad messages and the browser's worker scheduler can run while
+    // RPCS3's PPU and RSX pthreads produce the next packet. This is polling,
+    // not guest or presentation pacing, and adds no fixed frame interval.
+    await new Promise((resolve) => setTimeout(resolve, 1));
     status = module.ccall("rpcs3_web_status", "number", [], []);
   }
   frameSequence += 1;
@@ -83,6 +99,10 @@ async function captureFrame(type) {
 }
 
 scope.addEventListener("message", async (event) => {
+  if (event.data?.type === "pad") {
+    applyPadState(event.data.state);
+    return;
+  }
   if (event.data?.type === "shutdown") {
     try {
       module?.ccall("rpcs3_web_stop", null, [], []);
@@ -126,6 +146,7 @@ scope.addEventListener("message", async (event) => {
     module.FS.writeFile(path, elf);
     bootStartedAt = performance.now();
     initialized = module.ccall("rpcs3_web_init", "number", [], []);
+    applyPadState(event.data.pad);
     bootResult = module.ccall("rpcs3_web_boot", "number", ["string"], [path]);
     await captureFrame("runtime-result");
   } catch (error) {

@@ -122,8 +122,8 @@ namespace
 		};
 		callbacks.handle_taskbar_progress = [](s32, s32) {};
 
-		// Browser keyboard, pointer and Gamepad API adapters are installed in the
-		// JS host.  The first boot milestone does not manufacture input here.
+		// Browser keyboard and touch state enters through RPCS3's normal pad
+		// thread. Pointer devices are not required by the current fixtures.
 		callbacks.init_kb_handler = [] {};
 		callbacks.init_mouse_handler = [] {};
 		callbacks.init_pad_handler = [](std::string_view title_id)
@@ -265,6 +265,11 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_debug_read32(u32 addr)
 	{
 		return vm::check_addr<4>(addr) ? static_cast<u32>(vm::read32(addr)) : 0u;
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_pad(u32 digital1, u32 digital2, u32 left_x, u32 left_y, u32 right_x, u32 right_y)
+	{
+		web_pad::set_state(digital1, digital2, left_x, left_y, right_x, right_y);
 	}
 
 	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_ppu_last_function()

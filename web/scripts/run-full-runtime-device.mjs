@@ -243,6 +243,7 @@ try {
     const [{ decodeDrawPacket }, renderer] = await Promise.all([import(packetUrl), import(rendererUrl)]);
     const prepared = await renderer.prepareWebGPU(canvas);
     globalThis.__rpcs3DeviceGpu = prepared;
+    const isTetris = ${JSON.stringify(fixtureName.includes("tetris"))};
 
     const worker = new Worker(workerUrl, { type: "module" });
     globalThis.__rpcs3DeviceWorker = worker;
@@ -263,7 +264,7 @@ try {
           const gpu = await renderer.renderPacketsToWebGPU(
             prepared,
             packetBuffers.map((buffer) => decodeDrawPacket(new Uint8Array(buffer))),
-            { captureRgba },
+            { captureRgba, readback: captureRgba || !isTetris, replayPresentation: true },
           );
           resolve({ ...runtimeResult, gpu });
         } catch (error) { reject(error); }
@@ -282,32 +283,76 @@ try {
         debugAddresses: [],
     });
     const frames = [await firstFrame];
-    for (let index = 1; index < 3; index += 1) {
-      const nextFrame = receiveFrame("runtime-frame", index === 2);
-      worker.postMessage({ type: "next-frame" });
-      frames.push(await nextFrame);
+    let runtime;
+    if (isTetris) {
+      while (frames.at(-1).gpu.draws < 9 && frames.length < 120) {
+        const nextFrame = receiveFrame("runtime-frame", false);
+        worker.postMessage({ type: "next-frame" });
+        frames.push(await nextFrame);
+      }
+      if (frames.at(-1).gpu.draws < 9) throw new Error("Tetris did not enter gameplay within 120 guest flips");
+      const center = (frame) => frame.gpu.drawDiagnostics.slice(-4)
+        .reduce((sum, draw) => sum + (draw.clipBounds.min[0] + draw.clipBounds.max[0]) / 2, 0) / 4;
+      const beforeInput = {
+        frameSequence: frames.at(-1).frameSequence,
+        ppuInstructions: frames.at(-1).ppuInstructions,
+        activeCenterX: center(frames.at(-1)),
+      };
+      worker.postMessage({ type: "pad", state: { digital1: 0x20 } });
+      for (let index = 0; index < 20; index += 1) {
+        const nextFrame = receiveFrame("runtime-frame", index === 19);
+        worker.postMessage({ type: "next-frame" });
+        frames.push(await nextFrame);
+      }
+      worker.postMessage({ type: "pad", state: { digital1: 0 } });
+      const finalFrame = frames.at(-1);
+      runtime = {
+        ...frames[0],
+        gpu: finalFrame.gpu,
+        tetris: {
+          totalFrames: frames.length,
+          beforeInput,
+          afterInput: {
+            frameSequence: finalFrame.frameSequence,
+            ppuInstructions: finalFrame.ppuInstructions,
+            activeCenterX: center(finalFrame),
+          },
+          elapsedMs: finalFrame.elapsedMs,
+          droppedPackets: finalFrame.droppedPackets,
+        },
+      };
+    } else {
+      for (let index = 1; index < 3; index += 1) {
+        const nextFrame = receiveFrame("runtime-frame", index === 2);
+        worker.postMessage({ type: "next-frame" });
+        frames.push(await nextFrame);
+      }
+      const animationFrames = frames.map((frame) => ({
+        frameSequence: frame.frameSequence,
+        ppuInstructions: frame.ppuInstructions,
+        elapsedMs: frame.elapsedMs,
+        droppedPackets: frame.droppedPackets,
+        frameHash: frame.gpu.frameHash,
+        timings: frame.gpu.timings,
+        changedBounds: frame.gpu.changedBounds,
+        cubeClipBounds: frame.gpu.drawDiagnostics[0]?.clipBounds,
+      }));
+      runtime = { ...frames[0], gpu: frames.at(-1).gpu, animationFrames };
     }
-    const animationFrames = frames.map((frame) => ({
-      frameSequence: frame.frameSequence,
-      ppuInstructions: frame.ppuInstructions,
-      elapsedMs: frame.elapsedMs,
-      droppedPackets: frame.droppedPackets,
-      frameHash: frame.gpu.frameHash,
-      timings: frame.gpu.timings,
-      changedBounds: frame.gpu.changedBounds,
-      cubeClipBounds: frame.gpu.drawDiagnostics[0]?.clipBounds,
-    }));
-    const runtime = { ...frames[0], gpu: frames.at(-1).gpu, animationFrames };
     const rgba = Uint8Array.from(atob(runtime.gpu.rgbaBase64), (character) => character.charCodeAt(0));
     const colors = new Set();
     let magentaPixels = 0;
     let textPixels = 0;
     let lightTextPixels = 0;
+    let backgroundPixels = 0;
+    let blockPixels = 0;
     for (let y = 0; y < runtime.gpu.height; y += 1) {
       for (let x = 0; x < runtime.gpu.width; x += 1) {
         const offset = (y * runtime.gpu.width + x) * 4;
         const red = rgba[offset], green = rgba[offset + 1], blue = rgba[offset + 2];
         colors.add((red << 16) | (green << 8) | blue);
+        backgroundPixels += red >= 160 && red <= 190 && green >= 160 && green <= 190 && blue >= 160 && blue <= 190 ? 1 : 0;
+        blockPixels += green > red * 1.4 && green > blue * 1.15 ? 1 : 0;
         magentaPixels += red > green + 20 && blue > green + 20 && red > 80 && blue > 80 ? 1 : 0;
         if (x < 140 && y < 40 && (red !== 32 || green !== 32 || blue !== 32)) {
           textPixels += 1;
@@ -317,7 +362,7 @@ try {
     }
     runtime.rgbaBase64 = runtime.gpu.rgbaBase64;
     delete runtime.gpu.rgbaBase64;
-    runtime.imageEvidence = { colors: colors.size, magentaPixels, textPixels, lightTextPixels };
+    runtime.imageEvidence = { colors: colors.size, magentaPixels, textPixels, lightTextPixels, backgroundPixels, blockPixels };
     runtime.prerequisites = ${JSON.stringify(parsedPrerequisites)};
     log.textContent = JSON.stringify(runtime, null, 2);
     globalThis.__rpcs3FullDeviceResult = runtime;
@@ -326,9 +371,22 @@ try {
 
   const rawRgba = Buffer.from(result?.rgbaBase64 ?? "", "base64");
   delete result?.rgbaBase64;
-  const passed = result?.ok
+  const commonPassed = result?.ok
     && result.bootResult === 0
-    && result.gpu?.adapter?.toLowerCase().includes("apple")
+    && result.gpu?.adapter?.toLowerCase().includes("apple");
+  const tetrisPassed = commonPassed
+    && result.gpu?.draws === 9
+    && result.gpu?.vertices === 49
+    && result.tetris?.totalFrames >= 21
+    && result.tetris?.afterInput?.ppuInstructions > result.tetris?.beforeInput?.ppuInstructions
+    && result.tetris?.afterInput?.activeCenterX > result.tetris?.beforeInput?.activeCenterX + 0.09
+    && result.tetris?.droppedPackets === 0
+    && result.gpu?.pipelineCache?.hits === 9
+    && result.gpu?.pipelineCache?.misses === 0
+    && result.imageEvidence?.backgroundPixels > 10_000
+    && result.imageEvidence?.blockPixels > 100;
+  const cubePassed = commonPassed
+    && result.gpu?.draws === 2
     && result.gpu?.draws === 2
     && result.gpu?.vertices === 162
     && result.gpu?.depthStates?.[0]?.comparison === "less"
@@ -344,6 +402,7 @@ try {
     && result.imageEvidence?.textPixels > 100
     && result.imageEvidence?.textPixels < 1_000
     && result.imageEvidence?.lightTextPixels > 50;
+  const passed = fixtureName.includes("tetris") ? tetrisPassed : cubePassed;
   const evidence = {
     capturedAt: new Date().toISOString(),
     transport: "usbmuxd / ios-webkit-debug-proxy / WebKit Inspector Protocol",

@@ -2779,9 +2779,14 @@ namespace
 	thread_local bool g_tls_web_stack_painted = false;
 	std::mutex g_web_stack_mutex;
 	std::map<std::string, std::pair<u64, u64>> g_web_stack_usage; // name -> {max used bytes, stack size}
+	std::map<const thread_base*, std::string> g_web_live_threads;
 
-	void web_thread_started()
+	void web_thread_started(const thread_base* thread, const std::string& name)
 	{
+		{
+			std::lock_guard lock(g_web_stack_mutex);
+			g_web_live_threads[thread] = name;
+		}
 		g_web_threads_started++;
 		const u32 live = ++g_web_threads_live;
 		g_web_threads_peak.fetch_op([&](u32& peak)
@@ -2858,6 +2863,24 @@ namespace
 		entry.first = std::max(entry.first, used);
 		entry.second = base > end ? base - end : 0;
 	}
+
+	void web_thread_exited(const thread_base* thread)
+	{
+		std::lock_guard lock(g_web_stack_mutex);
+		g_web_live_threads.erase(thread);
+	}
+}
+
+std::string thread_ctrl::web_live_thread_names()
+{
+	std::string names;
+	std::lock_guard lock(g_web_stack_mutex);
+	for (const auto& [thread, name] : g_web_live_threads)
+	{
+		names += name;
+		names += '\n';
+	}
+	return names;
 }
 
 u32 thread_ctrl::web_live_threads()
@@ -2930,7 +2953,14 @@ void thread_base::start()
 	pthread_t thread_id{};
 	ensure(pthread_create(&thread_id, nullptr, entry_point, this) == 0);
 #ifdef RPCS3_WEB
-	web_thread_started();
+	if (const auto name = m_tname.load())
+	{
+		web_thread_started(this, *name);
+	}
+	else
+	{
+		web_thread_started(this, "");
+	}
 #endif
 #endif
 
@@ -3146,6 +3176,7 @@ u64 thread_base::finalize(thread_state result_state) noexcept
 	{
 		web_stack_record(*name);
 	}
+	web_thread_exited(this);
 	--g_web_threads_live;
 #endif
 

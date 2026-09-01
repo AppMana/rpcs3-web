@@ -57,6 +57,7 @@ async function captureDispatch(expectedVerdict = "", timeoutMs = 30_000) {
       aotSnapshot = snapshot;
     }
     if (spuDispatcher) spuDispatcher.runBatch(256);
+    runHostTasks();
     if (!ppuDispatcher || aotSnapshot?.context) refreshDispatchLines();
     terminal = dispatchLines.findLast((line) => / (PASS|FAIL) /.test(line)) ?? "";
     if (terminal) break;
@@ -185,8 +186,15 @@ function stackReport() {
     .sort((a, b) => b.usedBytes - a.usedBytes);
 }
 
+// RPCS3 queues work for its main thread; this worker is that thread.
+function runHostTasks() {
+  if (!module) return 0;
+  return module.ccall("rpcs3_web_run_host_tasks", "number", [], []) >>> 0;
+}
+
 function progress(includeThreads = false) {
   if (!module) return;
+  runHostTasks();
   scope.postMessage({
     type: "runtime-progress",
     bootResult,
@@ -311,6 +319,7 @@ async function captureFrame(type, discardPackets = false) {
     // Wait for the RSX thread's flip notification (bounded so pad messages
     // and status changes are still observed). This is not guest pacing.
     await waitForFlip(Math.min(250, packetDeadline - performance.now()));
+    runHostTasks();
     status = module.ccall("rpcs3_web_status", "number", [], []);
   }
   frameSequence += 1;
@@ -385,9 +394,35 @@ scope.addEventListener("message", async (event) => {
       ppuDispatcher = undefined;
       spuDispatcher?.release();
       spuDispatcher = undefined;
+      const stopStartedAt = performance.now();
       module?.ccall("rpcs3_web_stop", null, [], []);
+      // Emu.Kill is asynchronous. Wait (without blocking this event-loop
+      // thread) for RPCS3's threads to exit cooperatively: they record their
+      // stack high-water marks on the way out, and a clean exit is what lets
+      // the browser release the workers and the shared heap.
+      let stoppedCleanly = false;
+      while (module && performance.now() - stopStartedAt < 5_000) {
+        runHostTasks();
+        if (module.ccall("rpcs3_web_is_stopped", "number", [], []) === 1
+          && (module.ccall("rpcs3_web_live_thread_count", "number", [], []) >>> 0) === 0) {
+          stoppedCleanly = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const shutdownStackReport = stackReport();
+      const shutdownWorkingSet = workingSet();
+      const liveThreadNames = module ? module.ccall("rpcs3_web_live_thread_names", "string", [], []).split("\n").filter(Boolean) : [];
       module?.PThread?.terminateAllThreads();
-      scope.postMessage({ type: "runtime-shutdown", ok: true });
+      scope.postMessage({
+        type: "runtime-shutdown",
+        ok: true,
+        stoppedCleanly,
+        stopMs: performance.now() - stopStartedAt,
+        stackReport: shutdownStackReport,
+        workingSet: shutdownWorkingSet,
+        liveThreadNames,
+      });
     } catch (error) {
       scope.postMessage({ type: "runtime-shutdown", ok: false, detail: detail(error) });
     }
@@ -445,6 +480,9 @@ scope.addEventListener("message", async (event) => {
     const moduleCreateStartedAt = performance.now();
     module = await createRPCS3({
       locateFile: resolveCoreFile,
+      // Emscripten workers started up front; RPCS3's homebrew boot uses 7-8
+      // threads and the pool grows on demand beyond this.
+      pthreadPoolSize: Math.max(2, Math.min(64, Number(event.data.pthreadPoolSize) || 12)),
       print: recordLog,
       printErr: recordLog,
       ...(mainWasm ? {

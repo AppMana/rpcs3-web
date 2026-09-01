@@ -91,6 +91,9 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
               {
                 captureRgba: Boolean(options.captureRgba),
                 vertexDiagnostics: options.vertexDiagnostics === true,
+                // Readback (frame hash, changed pixels) stays on for the
+                // deterministic acceptance gates; sustained runs turn it off.
+                readback: options.readback !== false || Boolean(options.captureRgba),
               },
             );
             if (vertexBackendComparison) {
@@ -126,6 +129,10 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
             clearTimeout(shutdownTimer);
             worker.removeEventListener("message", onShutdown);
             if (activeWorker === worker) activeWorker = undefined;
+            // Stack high-water marks and the final working set are known only
+            // after RPCS3's threads have exited.
+            const { type: _type, ...shutdown } = shutdownEvent.data;
+            result.shutdown = shutdown;
             resolve(result);
           };
           worker.addEventListener("message", onShutdown);
@@ -140,7 +147,7 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
     worker.addEventListener("error", (event) => {
       clearTimeout(timeout);
       worker.terminate();
-      reject(new Error(event.message || "real RPCS3 runtime worker failed"));
+      reject(new Error(`real RPCS3 runtime worker failed: ${event.message || ""} ${event.filename || ""}:${event.lineno || 0} ${String(event.error ?? "")}`.trim()));
     }, { once: true });
     worker.postMessage({
       type: "boot",
@@ -169,14 +176,26 @@ function snapshot() {
   activeWorker?.postMessage({ type: "snapshot" });
 }
 
+// Resolves with the worker's shutdown report (stack high-water marks per
+// thread name and the final working set) once RPCS3 has stopped.
 function stop() {
   stopWebGPUPresentation();
   const worker = activeWorker;
+  const shutdown = new Promise((resolve) => {
+    if (!worker) { resolve(undefined); return; }
+    const timer = setTimeout(() => resolve(undefined), 5_000);
+    worker.addEventListener("message", (event) => {
+      if (event.data?.type !== "runtime-shutdown") return;
+      clearTimeout(timer);
+      resolve(event.data);
+    });
+  });
   worker?.postMessage({ type: "shutdown" });
   if (worker) setTimeout(() => worker.terminate(), 5_000);
   activeWorker = undefined;
   releaseWebGPU(activeGpu);
   activeGpu = undefined;
+  return shutdown;
 }
 
 window.__rpcs3Runtime = { run, stop, setPad, snapshot };

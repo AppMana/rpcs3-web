@@ -36,6 +36,7 @@
 #include "util/video_source.h"
 
 #include <emscripten.h>
+#include <emscripten/threading.h>
 #include <emscripten/wasmfs.h>
 #include <malloc.h>
 
@@ -45,7 +46,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <functional>
+#include <mutex>
 #include <memory>
 #include <set>
 #include <string>
@@ -121,6 +124,8 @@ namespace
 
 	std::atomic<bool> s_initialized{false};
 	std::atomic<bool> s_null_renderer{false};
+	std::mutex s_host_task_mutex;
+	std::deque<std::function<void()>> s_host_tasks;
 	std::atomic<s32> s_storage_state{0};
 	std::atomic<u32> s_firmware_result{0};
 	std::atomic<u32> s_firmware_progress{0};
@@ -327,14 +332,33 @@ namespace
 	{
 		EmuCallbacks callbacks{};
 
+		// RPCS3's "main thread" is the Emscripten main runtime thread: the
+		// JavaScript worker that owns the module, which drains this queue on
+		// its event-loop ticks (rpcs3_web_run_host_tasks). Running the
+		// function inline on an emulation thread is wrong in general and
+		// deadlocks the stop sequence: Emulator::Kill hands the join thread's
+		// last owner to the main thread, and destroying it from the join
+		// thread itself joins forever.
 		callbacks.call_from_main_thread = [](std::function<void()> fn, atomic_t<u32>* wake_up)
 		{
-			fn();
-			if (wake_up)
+			auto task = [fn = std::move(fn), wake_up]()
 			{
-				*wake_up = 1;
-				wake_up->notify_one();
+				fn();
+				if (wake_up)
+				{
+					*wake_up = 1;
+					wake_up->notify_one();
+				}
+			};
+
+			if (emscripten_is_main_runtime_thread())
+			{
+				task();
+				return;
 			}
+
+			std::lock_guard lock(s_host_task_mutex);
+			s_host_tasks.emplace_back(std::move(task));
 		};
 		callbacks.on_run = [](bool) { notify_host_event("rpcs3-running", 0); };
 		callbacks.on_pause = [] { notify_host_event("rpcs3-paused", 0); };
@@ -1223,6 +1247,14 @@ extern "C"
 		return report.c_str();
 	}
 
+	// Names of RPCS3 threads currently running, one per line.
+	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_live_thread_names()
+	{
+		static std::string names;
+		names = thread_ctrl::web_live_thread_names();
+		return names.c_str();
+	}
+
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_vm_mapped_pages()
 	{
 		return vm::web_mapped_pages();
@@ -1295,12 +1327,40 @@ extern "C"
 		s_aot_context_thread.reset();
 		if (s_initialized && !Emu.IsStopped())
 		{
+			// Kill is asynchronous: the join thread stops the emulation threads
+			// and they record their stack high-water marks as they exit. The
+			// browser polls rpcs3_web_is_stopped instead of blocking this
+			// (event-loop) thread, which Emscripten proxies thread cleanup through.
 			Emu.Kill(false);
-			while (!Emu.IsStopped())
-			{
-				std::this_thread::yield();
-			}
 		}
+	}
+
+	// Run functions RPCS3 queued for its main thread. Called by the worker
+	// on every event-loop tick it owns (progress, frame waits, shutdown).
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_run_host_tasks()
+	{
+		u32 executed = 0;
+		for (;;)
+		{
+			std::function<void()> task;
+			{
+				std::lock_guard lock(s_host_task_mutex);
+				if (s_host_tasks.empty())
+				{
+					break;
+				}
+				task = std::move(s_host_tasks.front());
+				s_host_tasks.pop_front();
+			}
+			task();
+			executed++;
+		}
+		return executed;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_is_stopped()
+	{
+		return !s_initialized || Emu.IsStopped(true) ? 1u : 0u;
 	}
 }
 

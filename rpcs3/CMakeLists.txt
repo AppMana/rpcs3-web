@@ -70,7 +70,13 @@ if(RPCS3_WEB)
 		"-sMAXIMUM_MEMORY=2147483648"
 		"-sINITIAL_MEMORY=${RPCS3_WEB_INITIAL_MEMORY}"
 		"-sSTACK_SIZE=8388608"
-		"-sPTHREAD_POOL_SIZE=64"
+		# Measured stack high-water marks on the homebrew fixtures are under
+		# 16 KiB per RPCS3 thread; 1 MiB keeps a wide margin without the 8 MiB
+		# per thread the implicit default committed. The pool is sized by the
+		# host (Module.pthreadPoolSize) so Mobile Safari can start fewer
+		# workers; Emscripten grows it on demand if RPCS3 needs more.
+		"-sDEFAULT_PTHREAD_STACK_SIZE=1048576"
+		"-sPTHREAD_POOL_SIZE=(Module['pthreadPoolSize']||12)"
 		"-sNO_EXIT_RUNTIME=1"
 		"-sFORCE_FILESYSTEM=1"
 		"-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8','PThread']"

@@ -353,6 +353,7 @@ public:
 	static u64 web_stack_max_used();
 	static void web_set_stack_paint(bool enabled);
 	static std::string web_stack_report();
+	static std::string web_live_thread_names();
 #endif
 
 	// Sets the native thread priority and returns it to zero at destructor

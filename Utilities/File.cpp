@@ -1335,6 +1335,109 @@ bool fs::create_symlink(const std::string& path, const std::string& target)
 #endif
 }
 
+#ifdef RPCS3_WEB
+// Move one regular file on WASMFS: FileSystemFileHandle.move() first, byte copy plus unlink otherwise.
+static bool web_move_file(const std::string& from, const std::string& to)
+{
+	if (::rename(from.c_str(), to.c_str()) == 0)
+	{
+		return true;
+	}
+
+	if (errno != EIO)
+	{
+		fs::g_tls_error = to_error(errno);
+		return false;
+	}
+
+	{
+		fs::file src(from, fs::read);
+
+		if (!src)
+		{
+			return false;
+		}
+
+		fs::file dst(to, fs::rewrite);
+
+		if (!dst)
+		{
+			return false;
+		}
+
+		std::vector<u8> buffer(1u << 20);
+
+		for (u64 total = src.size(), done = 0; done < total;)
+		{
+			const u64 read = src.read(buffer.data(), std::min<u64>(buffer.size(), total - done));
+
+			if (!read)
+			{
+				fs::g_tls_error = fs::error::unknown;
+				return false;
+			}
+
+			if (dst.write(buffer.data(), read) != read)
+			{
+				return false;
+			}
+
+			done += read;
+		}
+	}
+
+	return fs::remove_file(from);
+}
+
+// Move a directory tree on WASMFS with the POSIX rename() outcome: the target may only exist as an empty directory.
+static bool web_move_directory(const std::string& from, const std::string& to)
+{
+	if (fs::is_dir(to))
+	{
+		for (const auto& entry : fs::dir(to))
+		{
+			if (entry.name != "." && entry.name != "..")
+			{
+				fs::g_tls_error = fs::error::notempty;
+				return false;
+			}
+		}
+	}
+	else if (fs::exists(to))
+	{
+		fs::g_tls_error = to_error(ENOTDIR);
+		return false;
+	}
+	else if (!fs::create_dir(to))
+	{
+		return false;
+	}
+
+	std::vector<fs::dir_entry> entries;
+
+	for (const auto& entry : fs::dir(from))
+	{
+		if (entry.name != "." && entry.name != "..")
+		{
+			entries.emplace_back(entry);
+		}
+	}
+
+	for (const auto& entry : entries)
+	{
+		const std::string src = from + '/' + entry.name;
+		const std::string dst = to + '/' + entry.name;
+
+		if (entry.is_directory ? !web_move_directory(src, dst) : !web_move_file(src, dst))
+		{
+			return false;
+		}
+	}
+
+	return fs::remove_dir(from);
+}
+#endif
+
 bool fs::rename(const std::string& from, const std::string& to, bool overwrite)
 {
 	if (from.empty() || to.empty())
@@ -1411,8 +1514,27 @@ bool fs::rename(const std::string& from, const std::string& to, bool overwrite)
 
 	if (::rename(from.c_str(), to.c_str()) != 0)
 	{
+#ifdef RPCS3_WEB
+		// WASMFS's OPFS backend cannot move directories (it reports EBUSY) and moves files
+		// with FileSystemFileHandle.move(), which reports EIO where the browser lacks it.
+		const int error = errno;
+
+		if (error == EBUSY && is_dir(from))
+		{
+			return web_move_directory(from, to);
+		}
+
+		if (error == EIO && is_file(from))
+		{
+			return web_move_file(from, to);
+		}
+
+		g_tls_error = to_error(error);
+		return false;
+#else
 		g_tls_error = to_error(errno);
 		return false;
+#endif
 	}
 
 	return true;
@@ -1837,7 +1959,29 @@ fs::file::file(const std::string& path, bs_t<open_mode> mode)
 		perm = 0;
 	}
 
+#ifdef RPCS3_WEB
+	// WASMFS's OPFS backend serves read-only descriptors from a Blob, which
+	// turns every read into an asynchronous slice proxied through the main
+	// runtime thread; writable descriptors get a synchronous access handle.
+	// Game images and firmware in origin-private storage are read sector by
+	// sector, so ask for the access handle first (it is exclusive per file)
+	// and keep the read-only semantics at this layer; fall back to the Blob
+	// path when another descriptor already holds the file. Only immutable
+	// inputs qualify: a read handle on a file the guest later opens for
+	// writing (dev_hdd0 game data, caches, saves) would refuse that write.
+	int fd = -1;
+	if ((flags & O_ACCMODE) == O_RDONLY && !(mode & fs::write) &&
+		(path.starts_with("/opfs/games/") || path.starts_with("/opfs/firmware/")))
+	{
+		fd = ::open(path.c_str(), (flags & ~O_ACCMODE) | O_RDWR, perm);
+	}
+	if (fd == -1)
+	{
+		fd = ::open(path.c_str(), flags, perm);
+	}
+#else
 	const int fd = ::open(path.c_str(), flags, perm);
+#endif
 
 	if (fd == -1)
 	{

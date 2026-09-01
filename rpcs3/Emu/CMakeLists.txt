@@ -67,6 +67,10 @@ if(RPCS3_WEB)
 	target_compile_definitions(rpcs3_emu PRIVATE RPCS3_WEB_INTERPRETER_ONLY=1)
 endif()
 
+if(RPCS3_PORTABLE_SPU_INTERPRETER)
+	target_compile_definitions(rpcs3_emu PRIVATE RPCS3_PORTABLE_SPU_INTERPRETER=1)
+endif()
+
 target_include_directories(rpcs3_emu
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty
@@ -431,6 +435,9 @@ else()
 		Cell/SPUCommonRecompiler.cpp
 		Cell/SPULLVMRecompiler.cpp
 	)
+	if(RPCS3_PORTABLE_SPU_INTERPRETER)
+		target_sources(rpcs3_emu PRIVATE Cell/SPUWebRuntime.cpp)
+	endif()
 endif()
 
 if(NOT MSVC)

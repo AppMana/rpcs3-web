@@ -158,10 +158,18 @@ public:
 	static const spu_function_t g_gateway;
 
 	// Longjmp to the end of the gateway function (native CC)
+#if defined(RPCS3_PORTABLE_SPU_INTERPRETER)
+	static void(*g_escape)(spu_thread*);
+#else
 	static void(*const g_escape)(spu_thread*);
+#endif
 
 	// Similar to g_escape, but doing tail call to the new function.
+#if defined(RPCS3_PORTABLE_SPU_INTERPRETER)
+	static void(*g_tail_escape)(spu_thread*, spu_function_t, u8*);
+#else
 	static void(*const g_tail_escape)(spu_thread*, spu_function_t, u8*);
+#endif
 
 	// Interpreter table (spu_itype -> ptr)
 	static std::array<u64, 256> g_interpreter_table;

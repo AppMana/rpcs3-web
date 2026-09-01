@@ -65,6 +65,7 @@ option(RUN_RPCS3_TESTS "Run RPCS3 unit tests. Requires BUILD_RPCS3_TESTS" OFF)
 option(USE_GAMEMODE "Choose whether to enable GameMode features or not." ON)
 option(RPCS3_WEB "Build the full RPCS3 emulation core with browser host backends." OFF)
 option(RPCS3_WEB_PROBE "Build the standalone browser capability probe." OFF)
+option(RPCS3_PORTABLE_SPU_INTERPRETER "Use the portable SPU interpreter dispatch path for native differential validation." OFF)
 
 if(RPCS3_WEB_PROBE)
     if(NOT EMSCRIPTEN)

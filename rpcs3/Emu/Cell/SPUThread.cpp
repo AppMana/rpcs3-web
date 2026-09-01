@@ -58,12 +58,15 @@ const u32 spu_frest_fraction_lut[32] =
 	0x124543, 0x124543, 0x0D392D, 0x0D392D, 0x08851A, 0x08851A, 0x041D07, 0x041D07
 };
 
-#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+#if defined(RPCS3_WEB_INTERPRETER_ONLY) || defined(RPCS3_PORTABLE_SPU_INTERPRETER)
 extern void spu_web_set_escape_context(std::jmp_buf* context) noexcept;
+#endif
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
 atomic_t<u64> g_spu_web_instruction_count{0};
 atomic_t<u32> g_spu_web_last_pc[6]{};
 atomic_t<u64> g_spu_web_ls_boundary_count{0};
 atomic_t<u64> g_spu_web_ls_boundary_last{0};
+atomic_t<u64> g_spu_web_page_split_dma_count{0};
 
 static void spu_web_note_ls_boundary(u32 lsa, u32 size)
 {
@@ -74,6 +77,19 @@ static void spu_web_note_ls_boundary(u32 lsa, u32 size)
 		g_spu_web_ls_boundary_last = (u64{lsa} << 32) | size;
 		g_spu_web_ls_boundary_count++;
 	}
+}
+#endif
+
+#ifdef RPCS3_WEB
+static bool spu_web_dma_is_contiguous(u32 ea, u32 size)
+{
+	if (!size || ea >= RAW_SPU_BASE_ADDR || vm::web_is_contiguous(ea, size))
+	{
+		return true;
+	}
+
+	g_spu_web_page_split_dma_count++;
+	return false;
 }
 #endif
 
@@ -1597,13 +1613,15 @@ void spu_thread::cpu_task()
 	}
 	else
 	{
-#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+#if defined(RPCS3_WEB_INTERPRETER_ONLY) || defined(RPCS3_PORTABLE_SPU_INTERPRETER)
 		// Browser execution calls the existing static interpreter table directly;
 		// no generated gateway, dispatcher mirror or executable memory is needed.
 		const auto& table = g_fxo->get<spu_interpreter_rt>();
 
 		allow_interrupts_in_cpu_work = true;
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
 		u32 web_progress_batch = 0;
+#endif
 		std::jmp_buf escape_context;
 		spu_web_set_escape_context(&escape_context);
 		while (true)
@@ -1623,12 +1641,14 @@ void spu_thread::cpu_task()
 			if (table.decode(op)(*this, {op}))
 				pc += 4;
 
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
 			if (++web_progress_batch == 256)
 			{
 				g_spu_web_instruction_count += web_progress_batch;
 				g_spu_web_last_pc[index % std::size(g_spu_web_last_pc)] = pc;
 				web_progress_batch = 0;
 			}
+#endif
 		}
 		spu_web_set_escape_context(nullptr);
 		allow_interrupts_in_cpu_work = false;
@@ -2123,6 +2143,22 @@ void spu_thread::push_snr(u32 number, u32 value)
 void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8* ls)
 {
 	perf_meter<"DMA"_u32> perf_;
+#ifdef RPCS3_WEB
+	if (!spu_web_dma_is_contiguous(args.eal, args.size))
+	{
+		for (u32 offset = 0; offset < args.size;)
+		{
+			spu_mfc_cmd fragment = args;
+			fragment.eal += offset;
+			fragment.lsa += offset;
+			fragment.size = std::min<u32>(args.size - offset, 0x1000 - (fragment.eal & 0xfff));
+			do_dma_transfer(_this, fragment, ls);
+			offset += fragment.size;
+		}
+
+		return;
+	}
+#endif
 
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
 	spu_web_note_ls_boundary(args.lsa, args.size);
@@ -3267,9 +3303,14 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 
 		const u32 size = items[index].ts & ts_mask;
 		const u32 addr = items[index].ea;
+#ifdef RPCS3_WEB
+		const bool host_contiguous = !size || addr >= RAW_SPU_BASE_ADDR || vm::web_is_contiguous(addr, size);
+#else
+		constexpr bool host_contiguous = true;
+#endif
 
 		// Try to inline the transfer
-		if (addr < RAW_SPU_BASE_ADDR && size && optimization_compatible == MFC_GET_CMD)
+		if (addr < RAW_SPU_BASE_ADDR && size && host_contiguous && optimization_compatible == MFC_GET_CMD)
 		{
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
 			spu_web_note_ls_boundary(arg_lsa + (addr & 0xf), size);
@@ -3343,7 +3384,7 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 			arg_lsa += utils::align<u32>(size, 16);
 		}
 		// Avoid inlining huge transfers because it intentionally drops range lock unlock
-		else if (optimization_compatible == MFC_PUT_CMD && ((addr >> 28 == rsx::constants::local_mem_base >> 28) || (addr < RAW_SPU_BASE_ADDR && size - 1 <= 0x400 - 1 && (addr % 0x10000 + (size - 1)) < 0x10000)))
+		else if (host_contiguous && optimization_compatible == MFC_PUT_CMD && ((addr >> 28 == rsx::constants::local_mem_base >> 28) || (addr < RAW_SPU_BASE_ADDR && size - 1 <= 0x400 - 1 && (addr % 0x10000 + (size - 1)) < 0x10000)))
 		{
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
 			spu_web_note_ls_boundary(arg_lsa + (addr & 0xf), size);

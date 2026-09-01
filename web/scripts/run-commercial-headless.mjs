@@ -28,6 +28,9 @@ const traceDelayPc = Number.parseInt(process.env.RPCS3_COMMERCIAL_TRACE_DELAY_PC
 const traceDelayMs = Math.max(0, Math.min(10_000, Number(process.env.RPCS3_COMMERCIAL_TRACE_DELAY_MS) || 0));
 const watchAddress = Number.parseInt(process.env.RPCS3_COMMERCIAL_WATCH_ADDRESS || "0", 0) >>> 0;
 const clockScale = Math.max(0, Math.min(3_000, Number(process.env.RPCS3_COMMERCIAL_CLOCK_SCALE) || 0));
+const accurateSpuDma = process.env.RPCS3_COMMERCIAL_ACCURATE_SPU_DMA === "1"
+  ? true
+  : process.env.RPCS3_COMMERCIAL_ACCURATE_SPU_DMA === "0" ? false : undefined;
 const renderer = process.env.RPCS3_COMMERCIAL_RENDERER === "null" ? "null" : "webgpu";
 const packetCaptureLevel = Math.max(0, Math.min(4, Number(process.env.RPCS3_COMMERCIAL_PACKET_CAPTURE_LEVEL ?? 4)));
 const captureRgba = process.env.RPCS3_COMMERCIAL_CAPTURE_RGBA === "1";
@@ -60,14 +63,105 @@ const context = await chromium.launchPersistentContext(profilePath, {
   args: chromeArgs,
 });
 let capturedPacketFrame;
-let cpuProfiler;
+let workerProfiler;
 let traceSession;
 let traceComplete;
 
-async function writeCpuProfile(profile) {
-  if (!cpuProfilePath || !profile) return;
+async function writeCpuProfiles(targets) {
+  if (!cpuProfilePath) return;
+  const ranked = targets
+    .filter(({ profile }) => profile)
+    .sort((left, right) => (right.profile.samples?.length || 0) - (left.profile.samples?.length || 0));
   await mkdir(path.dirname(cpuProfilePath), { recursive: true });
-  await writeFile(cpuProfilePath, `${JSON.stringify(profile)}\n`);
+  if (ranked.length) await writeFile(cpuProfilePath, `${JSON.stringify(ranked[0].profile)}\n`);
+  await writeFile(`${cpuProfilePath}.targets.json`, `${JSON.stringify({
+    selected: ranked[0]?.targetInfo,
+    targets: targets.map(({ targetInfo, profile, error }) => ({
+      targetInfo,
+      samples: profile?.samples?.length || 0,
+      error,
+    })),
+  }, null, 2)}\n`);
+}
+
+function createWorkerProfiler(session) {
+  let commandId = 0;
+  const pending = new Map();
+  const targets = new Map();
+  const starts = [];
+
+  const send = async (sessionId, method, params = {}) => {
+    const id = ++commandId;
+    const key = `${sessionId}:${id}`;
+    const response = new Promise((resolve, reject) => pending.set(key, { resolve, reject }));
+    await session.send("Target.sendMessageToTarget", {
+      sessionId,
+      message: JSON.stringify({ id, method, params }),
+    });
+    return response;
+  };
+
+  session.on("Target.receivedMessageFromTarget", ({ sessionId, message }) => {
+    const payload = JSON.parse(message);
+    if (!payload.id) return;
+    const waiter = pending.get(`${sessionId}:${payload.id}`);
+    if (!waiter) return;
+    pending.delete(`${sessionId}:${payload.id}`);
+    if (payload.error) waiter.reject(new Error(`${payload.error.code}: ${payload.error.message}`));
+    else waiter.resolve(payload.result || {});
+  });
+  session.on("Target.detachedFromTarget", ({ sessionId }) => {
+    const target = targets.get(sessionId);
+    if (target && !target.profile) target.error = "target detached before profile collection";
+    for (const [key, waiter] of pending) {
+      if (!key.startsWith(`${sessionId}:`)) continue;
+      pending.delete(key);
+      waiter.reject(new Error("target detached"));
+    }
+  });
+  session.on("Target.attachedToTarget", ({ sessionId, targetInfo }) => {
+    if (targetInfo.type !== "worker") return;
+    const target = { sessionId, targetInfo };
+    targets.set(sessionId, target);
+    starts.push((async () => {
+      try {
+        await send(sessionId, "Profiler.enable");
+        await send(sessionId, "Profiler.setSamplingInterval", { interval: 1_000 });
+        await send(sessionId, "Profiler.start");
+        target.started = true;
+      } catch (error) {
+        target.error = error instanceof Error ? error.message : String(error);
+      }
+    })());
+  });
+
+  return {
+    async start() {
+      await session.send("Target.setAutoAttach", {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: false,
+      });
+    },
+    async stop() {
+      await Promise.allSettled(starts);
+      await Promise.all([...targets.values()].map(async (target) => {
+        if (!target.started) return;
+        try {
+          const { profile } = await send(target.sessionId, "Profiler.stop");
+          target.profile = profile;
+        } catch (error) {
+          target.error = error instanceof Error ? error.message : String(error);
+        }
+      }));
+      await session.send("Target.setAutoAttach", {
+        autoAttach: false,
+        waitForDebuggerOnStart: false,
+        flatten: false,
+      });
+      return [...targets.values()];
+    },
+  };
 }
 
 async function stopTrace() {
@@ -111,10 +205,9 @@ try {
   });
 
   if (cpuProfilePath) {
-    cpuProfiler = await context.newCDPSession(page);
-    await cpuProfiler.send("Profiler.enable");
-    await cpuProfiler.send("Profiler.setSamplingInterval", { interval: 1_000 });
-    await cpuProfiler.send("Profiler.start");
+    const profilerSession = await context.newCDPSession(page);
+    workerProfiler = createWorkerProfiler(profilerSession);
+    await workerProfiler.start();
   }
   if (tracePath) {
     traceSession = await context.newCDPSession(page);
@@ -136,7 +229,7 @@ try {
   }
 
   await page.goto(`${baseURL}/storage.html`, { waitUntil: "domcontentloaded" });
-  const execution = await page.evaluate(async ({ bootPath: guestPath, timeout, requestedFrames, presentToCanvas, untilDraw, renderInterval, captureFrameRgba, captureShaderPrograms, repeatedRenders, capturePacketFixture, watchedAddresses, tracedPc, tracedDelayPc, tracedDelayMs, watchedWriteAddress, guestClockScale, guestRenderer, guestPacketCaptureLevel }) => {
+  const execution = await page.evaluate(async ({ bootPath: guestPath, timeout, requestedFrames, presentToCanvas, untilDraw, renderInterval, captureFrameRgba, captureShaderPrograms, repeatedRenders, capturePacketFixture, watchedAddresses, tracedPc, tracedDelayPc, tracedDelayMs, watchedWriteAddress, guestClockScale, guestAccurateSpuDma, guestRenderer, guestPacketCaptureLevel }) => {
     const [{ decodeDrawPacket }, { prepareWebGPU, renderPacketsToWebGPU }] = await Promise.all([
       import("./rpcs3-webgpu-packet.mjs"),
       import("./rpcs3-webgpu-renderer.mjs"),
@@ -172,7 +265,6 @@ try {
       );
       const finish = (terminal) => {
         clearTimeout(timer);
-        worker.terminate();
         resolve({ terminal, lastProgress, lastFrame, events, frames });
       };
       let timer = setTimeout(() => {
@@ -182,7 +274,7 @@ try {
           detail: `commercial boot exceeded ${timeout} ms`,
           lastProgress,
           lastFrame,
-        }), 1_000);
+        }), 5_000);
       }, timeout);
       worker.addEventListener("message", async (event) => {
         const { packetBuffers = [], ...serializable } = event.data ?? {};
@@ -270,6 +362,7 @@ try {
         traceDelayMs: tracedDelayMs,
         watchAddress: watchedWriteAddress,
         clockScale: guestClockScale,
+        accurateSpuDma: guestAccurateSpuDma,
         renderer: guestRenderer,
         packetCaptureLevel: guestPacketCaptureLevel,
         discardPackets: !needsPackets(1),
@@ -293,15 +386,15 @@ try {
     tracedDelayMs: traceDelayMs,
     watchedWriteAddress: watchAddress,
     guestClockScale: clockScale,
+    guestAccurateSpuDma: accurateSpuDma,
     guestRenderer: renderer,
     guestPacketCaptureLevel: packetCaptureLevel,
   });
 
   const { capabilities, run } = execution;
-  if (cpuProfiler) {
-    const { profile } = await cpuProfiler.send("Profiler.stop");
-    await writeCpuProfile(profile);
-    cpuProfiler = undefined;
+  if (workerProfiler) {
+    await writeCpuProfiles(await workerProfiler.stop());
+    workerProfiler = undefined;
   }
   await stopTrace();
   const completed = Boolean(
@@ -351,10 +444,9 @@ try {
   }
   if (!completed) process.exitCode = 1;
 } finally {
-  if (cpuProfiler) {
+  if (workerProfiler) {
     try {
-      const { profile } = await cpuProfiler.send("Profiler.stop");
-      await writeCpuProfile(profile);
+      await writeCpuProfiles(await workerProfiler.stop());
     } catch {}
   }
   if (traceSession) {

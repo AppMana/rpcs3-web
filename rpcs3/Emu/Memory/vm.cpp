@@ -117,6 +117,68 @@ namespace vm
 			}
 		}
 	}
+
+	bool web_is_contiguous(u32 addr, u32 size) noexcept
+	{
+		if (!size)
+		{
+			return true;
+		}
+
+		const u64 end = static_cast<u64>(addr) + size;
+		if (end > 0x1'0000'0000ull)
+		{
+			return false;
+		}
+
+		u8* const first = web_base(addr);
+		if (!first)
+		{
+			return false;
+		}
+
+		for (u64 page = (static_cast<u64>(addr) & -0x1000ll) + 0x1000; page < end; page += 0x1000)
+		{
+			if (web_base(static_cast<u32>(page)) != first + (page - addr))
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	bool web_copy_range(u32 addr, void* buffer, u32 size, bool is_write) noexcept
+	{
+		if (static_cast<u64>(addr) + size > 0x1'0000'0000ull)
+		{
+			return false;
+		}
+
+		u8* bytes = static_cast<u8*>(buffer);
+		for (u32 offset = 0; offset < size;)
+		{
+			const u32 current = addr + offset;
+			const u32 chunk = std::min<u32>(size - offset, 0x1000 - (current & 0xfff));
+			u8* guest = web_base(current);
+			if (!guest)
+			{
+				return false;
+			}
+
+			if (is_write)
+			{
+				std::memcpy(guest, bytes + offset, chunk);
+			}
+			else
+			{
+				std::memcpy(bytes + offset, guest, chunk);
+			}
+			offset += chunk;
+		}
+
+		return true;
+	}
 #endif
 
 	// Reservation stats
@@ -2249,6 +2311,13 @@ namespace vm
 					return true;
 				}
 			}
+
+#ifdef RPCS3_WEB
+			if (!web_is_contiguous(addr, size))
+			{
+				return web_copy_range(addr, ptr, size, is_write);
+			}
+#endif
 
 			std::memcpy(dst, src, size);
 			return true;

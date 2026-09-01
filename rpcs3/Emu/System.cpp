@@ -2028,7 +2028,7 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 					return;
 				}
 
-#if !defined(RPCS3_WEB_INTERPRETER_ONLY)
+#if !defined(RPCS3_WEB_INTERPRETER_ONLY) && !defined(RPCS3_PORTABLE_SPU_INTERPRETER)
 				spu_cache::initialize(false);
 #endif
 

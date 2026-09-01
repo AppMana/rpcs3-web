@@ -680,6 +680,10 @@ s32 lv2_socket_p2ps::bind(const sys_net_sockaddr& addr)
 		sys_net.warning("[P2PS] Attempting to bind a socket to a port != %d", +SCE_NP_PORT);
 	}
 
+#ifdef __EMSCRIPTEN__
+	return -SYS_NET_EOPNOTSUPP;
+#endif
+
 	socket_type real_socket{};
 
 	auto& nc = g_fxo->get<p2p_context>();
@@ -780,6 +784,10 @@ std::optional<s32> lv2_socket_p2ps::connect(const sys_net_sockaddr& addr)
 	{
 		dst_port = SCE_NP_PORT;
 	}
+
+#ifdef __EMSCRIPTEN__
+	return -SYS_NET_EOPNOTSUPP;
+#endif
 
 	auto& nc = g_fxo->get<p2p_context>();
 	std::lock_guard list_lock(nc.list_p2p_ports_mutex);

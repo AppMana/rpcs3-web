@@ -118,6 +118,10 @@ s32 lv2_socket_p2p::bind(const sys_net_sockaddr& addr)
 		sys_net.warning("[P2P] Attempting to bind a socket to a port != %d", +SCE_NP_PORT);
 	}
 
+#ifdef __EMSCRIPTEN__
+	return -SYS_NET_EOPNOTSUPP;
+#endif
+
 	socket_type real_socket{};
 
 	auto& nc = g_fxo->get<p2p_context>();

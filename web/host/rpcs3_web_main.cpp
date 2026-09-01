@@ -68,6 +68,7 @@ extern atomic_t<u64> g_spu_web_instruction_count;
 extern atomic_t<u32> g_spu_web_last_pc[6];
 extern atomic_t<u64> g_spu_web_ls_boundary_count;
 extern atomic_t<u64> g_spu_web_ls_boundary_last;
+extern atomic_t<u64> g_spu_web_page_split_dma_count;
 #endif
 
 // The desktop frontend owns these input-profile globals. The browser host is
@@ -510,6 +511,48 @@ extern "C"
 		return s_atomic_notify_reentry_observed;
 	}
 
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_sparse_vm_probe()
+	{
+		constexpr u32 base = 0x60000000;
+		constexpr u32 page_size = 0x1000;
+		constexpr u32 transfer_address = base + page_size - 0x100;
+		constexpr u32 transfer_size = 0x400;
+		if (vm::web_base(base) || vm::web_base(base + page_size))
+		{
+			return 0;
+		}
+
+		u8* first = static_cast<u8*>(std::aligned_alloc(page_size, page_size));
+		u8* second = static_cast<u8*>(std::aligned_alloc(page_size, page_size));
+		if (!first || !second)
+		{
+			std::free(first);
+			std::free(second);
+			return 0;
+		}
+
+		u8* const higher = reinterpret_cast<uptr>(first) > reinterpret_cast<uptr>(second) ? first : second;
+		u8* const lower = higher == first ? second : first;
+		vm::web_map(base, page_size, higher);
+		vm::web_map(base + page_size, page_size, lower);
+
+		std::array<u8, transfer_size> input{};
+		std::array<u8, transfer_size> output{};
+		for (u32 index = 0; index < transfer_size; ++index)
+		{
+			input[index] = static_cast<u8>((index * 37 + 11) & 0xff);
+		}
+
+		const u32 result = !vm::web_is_contiguous(transfer_address, transfer_size) &&
+			vm::web_copy_range(transfer_address, input.data(), transfer_size, true) &&
+			vm::web_copy_range(transfer_address, output.data(), transfer_size, false) &&
+			input == output;
+		vm::web_unmap(base, page_size * 2);
+		std::free(first);
+		std::free(second);
+		return result;
+	}
+
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_sync_logs()
 	{
 		logs::listener::sync_all();
@@ -550,6 +593,11 @@ extern "C"
 		return g_spu_web_ls_boundary_last;
 	}
 
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_spu_page_split_dma_count()
+	{
+		return g_spu_web_page_split_dma_count;
+	}
+
 	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_vm_range_lock_bits(u32 exclusive)
 	{
 		return vm::g_range_lock_bits[exclusive != 0].load();
@@ -578,6 +626,11 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_clock_scale(u32 percent)
 	{
 		g_cfg.core.clocks_scale.set(std::clamp(percent, 10u, 3000u));
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_accurate_spu_dma(s32 enabled)
+	{
+		g_cfg.core.spu_accurate_dma.set(enabled != 0);
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_trace_pc(u32 pc)

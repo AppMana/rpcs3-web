@@ -52,6 +52,12 @@ sys_net_error convert_error(bool is_blocking, int native_error, [[maybe_unused]]
 		ERROR_CASE(EBUSY);
 		ERROR_CASE(ENOSPC);
 		ERROR_CASE(EPIPE);
+#ifdef __EMSCRIPTEN__
+	case ENOSYS:
+		result = SYS_NET_EOPNOTSUPP;
+		name = "ENOSYS";
+		break;
+#endif
 #endif
 
 		// TODO: We don't currently support EFAULT or EINTR

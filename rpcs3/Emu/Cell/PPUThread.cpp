@@ -2691,7 +2691,7 @@ void ppu_thread::cpu_task()
 				return;
 			}
 
-#if !defined(RPCS3_WEB_INTERPRETER_ONLY)
+#if !defined(RPCS3_WEB_INTERPRETER_ONLY) && !defined(RPCS3_PORTABLE_SPU_INTERPRETER)
 			spu_cache::initialize();
 #endif
 
@@ -4896,7 +4896,7 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 					_main.name = ' '; // Make ppu_finalize work
 					Emu.ConfigurePPUCache();
 					ppu_initialize(_main, false, file_size);
-#if !defined(RPCS3_WEB_INTERPRETER_ONLY)
+#if !defined(RPCS3_WEB_INTERPRETER_ONLY) && !defined(RPCS3_PORTABLE_SPU_INTERPRETER)
 					spu_cache::initialize(false);
 #endif
 					ppu_finalize(_main, true);

@@ -13,7 +13,9 @@ let tracePc = 0;
 let traceDelayPc = 0;
 let watchAddress = 0;
 let clockScale = 0;
+let accurateSpuDma;
 let atomicNotifyReentry = 0;
+let sparseVmProbe = 0;
 let packetTimeoutMs = 10_000;
 let progressIntervalMs = 250;
 let progressTimer;
@@ -74,6 +76,7 @@ function progress(includeThreads = false) {
       module.ccall("rpcs3_web_spu_last_pc", "number", ["number"], [index]) >>> 0),
     spuLsBoundaryCount: Number(module.ccall("rpcs3_web_spu_ls_boundary_count", "bigint", [], [])),
     spuLsBoundaryLast: `0x${module.ccall("rpcs3_web_spu_ls_boundary_last", "bigint", [], []).toString(16).padStart(16, "0")}`,
+    spuPageSplitDmaCount: Number(module.ccall("rpcs3_web_spu_page_split_dma_count", "bigint", [], [])),
     vmRangeLocks: vmRangeLocks(),
     vmPpuLocks: vmPpuLocks(),
     tracePc,
@@ -185,9 +188,11 @@ async function captureFrame(type, discardPackets = false) {
       module.ccall("rpcs3_web_spu_last_pc", "number", ["number"], [index]) >>> 0),
     spuLsBoundaryCount: Number(module.ccall("rpcs3_web_spu_ls_boundary_count", "bigint", [], [])),
     spuLsBoundaryLast: `0x${module.ccall("rpcs3_web_spu_ls_boundary_last", "bigint", [], []).toString(16).padStart(16, "0")}`,
+    spuPageSplitDmaCount: Number(module.ccall("rpcs3_web_spu_page_split_dma_count", "bigint", [], [])),
     tracePc,
     traceHits: module.ccall("rpcs3_web_trace_hits", "number", [], []) >>> 0,
     atomicNotifyReentry,
+    sparseVmProbe,
     entryOpd: [0x40250, 0x40254].map((address) => debugRead32(address)),
     entryCodeWord: debugRead32(0x1022c),
     elapsedMs: performance.now() - bootStartedAt,
@@ -238,6 +243,7 @@ scope.addEventListener("message", async (event) => {
   traceDelayPc = Number(event.data.traceDelayPc) >>> 0;
   watchAddress = Number(event.data.watchAddress) >>> 0;
   clockScale = Math.max(0, Math.min(3_000, Number(event.data.clockScale) || 0)) >>> 0;
+  accurateSpuDma = typeof event.data.accurateSpuDma === "boolean" ? event.data.accurateSpuDma : undefined;
   packetTimeoutMs = Math.max(1_000, Math.min(300_000, Number(event.data.packetTimeoutMs) || 10_000));
   progressIntervalMs = Math.max(100, Math.min(10_000, Number(event.data.progressIntervalMs) || 250));
   try {
@@ -262,8 +268,12 @@ scope.addEventListener("message", async (event) => {
     module.ccall("rpcs3_web_set_null_renderer", null, ["number"], [event.data.renderer === "null" ? 1 : 0]);
     bootStartedAt = performance.now();
     initialized = module.ccall("rpcs3_web_init", "number", [], []);
+    sparseVmProbe = module.ccall("rpcs3_web_sparse_vm_probe", "number", [], []);
     module.ccall("rpcs3_webgpu_set_capture_level", null, ["number"], [Number(event.data.packetCaptureLevel ?? 4)]);
     if (clockScale) module.ccall("rpcs3_web_set_clock_scale", null, ["number"], [clockScale]);
+    if (typeof accurateSpuDma === "boolean") {
+      module.ccall("rpcs3_web_set_accurate_spu_dma", null, ["number"], [accurateSpuDma ? 1 : 0]);
+    }
     module.ccall("rpcs3_web_set_trace_pc", null, ["number"], [tracePc]);
     module.ccall("rpcs3_web_set_trace_delay", null, ["number", "number"], [
       traceDelayPc,

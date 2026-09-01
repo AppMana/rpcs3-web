@@ -42,8 +42,13 @@ namespace
 void spu_web_set_escape_context(std::jmp_buf* context) noexcept
 {
 	s_escape_context = context;
+#if defined(RPCS3_PORTABLE_SPU_INTERPRETER)
+	spu_runtime::g_escape = &web_spu_escape;
+	spu_runtime::g_tail_escape = &web_spu_tail_escape;
+#endif
 }
 
+#if !defined(RPCS3_PORTABLE_SPU_INTERPRETER)
 std::array<atomic_t<spu_function_t>, (1 << 20)>* const spu_runtime::g_dispatcher = nullptr;
 const spu_function_t spu_runtime::g_gateway = &web_spu_gateway;
 void (*const spu_runtime::g_escape)(spu_thread*) = &web_spu_escape;
@@ -213,3 +218,4 @@ std::vector<u32> spu_thread::discover_functions(u32 base_addr, std::span<const u
 	std::sort(addrs.begin(), addrs.end());
 	return addrs;
 }
+#endif

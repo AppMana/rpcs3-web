@@ -41,6 +41,10 @@ endif()
 gen_git_version(${CMAKE_CURRENT_SOURCE_DIR})
 
 if(RPCS3_WEB)
+	set(RPCS3_WEB_INITIAL_MEMORY "536870912" CACHE STRING
+		"Initial Wasm linear-memory size for the full browser runtime")
+	option(RPCS3_WEB_ALLOW_MEMORY_GROWTH
+		"Allow the full browser runtime to grow its shared Wasm memory" ON)
 	add_executable(rpcs3_web_runtime
 		${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_main.cpp)
 	target_link_libraries(rpcs3_web_runtime PRIVATE
@@ -57,10 +61,9 @@ if(RPCS3_WEB)
 		"-sEXPORT_ES6=1"
 		"-sEXPORT_NAME=createRPCS3"
 		"-sENVIRONMENT=web,worker"
-		"-sALLOW_MEMORY_GROWTH=1"
 		"-sWASMFS=1"
 		"-sMAXIMUM_MEMORY=2147483648"
-		"-sINITIAL_MEMORY=536870912"
+		"-sINITIAL_MEMORY=${RPCS3_WEB_INITIAL_MEMORY}"
 		"-sSTACK_SIZE=8388608"
 		"-sPTHREAD_POOL_SIZE=64"
 		"-sNO_EXIT_RUNTIME=1"
@@ -71,6 +74,11 @@ if(RPCS3_WEB)
 		"-g1"
 		"--profiling-funcs"
 		"-sWASM_BIGINT=1")
+	if(RPCS3_WEB_ALLOW_MEMORY_GROWTH)
+		target_link_options(rpcs3_web_runtime PRIVATE "-sALLOW_MEMORY_GROWTH=1")
+	else()
+		target_link_options(rpcs3_web_runtime PRIVATE "-sALLOW_MEMORY_GROWTH=0")
+	endif()
 
 	# Compile the original low-dependency RPCS3 GoogleTest sources to Wasm.  The
 	# project already carries this GoogleTest copy through yaml-cpp, which keeps

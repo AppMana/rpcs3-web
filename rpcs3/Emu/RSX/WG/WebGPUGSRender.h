@@ -5,6 +5,7 @@
 #include "WebGPUCommand.h"
 
 #include <cstdint>
+#include <vector>
 
 class WebGPUGSRender : public GSRender
 {
@@ -24,5 +25,6 @@ private:
 	void emit_control_packet(rsx::webgpu::packet_kind kind, u32 value, u32 flags = 0);
 
 	rsx::vertex_input_layout m_vertex_layout;
+	std::vector<rsx::webgpu::texture_packet_record> m_frame_textures;
 	std::uint64_t m_sequence = 0;
 };

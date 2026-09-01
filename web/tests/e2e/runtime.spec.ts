@@ -22,6 +22,7 @@ test("boots PS3 homebrew through the complete RPCS3 Wasm runtime", async ({ page
   expect(result.ok).toBe(true);
   expect(result.initialized).toBe(1);
   expect(result.bootResult).toBe(0);
+  expect(result.atomicNotifyReentry).toBe(1);
   expect(result.fixtureBytes).toBeGreaterThan(10_000);
   expect((result.events as Array<{ type?: string }>).some((event) => event.type === "rpcs3-running")).toBe(true);
   expect((result.logs as string[]).some((line) => line.includes("thread pool is exhausted"))).toBe(false);

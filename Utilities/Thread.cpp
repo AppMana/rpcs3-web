@@ -2769,11 +2769,6 @@ void thread_base::start()
 		v |= static_cast<u32>(thread_state::created);
 	});
 
-#ifdef __EMSCRIPTEN__
-	const auto web_thread_name = m_tname.load();
-	std::fprintf(stderr, "RPCS3 Web pthread start: %s\n", web_thread_name ? web_thread_name->c_str() : "<unnamed>");
-#endif
-
 #ifdef _WIN32
 	m_thread = ::_beginthreadex(nullptr, 0, entry_point, this, CREATE_SUSPENDED, nullptr);
 	ensure(m_thread);
@@ -2843,6 +2838,29 @@ void thread_base::initialize(void (*error_cb)())
 
 	atomic_wait_engine::set_wait_callback([](const void*, u64 attempts, u64 stamp0) -> bool
 	{
+	#ifdef __EMSCRIPTEN__
+		static thread_local bool s_servicing_memory_safe_point = false;
+
+		// Web futex waits are periodically re-entered because Emscripten cannot
+		// alert a worker blocked on an unrelated futex. Service a pending memory
+		// safe point here, before a contended host mutex can indefinitely retain
+		// the PPU's passive VM lock. check_state() may itself wait on an RPCS3
+		// mutex, so suppress callback re-entry for the complete safe-point call.
+		if (attempts != umax && !s_servicing_memory_safe_point)
+		{
+			if (cpu_thread* cpu = cpu_thread::get_current(); cpu)
+			{
+				const auto state = +cpu->state;
+				if (state & cpu_flag::memory && !(state & cpu_flag::wait) && !is_stopped(state))
+				{
+					s_servicing_memory_safe_point = true;
+					cpu->check_state();
+					s_servicing_memory_safe_point = false;
+				}
+			}
+		}
+	#endif
+
 		if (attempts == umax)
 		{
 			g_tls_wait_time += utils::get_tsc() - stamp0;
@@ -2856,10 +2874,6 @@ void thread_base::initialize(void (*error_cb)())
 	});
 
 	set_name(thread_ctrl::get_name_cached());
-#ifdef __EMSCRIPTEN__
-	std::fprintf(stderr, "RPCS3 Web pthread ready: id=0x%llx name=%s\n",
-		static_cast<u64>(pthread_self()), thread_ctrl::get_name_cached().c_str());
-#endif
 }
 
 void thread_base::set_name(std::string name)

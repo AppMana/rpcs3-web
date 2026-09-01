@@ -3,6 +3,7 @@
 #include "WebGPUCommand.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <limits>
 
@@ -15,6 +16,18 @@
 
 namespace rsx::webgpu
 {
+	static std::atomic<std::uint32_t> s_packet_capture_level{4};
+
+	std::uint32_t packet_capture_level()
+	{
+		return s_packet_capture_level.load(std::memory_order_relaxed);
+	}
+
+	void set_packet_capture_level(std::uint32_t level)
+	{
+		s_packet_capture_level.store(std::min(level, 4u), std::memory_order_relaxed);
+	}
+
 	command_queue::command_queue(std::size_t byte_limit)
 		: m_byte_limit(std::max<std::size_t>(byte_limit, 1))
 	{}
@@ -46,6 +59,18 @@ namespace rsx::webgpu
 			return 0;
 		}
 		return static_cast<std::uint32_t>(m_packets.front().size());
+	}
+
+	std::uint32_t command_queue::front_kind() const
+	{
+		std::lock_guard lock(m_mutex);
+		if (m_packets.empty())
+		{
+			return 0;
+		}
+
+		const draw_packet_view packet(m_packets.front());
+		return packet.valid() ? static_cast<std::uint32_t>(packet.header()->kind) : 0;
 	}
 
 	std::uint32_t command_queue::copy_front(std::span<std::byte> destination) const
@@ -129,6 +154,11 @@ extern "C"
 		return rsx::webgpu::host_command_queue().front_size();
 	}
 
+	RPCS3_WEB_EXPORT std::uint32_t rpcs3_webgpu_front_kind()
+	{
+		return rsx::webgpu::host_command_queue().front_kind();
+	}
+
 	RPCS3_WEB_EXPORT std::uint32_t rpcs3_webgpu_copy_front(void* destination, std::uint32_t capacity)
 	{
 		if (!destination && capacity)
@@ -152,6 +182,11 @@ extern "C"
 	RPCS3_WEB_EXPORT std::uint64_t rpcs3_webgpu_dropped_packets()
 	{
 		return rsx::webgpu::host_command_queue().dropped_packets();
+	}
+
+	RPCS3_WEB_EXPORT void rpcs3_webgpu_set_capture_level(std::uint32_t level)
+	{
+		rsx::webgpu::set_packet_capture_level(level);
 	}
 
 	RPCS3_WEB_EXPORT void rpcs3_webgpu_clear()

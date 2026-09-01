@@ -24,11 +24,17 @@ namespace
 int main()
 {
 	using namespace rsx::webgpu;
+	assert(packet_capture_level() == 4);
+	set_packet_capture_level(2);
+	assert(packet_capture_level() == 2);
+	set_packet_capture_level(9);
+	assert(packet_capture_level() == 4);
 
 	command_queue queue(1024);
 	assert(queue.push(make_packet(7)));
 	assert(queue.packet_count() == 1);
 	assert(queue.front_size() > sizeof(draw_packet_header));
+	assert(queue.front_kind() == static_cast<std::uint32_t>(packet_kind::draw));
 
 	std::array<std::byte, 8> too_small{};
 	assert(queue.copy_front(too_small) == queue.front_size());
@@ -40,6 +46,7 @@ int main()
 	assert(view.valid());
 	assert(view.header()->sequence == 7);
 	assert(queue.pop_front());
+	assert(queue.front_kind() == 0);
 	assert(!queue.pop_front());
 
 	command_queue bounded(256);

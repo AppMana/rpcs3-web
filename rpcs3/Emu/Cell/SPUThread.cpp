@@ -60,6 +60,21 @@ const u32 spu_frest_fraction_lut[32] =
 
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
 extern void spu_web_set_escape_context(std::jmp_buf* context) noexcept;
+atomic_t<u64> g_spu_web_instruction_count{0};
+atomic_t<u32> g_spu_web_last_pc[6]{};
+atomic_t<u64> g_spu_web_ls_boundary_count{0};
+atomic_t<u64> g_spu_web_ls_boundary_last{0};
+
+static void spu_web_note_ls_boundary(u32 lsa, u32 size)
+{
+	const u32 offset = lsa & (SPU_LS_SIZE - 1);
+
+	if (lsa >= SPU_LS_SIZE || size > SPU_LS_SIZE - offset)
+	{
+		g_spu_web_ls_boundary_last = (u64{lsa} << 32) | size;
+		g_spu_web_ls_boundary_count++;
+	}
+}
 #endif
 
 const u32 spu_frest_exponent_lut[256] =
@@ -1588,6 +1603,7 @@ void spu_thread::cpu_task()
 		const auto& table = g_fxo->get<spu_interpreter_rt>();
 
 		allow_interrupts_in_cpu_work = true;
+		u32 web_progress_batch = 0;
 		std::jmp_buf escape_context;
 		spu_web_set_escape_context(&escape_context);
 		while (true)
@@ -1606,6 +1622,13 @@ void spu_thread::cpu_task()
 			const u32 op = _ref<be_t<u32>>(pc);
 			if (table.decode(op)(*this, {op}))
 				pc += 4;
+
+			if (++web_progress_batch == 256)
+			{
+				g_spu_web_instruction_count += web_progress_batch;
+				g_spu_web_last_pc[index % std::size(g_spu_web_last_pc)] = pc;
+				web_progress_batch = 0;
+			}
 		}
 		spu_web_set_escape_context(nullptr);
 		allow_interrupts_in_cpu_work = false;
@@ -2100,6 +2123,10 @@ void spu_thread::push_snr(u32 number, u32 value)
 void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8* ls)
 {
 	perf_meter<"DMA"_u32> perf_;
+
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+	spu_web_note_ls_boundary(args.lsa, args.size);
+#endif
 
 	const bool is_get = (args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GET_CMD;
 
@@ -2961,6 +2988,10 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 					// Execute the postponed byteswapping and masking
 					s_size = std::bit_cast<be_t<u32>>(s_size) & ts_mask;
 
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+					spu_web_note_ls_boundary(arg_lsa, fetch_size * utils::align<u32>(s_size, 16));
+#endif
+
 					u8* src = vm::_ptr<u8>(0);
 					u8* dst = this->ls + arg_lsa;
 
@@ -3240,6 +3271,9 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 		// Try to inline the transfer
 		if (addr < RAW_SPU_BASE_ADDR && size && optimization_compatible == MFC_GET_CMD)
 		{
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+			spu_web_note_ls_boundary(arg_lsa + (addr & 0xf), size);
+#endif
 			const u8* src = vm::_ptr<u8>(addr);
 			u8* dst = this->ls + arg_lsa + (addr & 0xf);
 
@@ -3311,6 +3345,9 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 		// Avoid inlining huge transfers because it intentionally drops range lock unlock
 		else if (optimization_compatible == MFC_PUT_CMD && ((addr >> 28 == rsx::constants::local_mem_base >> 28) || (addr < RAW_SPU_BASE_ADDR && size - 1 <= 0x400 - 1 && (addr % 0x10000 + (size - 1)) < 0x10000)))
 		{
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+			spu_web_note_ls_boundary(arg_lsa + (addr & 0xf), size);
+#endif
 			if (addr >> 28 != rsx::constants::local_mem_base >> 28)
 			{
 				rsx_lock.update_if_enabled(addr, size, range_lock);

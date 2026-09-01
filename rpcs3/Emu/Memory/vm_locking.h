@@ -29,6 +29,13 @@ namespace vm
 	};
 
 	extern atomic_t<u64, 128> g_range_lock_bits[2];
+	extern atomic_t<u64, 128> g_range_lock_set[64];
+
+#ifdef RPCS3_WEB
+	u32 web_ppu_lock_count() noexcept;
+	u32 web_ppu_lock_id(u32 index) noexcept;
+	u32 web_ppu_lock_state(u32 index) noexcept;
+#endif
 
 	extern atomic_t<u64> g_shmem[];
 

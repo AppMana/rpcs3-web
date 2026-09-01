@@ -161,7 +161,7 @@ struct ppu_exec_select
 };
 
 // Switch between inlined interpreter invocation (exec) and builder function
-#if defined(ARCH_X64)
+#if defined(ARCH_X64) && !defined(RPCS3_PORTABLE_PPU_INTERPRETER)
 #define RETURN(...) \
 	if constexpr (Build == 0) { \
 		static_cast<void>(exec); \

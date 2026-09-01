@@ -523,17 +523,22 @@ static ppu_intrp_func_t ppu_cache(u32 addr);
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
 namespace
 {
-	shared_mutex s_ppu_web_dispatch_mutex;
-	std::unordered_map<u32, ppu_intrp_func_t> s_ppu_web_dispatch_overrides;
+	struct ppu_web_dispatch_page
+	{
+		std::atomic<ppu_intrp_func_t> entries[0x10000 / sizeof(u32)]{};
+	};
+
+	std::array<std::atomic<ppu_web_dispatch_page*>, 0x10000> s_ppu_web_dispatch_pages{};
+	std::mutex s_ppu_web_dispatch_mutex;
 }
 
 static inline ppu_intrp_func_t ppu_read(u32 addr)
 {
+	if (const auto page = s_ppu_web_dispatch_pages[addr >> 16].load(std::memory_order_acquire))
 	{
-		reader_lock lock(s_ppu_web_dispatch_mutex);
-		if (const auto found = s_ppu_web_dispatch_overrides.find(addr); found != s_ppu_web_dispatch_overrides.end())
+		if (const auto function = page->entries[(addr & 0xffff) / sizeof(u32)].load(std::memory_order_acquire))
 		{
-			return found->second;
+			return function;
 		}
 	}
 	return ppu_cache(addr);
@@ -541,15 +546,21 @@ static inline ppu_intrp_func_t ppu_read(u32 addr)
 
 static inline void ppu_write(u32 addr, ppu_intrp_func_t function)
 {
-	std::lock_guard lock(s_ppu_web_dispatch_mutex);
-	if (function)
+	auto& page_slot = s_ppu_web_dispatch_pages[addr >> 16];
+	auto page = page_slot.load(std::memory_order_acquire);
+	if (!page && function)
 	{
-		s_ppu_web_dispatch_overrides.insert_or_assign(addr, function);
+		std::lock_guard lock(s_ppu_web_dispatch_mutex);
+		page = page_slot.load(std::memory_order_relaxed);
+		if (!page)
+		{
+			page = new ppu_web_dispatch_page;
+			page_slot.store(page, std::memory_order_release);
+		}
 	}
-	else
-	{
-		s_ppu_web_dispatch_overrides.erase(addr);
-	}
+
+	if (page)
+		page->entries[(addr & 0xffff) / sizeof(u32)].store(function, std::memory_order_release);
 }
 #else
 static inline ppu_intrp_func_t ppu_read(u32 addr)
@@ -3401,12 +3412,6 @@ be_t<u64>* ppu_thread::get_stack_arg(s32 i, u64 align)
 
 void ppu_thread::fast_call(u32 addr, u64 rtoc, bool is_thread_entry)
 {
-#ifdef RPCS3_WEB
-	if (is_thread_entry)
-	{
-		std::fprintf(stderr, "RPCS3 Web PPU entry: addr=0x%08x rtoc=0x%08llx\n", addr, rtoc);
-	}
-#endif
 	const auto old_cia = cia;
 	const auto old_rtoc = gpr[2];
 	const auto old_lr = lr;

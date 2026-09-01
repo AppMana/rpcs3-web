@@ -2145,14 +2145,20 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 	// Write PARAM.SFO and savedata
 	if (!psf.empty() && has_modified)
 	{
-		// First, create temporary directory
-		if (fs::create_dir(new_path) || fs::g_tls_error == fs::error::exist)
+#ifdef RPCS3_WEB
+		const std::string& write_path = dir_path;
+#else
+		const std::string& write_path = new_path;
+#endif
+
+		// First, create destination directory
+		if (fs::create_dir(write_path) || fs::g_tls_error == fs::error::exist)
 		{
-			fs::remove_all(new_path, false);
+			fs::remove_all(write_path, false);
 		}
 		else
 		{
-			fmt::throw_exception("Failed to create directory %s (%s)", new_path, fs::g_tls_error);
+			fmt::throw_exception("Failed to create directory %s (%s)", write_path, fs::g_tls_error);
 		}
 
 		// add file list per FS order to PARAM.SFO
@@ -2171,11 +2177,11 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 			{
 				auto&& fvec = static_cast<fs::container_stream<std::vector<uchar>>&>(*file);
 #ifdef _WIN32
-				fs::pending_file f(new_path + vfs::escape(pair.first));
+				fs::pending_file f(write_path + vfs::escape(pair.first));
 				f.file.write(fvec.obj);
 				ensure(f.commit());
 #else
-				ensure(fs::write_file(new_path + vfs::escape(pair.first), fs::rewrite, fvec.obj));
+				ensure(fs::write_file(write_path + vfs::escape(pair.first), fs::rewrite, fvec.obj));
 #endif
 			}
 		}
@@ -2183,9 +2189,14 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 		for (auto&& pair : all_times)
 		{
 			// Restore atime/mtime for files which have not been modified
-			fs::utime(new_path + vfs::escape(pair.first), pair.second.first, pair.second.second);
+			fs::utime(write_path + vfs::escape(pair.first), pair.second.first, pair.second.second);
 		}
 
+#ifdef RPCS3_WEB
+		fs::remove_all(new_path);
+		fs::remove_all(old_path);
+		fs::sync();
+#else
 		// Remove old backup
 		fs::remove_all(old_path);
 		fs::sync();
@@ -2205,6 +2216,7 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 
 		// Remove backup again (TODO: may be changed to persistent backup implementation)
 		fs::remove_all(old_path);
+#endif
 	}
 
 	if (show_auto_indicator)

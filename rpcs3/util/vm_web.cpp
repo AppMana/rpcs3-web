@@ -29,20 +29,11 @@ namespace utils
 		}
 
 		const usz aligned_size = (size + 0xffff) & ~usz{0xffff};
-#ifdef RPCS3_WEB
-		if (size >= 128 * 1024 * 1024) std::fprintf(stderr, "RPCS3 Web VM backing: allocate %zu bytes\n", static_cast<std::size_t>(aligned_size));
-#endif
 		void* ptr = std::aligned_alloc(0x10000, aligned_size);
 
 		if (ptr)
 		{
-#ifdef RPCS3_WEB
-			if (size >= 128 * 1024 * 1024) std::fprintf(stderr, "RPCS3 Web VM backing: zeroing\n");
-#endif
 			std::memset(ptr, 0, aligned_size);
-#ifdef RPCS3_WEB
-			if (size >= 128 * 1024 * 1024) std::fprintf(stderr, "RPCS3 Web VM backing: ready\n");
-#endif
 		}
 
 		return ptr;

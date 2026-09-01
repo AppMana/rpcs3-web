@@ -5,8 +5,10 @@
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/Cell/SPUThread.h"
 #include "Emu/RSX/GSFrameBase.h"
+#include "Emu/RSX/Null/NullGSRender.h"
 #include "Emu/RSX/WG/WebGPUGSRender.h"
 #include "Emu/Memory/vm.h"
+#include "Emu/Memory/vm_locking.h"
 #include "Emu/Audio/Null/NullAudioBackend.h"
 #include "Emu/Audio/Null/null_enumerator.h"
 #include "Emu/Io/Null/null_camera_handler.h"
@@ -62,6 +64,10 @@ extern atomic_t<u32> g_ppu_web_trace_delay_hits;
 extern atomic_t<u32> g_ppu_web_trace_delay_ms;
 extern atomic_t<u32> g_ppu_web_watch_address;
 extern std::vector<std::string> g_ppu_function_names;
+extern atomic_t<u64> g_spu_web_instruction_count;
+extern atomic_t<u32> g_spu_web_last_pc[6];
+extern atomic_t<u64> g_spu_web_ls_boundary_count;
+extern atomic_t<u64> g_spu_web_ls_boundary_last;
 #endif
 
 // The desktop frontend owns these input-profile globals. The browser host is
@@ -72,12 +78,15 @@ std::string g_input_config_override;
 namespace
 {
 	std::atomic<bool> s_initialized{false};
+	std::atomic<bool> s_null_renderer{false};
 	std::atomic<s32> s_storage_state{0};
 	std::atomic<u32> s_firmware_result{0};
 	std::atomic<u32> s_firmware_progress{0};
 	std::atomic<u32> s_firmware_total{0};
 	std::atomic<u32> s_last_boot_result{static_cast<u32>(game_boot_result::nothing_to_boot)};
 	std::unique_ptr<logs::listener> s_log_listener;
+	thread_local bool s_atomic_notify_reentry_observed = false;
+	std::atomic<bool> s_atomic_notify_watchdog_fired{false};
 
 	EM_JS(void, notify_host_event, (const char* event, u32 value), {
 		const message = { type: UTF8ToString(event), value };
@@ -300,7 +309,14 @@ namespace
 		callbacks.get_music_handler = [] { return std::make_shared<null_music_handler>(); };
 		callbacks.init_gs_render = [](utils::serial* ar)
 		{
-			g_fxo->init<rsx::thread, named_thread<WebGPUGSRender>>(ar);
+			if (s_null_renderer)
+			{
+				g_fxo->init<rsx::thread, named_thread<NullGSRender>>(ar);
+			}
+			else
+			{
+				g_fxo->init<rsx::thread, named_thread<WebGPUGSRender>>(ar);
+			}
 		};
 		callbacks.get_audio = [] { return std::make_shared<NullAudioBackend>(); };
 		callbacks.get_audio_enumerator = [](u64) { return std::make_shared<null_enumerator>(); };
@@ -391,8 +407,9 @@ extern "C"
 		}
 		Emu.SetHasGui(false);
 		Emu.SetHeadless(false);
-		Emu.SetSupportedRenderers({video_renderer::webgpu});
-		Emu.SetDefaultRenderer(video_renderer::webgpu);
+		const video_renderer renderer = s_null_renderer ? video_renderer::null : video_renderer::webgpu;
+		Emu.SetSupportedRenderers({renderer});
+		Emu.SetDefaultRenderer(renderer);
 		Emu.SetUsr("00000001");
 		Emu.Init();
 		notify_host_event("rpcs3-initialized", 0);
@@ -412,6 +429,14 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_firmware_result()
 	{
 		return s_firmware_result;
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_null_renderer(s32 enabled)
+	{
+		if (!s_initialized)
+		{
+			s_null_renderer = enabled != 0;
+		}
 	}
 
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_firmware_progress()
@@ -455,6 +480,36 @@ extern "C"
 		return static_cast<u32>(Emu.GetStatus(false));
 	}
 
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_atomic_notify_reentry_probe()
+	{
+		atomic_t<u32> value{0};
+		s_atomic_notify_watchdog_fired = false;
+		s_atomic_notify_reentry_observed = false;
+		atomic_wait_engine::set_wait_callback([](const void* data, u64 attempts, u64)
+		{
+			if (attempts == 1)
+			{
+				s_atomic_notify_reentry_observed = !s_atomic_notify_watchdog_fired.load(std::memory_order_acquire);
+				atomic_wait_engine::notify_all(data);
+				return false;
+			}
+
+			return true;
+		});
+
+		std::thread notifier([&value]
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			s_atomic_notify_watchdog_fired.store(true, std::memory_order_release);
+			value = 1;
+			value.notify_all();
+		});
+		value.wait(0);
+		notifier.join();
+		atomic_wait_engine::set_wait_callback(nullptr);
+		return s_atomic_notify_reentry_observed;
+	}
+
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_sync_logs()
 	{
 		logs::listener::sync_all();
@@ -473,6 +528,51 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_last_pc()
 	{
 		return g_ppu_web_last_pc;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_spu_instruction_count()
+	{
+		return g_spu_web_instruction_count;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_last_pc(u32 index)
+	{
+		return index < std::size(g_spu_web_last_pc) ? g_spu_web_last_pc[index].load() : 0;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_spu_ls_boundary_count()
+	{
+		return g_spu_web_ls_boundary_count;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_spu_ls_boundary_last()
+	{
+		return g_spu_web_ls_boundary_last;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_vm_range_lock_bits(u32 exclusive)
+	{
+		return vm::g_range_lock_bits[exclusive != 0].load();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_vm_range_lock(u32 index)
+	{
+		return index < std::size(vm::g_range_lock_set) ? vm::g_range_lock_set[index].load() : 0;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_vm_ppu_lock_count()
+	{
+		return vm::web_ppu_lock_count();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_vm_ppu_lock_id(u32 index)
+	{
+		return vm::web_ppu_lock_id(index);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_vm_ppu_lock_state(u32 index)
+	{
+		return vm::web_ppu_lock_state(index);
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_clock_scale(u32 percent)

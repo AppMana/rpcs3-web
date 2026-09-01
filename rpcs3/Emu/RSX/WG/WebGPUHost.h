@@ -19,6 +19,7 @@ namespace rsx::webgpu
 
 		[[nodiscard]] bool push(std::vector<std::byte> packet);
 		[[nodiscard]] std::uint32_t front_size() const;
+		[[nodiscard]] std::uint32_t front_kind() const;
 		[[nodiscard]] std::uint32_t copy_front(std::span<std::byte> destination) const;
 		[[nodiscard]] bool pop_front();
 
@@ -36,6 +37,8 @@ namespace rsx::webgpu
 	};
 
 	command_queue& host_command_queue();
+	std::uint32_t packet_capture_level();
+	void set_packet_capture_level(std::uint32_t level);
 }
 
 // Copy-based C ABI consumed from a browser worker.  copy_front returns the
@@ -45,9 +48,11 @@ extern "C"
 	std::uint32_t rpcs3_webgpu_packet_abi();
 	std::uint32_t rpcs3_webgpu_packet_count();
 	std::uint32_t rpcs3_webgpu_front_size();
+	std::uint32_t rpcs3_webgpu_front_kind();
 	std::uint32_t rpcs3_webgpu_copy_front(void* destination, std::uint32_t capacity);
 	std::uint32_t rpcs3_webgpu_pop_front();
 	std::uint64_t rpcs3_webgpu_queued_bytes();
 	std::uint64_t rpcs3_webgpu_dropped_packets();
+	void rpcs3_webgpu_set_capture_level(std::uint32_t level);
 	void rpcs3_webgpu_clear();
 }

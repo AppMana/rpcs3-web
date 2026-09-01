@@ -134,6 +134,25 @@ namespace vm
 	// Memory mutex: passive locks
 	std::array<atomic_t<cpu_thread*>, g_cfg.core.ppu_threads.max> g_locks{};
 
+#ifdef RPCS3_WEB
+	u32 web_ppu_lock_count() noexcept
+	{
+		return g_cfg.core.ppu_threads;
+	}
+
+	u32 web_ppu_lock_id(u32 index) noexcept
+	{
+		const auto cpu = index < static_cast<u32>(g_cfg.core.ppu_threads) ? +g_locks[index] : nullptr;
+		return cpu ? cpu->id : 0;
+	}
+
+	u32 web_ppu_lock_state(u32 index) noexcept
+	{
+		const auto cpu = index < static_cast<u32>(g_cfg.core.ppu_threads) ? +g_locks[index] : nullptr;
+		return cpu ? static_cast<u32>(+cpu->state) : 0;
+	}
+#endif
+
 	// Range lock slot allocation bits
 	atomic_t<u64, 128> g_range_lock_bits[2]{};
 
@@ -1189,26 +1208,7 @@ namespace vm
 
 	bool falloc(u32 addr, u32 size, memory_location_t location, const std::shared_ptr<utils::shm>* src)
 	{
-#ifdef RPCS3_WEB
-		const bool web_large_allocation = size >= 128 * 1024 * 1024;
-		if (web_large_allocation)
-		{
-			const auto* cpu = get_current_cpu_thread();
-			std::fprintf(stderr, "RPCS3 Web VM falloc dispatch: addr=0x%x size=0x%x exclusive=0x%llx ranges=0x%llx cpu_state=0x%llx tls_lock=%d\n",
-				addr, size,
-				static_cast<unsigned long long>(g_range_lock_bits[1].load()),
-				static_cast<unsigned long long>(g_range_lock_bits[0].load()),
-				static_cast<unsigned long long>(cpu ? static_cast<bs_t<cpu_flag>::under>(cpu->state.load()) : 0),
-				g_tls_locked != nullptr);
-		}
-#endif
 		const auto block = get(location, addr);
-#ifdef RPCS3_WEB
-		if (web_large_allocation)
-		{
-			std::fprintf(stderr, "RPCS3 Web VM falloc dispatch: location resolved=%d\n", block != nullptr);
-		}
-#endif
 
 		if (!block)
 		{
@@ -1501,7 +1501,17 @@ namespace vm
 			shm = *src;
 		else
 		{
+			// Desktop RPCS3 keeps the complete 256 MiB RSX video aperture in one
+			// contiguous preallocated mapping. Preserve that tail on Wasm as well:
+			// optimized RSX/SPU copies may legally operate through a host pointer
+			// near the reported local-memory limit even though only the requested
+			// guest pages are published in the software page table.
+#ifdef RPCS3_WEB
+			const u32 backing_size = this->addr == rsx::constants::local_mem_base ? this->size : size;
+			shm = std::make_shared<utils::shm>(backing_size);
+#else
 			shm = std::make_shared<utils::shm>(size);
+#endif
 		}
 
 		const u32 max = (this->addr + this->size - size) & (0 - align);
@@ -1540,10 +1550,6 @@ namespace vm
 
 	bool block_t::falloc(u32 addr, const u32 orig_size, const std::shared_ptr<utils::shm>* src, u64 flags)
 	{
-#ifdef RPCS3_WEB
-		const bool web_large_allocation = orig_size >= 128 * 1024 * 1024;
-		if (web_large_allocation) std::fprintf(stderr, "RPCS3 Web VM falloc: begin addr=0x%x size=0x%x\n", addr, orig_size);
-#endif
 		if (!src)
 		{
 			// Use the block's flags (excpet for protection)
@@ -1584,13 +1590,17 @@ namespace vm
 			shm = *src;
 		else
 		{
+			// Match the desktop backend's contiguous 256 MiB RSX aperture while
+			// publishing only the guest-requested pages through web_map().
+#ifdef RPCS3_WEB
+			const u32 backing_size = this->addr == rsx::constants::local_mem_base ? this->size : size;
+			shm = std::make_shared<utils::shm>(backing_size);
+#else
 			shm = std::make_shared<utils::shm>(size);
+#endif
 		}
 
 		vm::writer_lock lock;
-#ifdef RPCS3_WEB
-		if (web_large_allocation) std::fprintf(stderr, "RPCS3 Web VM falloc: writer lock acquired\n");
-#endif
 
 		if (!is_valid())
 		{
@@ -1602,9 +1612,6 @@ namespace vm
 		{
 			return false;
 		}
-#ifdef RPCS3_WEB
-		if (web_large_allocation) std::fprintf(stderr, "RPCS3 Web VM falloc: mapped\n");
-#endif
 
 		return true;
 	}

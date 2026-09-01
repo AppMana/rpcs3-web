@@ -153,6 +153,15 @@ export function copyFrontPacket(module) {
   }
 }
 
+export function discardFrontPacket(module) {
+  const kind = module.ccall("rpcs3_webgpu_front_kind", "number", [], []) >>> 0;
+  if (!kind) return undefined;
+  if (module.ccall("rpcs3_webgpu_pop_front", "number", [], []) !== 1) {
+    throw new Error("WebGPU packet disappeared before discard");
+  }
+  return kind;
+}
+
 export function packetSummary(packet) {
   const summary = {
     kind: packet.kind,

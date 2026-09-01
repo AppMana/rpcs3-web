@@ -15,6 +15,12 @@
 #include <variant>
 #include <vector>
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wold-style-cast"
+#define XXH_INLINE_ALL
+#include <common/xxhash.h>
+#pragma clang diagnostic pop
+
 namespace
 {
 	using byte_vector = std::vector<std::byte>;
@@ -52,11 +58,13 @@ namespace
 	{
 		rsx::webgpu::texture_packet_record record;
 		u32 address = 0;
+		u32 payload_size = 0;
 	};
 
 	struct texture_capture
 	{
 		byte_vector bytes;
+		std::vector<rsx::webgpu::texture_packet_record> additions;
 		bool complete = true;
 	};
 
@@ -135,17 +143,40 @@ namespace
 		return true;
 	}
 
-	u32 hash_bytes(std::span<const std::byte> bytes)
+	bool hash_guest_bytes(u32 address, u32 size, u32& result)
 	{
-		u32 hash = 2166136261u;
-		for (const std::byte value : bytes)
+		XXH32_state_t hash{};
+		XXH32_reset(&hash, 0);
+		usz hashed = 0;
+		while (hashed < size)
 		{
-			hash = (hash ^ static_cast<u8>(value)) * 16777619u;
+			const u32 current = address + static_cast<u32>(hashed);
+			const usz chunk = std::min<usz>(size - hashed, 0x1000 - (current & 0xfff));
+			const auto* source = static_cast<const std::byte*>(vm::base(current));
+			if (!source)
+			{
+				return false;
+			}
+			XXH32_update(&hash, source, chunk);
+			hashed += chunk;
 		}
-		return hash;
+		result = XXH32_digest(&hash);
+		return true;
 	}
 
-	texture_capture capture_textures(u32 fragment_mask, u32 vertex_mask)
+	bool same_texture(const rsx::webgpu::texture_packet_record& lhs,
+		const rsx::webgpu::texture_packet_record& rhs)
+	{
+		return lhs.stage == rhs.stage && lhs.slot == rhs.slot && lhs.address == rhs.address &&
+			lhs.format == rhs.format && lhs.width == rhs.width && lhs.height == rhs.height &&
+			lhs.depth == rhs.depth && lhs.pitch == rhs.pitch && lhs.mip_count == rhs.mip_count &&
+			lhs.dimension == rhs.dimension && lhs.data_size == rhs.data_size &&
+			lhs.content_hash == rhs.content_hash && lhs.remap == rhs.remap &&
+			lhs.address_modes == rhs.address_modes && lhs.filter_modes == rhs.filter_modes;
+	}
+
+	texture_capture capture_textures(u32 fragment_mask, u32 vertex_mask,
+		const std::vector<rsx::webgpu::texture_packet_record>& frame_cache)
 	{
 		std::vector<texture_source> sources;
 		bool complete = true;
@@ -165,18 +196,37 @@ namespace
 			}
 		}
 
+		texture_capture result;
 		usz total_size = sources.size() * sizeof(rsx::webgpu::texture_packet_record);
-		for (const auto& source : sources)
+		for (auto& source : sources)
 		{
-			total_size = align_up(total_size, 16);
-			if (total_size > std::numeric_limits<u32>::max() - source.record.data_size)
+			if (!source.record.data_size ||
+				!hash_guest_bytes(source.address, source.record.data_size, source.record.content_hash))
 			{
-				return {{}, false};
+				return {{}, {}, false};
 			}
-			total_size += source.record.data_size;
+
+			const auto is_match = [&](const auto& entry)
+			{
+				return same_texture(entry, source.record);
+			};
+			const bool cached = std::any_of(frame_cache.begin(), frame_cache.end(), is_match) ||
+				std::any_of(result.additions.begin(), result.additions.end(), is_match);
+			source.payload_size = cached ? 0 : source.record.data_size;
+			if (!cached)
+			{
+				result.additions.push_back(source.record);
+			}
+
+			total_size = align_up(total_size, 16);
+			if (total_size > std::numeric_limits<u32>::max() - source.payload_size)
+			{
+				return {{}, {}, false};
+			}
+			total_size += source.payload_size;
 		}
 
-		texture_capture result{{}, complete};
+		result.complete = complete;
 		result.bytes.resize(total_size);
 		usz data_offset = sources.size() * sizeof(rsx::webgpu::texture_packet_record);
 		for (usz index = 0; index < sources.size(); ++index)
@@ -184,16 +234,16 @@ namespace
 			auto& source = sources[index];
 			data_offset = align_up(data_offset, 16);
 			source.record.data_offset = static_cast<u32>(data_offset);
-			const std::span texture_bytes{result.bytes.data() + data_offset, source.record.data_size};
-			if (!copy_guest_bytes(texture_bytes, source.address))
+			source.record.data_size = source.payload_size;
+			const std::span texture_bytes{result.bytes.data() + data_offset, source.payload_size};
+			if (source.payload_size && !copy_guest_bytes(texture_bytes, source.address))
 			{
 				result.complete = false;
 				result.bytes.clear();
 				return result;
 			}
-			source.record.content_hash = hash_bytes(texture_bytes);
 			std::memcpy(result.bytes.data() + index * sizeof(source.record), &source.record, sizeof(source.record));
-			data_offset += source.record.data_size;
+			data_offset += source.payload_size;
 		}
 
 		return result;
@@ -345,6 +395,11 @@ void WebGPUGSRender::end()
 
 bool WebGPUGSRender::emit_draw_packet(u32 subdraw)
 {
+	if (rsx::webgpu::packet_capture_level() < 2)
+	{
+		return true;
+	}
+
 	auto& clause = rsx::method_registers.current_draw_clause;
 	const auto state = subdraw == 0
 		? rsx::flags32_t{rsx::vertex_arrays_changed}
@@ -408,9 +463,10 @@ bool WebGPUGSRender::emit_draw_packet(u32 subdraw)
 
 	std::array<std::byte, 468 * 16> vertex_constants{};
 	m_draw_processor.fill_vertex_program_constants_data(vertex_constants.data(), {});
-	const auto textures = capture_textures(
-		current_fp_metadata.referenced_textures_mask,
-		current_vp_metadata.referenced_textures_mask);
+	const u32 capture_level = rsx::webgpu::packet_capture_level();
+	auto textures = capture_level >= 4
+		? capture_textures(current_fp_metadata.referenced_textures_mask, current_vp_metadata.referenced_textures_mask, m_frame_textures)
+		: texture_capture{};
 
 	rsx::webgpu::draw_packet_header header{};
 	header.sequence = ++m_sequence;
@@ -421,7 +477,7 @@ bool WebGPUGSRender::emit_draw_packet(u32 subdraw)
 		(upload.primitive_expanded ? rsx::webgpu::packet_primitive_expanded : 0u) |
 		(current_fp_metadata.referenced_textures_mask ? rsx::webgpu::packet_uses_fragment_textures : 0u) |
 		(current_vp_metadata.referenced_textures_mask ? rsx::webgpu::packet_uses_vertex_textures : 0u) |
-		(!textures.complete
+		((capture_level < 4 && (current_fp_metadata.referenced_textures_mask || current_vp_metadata.referenced_textures_mask)) || !textures.complete
 			? rsx::webgpu::packet_texture_payload_pending : 0u);
 	header.first_vertex = upload.first_vertex;
 	header.vertex_count = upload.allocated_vertex_count;
@@ -462,11 +518,22 @@ bool WebGPUGSRender::emit_draw_packet(u32 subdraw)
 	packet_ok = packet.append(rsx::webgpu::section_kind::indices, upload.indices, 4) && packet_ok;
 	packet_ok = packet.append(rsx::webgpu::section_kind::textures, textures.bytes, 16) && packet_ok;
 
-	return packet_ok && rsx::webgpu::host_command_queue().push(packet.finish());
+	if (!packet_ok || !rsx::webgpu::host_command_queue().push(packet.finish()))
+	{
+		return false;
+	}
+
+	m_frame_textures.insert(m_frame_textures.end(), textures.additions.begin(), textures.additions.end());
+	return true;
 }
 
 void WebGPUGSRender::emit_control_packet(rsx::webgpu::packet_kind kind, u32 value, u32 flags)
 {
+	if (rsx::webgpu::packet_capture_level() == 0)
+	{
+		return;
+	}
+
 	rsx::webgpu::draw_packet_header header{};
 	header.sequence = ++m_sequence;
 	header.kind = kind;
@@ -506,6 +573,7 @@ void WebGPUGSRender::flip(const rsx::display_flip_info_t& info)
 {
 	const u32 flags = info.skip_frame ? rsx::webgpu::packet_skipped : 0u;
 	emit_control_packet(rsx::webgpu::packet_kind::flip, info.buffer, flags);
+	m_frame_textures.clear();
 	if (m_frame)
 	{
 		m_frame->flip(m_context, info.skip_frame);

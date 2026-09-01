@@ -29,6 +29,10 @@ if(USE_ASAN)
     set_source_files_properties(../../Utilities/Thread.cpp PROPERTIES COMPILE_DEFINITIONS USE_ASAN)
 endif()
 
+if(RPCS3_PORTABLE_PPU_INTERPRETER)
+    set_source_files_properties(Cell/PPUInterpreter.cpp PROPERTIES COMPILE_DEFINITIONS RPCS3_PORTABLE_PPU_INTERPRETER)
+endif()
+
 # GCC overemits weak type information when using LTO
 # This causes an issue with LLVM 22 which is build without RTTI
 # Issue is specifically related to vfs::ProxyFileSystem

@@ -28,11 +28,19 @@ const traceDelayPc = Number.parseInt(process.env.RPCS3_COMMERCIAL_TRACE_DELAY_PC
 const traceDelayMs = Math.max(0, Math.min(10_000, Number(process.env.RPCS3_COMMERCIAL_TRACE_DELAY_MS) || 0));
 const watchAddress = Number.parseInt(process.env.RPCS3_COMMERCIAL_WATCH_ADDRESS || "0", 0) >>> 0;
 const clockScale = Math.max(0, Math.min(3_000, Number(process.env.RPCS3_COMMERCIAL_CLOCK_SCALE) || 0));
+const renderer = process.env.RPCS3_COMMERCIAL_RENDERER === "null" ? "null" : "webgpu";
+const packetCaptureLevel = Math.max(0, Math.min(4, Number(process.env.RPCS3_COMMERCIAL_PACKET_CAPTURE_LEVEL ?? 4)));
 const captureRgba = process.env.RPCS3_COMMERCIAL_CAPTURE_RGBA === "1";
 const captureShaders = process.env.RPCS3_COMMERCIAL_CAPTURE_SHADERS === "1";
 const replayCount = Math.max(1, Math.min(10, Number(process.env.RPCS3_COMMERCIAL_REPLAY_COUNT) || 1));
 const packetFixturePath = process.env.RPCS3_COMMERCIAL_PACKET_FIXTURE
   ? path.resolve(process.env.RPCS3_COMMERCIAL_PACKET_FIXTURE)
+  : undefined;
+const cpuProfilePath = process.env.RPCS3_COMMERCIAL_CPU_PROFILE
+  ? path.resolve(process.env.RPCS3_COMMERCIAL_CPU_PROFILE)
+  : undefined;
+const tracePath = process.env.RPCS3_COMMERCIAL_TRACE
+  ? path.resolve(process.env.RPCS3_COMMERCIAL_TRACE)
   : undefined;
 const headed = process.env.RPCS3_HEADED === "1";
 
@@ -52,6 +60,32 @@ const context = await chromium.launchPersistentContext(profilePath, {
   args: chromeArgs,
 });
 let capturedPacketFrame;
+let cpuProfiler;
+let traceSession;
+let traceComplete;
+
+async function writeCpuProfile(profile) {
+  if (!cpuProfilePath || !profile) return;
+  await mkdir(path.dirname(cpuProfilePath), { recursive: true });
+  await writeFile(cpuProfilePath, `${JSON.stringify(profile)}\n`);
+}
+
+async function stopTrace() {
+  if (!traceSession || !traceComplete) return;
+  await traceSession.send("Tracing.end");
+  const { stream } = await traceComplete;
+  let trace = "";
+  while (true) {
+    const chunk = await traceSession.send("IO.read", { handle: stream });
+    trace += chunk.data;
+    if (chunk.eof) break;
+  }
+  await traceSession.send("IO.close", { handle: stream });
+  await mkdir(path.dirname(tracePath), { recursive: true });
+  await writeFile(tracePath, trace);
+  traceSession = undefined;
+  traceComplete = undefined;
+}
 
 try {
   const pages = context.pages();
@@ -76,8 +110,33 @@ try {
     process.stderr.write(`${line}\n`);
   });
 
+  if (cpuProfilePath) {
+    cpuProfiler = await context.newCDPSession(page);
+    await cpuProfiler.send("Profiler.enable");
+    await cpuProfiler.send("Profiler.setSamplingInterval", { interval: 1_000 });
+    await cpuProfiler.send("Profiler.start");
+  }
+  if (tracePath) {
+    traceSession = await context.newCDPSession(page);
+    traceComplete = new Promise((resolve) => traceSession.once("Tracing.tracingComplete", resolve));
+    await traceSession.send("Tracing.start", {
+      transferMode: "ReturnAsStream",
+      traceConfig: {
+        recordMode: "recordContinuously",
+        includedCategories: [
+          "toplevel",
+          "v8",
+          "v8.execute",
+          "v8.wasm",
+          "disabled-by-default-v8.cpu_profiler",
+          "disabled-by-default-v8.cpu_profiler.hires",
+        ],
+      },
+    });
+  }
+
   await page.goto(`${baseURL}/storage.html`, { waitUntil: "domcontentloaded" });
-  const execution = await page.evaluate(async ({ bootPath: guestPath, timeout, requestedFrames, presentToCanvas, untilDraw, renderInterval, captureFrameRgba, captureShaderPrograms, repeatedRenders, capturePacketFixture, watchedAddresses, tracedPc, tracedDelayPc, tracedDelayMs, watchedWriteAddress, guestClockScale }) => {
+  const execution = await page.evaluate(async ({ bootPath: guestPath, timeout, requestedFrames, presentToCanvas, untilDraw, renderInterval, captureFrameRgba, captureShaderPrograms, repeatedRenders, capturePacketFixture, watchedAddresses, tracedPc, tracedDelayPc, tracedDelayMs, watchedWriteAddress, guestClockScale, guestRenderer, guestPacketCaptureLevel }) => {
     const [{ decodeDrawPacket }, { prepareWebGPU, renderPacketsToWebGPU }] = await Promise.all([
       import("./rpcs3-webgpu-packet.mjs"),
       import("./rpcs3-webgpu-renderer.mjs"),
@@ -108,6 +167,9 @@ try {
       const frames = [];
       let lastProgress;
       let lastFrame;
+      const needsPackets = (frameNumber) => untilDraw || (
+        renderInterval > 0 && ((frameNumber - 1) % renderInterval === 0 || frameNumber === requestedFrames)
+      );
       const finish = (terminal) => {
         clearTimeout(timer);
         worker.terminate();
@@ -181,7 +243,7 @@ try {
             frames.push(frame);
             lastFrame = frame;
             if (serializable.ok && frames.length < requestedFrames && (!untilDraw || serializable.drawPacketCount === 0)) {
-              worker.postMessage({ type: "next-frame" });
+              worker.postMessage({ type: "next-frame", discardPackets: !needsPackets(frames.length + 1) });
             } else {
               finish(frame);
             }
@@ -200,7 +262,6 @@ try {
       worker.postMessage({
         type: "boot",
         path: guestPath,
-        returnPackets: true,
         packetTimeoutMs: Math.max(1_000, timeout - 5_000),
         progressIntervalMs: 1_000,
         debugAddresses: watchedAddresses,
@@ -209,6 +270,9 @@ try {
         traceDelayMs: tracedDelayMs,
         watchAddress: watchedWriteAddress,
         clockScale: guestClockScale,
+        renderer: guestRenderer,
+        packetCaptureLevel: guestPacketCaptureLevel,
+        discardPackets: !needsPackets(1),
       });
     });
     return { capabilities, run };
@@ -229,10 +293,35 @@ try {
     tracedDelayMs: traceDelayMs,
     watchedWriteAddress: watchAddress,
     guestClockScale: clockScale,
+    guestRenderer: renderer,
+    guestPacketCaptureLevel: packetCaptureLevel,
   });
 
   const { capabilities, run } = execution;
-  const report = { bootPath, capabilities, run, browserConsole };
+  if (cpuProfiler) {
+    const { profile } = await cpuProfiler.send("Profiler.stop");
+    await writeCpuProfile(profile);
+    cpuProfiler = undefined;
+  }
+  await stopTrace();
+  const completed = Boolean(
+    run.terminal?.ok &&
+    (stopAtFirstDraw
+      ? run.frames.some((frame) => frame.drawPacketCount > 0)
+      : run.frames.length >= frameCount)
+  );
+  const report = {
+    bootPath,
+    capabilities,
+    acceptance: {
+      completed,
+      requestedFrames: frameCount,
+      completedFrames: run.frames.length,
+      stopAtFirstDraw,
+    },
+    run,
+    browserConsole,
+  };
   const json = `${JSON.stringify(report, null, 2)}\n`;
   process.stdout.write(json);
   if (outputPath) {
@@ -260,7 +349,18 @@ try {
       },
     }, null, 2)}\n`);
   }
-  if (!["runtime-result", "runtime-frame", "runtime-fatal"].includes(run.terminal.type)) process.exitCode = 1;
+  if (!completed) process.exitCode = 1;
 } finally {
+  if (cpuProfiler) {
+    try {
+      const { profile } = await cpuProfiler.send("Profiler.stop");
+      await writeCpuProfile(profile);
+    } catch {}
+  }
+  if (traceSession) {
+    try {
+      await stopTrace();
+    } catch {}
+  }
   await context.close();
 }

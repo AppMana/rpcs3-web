@@ -2,8 +2,14 @@
 
 #if defined(__linux__) || defined(__APPLE__)
 #define USE_FUTEX
+#elif defined(__EMSCRIPTEN__)
+#define USE_WEB_FUTEX
 #elif !defined(_WIN32)
 #define USE_STD
+#endif
+
+#ifdef USE_WEB_FUTEX
+#include <emscripten/threading.h>
 #endif
 
 #ifdef _MSC_VER
@@ -336,6 +342,8 @@ namespace
 #ifdef USE_FUTEX
 			// Use "wake all" arg for robustness, only 1 thread is expected
 			futex(&sync, FUTEX_WAKE_PRIVATE, 0x7fff'ffff);
+#elif defined(USE_WEB_FUTEX)
+			emscripten_futex_wake(&sync, INT_MAX);
 #elif defined(USE_STD)
 			// Not super efficient: locking is required to avoid lost notifications
 			mtx->lock();
@@ -359,6 +367,9 @@ namespace
 		{
 #if defined(USE_FUTEX)
 			return false;
+#elif defined(USE_WEB_FUTEX)
+			emscripten_futex_wake(&sync, INT_MAX);
+			return true;
 #elif defined(USE_STD)
 			// Optimistic non-blocking path
 			if (mtx->try_lock())
@@ -1095,7 +1106,7 @@ atomic_wait_engine::wait(const void* data, u32 old_value, u64 timeout, atomic_wa
 #endif
 
 	// Can skip unqueue process if true
-#if defined(USE_FUTEX) || defined(USE_STD)
+#if defined(USE_FUTEX) || defined(USE_WEB_FUTEX) || defined(USE_STD)
 	constexpr bool fallback = true;
 #else
 	bool fallback = false;
@@ -1131,6 +1142,24 @@ atomic_wait_engine::wait(const void* data, u32 old_value, u64 timeout, atomic_wa
 		else
 		{
 			futex(&cond->sync, FUTEX_WAIT_PRIVATE, val, timeout + 1 ? &ts : nullptr);
+		}
+#elif defined(USE_WEB_FUTEX)
+		const u32 val = cond->sync;
+
+		if (val > 1) [[unlikely]]
+		{
+			if (!cond->set_sleep())
+			{
+				break;
+			}
+		}
+		else
+		{
+			// A browser cannot interrupt a worker waiting on this futex when an
+			// unrelated thread-control atomic is notified. Re-enter the wait
+			// callback periodically so CPU threads can acknowledge VM safe points.
+			const double timeout_ms = timeout + 1 ? std::min(static_cast<double>(timeout) / 1'000'000.0, 1.0) : 1.0;
+			emscripten_futex_wait(&cond->sync, val, timeout_ms);
 		}
 #elif defined(USE_STD)
 		if (cond->sync > 1) [[unlikely]]

@@ -1,4 +1,4 @@
-import { PacketKind, copyFrontPacket, packetSummary } from "./rpcs3-webgpu-packet.mjs";
+import { PacketKind, copyFrontPacket, discardFrontPacket, packetSummary } from "./rpcs3-webgpu-packet.mjs";
 
 const scope = self;
 let module;
@@ -13,8 +13,10 @@ let tracePc = 0;
 let traceDelayPc = 0;
 let watchAddress = 0;
 let clockScale = 0;
+let atomicNotifyReentry = 0;
 let packetTimeoutMs = 10_000;
 let progressIntervalMs = 250;
+let progressTimer;
 let padState = { digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 };
 
 function recordLog(line) {
@@ -30,7 +32,35 @@ function detail(error) {
   return error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ""}` : String(error);
 }
 
-function progress() {
+function vmRangeLocks() {
+  const read = (name, args = [], values = []) =>
+    BigInt.asUintN(64, module.ccall(name, "bigint", args, values));
+  const allocated = read("rpcs3_web_vm_range_lock_bits", ["number"], [0]);
+  const exclusive = read("rpcs3_web_vm_range_lock_bits", ["number"], [1]);
+  const active = [];
+  const relevant = allocated | exclusive;
+  for (let index = 0; index < 64; index += 1) {
+    if ((relevant & (1n << BigInt(index))) === 0n) continue;
+    const value = read("rpcs3_web_vm_range_lock", ["number"], [index]);
+    active.push({ index, value: `0x${value.toString(16).padStart(16, "0")}` });
+  }
+  return {
+    allocated: `0x${allocated.toString(16).padStart(16, "0")}`,
+    exclusive: `0x${exclusive.toString(16).padStart(16, "0")}`,
+    active,
+  };
+}
+
+function vmPpuLocks() {
+  const count = module.ccall("rpcs3_web_vm_ppu_lock_count", "number", [], []) >>> 0;
+  return Array.from({ length: count }, (_, index) => ({
+    index,
+    id: module.ccall("rpcs3_web_vm_ppu_lock_id", "number", ["number"], [index]) >>> 0,
+    state: module.ccall("rpcs3_web_vm_ppu_lock_state", "number", ["number"], [index]) >>> 0,
+  })).filter(({ id }) => id !== 0);
+}
+
+function progress(includeThreads = false) {
   if (!module) return;
   scope.postMessage({
     type: "runtime-progress",
@@ -39,10 +69,17 @@ function progress() {
     ppuInstructions: Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], [])),
     ppuLastPc: module.ccall("rpcs3_web_ppu_last_pc", "number", [], []) >>> 0,
     ppuLastFunction: module.ccall("rpcs3_web_ppu_last_function", "string", [], []),
+    spuInstructions: Number(module.ccall("rpcs3_web_spu_instruction_count", "bigint", [], [])),
+    spuLastPcs: Array.from({ length: 6 }, (_, index) =>
+      module.ccall("rpcs3_web_spu_last_pc", "number", ["number"], [index]) >>> 0),
+    spuLsBoundaryCount: Number(module.ccall("rpcs3_web_spu_ls_boundary_count", "bigint", [], [])),
+    spuLsBoundaryLast: `0x${module.ccall("rpcs3_web_spu_ls_boundary_last", "bigint", [], []).toString(16).padStart(16, "0")}`,
+    vmRangeLocks: vmRangeLocks(),
+    vmPpuLocks: vmPpuLocks(),
     tracePc,
     clockScale,
     traceHits: module.ccall("rpcs3_web_trace_hits", "number", [], []) >>> 0,
-    threads: module.ccall("rpcs3_web_thread_snapshot", "string", [], []),
+    threads: includeThreads ? module.ccall("rpcs3_web_thread_snapshot", "string", [], []) : "",
     elapsedMs: bootStartedAt ? performance.now() - bootStartedAt : 0,
   });
 }
@@ -77,7 +114,7 @@ function applyPadState(next = {}) {
     [padState.digital1, padState.digital2, padState.leftX, padState.leftY, padState.rightX, padState.rightY]);
 }
 
-async function captureFrame(type) {
+async function captureFrame(type, discardPackets = false) {
   let status = module.ccall("rpcs3_web_status", "number", [], []);
   let packetCount = 0;
   let drawPacketCount = 0;
@@ -88,8 +125,17 @@ async function captureFrame(type) {
   // Capture exactly one coherent RSX frame. Stopping at the first draw can
   // omit overlays, while draining past a flip would blend independent frames.
   while (bootResult === 0 && flipPacketCount === 0 && status !== 0 && performance.now() < packetDeadline) {
+    if (discardPackets) {
+      let kind;
+      while ((kind = discardFrontPacket(module))) {
+        packetCount += 1;
+        drawPacketCount += kind === PacketKind.draw ? 1 : 0;
+        flipPacketCount += kind === PacketKind.flip ? 1 : 0;
+        if (kind === PacketKind.flip) break;
+      }
+    }
     let packet;
-    while ((packet = copyFrontPacket(module))) {
+    while (!discardPackets && (packet = copyFrontPacket(module))) {
       packetCount += 1;
       drawPacketCount += packet.kind === PacketKind.draw ? 1 : 0;
       flipPacketCount += packet.kind === PacketKind.flip ? 1 : 0;
@@ -134,8 +180,14 @@ async function captureFrame(type) {
     ppuInstructions: Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], [])),
     ppuLastPc: module.ccall("rpcs3_web_ppu_last_pc", "number", [], []) >>> 0,
     ppuLastFunction: module.ccall("rpcs3_web_ppu_last_function", "string", [], []),
+    spuInstructions: Number(module.ccall("rpcs3_web_spu_instruction_count", "bigint", [], [])),
+    spuLastPcs: Array.from({ length: 6 }, (_, index) =>
+      module.ccall("rpcs3_web_spu_last_pc", "number", ["number"], [index]) >>> 0),
+    spuLsBoundaryCount: Number(module.ccall("rpcs3_web_spu_ls_boundary_count", "bigint", [], [])),
+    spuLsBoundaryLast: `0x${module.ccall("rpcs3_web_spu_ls_boundary_last", "bigint", [], []).toString(16).padStart(16, "0")}`,
     tracePc,
     traceHits: module.ccall("rpcs3_web_trace_hits", "number", [], []) >>> 0,
+    atomicNotifyReentry,
     entryOpd: [0x40250, 0x40254].map((address) => debugRead32(address)),
     entryCodeWord: debugRead32(0x1022c),
     elapsedMs: performance.now() - bootStartedAt,
@@ -148,7 +200,7 @@ async function captureFrame(type) {
 scope.addEventListener("message", async (event) => {
   if (event.data?.type === "snapshot") {
     module?.ccall("rpcs3_web_sync_logs", null, [], []);
-    progress();
+    progress(true);
     return;
   }
   if (event.data?.type === "pad") {
@@ -157,6 +209,7 @@ scope.addEventListener("message", async (event) => {
   }
   if (event.data?.type === "shutdown") {
     try {
+      clearInterval(progressTimer);
       module?.ccall("rpcs3_web_stop", null, [], []);
       module?.PThread?.terminateAllThreads();
       scope.postMessage({ type: "runtime-shutdown", ok: true });
@@ -172,7 +225,7 @@ scope.addEventListener("message", async (event) => {
       return;
     }
     try {
-      await captureFrame("runtime-frame");
+      await captureFrame("runtime-frame", event.data.discardPackets === true);
     } catch (error) {
       scope.postMessage({ type: "runtime-frame", ok: false, detail: detail(error), logs: logs.slice(-200) });
     }
@@ -196,6 +249,7 @@ scope.addEventListener("message", async (event) => {
       print: recordLog,
       printErr: recordLog,
     });
+    atomicNotifyReentry = module.ccall("rpcs3_web_atomic_notify_reentry_probe", "number", [], []);
     let path = event.data.path;
     if (!path) {
       const response = await fetch(new URL(`./${event.data.fixture}`, scope.location.href));
@@ -205,8 +259,10 @@ scope.addEventListener("message", async (event) => {
       path = "/acceptance-homebrew.elf";
       module.FS.writeFile(path, elf);
     }
+    module.ccall("rpcs3_web_set_null_renderer", null, ["number"], [event.data.renderer === "null" ? 1 : 0]);
     bootStartedAt = performance.now();
     initialized = module.ccall("rpcs3_web_init", "number", [], []);
+    module.ccall("rpcs3_webgpu_set_capture_level", null, ["number"], [Number(event.data.packetCaptureLevel ?? 4)]);
     if (clockScale) module.ccall("rpcs3_web_set_clock_scale", null, ["number"], [clockScale]);
     module.ccall("rpcs3_web_set_trace_pc", null, ["number"], [tracePc]);
     module.ccall("rpcs3_web_set_trace_delay", null, ["number", "number"], [
@@ -217,10 +273,9 @@ scope.addEventListener("message", async (event) => {
     if (event.data.path) fixtureBytes = Number(module.FS.stat(path).size);
     applyPadState(event.data.pad);
     bootResult = module.ccall("rpcs3_web_boot", "number", ["string"], [path]);
-    progress();
-    const progressTimer = setInterval(progress, progressIntervalMs);
-    await captureFrame("runtime-result");
-    clearInterval(progressTimer);
+    progress(true);
+    progressTimer = setInterval(progress, progressIntervalMs);
+    await captureFrame("runtime-result", event.data.discardPackets === true);
   } catch (error) {
     scope.postMessage({ type: "runtime-result", ok: false, detail: detail(error), logs: logs.slice(-200) });
   }

@@ -1,0 +1,11 @@
+/build/
+/data/
+/spu/build/
+/spu/data/
+/spu/spu_worker.elf
+/raw_spu/build/
+/raw_spu/data/
+/raw_spu/raw_spu.elf
+/web_dispatch_conformance.elf
+/web_dispatch_conformance.self
+/web_dispatch_conformance.fake.self

@@ -2635,6 +2635,14 @@ void ppu_thread::dump_all(std::string& ret) const
 
 extern thread_local std::string(*g_tls_log_prefix)();
 
+#ifdef RPCS3_WEB
+atomic_t<u32> g_ppu_web_aot_hold_entry{0};
+atomic_t<u32> g_ppu_web_aot_entry_ready{0};
+atomic_t<u32> g_ppu_web_aot_step_request{0};
+atomic_t<u32> g_ppu_web_aot_step_complete{0};
+atomic_t<u32> g_ppu_web_aot_step_result{0};
+#endif
+
 void ppu_thread::cpu_task()
 {
 	std::fesetround(FE_TONEAREST);
@@ -2694,6 +2702,38 @@ void ppu_thread::cpu_task()
 		}
 		case ppu_cmd::entry_call:
 		{
+		#ifdef RPCS3_WEB
+			const auto thread_name = ppu_tname.load();
+			if (g_ppu_web_aot_hold_entry && thread_name && *thread_name == "main_thread")
+			{
+				cmd_pop();
+				interrupt_thread_executing = true;
+				cia = entry_func.addr;
+				gpr[2] = entry_func.rtoc;
+				lr = g_fxo->get<ppu_function_manager>().func_addr(1, true);
+				current_function = nullptr;
+				stop_flag_removal_protection = true;
+				g_ppu_web_aot_entry_ready.release(1);
+				g_ppu_web_aot_entry_ready.notify_all();
+				while (g_ppu_web_aot_hold_entry && !Emu.IsStopped())
+				{
+					if (!g_ppu_web_aot_step_request.exchange(0))
+					{
+						g_ppu_web_aot_step_request.wait(0);
+						continue;
+					}
+
+					const auto idle_state = state.exchange(cpu_flag::wait + cpu_flag::memory);
+					static_cast<void>(check_state());
+					g_ppu_web_aot_step_result = ppu_web_interpreter_step(*this);
+					vm::temporary_unlock(*this);
+					state.store(idle_state - cpu_flag::notify);
+					g_ppu_web_aot_step_complete.release(1);
+					g_ppu_web_aot_step_complete.notify_one();
+				}
+				break;
+			}
+		#endif
 			cmd_pop(), fast_call(entry_func.addr, entry_func.rtoc, true);
 			break;
 		}

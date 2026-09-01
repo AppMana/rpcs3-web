@@ -1,0 +1,35 @@
+{
+  "protocol": "RPCS3-DISPATCH/1",
+  "ps3dev": {
+    "release": "nightly-2026-07-26",
+    "archive": "https://github.com/ps3dev/ps3dev/releases/download/nightly-2026-07-26/ps3dev-linux-X64.tar.gz",
+    "sha256": "dcbed747e094c6a382dae5b0aacc322a1d4390d9f2849a7d750a96ea398ee8ab"
+  },
+  "tools": {
+    "ppu": "ppu-gcc (GCC) 7.2.0",
+    "spu": "spu-gcc (GCC) 7.2.0"
+  },
+  "source": {
+    "sha256": "b004a8066b9ce8808acbb80a22ddb8dab4289b9a3d1982b1ccfdc75b8139f1e3",
+    "files": [
+      "Makefile",
+      "raw_spu/Makefile",
+      "raw_spu/source/main.c",
+      "source/main.c",
+      "spu/Makefile",
+      "spu/source/main.c"
+    ]
+  },
+  "outputs": {
+    "elf": {
+      "file": "bin/test/web_dispatch_conformance.elf",
+      "bytes": 1002767,
+      "sha256": "477f9e8e2d6dce7fabe2662c71f87c8ce58e3edeceb5f5fd87c6e698284b8a18"
+    },
+    "self": {
+      "file": "bin/test/web_dispatch_conformance.self",
+      "bytes": 270736,
+      "sha256": "b768009030c44e1a9cd41462d1504b1cc3d147acbdc8d5dd9f81d578aa73bfdc"
+    }
+  }
+}

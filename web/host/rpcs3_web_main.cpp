@@ -4,6 +4,7 @@
 #include "Emu/Cell/PPUFunction.h"
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/Cell/SPUThread.h"
+#include "Emu/Cell/timers.hpp"
 #include "Emu/RSX/GSFrameBase.h"
 #include "Emu/RSX/Null/NullGSRender.h"
 #include "Emu/RSX/WG/WebGPUGSRender.h"
@@ -70,6 +71,15 @@ extern atomic_t<u64> g_spu_web_ls_boundary_count;
 extern atomic_t<u64> g_spu_web_ls_boundary_last;
 extern atomic_t<u64> g_spu_web_page_split_dma_count;
 extern u32 ppu_web_interpreter_step(ppu_thread& ppu);
+extern atomic_t<u32> g_ppu_web_aot_hold_entry;
+extern atomic_t<u32> g_ppu_web_aot_entry_ready;
+extern atomic_t<u32> g_ppu_web_aot_step_request;
+extern atomic_t<u32> g_ppu_web_aot_step_complete;
+extern atomic_t<u32> g_ppu_web_aot_step_result;
+extern u32 ppu_lwarx(ppu_thread& ppu, u32 addr);
+extern u64 ppu_ldarx(ppu_thread& ppu, u32 addr);
+extern bool ppu_stwcx(ppu_thread& ppu, u32 addr, u32 reg_value);
+extern bool ppu_stdcx(ppu_thread& ppu, u32 addr, u64 reg_value);
 #endif
 
 // The desktop frontend owns these input-profile globals. The browser host is
@@ -110,6 +120,32 @@ namespace
 	atomic_t<u32> s_aot_slice_ready{0};
 	atomic_t<u32> s_aot_slice_release{0};
 	atomic_t<u32> s_aot_slice_complete{0};
+
+	ppu_thread* aot_context(u32 context)
+	{
+		const auto expected = s_aot_context_thread
+			? static_cast<ppu_thread*>(s_aot_context_thread.get()) : nullptr;
+		return expected && reinterpret_cast<uptr>(expected) == context ? expected : nullptr;
+	}
+
+	u32 acquire_main_ppu()
+	{
+		if (!s_aot_context_thread)
+		{
+			auto selected = idm::select<named_thread<ppu_thread>>([](u32, named_thread<ppu_thread>& ppu)
+			{
+				const auto name = ppu.ppu_tname.load();
+				return name && *name == "main_thread";
+			});
+			if (!selected.ptr)
+			{
+				return 0;
+			}
+			s_aot_context_thread = std::move(selected.ptr);
+		}
+
+		return static_cast<u32>(reinterpret_cast<uptr>(static_cast<ppu_thread*>(s_aot_context_thread.get())));
+	}
 
 	EM_JS(void, notify_host_event, (const char* event, u32 value), {
 		const message = { type: UTF8ToString(event), value };
@@ -503,6 +539,25 @@ extern "C"
 		Emu.SetHoldAtEntry(enabled != 0);
 	}
 
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_ppu_aot_handoff(s32 enabled)
+	{
+		g_ppu_web_aot_entry_ready = 0;
+		g_ppu_web_aot_step_request = 0;
+		g_ppu_web_aot_step_complete = 0;
+		g_ppu_web_aot_hold_entry = enabled != 0;
+		g_ppu_web_aot_step_request.notify_all();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_entry_ready()
+	{
+		return g_ppu_web_aot_entry_ready;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_entry_ready_address()
+	{
+		return static_cast<u32>(reinterpret_cast<uptr>(&g_ppu_web_aot_entry_ready));
+	}
+
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_status()
 	{
 		return static_cast<u32>(Emu.GetStatus(false));
@@ -640,21 +695,11 @@ extern "C"
 	{
 		if (s_aot_context_thread)
 		{
-			return static_cast<u32>(reinterpret_cast<uptr>(static_cast<ppu_thread*>(s_aot_context_thread.get())));
+			return acquire_main_ppu();
 		}
 
-		auto selected = idm::select<named_thread<ppu_thread>>([](u32, named_thread<ppu_thread>& ppu)
-		{
-			const auto name = ppu.ppu_tname.load();
-			return name && *name == "main_thread";
-		});
-		if (!selected.ptr)
-		{
-			return 0;
-		}
-
-		auto thread = std::move(selected.ptr);
-		s_aot_context_thread = std::move(thread);
+		const u32 context = acquire_main_ppu();
+		if (!context) return 0;
 		auto expected = static_cast<ppu_thread*>(s_aot_context_thread.get());
 		atomic_t<u32> complete{0};
 		(*s_aot_context_thread)([expected, entry, rtoc, tls, &complete]
@@ -673,16 +718,131 @@ extern "C"
 		{
 			complete.wait(0);
 		}
-		return static_cast<u32>(reinterpret_cast<uptr>(static_cast<ppu_thread*>(s_aot_context_thread.get())));
+		return context;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_acquire_main()
+	{
+		const u32 context = acquire_main_ppu();
+		if (!context) return 0;
+		if (g_ppu_web_aot_entry_ready)
+		{
+			return context;
+		}
+
+		auto expected = static_cast<ppu_thread*>(s_aot_context_thread.get());
+		atomic_t<u32> complete{0};
+		(*s_aot_context_thread)([expected, &complete]
+		{
+			expected->stop_flag_removal_protection = true;
+			expected->state -= cpu_flag::notify;
+			complete.release(1);
+			complete.notify_one();
+		});
+		expected->state += cpu_flag::notify;
+		expected->notify();
+		while (!complete)
+		{
+			complete.wait(0);
+		}
+		return context;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_release(u32 context)
+	{
+		if (!aot_context(context) || s_aot_slice_active)
+		{
+			return 0;
+		}
+		s_aot_context_thread.reset();
+		return 1;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_pc(u32 context)
+	{
+		const auto expected = aot_context(context);
+		return expected ? expected->cia : 0;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_ppu_aot_gpr(u32 context, u32 index)
+	{
+		const auto expected = aot_context(context);
+		return expected && index < std::size(expected->gpr) ? expected->gpr[index] : 0;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_ppu_aot_lr(u32 context)
+	{
+		const auto expected = aot_context(context);
+		return expected ? expected->lr : 0;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_state(u32 context)
+	{
+		const auto expected = aot_context(context);
+		return expected ? static_cast<u32>(+expected->state) : umax;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_terminal(u32 context)
+	{
+		const auto expected = aot_context(context);
+		return !expected || is_stopped(expected->state);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_set_pc(u32 context, u32 pc)
+	{
+		const auto expected = aot_context(context);
+		if (!expected || !s_aot_slice_active) return 0;
+		expected->cia = pc;
+		return 1;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_check(u32 context, u32 pc)
+	{
+		const auto expected = aot_context(context);
+		if (!expected || !s_aot_slice_active) return 1;
+		expected->cia = pc;
+		return is_stopped(expected->state);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_ppu_aot_timebase()
+	{
+		return get_timebased_time();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_lwarx(u32 context, u64 address)
+	{
+		const auto expected = aot_context(context);
+		return expected && s_aot_slice_active ? ppu_lwarx(*expected, static_cast<u32>(address)) : 0;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_ppu_aot_ldarx(u32 context, u64 address)
+	{
+		const auto expected = aot_context(context);
+		return expected && s_aot_slice_active ? ppu_ldarx(*expected, static_cast<u32>(address)) : 0;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_stwcx(u32 context, u64 address, u32 value)
+	{
+		const auto expected = aot_context(context);
+		return expected && s_aot_slice_active && ppu_stwcx(*expected, static_cast<u32>(address), value);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_stdcx(u32 context, u64 address, u64 value)
+	{
+		const auto expected = aot_context(context);
+		return expected && s_aot_slice_active && ppu_stdcx(*expected, static_cast<u32>(address), value);
 	}
 
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_begin(u32 context)
 	{
-		const auto expected = s_aot_context_thread
-			? static_cast<ppu_thread*>(s_aot_context_thread.get()) : nullptr;
-		if (!expected || reinterpret_cast<uptr>(expected) != context || !s_aot_slice_active.compare_and_swap_test(0, 1))
+		const auto expected = aot_context(context);
+		if (!expected || !s_aot_slice_active.compare_and_swap_test(0, 1))
 		{
 			return 0;
+		}
+		if (g_ppu_web_aot_entry_ready)
+		{
+			return 1;
 		}
 
 		s_aot_slice_ready = 0;
@@ -712,11 +872,15 @@ extern "C"
 
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_end(u32 context)
 	{
-		const auto expected = s_aot_context_thread
-			? static_cast<ppu_thread*>(s_aot_context_thread.get()) : nullptr;
-		if (!expected || reinterpret_cast<uptr>(expected) != context || !s_aot_slice_active)
+		const auto expected = aot_context(context);
+		if (!expected || !s_aot_slice_active)
 		{
 			return 0;
+		}
+		if (g_ppu_web_aot_entry_ready)
+		{
+			s_aot_slice_active = 0;
+			return 1;
 		}
 
 		s_aot_slice_release.release(1);
@@ -731,11 +895,21 @@ extern "C"
 
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_interpreter_step(u32 context)
 	{
-		const auto expected = s_aot_context_thread
-			? static_cast<ppu_thread*>(s_aot_context_thread.get()) : nullptr;
-		if (!expected || reinterpret_cast<uptr>(expected) != context)
+		const auto expected = aot_context(context);
+		if (!expected)
 		{
 			return 0;
+		}
+		if (g_ppu_web_aot_entry_ready)
+		{
+			g_ppu_web_aot_step_complete = 0;
+			g_ppu_web_aot_step_request.release(1);
+			g_ppu_web_aot_step_request.notify_one();
+			while (!g_ppu_web_aot_step_complete)
+			{
+				g_ppu_web_aot_step_complete.wait(0);
+			}
+			return g_ppu_web_aot_step_result;
 		}
 
 		atomic_t<u32> next{0};
@@ -925,6 +1099,8 @@ extern "C"
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_stop()
 	{
+		g_ppu_web_aot_hold_entry = 0;
+		g_ppu_web_aot_step_request.notify_all();
 		if (s_aot_slice_active)
 		{
 			s_aot_slice_release.release(1);

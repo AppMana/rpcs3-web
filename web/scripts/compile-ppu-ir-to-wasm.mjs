@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { accessSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
 const [inputArg, outputArg, ...options] = process.argv.slice(2);
@@ -24,6 +24,38 @@ function findTool(environmentName, name) {
   throw new Error(`${name} was not found; set ${environmentName}`);
 }
 
+function existing(paths) {
+  return paths.filter((candidate) => {
+    try {
+      accessSync(candidate);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+function findRuntimeArchives() {
+  const explicit = options
+    .filter((option) => option.startsWith("--runtime="))
+    .map((option) => resolve(option.slice("--runtime=".length)));
+  if (explicit.length) return explicit;
+
+  const sysroots = existing([
+    process.env.EMSDK ? join(process.env.EMSDK, "upstream/emscripten/cache/sysroot") : "",
+    join(homedir(), ".cache/emsdk-6.0.8/upstream/emscripten/cache/sysroot"),
+  ].filter(Boolean));
+  for (const sysroot of sysroots) {
+    const libraryDirectory = join(sysroot, "lib/wasm32-emscripten");
+    const archives = existing([
+      join(libraryDirectory, "libclang_rt.builtins-wasmsjlj.a"),
+      join(libraryDirectory, "libc.a"),
+    ]);
+    if (archives.length === 2) return archives;
+  }
+  return [];
+}
+
 const input = resolve(inputArg);
 const output = resolve(outputArg);
 const exports = options.filter((option) => option.startsWith("--export="));
@@ -32,6 +64,7 @@ const pic = options.includes("--pic");
 const llvmAs = findTool("RPCS3_LLVM_AS", "llvm-as");
 const llc = findTool("RPCS3_LLC", "llc");
 const wasmLd = findTool("RPCS3_WASM_LD", "wasm-ld");
+const runtimeArchives = findRuntimeArchives();
 const scratch = mkdtempSync(join(tmpdir(), "rpcs3-ppu-aot-"));
 
 try {
@@ -60,6 +93,7 @@ try {
     exportAll ? "--export-all" : undefined,
     ...exports,
     object,
+    ...runtimeArchives,
     "-o",
     output,
   ].filter(Boolean);
@@ -72,6 +106,7 @@ try {
     output,
     pic,
     bytes: bytes.byteLength,
+    runtimeArchives,
     imports: WebAssembly.Module.imports(module),
     exports: WebAssembly.Module.exports(module),
   })}\n`);

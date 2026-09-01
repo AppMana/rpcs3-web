@@ -1,0 +1,510 @@
+{
+  "schema": 1,
+  "source": "web_dispatch_conformance.self",
+  "sourceSha256": "b768009030c44e1a9cd41462d1504b1cc3d147acbdc8d5dd9f81d578aa73bfdc",
+  "fragmentCount": 2,
+  "fragmentBytes": [
+    8999430,
+    973623
+  ],
+  "linkedIrBytes": 9964552,
+  "wasmBytes": 1456024,
+  "wasmSha256": "9eecc415e00e0605bc940718bb20bf0a6cbd3633248bf8ae309678ed91c11e42",
+  "imports": [
+    {
+      "module": "env",
+      "name": "memory",
+      "kind": "memory"
+    },
+    {
+      "module": "env",
+      "name": "__stack_pointer",
+      "kind": "global"
+    },
+    {
+      "module": "env",
+      "name": "__memory_base",
+      "kind": "global"
+    },
+    {
+      "module": "env",
+      "name": "__table_base",
+      "kind": "global"
+    },
+    {
+      "module": "env",
+      "name": "rpcs3_web_vm_write64_raw",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "__check",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "rpcs3_web_vm_read64_raw",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "rpcs3_web_vm_read8_raw",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "rpcs3_web_vm_write8_raw",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "rpcs3_web_vm_write32_raw",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "rpcs3_web_vm_read32_raw",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_mutex_lock",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_cond_signal",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_mutex_unlock",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_semaphore_wait",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "__lwarx",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "__stwcx",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_event_port_send",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "rpcs3_web_vm_read16_raw",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_mutex_create",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_cond_create",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_semaphore_create",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_event_queue_create",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_event_port_create",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_event_port_connect_local",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_cond_wait",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_semaphore_post",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_event_queue_receive",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_ppu_thread_join",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_event_port_disconnect",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_event_port_destroy",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_event_queue_destroy",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_semaphore_destroy",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_cond_destroy",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_mutex_destroy",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "rpcs3_web_vm_write128_raw",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_spu_initialize",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_spu_thread_group_create",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_spu_thread_initialize",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_spu_thread_set_spu_cfg",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_spu_thread_group_start",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_spu_thread_write_snr",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_spu_thread_group_join",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_spu_thread_group_destroy",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_raw_spu_create",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_raw_spu_destroy",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_mmapper_allocate_address",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_mmapper_free_address",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_mmapper_search_and_map",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_close",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_net_bnet_close",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_lseek",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_tty_read",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_read",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_net_bnet_recvfrom",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_open",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_chmod",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_timer_usleep",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_timer_sleep",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_tty_write",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_write",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_net_bnet_sendto",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_fstat",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "rpcs3_web_vm_write16_raw",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_stat",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_net_bnet_accept",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_net_bnet_bind",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_net_bnet_connect",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_net_bnet_listen",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_net_bnet_socket",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_net_bnet_shutdown",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_readdir",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_opendir",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_closedir",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_mkdir",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "__get_tb",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_rename",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_rmdir",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_time_get_current_time",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_time_set_current_time",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_unlink",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_link",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_truncate",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_ftruncate",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_fsync",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "sys_fs_utime",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "__0x2ce98",
+      "kind": "function"
+    }
+  ],
+  "exportCount": 6654,
+  "guestBlockExportCount": 6640,
+  "runtimeExports": [
+    {
+      "name": "__wasm_call_ctors",
+      "kind": "function"
+    },
+    {
+      "name": "__tls_base",
+      "kind": "global"
+    },
+    {
+      "name": "__tls_size",
+      "kind": "global"
+    },
+    {
+      "name": "__tls_align",
+      "kind": "global"
+    },
+    {
+      "name": "__wasm_init_tls",
+      "kind": "function"
+    },
+    {
+      "name": "__lshrti3",
+      "kind": "function"
+    },
+    {
+      "name": "__ashlti3",
+      "kind": "function"
+    },
+    {
+      "name": "__multi3",
+      "kind": "function"
+    },
+    {
+      "name": "fma",
+      "kind": "function"
+    },
+    {
+      "name": "scalbn",
+      "kind": "function"
+    },
+    {
+      "name": "__dso_handle",
+      "kind": "global"
+    },
+    {
+      "name": "__wasm_first_page_end",
+      "kind": "global"
+    },
+    {
+      "name": "__wasm_init_memory_flag",
+      "kind": "global"
+    },
+    {
+      "name": "__wasm_init_memory",
+      "kind": "function"
+    }
+  ]
+}

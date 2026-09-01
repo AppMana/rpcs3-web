@@ -1,4 +1,5 @@
 import { PacketKind, copyFrontPacket, discardFrontPacket, packetSummary } from "./rpcs3-webgpu-packet.mjs";
+import { createPpuDispatcher } from "./rpcs3-ppu-dispatcher.mjs";
 
 const scope = self;
 let module;
@@ -19,19 +20,88 @@ let sparseVmProbe = 0;
 let packetTimeoutMs = 10_000;
 let progressIntervalMs = 250;
 let progressTimer;
+let dispatchLines = [];
+let ppuDispatcher;
 let padState = { digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 };
 
 function recordLog(line) {
   const text = String(line);
   logs.push(text);
+  const marker = text.indexOf("RPCS3-DISPATCH/1 ");
+  if (marker >= 0) {
+    const protocolLine = text.slice(marker).split(/\r?\n/, 1)[0];
+    dispatchLines.push(protocolLine);
+    scope.postMessage({ type: "runtime-dispatch", line: protocolLine });
+  }
   if (text.includes("RPCS3 Web") || text.startsWith("Aborted") ||
       text.includes("RuntimeError") || text.startsWith("worker:") || text.startsWith("Pthread ")) {
     scope.postMessage({ type: "runtime-log", line: text });
   }
 }
 
+async function captureDispatch(expectedVerdict = "", timeoutMs = 30_000) {
+  const deadline = performance.now() + timeoutMs;
+  let terminal = "";
+  let aotSnapshot;
+  while (bootResult === 0 && performance.now() < deadline) {
+    if (ppuDispatcher) {
+      const snapshot = ppuDispatcher.runBatch(256);
+      aotSnapshot = snapshot;
+    }
+    if (!ppuDispatcher || aotSnapshot?.context) refreshDispatchLines();
+    terminal = dispatchLines.findLast((line) => / (PASS|FAIL) /.test(line)) ?? "";
+    if (terminal) break;
+    if (ppuDispatcher && aotSnapshot?.context) await ppuDispatcher.taskYield();
+    else if (ppuDispatcher) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    else await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  module.ccall("rpcs3_web_sync_logs", null, [], []);
+  refreshDispatchLines();
+  terminal ||= dispatchLines.findLast((line) => / (PASS|FAIL) /.test(line)) ?? "";
+  const verdict = terminal.startsWith("RPCS3-DISPATCH/1 PASS ") ? terminal.split(" ").at(-1) : "";
+  const ppuInstructions = Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], []));
+  const spuInstructions = Number(module.ccall("rpcs3_web_spu_instruction_count", "bigint", [], []));
+  scope.postMessage({
+    type: "runtime-result",
+    ok: initialized === 1 && bootResult === 0 && Boolean(verdict) && (!expectedVerdict || verdict === expectedVerdict),
+    initialized,
+    bootResult,
+    status: module.ccall("rpcs3_web_status", "number", [], []),
+    fixtureBytes,
+    dispatchLines,
+    verdict,
+    expectedVerdict,
+    ppuInstructions,
+    ppuLastPc: module.ccall("rpcs3_web_ppu_last_pc", "number", [], []) >>> 0,
+    spuInstructions,
+    spuLastPcs: Array.from({ length: 6 }, (_, index) =>
+      module.ccall("rpcs3_web_spu_last_pc", "number", ["number"], [index]) >>> 0),
+    spuLsBoundaryCount: Number(module.ccall("rpcs3_web_spu_ls_boundary_count", "bigint", [], [])),
+    spuLsBoundaryLast: `0x${module.ccall("rpcs3_web_spu_ls_boundary_last", "bigint", [], []).toString(16).padStart(16, "0")}`,
+    spuPageSplitDmaCount: Number(module.ccall("rpcs3_web_spu_page_split_dma_count", "bigint", [], [])),
+    atomicNotifyReentry,
+    sparseVmProbe,
+    ppuAot: ppuDispatcher?.snapshot() ?? null,
+    elapsedMs: performance.now() - bootStartedAt,
+    logs: logs.slice(-300),
+    detail: terminal || `dispatch protocol did not finish within ${timeoutMs} ms`,
+  });
+}
+
 function detail(error) {
   return error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ""}` : String(error);
+}
+
+function refreshDispatchLines() {
+  for (const path of ["/opfs/cache/rpcs3/TTY.log", "/opfs/rpcs3/TTY.log"]) {
+    try {
+      const text = module.FS.readFile(path, { encoding: "utf8" });
+      const lines = text.split(/\r?\n/).filter((line) => line.startsWith("RPCS3-DISPATCH/1 "));
+      if (lines.length >= dispatchLines.length) dispatchLines = lines;
+    } catch {}
+  }
 }
 
 function vmRangeLocks() {
@@ -71,6 +141,7 @@ function progress(includeThreads = false) {
     ppuInstructions: Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], [])),
     ppuLastPc: module.ccall("rpcs3_web_ppu_last_pc", "number", [], []) >>> 0,
     ppuLastFunction: module.ccall("rpcs3_web_ppu_last_function", "string", [], []),
+    ppuAotEntryReady: module.ccall("rpcs3_web_ppu_aot_entry_ready", "number", [], []),
     spuInstructions: Number(module.ccall("rpcs3_web_spu_instruction_count", "bigint", [], [])),
     spuLastPcs: Array.from({ length: 6 }, (_, index) =>
       module.ccall("rpcs3_web_spu_last_pc", "number", ["number"], [index]) >>> 0),
@@ -215,6 +286,8 @@ scope.addEventListener("message", async (event) => {
   if (event.data?.type === "shutdown") {
     try {
       clearInterval(progressTimer);
+      ppuDispatcher?.release();
+      ppuDispatcher = undefined;
       module?.ccall("rpcs3_web_stop", null, [], []);
       module?.PThread?.terminateAllThreads();
       scope.postMessage({ type: "runtime-shutdown", ok: true });
@@ -238,6 +311,7 @@ scope.addEventListener("message", async (event) => {
   }
   if (event.data?.type !== "boot") return;
   logs = [];
+  dispatchLines = [];
   debugAddresses = Array.isArray(event.data.debugAddresses) ? event.data.debugAddresses : [];
   tracePc = Number(event.data.tracePc) >>> 0;
   traceDelayPc = Number(event.data.traceDelayPc) >>> 0;
@@ -250,10 +324,28 @@ scope.addEventListener("message", async (event) => {
     // Keep Emscripten out of module evaluation so the host can acquire and
     // configure its WebGPU device before allocating the shared Wasm memory.
     const { default: createRPCS3 } = await import("./core/rpcs3-web.mjs");
+    let mainInstance;
+    let mainMemory;
+    let mainWasm;
+    let aotWasm;
+    if (event.data.ppuAot === true) {
+      [mainWasm, aotWasm] = await Promise.all([
+        WebAssembly.compileStreaming(fetch("./core/rpcs3-web.wasm")),
+        WebAssembly.compileStreaming(fetch("./fixtures/web_dispatch_conformance-aot.wasm")),
+      ]);
+    }
     module = await createRPCS3({
       locateFile: (name) => new URL(`./core/${name}`, scope.location.href).href,
       print: recordLog,
       printErr: recordLog,
+      ...(mainWasm ? {
+        instantiateWasm(imports, receiveInstance) {
+          mainMemory = imports.env.memory;
+          mainInstance = new WebAssembly.Instance(mainWasm, imports);
+          receiveInstance(mainInstance, mainWasm);
+          return mainInstance.exports;
+        },
+      } : {}),
     });
     atomicNotifyReentry = module.ccall("rpcs3_web_atomic_notify_reentry_probe", "number", [], []);
     let path = event.data.path;
@@ -280,12 +372,26 @@ scope.addEventListener("message", async (event) => {
       Number(event.data.traceDelayMs) >>> 0,
     ]);
     module.ccall("rpcs3_web_set_watch_address", null, ["number"], [watchAddress]);
+    if (aotWasm) module.ccall("rpcs3_web_set_ppu_aot_handoff", null, ["number"], [1]);
     if (event.data.path) fixtureBytes = Number(module.FS.stat(path).size);
     applyPadState(event.data.pad);
     bootResult = module.ccall("rpcs3_web_boot", "number", ["string"], [path]);
+    if (aotWasm) {
+      ppuDispatcher = createPpuDispatcher({
+        module,
+        mainExports: mainInstance.exports,
+        mainMemory,
+        aotModule: aotWasm,
+        entryReadyAddress: mainInstance.exports.rpcs3_web_ppu_aot_entry_ready_address() >>> 0,
+      });
+    }
     progress(true);
     progressTimer = setInterval(progress, progressIntervalMs);
-    await captureFrame("runtime-result", event.data.discardPackets === true);
+    if (event.data.completion === "dispatch") {
+      await captureDispatch(String(event.data.expectedVerdict ?? ""), Number(event.data.dispatchTimeoutMs) || 30_000);
+    } else {
+      await captureFrame("runtime-result", event.data.discardPackets === true);
+    }
   } catch (error) {
     scope.postMessage({ type: "runtime-result", ok: false, detail: detail(error), logs: logs.slice(-200) });
   }

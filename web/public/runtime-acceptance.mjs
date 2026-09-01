@@ -19,7 +19,10 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
   if (active) return active;
   activeWorker?.terminate();
   active = new Promise((resolve, reject) => {
-    const requestedFrames = Number.isInteger(options.frames) ? Math.max(1, Math.min(60, options.frames)) : 1;
+    const dispatchCompletion = options.completion === "dispatch";
+    const requestedFrames = dispatchCompletion
+      ? 1
+      : Number.isInteger(options.frames) ? Math.max(1, Math.min(60, options.frames)) : 1;
     const canvas = document.querySelector("#gpu-output");
     if (options.render && !(canvas instanceof HTMLCanvasElement)) {
       reject(new Error("GPU output canvas is unavailable"));
@@ -61,7 +64,7 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
           const frame = { ...eventWithoutPackets, gpu };
           frames.push(frame);
           firstResult ??= frame;
-          if (frames.length < requestedFrames) {
+          if (!dispatchCompletion && frames.length < requestedFrames) {
             worker.postMessage({ type: "next-frame" });
             return;
           }
@@ -100,6 +103,11 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       returnPackets: Boolean(options.render),
       debugAddresses: Array.isArray(options.debugAddresses) ? options.debugAddresses : [],
       pad: options.pad ?? currentPad,
+      completion: dispatchCompletion ? "dispatch" : "frame",
+      expectedVerdict: options.expectedVerdict ?? "",
+      dispatchTimeoutMs: options.dispatchTimeoutMs ?? 30_000,
+      ppuAot: options.ppuAot === true,
+      renderer: options.renderer ?? (options.render ? "webgpu" : "null"),
     });
   }).finally(() => { active = undefined; });
   return active;

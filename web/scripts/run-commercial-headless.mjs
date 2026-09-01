@@ -32,7 +32,7 @@ const accurateSpuDma = process.env.RPCS3_COMMERCIAL_ACCURATE_SPU_DMA === "1"
   ? true
   : process.env.RPCS3_COMMERCIAL_ACCURATE_SPU_DMA === "0" ? false : undefined;
 const renderer = process.env.RPCS3_COMMERCIAL_RENDERER === "null" ? "null" : "webgpu";
-const packetCaptureLevel = Math.max(0, Math.min(4, Number(process.env.RPCS3_COMMERCIAL_PACKET_CAPTURE_LEVEL ?? 4)));
+const packetCaptureLevel = Math.max(0, Math.min(5, Number(process.env.RPCS3_COMMERCIAL_PACKET_CAPTURE_LEVEL ?? 4)));
 const captureRgba = process.env.RPCS3_COMMERCIAL_CAPTURE_RGBA === "1";
 const captureShaders = process.env.RPCS3_COMMERCIAL_CAPTURE_SHADERS === "1";
 const replayCount = Math.max(1, Math.min(10, Number(process.env.RPCS3_COMMERCIAL_REPLAY_COUNT) || 1));

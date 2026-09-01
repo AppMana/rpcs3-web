@@ -5,7 +5,10 @@
 #include "WebGPUHost.h"
 #include "Emu/RSX/Common/BufferUtils.h"
 #include "Emu/RSX/Common/TextureUtils.h"
+#include "Emu/RSX/Common/surface_store.h"
+#include "Emu/RSX/color_utils.h"
 #include "Emu/RSX/rsx_methods.h"
+#include "Emu/RSX/rsx_utils.h"
 #include "Emu/Memory/vm.h"
 
 #include <array>
@@ -507,9 +510,17 @@ bool WebGPUGSRender::emit_draw_packet(u32 subdraw)
 	header.reserved0 = upload.draw_count;
 	header.reserved1 = subdraw;
 
+	rsx::webgpu::resolved_state_packet resolved{};
+	fill_resolved_state(resolved, 0);
+
 	rsx::webgpu::draw_packet_builder packet(header);
-	bool packet_ok = packet.append(rsx::webgpu::section_kind::registers,
-		std::as_bytes(std::span(rsx::method_registers.registers)));
+	bool packet_ok = packet.append(rsx::webgpu::section_kind::resolved_state,
+		std::as_bytes(std::span{&resolved, 1}));
+	if (rsx::webgpu::packet_capture_level() >= 5)
+	{
+		packet_ok = packet.append(rsx::webgpu::section_kind::raw_registers,
+			std::as_bytes(std::span(rsx::method_registers.registers))) && packet_ok;
+	}
 	packet_ok = packet.append(rsx::webgpu::section_kind::vertex_program,
 		std::as_bytes(std::span(current_vertex_program.data))) && packet_ok;
 	if (current_fragment_program.get_data() && current_fragment_program.ucode_length)
@@ -554,12 +565,221 @@ void WebGPUGSRender::emit_control_packet(rsx::webgpu::packet_kind kind, u32 valu
 	header.color_format = static_cast<u32>(m_framebuffer_layout.color_format);
 	header.depth_format = static_cast<u32>(m_framebuffer_layout.depth_format);
 
+	rsx::webgpu::resolved_state_packet resolved{};
+	fill_resolved_state(resolved, kind == rsx::webgpu::packet_kind::clear ? value : 0);
+
 	rsx::webgpu::draw_packet_builder packet(header);
-	if (packet.append(rsx::webgpu::section_kind::registers,
-		std::as_bytes(std::span(rsx::method_registers.registers))))
+	bool packet_ok = packet.append(rsx::webgpu::section_kind::resolved_state,
+		std::as_bytes(std::span{&resolved, 1}));
+	if (rsx::webgpu::packet_capture_level() >= 5)
+	{
+		packet_ok = packet.append(rsx::webgpu::section_kind::raw_registers,
+			std::as_bytes(std::span(rsx::method_registers.registers))) && packet_ok;
+	}
+	if (packet_ok)
 	{
 		(void)rsx::webgpu::host_command_queue().push(packet.finish());
 	}
+}
+
+// Resolve the render state the browser consumes through the same
+// rsx::method_registers accessors and surface-format helpers that
+// VKGSRender::decode_rsx_state and VKGSRender::clear_surface use, so the
+// packet never re-derives guest register semantics.
+void WebGPUGSRender::fill_resolved_state(rsx::webgpu::resolved_state_packet& state, u32 clear_mask) const
+{
+	const auto& regs = rsx::method_registers;
+	const auto surface_color = regs.surface_color();
+	const auto surface_depth = regs.surface_depth_fmt();
+	const u32 draw_buffer_count = static_cast<u32>(rsx::utility::get_rtt_indexes(m_framebuffer_layout.target).size());
+
+	state.surface_color_format = static_cast<u32>(surface_color);
+	state.surface_depth_format = static_cast<u32>(surface_depth);
+	state.draw_buffer_count = draw_buffer_count;
+
+	// Clear values (VKGSRender::clear_surface)
+	u32 mask = clear_mask;
+	if (!regs.stencil_mask()) mask &= ~RSX_GCM_CLEAR_STENCIL_BIT;
+
+	if (mask & RSX_GCM_CLEAR_DEPTH_STENCIL_MASK)
+	{
+		if (mask & RSX_GCM_CLEAR_DEPTH_BIT)
+		{
+			const u32 max_depth_value = get_max_depth_value(surface_depth);
+			const u32 clear_depth = regs.z_clear_value(is_depth_stencil_format(surface_depth));
+			state.clear_depth = static_cast<f32>(clear_depth) / max_depth_value;
+		}
+
+		if (is_depth_stencil_format(surface_depth))
+		{
+			if (mask & RSX_GCM_CLEAR_STENCIL_BIT)
+			{
+				state.clear_stencil = regs.stencil_clear_value();
+			}
+		}
+		else
+		{
+			mask &= ~RSX_GCM_CLEAR_STENCIL_BIT;
+		}
+	}
+
+	if (u32 colormask = (mask & RSX_GCM_CLEAR_COLOR_RGBA_MASK))
+	{
+		u8 clear_a = regs.clear_color_a();
+		u8 clear_r = regs.clear_color_r();
+		u8 clear_g = regs.clear_color_g();
+		u8 clear_b = regs.clear_color_b();
+
+		switch (surface_color)
+		{
+		case rsx::surface_color_format::x32:
+		case rsx::surface_color_format::w16z16y16x16:
+		case rsx::surface_color_format::w32z32y32x32:
+		{
+			colormask = 0;
+			break;
+		}
+		case rsx::surface_color_format::b8:
+		{
+			rsx::get_b8_clear_color(clear_r, clear_g, clear_b, clear_a);
+			colormask = rsx::get_b8_clearmask(colormask);
+			break;
+		}
+		case rsx::surface_color_format::g8b8:
+		{
+			rsx::get_g8b8_clear_color(clear_r, clear_g, clear_b, clear_a);
+			colormask = rsx::get_g8b8_r8g8_clearmask(colormask);
+			break;
+		}
+		case rsx::surface_color_format::r5g6b5:
+		{
+			rsx::get_rgb565_clear_color(clear_r, clear_g, clear_b, clear_a);
+			break;
+		}
+		case rsx::surface_color_format::x1r5g5b5_o1r5g5b5:
+		{
+			rsx::get_a1rgb555_clear_color(clear_r, clear_g, clear_b, clear_a, 255);
+			break;
+		}
+		case rsx::surface_color_format::x1r5g5b5_z1r5g5b5:
+		{
+			rsx::get_a1rgb555_clear_color(clear_r, clear_g, clear_b, clear_a, 0);
+			break;
+		}
+		case rsx::surface_color_format::a8b8g8r8:
+		case rsx::surface_color_format::x8b8g8r8_o8b8g8r8:
+		case rsx::surface_color_format::x8b8g8r8_z8b8g8r8:
+		{
+			rsx::get_abgr8_clear_color(clear_r, clear_g, clear_b, clear_a);
+			colormask = rsx::get_abgr8_clearmask(colormask);
+			break;
+		}
+		default:
+		{
+			break;
+		}
+		}
+
+		mask = (mask & ~RSX_GCM_CLEAR_COLOR_RGBA_MASK) | colormask;
+		state.clear_color[0] = static_cast<f32>(clear_r) / 255;
+		state.clear_color[1] = static_cast<f32>(clear_g) / 255;
+		state.clear_color[2] = static_cast<f32>(clear_b) / 255;
+		state.clear_color[3] = static_cast<f32>(clear_a) / 255;
+	}
+
+	state.clear_mask = mask;
+
+	// Depth (VKGSRender::decode_rsx_state)
+	state.depth_test_enabled = regs.depth_test_enabled();
+	state.depth_write_enabled = regs.depth_write_enabled();
+	state.depth_func = static_cast<u32>(regs.depth_func());
+	state.depth_clamp_enabled = regs.depth_clamp_enabled();
+	state.depth_clip_enabled = regs.depth_clip_enabled();
+	state.depth_bounds_test_enabled = regs.depth_bounds_test_enabled();
+	state.depth_bounds_min = regs.depth_bounds_min();
+	state.depth_bounds_max = regs.depth_bounds_max();
+
+	// Stencil
+	state.stencil_test_enabled = regs.stencil_test_enabled();
+	state.two_sided_stencil_test_enabled = regs.two_sided_stencil_test_enabled();
+	state.stencil_func = static_cast<u32>(regs.stencil_func());
+	state.stencil_op_fail = static_cast<u32>(regs.stencil_op_fail());
+	state.stencil_op_zfail = static_cast<u32>(regs.stencil_op_zfail());
+	state.stencil_op_zpass = static_cast<u32>(regs.stencil_op_zpass());
+	state.stencil_func_ref = regs.stencil_func_ref();
+	state.stencil_func_mask = regs.stencil_func_mask();
+	state.stencil_mask = regs.stencil_mask();
+	state.back_stencil_func = static_cast<u32>(regs.back_stencil_func());
+	state.back_stencil_op_fail = static_cast<u32>(regs.back_stencil_op_fail());
+	state.back_stencil_op_zfail = static_cast<u32>(regs.back_stencil_op_zfail());
+	state.back_stencil_op_zpass = static_cast<u32>(regs.back_stencil_op_zpass());
+	state.back_stencil_func_ref = regs.back_stencil_func_ref();
+	state.back_stencil_func_mask = regs.back_stencil_func_mask();
+	state.back_stencil_mask = regs.back_stencil_mask();
+
+	// Color output. LogicOp and blend are mutually exclusive; logic op wins.
+	state.logic_op_enabled = regs.logic_op_enabled();
+	state.logic_operation = static_cast<u32>(regs.logic_operation());
+	state.blend_enabled_mask =
+		(regs.blend_enabled() ? 1u : 0u) |
+		(regs.blend_enabled_surface_1() ? 2u : 0u) |
+		(regs.blend_enabled_surface_2() ? 4u : 0u) |
+		(regs.blend_enabled_surface_3() ? 8u : 0u);
+	state.blend_sfactor_rgb = static_cast<u32>(regs.blend_func_sfactor_rgb());
+	state.blend_sfactor_a = static_cast<u32>(regs.blend_func_sfactor_a());
+	state.blend_dfactor_rgb = static_cast<u32>(regs.blend_func_dfactor_rgb());
+	state.blend_dfactor_a = static_cast<u32>(regs.blend_func_dfactor_a());
+	state.blend_equation_rgb = static_cast<u32>(regs.blend_equation_rgb());
+	state.blend_equation_a = static_cast<u32>(regs.blend_equation_a());
+	const auto blend_colors = rsx::get_constant_blend_colors();
+	for (u32 i = 0; i < 4; ++i) state.blend_color[i] = blend_colors[i];
+
+	const auto host_write_mask = rsx::get_write_output_mask(surface_color);
+	for (u32 index = 0; index < 4; ++index)
+	{
+		if (index >= draw_buffer_count)
+		{
+			state.color_write_mask[index] = 0;
+			continue;
+		}
+
+		bool color_mask_b = regs.color_mask_b(index);
+		bool color_mask_g = regs.color_mask_g(index);
+		bool color_mask_r = regs.color_mask_r(index);
+		bool color_mask_a = regs.color_mask_a(index);
+
+		switch (surface_color)
+		{
+		case rsx::surface_color_format::b8:
+			rsx::get_b8_colormask(color_mask_r, color_mask_g, color_mask_b, color_mask_a);
+			break;
+		case rsx::surface_color_format::g8b8:
+			rsx::get_g8b8_r8g8_colormask(color_mask_r, color_mask_g, color_mask_b, color_mask_a);
+			break;
+		default:
+			break;
+		}
+
+		state.color_write_mask[index] =
+			((color_mask_r && host_write_mask[0]) ? 1u : 0u) |
+			((color_mask_g && host_write_mask[1]) ? 2u : 0u) |
+			((color_mask_b && host_write_mask[2]) ? 4u : 0u) |
+			((color_mask_a && host_write_mask[3]) ? 8u : 0u);
+	}
+
+	state.alpha_test_enabled = regs.alpha_test_enabled();
+	state.alpha_func = static_cast<u32>(regs.alpha_func());
+	state.alpha_ref = regs.alpha_ref();
+
+	// Raster
+	state.cull_face_enabled = regs.cull_face_enabled();
+	state.cull_face_mode = static_cast<u32>(regs.cull_face_mode());
+	state.front_face_mode = static_cast<u32>(regs.front_face_mode());
+	state.line_width = regs.line_width();
+	state.poly_offset_fill_enabled = regs.poly_offset_fill_enabled();
+	state.poly_offset_scale = regs.poly_offset_scale();
+	state.poly_offset_bias = regs.poly_offset_bias();
+	state.shader_control = regs.shader_control();
 }
 
 void WebGPUGSRender::clear_surface(u32 mask)

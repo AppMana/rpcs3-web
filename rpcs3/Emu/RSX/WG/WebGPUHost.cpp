@@ -25,7 +25,7 @@ namespace rsx::webgpu
 
 	void set_packet_capture_level(std::uint32_t level)
 	{
-		s_packet_capture_level.store(std::min(level, 4u), std::memory_order_relaxed);
+		s_packet_capture_level.store(std::min(level, 5u), std::memory_order_relaxed);
 	}
 
 	command_queue::command_queue(std::size_t byte_limit)

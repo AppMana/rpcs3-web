@@ -18,7 +18,7 @@ namespace
 		header.kind = kind;
 		std::vector<std::byte> payload(payload_size, std::byte{0x5a});
 		rsx::webgpu::draw_packet_builder builder(header);
-		assert(builder.append(rsx::webgpu::section_kind::registers, payload));
+		assert(builder.append(rsx::webgpu::section_kind::resolved_state, payload));
 		return builder.finish();
 	}
 }
@@ -30,7 +30,7 @@ int main()
 	set_packet_capture_level(2);
 	assert(packet_capture_level() == 2);
 	set_packet_capture_level(9);
-	assert(packet_capture_level() == 4);
+	assert(packet_capture_level() == 5);
 
 	command_queue queue(1024);
 	assert(queue.push(make_packet(7)));

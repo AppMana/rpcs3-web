@@ -24,7 +24,13 @@ int main()
 	};
 	const raster_environment_packet raster{16, 24, 640, 360};
 
+	resolved_state_packet resolved{};
+	resolved.clear_mask = 0xf3;
+	resolved.depth_func = 0x201;
+	resolved.color_write_mask[0] = 0xf;
+
 	draw_packet_builder builder(header);
+	assert(builder.append(section_kind::resolved_state, std::as_bytes(std::span{&resolved, 1})));
 	assert(builder.append(section_kind::vertex_program, std::as_bytes(std::span(program))));
 	assert(builder.append(section_kind::persistent_vertices, vertices, 256));
 	assert(builder.append(section_kind::raster_environment, std::as_bytes(std::span{&raster, 1})));
@@ -43,6 +49,12 @@ int main()
 	assert(std::memcmp(view.section(section_kind::raster_environment).data(), &raster, sizeof(raster)) == 0);
 	assert(view.section(section_kind::persistent_vertices).size() == vertices.size());
 	assert(view.section(section_kind::indices).empty());
+	assert(view.section(section_kind::raw_registers).empty());
+	assert(view.section(section_kind::resolved_state).size() == sizeof(resolved_state_packet));
+	assert(view.header()->abi == 5);
+	assert(view.header()->sections[static_cast<std::size_t>(section_kind::resolved_state)].offset >= sizeof(draw_packet_header));
+	assert(view.header()->sections[static_cast<std::size_t>(section_kind::resolved_state)].offset % 16 == 0);
+	assert(std::memcmp(view.section(section_kind::resolved_state).data(), &resolved, sizeof(resolved)) == 0);
 
 	auto truncated = bytes;
 	truncated.pop_back();

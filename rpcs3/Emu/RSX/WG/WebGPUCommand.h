@@ -9,7 +9,7 @@
 namespace rsx::webgpu
 {
 	constexpr std::uint32_t draw_packet_magic = 0x52444757; // "WGDR" in little endian memory.
-	constexpr std::uint32_t draw_packet_abi = 4;
+	constexpr std::uint32_t draw_packet_abi = 5;
 
 	enum class packet_kind : std::uint32_t
 	{
@@ -62,9 +62,78 @@ namespace rsx::webgpu
 
 	static_assert(sizeof(raster_environment_packet) == 16);
 
+	// Render state resolved by RPCS3's common RSX code (rsx::method_registers
+	// accessors and the same surface-format helpers the Vulkan backend uses).
+	// Enum-valued fields carry the CELL_GCM values RPCS3's enums are defined
+	// with; the browser translates them to WebGPU enums without re-deriving
+	// guest semantics. Clear fields are meaningful on clear packets only.
+	struct resolved_state_packet
+	{
+		std::uint32_t clear_mask = 0;          // RSX_GCM_CLEAR_* bits after RPCS3's format/stencil adjustments
+		float clear_color[4] = {};             // normalized, after surface-format clear-color helpers
+		float clear_depth = 0.f;               // z_clear_value / max depth value of the surface format
+		std::uint32_t clear_stencil = 0;
+		std::uint32_t surface_color_format = 0;
+		std::uint32_t surface_depth_format = 0;
+		std::uint32_t draw_buffer_count = 0;
+
+		std::uint32_t depth_test_enabled = 0;
+		std::uint32_t depth_write_enabled = 0;
+		std::uint32_t depth_func = 0;
+		std::uint32_t depth_clamp_enabled = 0;
+		std::uint32_t depth_clip_enabled = 0;
+		std::uint32_t depth_bounds_test_enabled = 0;
+		float depth_bounds_min = 0.f;
+		float depth_bounds_max = 0.f;
+
+		std::uint32_t stencil_test_enabled = 0;
+		std::uint32_t two_sided_stencil_test_enabled = 0;
+		std::uint32_t stencil_func = 0;
+		std::uint32_t stencil_op_fail = 0;
+		std::uint32_t stencil_op_zfail = 0;
+		std::uint32_t stencil_op_zpass = 0;
+		std::uint32_t stencil_func_ref = 0;
+		std::uint32_t stencil_func_mask = 0;
+		std::uint32_t stencil_mask = 0;
+		std::uint32_t back_stencil_func = 0;
+		std::uint32_t back_stencil_op_fail = 0;
+		std::uint32_t back_stencil_op_zfail = 0;
+		std::uint32_t back_stencil_op_zpass = 0;
+		std::uint32_t back_stencil_func_ref = 0;
+		std::uint32_t back_stencil_func_mask = 0;
+		std::uint32_t back_stencil_mask = 0;
+
+		std::uint32_t logic_op_enabled = 0;
+		std::uint32_t logic_operation = 0;
+		std::uint32_t blend_enabled_mask = 0;  // bit n = draw buffer n
+		std::uint32_t blend_sfactor_rgb = 0;
+		std::uint32_t blend_sfactor_a = 0;
+		std::uint32_t blend_dfactor_rgb = 0;
+		std::uint32_t blend_dfactor_a = 0;
+		std::uint32_t blend_equation_rgb = 0;
+		std::uint32_t blend_equation_a = 0;
+		float blend_color[4] = {};             // rsx::get_constant_blend_colors()
+		std::uint32_t color_write_mask[4] = {}; // bit0 R, bit1 G, bit2 B, bit3 A, host-resolved per draw buffer
+		std::uint32_t alpha_test_enabled = 0;
+		std::uint32_t alpha_func = 0;
+		float alpha_ref = 0.f;
+
+		std::uint32_t cull_face_enabled = 0;
+		std::uint32_t cull_face_mode = 0;
+		std::uint32_t front_face_mode = 0;
+		float line_width = 0.f;
+		std::uint32_t poly_offset_fill_enabled = 0;
+		float poly_offset_scale = 0.f;
+		float poly_offset_bias = 0.f;
+		std::uint32_t shader_control = 0;
+		std::uint32_t reserved[2] = {};
+	};
+
+	static_assert(sizeof(resolved_state_packet) == 256);
+
 	enum class section_kind : std::uint32_t
 	{
-		registers,
+		resolved_state,
 		vertex_program,
 		fragment_program,
 		vertex_constants,
@@ -76,6 +145,8 @@ namespace rsx::webgpu
 		indices,
 		textures,
 		raster_environment,
+		fragment_constants,
+		raw_registers, // full rsx::method_registers snapshot, capture level 5 only
 		count,
 	};
 
@@ -123,7 +194,7 @@ namespace rsx::webgpu
 	};
 
 	static_assert(sizeof(packet_section) == 8);
-	static_assert(sizeof(draw_packet_header) == 200);
+	static_assert(sizeof(draw_packet_header) == 216);
 
 	class draw_packet_builder
 	{

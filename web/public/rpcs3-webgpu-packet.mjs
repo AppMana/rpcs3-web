@@ -1,7 +1,21 @@
 export const DRAW_PACKET_MAGIC = 0x52444757;
-export const DRAW_PACKET_ABI = 4;
-export const DRAW_PACKET_HEADER_SIZE = 200;
+export const DRAW_PACKET_ABI = 5;
+export const DRAW_PACKET_SECTION_COUNT = 14;
+export const DRAW_PACKET_HEADER_SIZE = 104 + DRAW_PACKET_SECTION_COUNT * 8;
 export const TEXTURE_PACKET_RECORD_SIZE = 64;
+export const RESOLVED_STATE_SIZE = 256;
+
+// RSX_GCM_CLEAR_* bits as RPCS3 defines them.
+export const ClearMask = Object.freeze({
+  depth: 0x01,
+  stencil: 0x02,
+  red: 0x10,
+  green: 0x20,
+  blue: 0x40,
+  alpha: 0x80,
+  colorRgba: 0xf0,
+  depthStencil: 0x03,
+});
 
 export const PacketKind = Object.freeze({ draw: 1, clear: 2, flip: 3 });
 export const PacketFlag = Object.freeze({
@@ -13,7 +27,7 @@ export const PacketFlag = Object.freeze({
   skipped: 1 << 5,
 });
 export const SectionKind = Object.freeze({
-  registers: 0,
+  resolvedState: 0,
   vertexProgram: 1,
   fragmentProgram: 2,
   vertexConstants: 3,
@@ -25,6 +39,8 @@ export const SectionKind = Object.freeze({
   indices: 9,
   textures: 10,
   rasterEnvironment: 11,
+  fragmentConstants: 12,
+  rawRegisters: 13,
 });
 
 function u32(view, offset) {
@@ -80,6 +96,75 @@ export function decodeTextureRecords(bytes) {
   return textures;
 }
 
+// Layout of rsx::webgpu::resolved_state_packet (WebGPUCommand.h). Values are
+// resolved by RPCS3's common RSX code; enum fields carry CELL_GCM values.
+export function decodeResolvedState(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength !== RESOLVED_STATE_SIZE) {
+    throw new Error(`invalid WebGPU resolved-state section (${bytes?.byteLength ?? 0} bytes)`);
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const f32 = (offset) => view.getFloat32(offset, true);
+  let offset = 0;
+  const next = () => { const value = u32(view, offset); offset += 4; return value; };
+  const nextF32 = () => { const value = f32(offset); offset += 4; return value; };
+  const state = {};
+  state.clearMask = next();
+  state.clearColor = [nextF32(), nextF32(), nextF32(), nextF32()];
+  state.clearDepth = nextF32();
+  state.clearStencil = next();
+  state.surfaceColorFormat = next();
+  state.surfaceDepthFormat = next();
+  state.drawBufferCount = next();
+  state.depthTestEnabled = Boolean(next());
+  state.depthWriteEnabled = Boolean(next());
+  state.depthFunc = next();
+  state.depthClampEnabled = Boolean(next());
+  state.depthClipEnabled = Boolean(next());
+  state.depthBoundsTestEnabled = Boolean(next());
+  state.depthBoundsMin = nextF32();
+  state.depthBoundsMax = nextF32();
+  state.stencilTestEnabled = Boolean(next());
+  state.twoSidedStencilTestEnabled = Boolean(next());
+  state.stencilFunc = next();
+  state.stencilOpFail = next();
+  state.stencilOpZFail = next();
+  state.stencilOpZPass = next();
+  state.stencilFuncRef = next();
+  state.stencilFuncMask = next();
+  state.stencilMask = next();
+  state.backStencilFunc = next();
+  state.backStencilOpFail = next();
+  state.backStencilOpZFail = next();
+  state.backStencilOpZPass = next();
+  state.backStencilFuncRef = next();
+  state.backStencilFuncMask = next();
+  state.backStencilMask = next();
+  state.logicOpEnabled = Boolean(next());
+  state.logicOperation = next();
+  state.blendEnabledMask = next();
+  state.blendSfactorRgb = next();
+  state.blendSfactorA = next();
+  state.blendDfactorRgb = next();
+  state.blendDfactorA = next();
+  state.blendEquationRgb = next();
+  state.blendEquationA = next();
+  state.blendColor = [nextF32(), nextF32(), nextF32(), nextF32()];
+  state.colorWriteMask = [next(), next(), next(), next()];
+  state.alphaTestEnabled = Boolean(next());
+  state.alphaFunc = next();
+  state.alphaRef = nextF32();
+  state.cullFaceEnabled = Boolean(next());
+  state.cullFaceMode = next();
+  state.frontFaceMode = next();
+  state.lineWidth = nextF32();
+  state.polyOffsetFillEnabled = Boolean(next());
+  state.polyOffsetScale = nextF32();
+  state.polyOffsetBias = nextF32();
+  state.shaderControl = next();
+  if (offset !== RESOLVED_STATE_SIZE - 8) throw new Error("resolved-state decoder is out of sync with the packet ABI");
+  return state;
+}
+
 export function decodeDrawPacket(bytes) {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength < DRAW_PACKET_HEADER_SIZE) {
     throw new Error(`truncated WebGPU packet (${bytes?.byteLength ?? 0} bytes)`);
@@ -90,7 +175,7 @@ export function decodeDrawPacket(bytes) {
     throw new Error(`invalid WebGPU packet header (magic=0x${u32(view, 0).toString(16)}, ABI=${u32(view, 4)}, declared=${byteSize}, actual=${bytes.byteLength})`);
   }
   const sections = [];
-  for (let index = 0; index < 12; index += 1) {
+  for (let index = 0; index < DRAW_PACKET_SECTION_COUNT; index += 1) {
     const offset = u32(view, 104 + index * 8);
     const size = u32(view, 108 + index * 8);
     if ((size === 0 && offset !== 0) || (size !== 0 && (offset < DRAW_PACKET_HEADER_SIZE || offset + size > byteSize))) {
@@ -129,6 +214,7 @@ export function decodeDrawPacket(bytes) {
     sections,
   };
   packet.textures = decodeTextureRecords(sections[SectionKind.textures].bytes);
+  packet.resolvedState = decodeResolvedState(sections[SectionKind.resolvedState].bytes);
   return packet;
 }
 
@@ -183,14 +269,21 @@ export function packetSummary(packet) {
     fragmentProgramControl: packet.fragmentProgramControl,
     sectionSizes: packet.sections.map((section) => section.size),
   };
-  const registers = packet.sections[SectionKind.registers].bytes;
+  const state = packet.resolvedState;
+  summary.clearMask = state.clearMask;
+  summary.clearColor = state.clearColor;
+  summary.clearDepth = state.clearDepth;
+  summary.shaderControl = state.shaderControl;
+  summary.depthFunction = state.depthFunc;
+  summary.depthWriteEnabled = state.depthWriteEnabled;
+  summary.depthTestEnabled = state.depthTestEnabled;
+  summary.blendEnabledMask = state.blendEnabledMask;
+  summary.colorWriteMask = state.colorWriteMask;
+  const registers = packet.sections[SectionKind.rawRegisters].bytes;
   if (registers.byteLength >= 0x1d90 + 4) {
     const registerView = new DataView(registers.buffer, registers.byteOffset, registers.byteLength);
-    summary.clearColor = registerView.getUint32(0x1d90, true);
-    summary.shaderControl = registerView.getUint32(0x1d60, true);
-    summary.depthFunction = registerView.getUint32(0x0a6c, true);
-    summary.depthWriteEnabled = Boolean(registerView.getUint32(0x0a70, true));
-    summary.depthTestEnabled = Boolean(registerView.getUint32(0x0a74, true));
+    summary.rawClearColor = registerView.getUint32(0x1d90, true);
+    summary.rawShaderControl = registerView.getUint32(0x1d60, true);
   }
   if (packet.kind === PacketKind.draw) {
     const layout = packet.sections[SectionKind.vertexLayout].bytes;

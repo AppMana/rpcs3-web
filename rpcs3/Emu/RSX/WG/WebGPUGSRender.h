@@ -23,6 +23,7 @@ private:
 
 	bool emit_draw_packet(u32 subdraw);
 	void emit_control_packet(rsx::webgpu::packet_kind kind, u32 value, u32 flags = 0);
+	void fill_resolved_state(rsx::webgpu::resolved_state_packet& state, u32 clear_mask) const;
 
 	rsx::vertex_input_layout m_vertex_layout;
 	areau m_scissor{};

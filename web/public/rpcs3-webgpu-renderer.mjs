@@ -1,4 +1,4 @@
-import { PacketFlag, PacketKind, SectionKind } from "./rpcs3-webgpu-packet.mjs";
+import { ClearMask, PacketFlag, PacketKind, SectionKind } from "./rpcs3-webgpu-packet.mjs";
 
 let activePresentation;
 
@@ -674,38 +674,35 @@ function translateDraw(packet, vertexDiagnostics = false, vertexBackend = "webgp
   };
 }
 
+// Clear values come from RPCS3's clear_surface resolution (surface-format
+// clear-color helpers, z_clear_value scaled by the depth format).
 function clearValue(packet) {
-  const registers = packet.sections[SectionKind.registers].bytes;
-  const word = registers.byteLength >= 0x1d94
-    ? new DataView(registers.buffer, registers.byteOffset, registers.byteLength).getUint32(0x1d90, true)
-    : 0;
+  const state = packet.resolvedState;
+  const [r, g, b, a] = state.clearColor;
   return {
-    r: ((word >>> 16) & 0xff) / 255,
-    g: ((word >>> 8) & 0xff) / 255,
-    b: (word & 0xff) / 255,
-    a: ((word >>> 24) & 0xff) / 255,
-    bytes: [(word >>> 16) & 0xff, (word >>> 8) & 0xff, word & 0xff, (word >>> 24) & 0xff],
+    r, g, b, a,
+    bytes: [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255), Math.round(a * 255)],
+    mask: state.clearMask,
+    depth: state.clearMask & ClearMask.depth ? state.clearDepth : 1,
+    stencil: state.clearMask & ClearMask.stencil ? state.clearStencil : 0,
   };
 }
 
 function depthState(packet) {
-  const registers = packet.sections[SectionKind.registers].bytes;
-  if (registers.byteLength < 0x0a78) throw new Error("RPCS3 register packet is missing depth state");
-  const view = new DataView(registers.buffer, registers.byteOffset, registers.byteLength);
-  const enabled = Boolean(view.getUint32(0x0a74, true));
-  const writeEnabled = Boolean(view.getUint32(0x0a70, true));
+  const state = packet.resolvedState;
+  const enabled = state.depthTestEnabled;
+  const writeEnabled = state.depthWriteEnabled;
   const comparison = new Map([
     [0x200, "never"], [0x201, "less"], [0x202, "equal"], [0x203, "less-equal"],
     [0x204, "greater"], [0x205, "not-equal"], [0x206, "greater-equal"], [0x207, "always"],
-  ]).get(view.getUint32(0x0a6c, true));
-  if (!comparison) throw new Error(`unsupported RSX depth comparison 0x${view.getUint32(0x0a6c, true).toString(16)}`);
+  ]).get(state.depthFunc);
+  if (!comparison) throw new Error(`unsupported RSX depth comparison 0x${state.depthFunc.toString(16)}`);
+  // Like RPCS3's Vulkan backend: depth write is meaningless without depth test.
   return { enabled, writeEnabled: enabled && writeEnabled, comparison: enabled ? comparison : "always" };
 }
 
 function renderTargetState(packet) {
-  const registers = packet.sections[SectionKind.registers].bytes;
-  if (registers.byteLength < 0x0328) throw new Error("RPCS3 register packet is missing render-target state");
-  const view = new DataView(registers.buffer, registers.byteOffset, registers.byteLength);
+  const state = packet.resolvedState;
   const factor = (value) => {
     const result = new Map([
       [0, "zero"], [1, "one"], [0x300, "src"], [0x301, "one-minus-src"],
@@ -725,43 +722,37 @@ function renderTargetState(packet) {
     if (!result) throw new Error(`unsupported RSX blend equation 0x${value.toString(16)}`);
     return result;
   };
-  const blendEnabled = Boolean(view.getUint32(0x0310, true));
-  const source = view.getUint32(0x0314, true);
-  const destination = view.getUint32(0x0318, true);
-  const equation = view.getUint32(0x0320, true);
-  const colorMask = view.getUint32(0x0324, true);
+  // Draw buffer 0 only: multiple render targets are not part of the exercised
+  // closure yet. Logic op and blend are mutually exclusive in RPCS3; logic op
+  // wins, and WebGPU has no logic op, so such draws are rejected explicitly.
+  if (state.logicOpEnabled) throw new Error(`RSX logic operation 0x${state.logicOperation.toString(16)} is not supported by WebGPU`);
+  const blendEnabled = Boolean(state.blendEnabledMask & 1);
+  const mask = state.colorWriteMask[0];
   let writeMask = 0;
-  if (colorMask & 0x000000ff) writeMask |= GPUColorWrite.BLUE;
-  if (colorMask & 0x0000ff00) writeMask |= GPUColorWrite.GREEN;
-  if (colorMask & 0x00ff0000) writeMask |= GPUColorWrite.RED;
-  if (colorMask & 0xff000000) writeMask |= GPUColorWrite.ALPHA;
+  if (mask & 1) writeMask |= GPUColorWrite.RED;
+  if (mask & 2) writeMask |= GPUColorWrite.GREEN;
+  if (mask & 4) writeMask |= GPUColorWrite.BLUE;
+  if (mask & 8) writeMask |= GPUColorWrite.ALPHA;
   const blend = blendEnabled ? {
-    color: { srcFactor: factor(source & 0xffff), dstFactor: factor(destination & 0xffff), operation: operation(equation & 0xffff) },
-    alpha: { srcFactor: factor(source >>> 16), dstFactor: factor(destination >>> 16), operation: operation(equation >>> 16) },
+    color: { srcFactor: factor(state.blendSfactorRgb), dstFactor: factor(state.blendDfactorRgb), operation: operation(state.blendEquationRgb) },
+    alpha: { srcFactor: factor(state.blendSfactorA), dstFactor: factor(state.blendDfactorA), operation: operation(state.blendEquationA) },
   } : undefined;
-  const blendColor = view.getUint32(0x031c, true);
+  const [r, g, b, a] = state.blendColor;
   return {
     blend,
     blendEnabled,
     writeMask,
-    blendConstant: {
-      r: ((blendColor >>> 16) & 0xff) / 255,
-      g: ((blendColor >>> 8) & 0xff) / 255,
-      b: (blendColor & 0xff) / 255,
-      a: ((blendColor >>> 24) & 0xff) / 255,
-    },
+    blendConstant: { r, g, b, a },
   };
 }
 
 function rasterState(packet) {
-  const registers = packet.sections[SectionKind.registers].bytes;
-  if (registers.byteLength < 0x1840) throw new Error("RPCS3 register packet is missing raster state");
-  const view = new DataView(registers.buffer, registers.byteOffset, registers.byteLength);
-  const frontFaceValue = view.getUint32(0x1834, true);
+  const state = packet.resolvedState;
+  const frontFaceValue = state.frontFaceMode;
   const frontFace = new Map([[0x0900, "ccw"], [0x0901, "cw"]]).get(frontFaceValue);
   if (!frontFace) throw new Error(`unsupported RSX front-face mode 0x${frontFaceValue.toString(16)}`);
-  const cullEnabled = Boolean(view.getUint32(0x183c, true));
-  const cullFaceValue = view.getUint32(0x1830, true);
+  const cullEnabled = state.cullFaceEnabled;
+  const cullFaceValue = state.cullFaceMode;
   const cullMode = cullEnabled
     ? new Map([[0x0404, "front"], [0x0405, "back"]]).get(cullFaceValue)
     : "none";
@@ -1229,7 +1220,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   const pass = encoder.beginRenderPass({ colorAttachments: [{
     view: texture.createView(), clearValue: clear, loadOp: "clear", storeOp: "store",
   }], depthStencilAttachment: {
-    view: depthTexture.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store",
+    view: depthTexture.createView(), depthClearValue: clear.depth, depthLoadOp: "clear", depthStoreOp: "store",
   } });
   for (let index = 0; index < translated.length; index += 1) {
     const scissor = scissorStates[index].scaled;
@@ -1325,7 +1316,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       const presentationPass = presentationEncoder.beginRenderPass({ colorAttachments: [{
         view: context.getCurrentTexture().createView(), clearValue: clear, loadOp: "clear", storeOp: "store",
       }], depthStencilAttachment: {
-        view: depthTexture.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store",
+        view: depthTexture.createView(), depthClearValue: clear.depth, depthLoadOp: "clear", depthStoreOp: "store",
       } });
       for (let index = 0; index < translated.length; index += 1) {
         const scissor = scissorStates[index].scaled;

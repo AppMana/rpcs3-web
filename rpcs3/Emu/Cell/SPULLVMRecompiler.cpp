@@ -12,6 +12,7 @@
 #include "Utilities/JIT.h"
 
 #include "SPUThread.h"
+#include "SPUWasmAbi.h"
 #include "SPUAnalyser.h"
 #include "SPUInterpreter.h"
 #include <algorithm>
@@ -81,6 +82,7 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 
 	// Interpreter table size power
 	const u8 m_interp_magn;
+	const bool m_wasm_aot = std::getenv("RPCS3_SPU_WASM_AOT_IR");
 
 	// Constant opcode bits
 	u32 m_op_const_mask = -1;
@@ -255,7 +257,7 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 		result->addParamAttr(0, llvm::Attribute::NoAlias);
 		result->addParamAttr(1, llvm::Attribute::NoAlias);
 #if 1
-		result->setCallingConv(llvm::CallingConv::GHC);
+		result->setCallingConv(m_wasm_aot ? llvm::CallingConv::C : llvm::CallingConv::GHC);
 #endif
 
 		empl.first->second.chunk = result;
@@ -279,7 +281,7 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 				fn->addParamAttr(0, llvm::Attribute::NoAlias);
 				fn->addParamAttr(1, llvm::Attribute::NoAlias);
 #if 1
-				fn->setCallingConv(llvm::CallingConv::GHC);
+				fn->setCallingConv(m_wasm_aot ? llvm::CallingConv::C : llvm::CallingConv::GHC);
 #endif
 				empl.first->second.fn = fn;
 			}
@@ -567,6 +569,34 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 		return _ptr(m_thread, ::offset32(offset_args...));
 	}
 
+	template <typename T>
+	u32 spu_wasm_root_offset(T spu_thread::* member)
+	{
+#define RPCS3_SPU_WASM_ABI_MATCH(name, offset) \
+		if constexpr (std::is_same_v<T, decltype(spu_thread::name)>) \
+		{ \
+			if (member == &spu_thread::name) return offset; \
+		}
+		RPCS3_SPU_WASM_ABI_FIELDS(RPCS3_SPU_WASM_ABI_MATCH)
+#undef RPCS3_SPU_WASM_ABI_MATCH
+		fmt::throw_exception("Missing SPU Wasm ABI field mapping");
+	}
+
+	template <typename T, typename... Args>
+	u32 spu_offset(T spu_thread::* root, Args... offset_args)
+	{
+		const u32 native_root = ::offset32(root);
+		const u32 native_full = ::offset32(root, offset_args...);
+		const u32 root_offset = m_wasm_aot ? spu_wasm_root_offset(root) : native_root;
+		return root_offset + native_full - native_root;
+	}
+
+	template <typename T, typename... Args>
+	llvm::Value* spu_ptr(T spu_thread::* root, Args... offset_args)
+	{
+		return _ptr(m_thread, spu_offset(root, offset_args...));
+	}
+
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnonnull"
@@ -634,15 +664,15 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 	{
 		if (index < 128)
 		{
-			return ::offset32(&spu_thread::gpr, index);
+			return spu_offset(&spu_thread::gpr, index);
 		}
 
 		switch (index)
 		{
-		case s_reg_mfc_eal: return ::offset32(&spu_thread::ch_mfc_cmd, &spu_mfc_cmd::eal);
-		case s_reg_mfc_lsa: return ::offset32(&spu_thread::ch_mfc_cmd, &spu_mfc_cmd::lsa);
-		case s_reg_mfc_tag: return ::offset32(&spu_thread::ch_mfc_cmd, &spu_mfc_cmd::tag);
-		case s_reg_mfc_size: return ::offset32(&spu_thread::ch_mfc_cmd, &spu_mfc_cmd::size);
+		case s_reg_mfc_eal: return spu_offset(&spu_thread::ch_mfc_cmd, &spu_mfc_cmd::eal);
+		case s_reg_mfc_lsa: return spu_offset(&spu_thread::ch_mfc_cmd, &spu_mfc_cmd::lsa);
+		case s_reg_mfc_tag: return spu_offset(&spu_thread::ch_mfc_cmd, &spu_mfc_cmd::tag);
+		case s_reg_mfc_size: return spu_offset(&spu_thread::ch_mfc_cmd, &spu_mfc_cmd::size);
 		default:
 			fmt::throw_exception("get_reg_offset(%u): invalid register index", index);
 		}
@@ -1599,6 +1629,14 @@ public:
 		{
 			m_spurt = &g_fxo->get<spu_runtime>();
 			cpu_translator::initialize(m_jit.get_context(), m_jit.get_engine());
+			if (m_wasm_aot)
+			{
+				m_use_ssse3 = false;
+				m_use_fma = false;
+				m_use_avx = false;
+				m_use_avx512 = false;
+				m_use_avx512_icl = false;
+			}
 
 			const auto md_name = llvm::MDString::get(m_context, "branch_weights");
 			const auto md_low = llvm::ValueAsMetadata::get(llvm::ConstantInt::get(GetType<u32>(), 1));
@@ -1764,8 +1802,10 @@ public:
 
 		// Create LLVM module
 		std::unique_ptr<Module> _module = std::make_unique<Module>(m_hash + ".obj", m_context);
-		_module->setTargetTriple(Triple(jit_compiler::triple2()));
-		_module->setDataLayout(m_jit.get_engine().getTargetMachine()->createDataLayout());
+		_module->setTargetTriple(Triple(m_wasm_aot ? "wasm32-unknown-unknown" : jit_compiler::triple2()));
+		_module->setDataLayout(m_wasm_aot
+			? DataLayout("e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128")
+			: m_jit.get_engine().getTargetMachine()->createDataLayout());
 		m_module = _module.get();
 
 		// Initialize IR Builder
@@ -1775,7 +1815,7 @@ public:
 		// Add entry function (contains only state/code check)
 		const auto main_func = llvm::cast<llvm::Function>(m_module->getOrInsertFunction(m_hash, get_ftype<void, u8*, u8*, u64>()).getCallee());
 		const auto main_arg2 = main_func->getArg(2);
-		main_func->setCallingConv(CallingConv::GHC);
+		main_func->setCallingConv(m_wasm_aot ? CallingConv::C : CallingConv::GHC);
 		set_function(main_func);
 
 		init_luts();
@@ -2490,7 +2530,7 @@ public:
 			const auto pbfail = spu_ptr(&spu_thread::block_failure);
 			m_ir->CreateStore(m_ir->CreateAdd(m_ir->CreateLoad(get_type<u64>(), pbfail), m_ir->getInt64(1)), pbfail);
 			const auto dispci = call("spu_dispatch", spu_runtime::tr_dispatch, m_thread, m_lsptr, main_arg2);
-			dispci->setCallingConv(CallingConv::GHC);
+			dispci->setCallingConv(m_wasm_aot ? CallingConv::C : CallingConv::GHC);
 			dispci->setTailCall();
 			m_ir->CreateRetVoid();
 		}
@@ -2523,7 +2563,7 @@ public:
 		// LLVM doesn't support PreserveAll on arm64.
 		m_test_state->setCallingConv(CallingConv::PreserveMost);
 #else
-		m_test_state->setCallingConv(CallingConv::PreserveAll);
+		m_test_state->setCallingConv(m_wasm_aot ? CallingConv::C : CallingConv::PreserveAll);
 #endif
 		m_ir->SetInsertPoint(BasicBlock::Create(m_context, "", m_test_state));
 		const auto escape_yes = BasicBlock::Create(m_context, "", m_test_state);
@@ -3896,6 +3936,45 @@ public:
 			}
 
 			fmt::throw_exception("Compilation failed");
+		}
+
+		if (m_wasm_aot)
+		{
+			std::string ir;
+			raw_string_ostream ir_out(ir);
+			ir_out << *_module;
+			std::string output_path = m_spurt->get_cache_path() + m_hash + ".wasm.ll";
+			if (const char* output_dir = std::getenv("RPCS3_SPU_WASM_AOT_DIR"))
+			{
+				std::string directory = output_dir;
+				if (!directory.empty())
+				{
+					if (!directory.ends_with('/'))
+					{
+						directory += '/';
+					}
+					if (!fs::create_path(directory) && !fs::is_dir(directory))
+					{
+						spu_log.error("LLVM: Failed to create SPU Wasm AOT output directory %s", directory);
+						return nullptr;
+					}
+					output_path = directory + m_hash + ".wasm.ll";
+				}
+			}
+			fs::write_file(output_path, fs::rewrite, ir_out.str());
+
+			// The x64 LLVM decoder initially installs the fast recompiler body and
+			// later patches its eight-byte entry sled to the LLVM result. Keep that
+			// existing body as the native oracle after exporting the Wasm module.
+			// Returning the body address makes the normal worker patch skip the sled.
+			if (const auto fallback = add_loc->compiled.load())
+			{
+				return reinterpret_cast<spu_function_t>(reinterpret_cast<u8*>(fallback) + 8);
+			}
+
+			// Cache precompilation never executes the returned address. It only
+			// requires a non-null result so it can continue exporting other units.
+			return spu_runtime::tr_interpreter;
 		}
 
 #if defined(__APPLE__)

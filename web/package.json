@@ -14,6 +14,7 @@
     "commercial:headless": "node scripts/run-commercial-headless.mjs",
     "ppu:aot": "node scripts/compile-ppu-ir-to-wasm.mjs",
     "ppu:aot:fixture": "node scripts/build-ppu-aot-fixture.mjs",
+    "spu:aot:fixture": "node scripts/build-spu-aot-fixture.mjs",
     "dispatch:build": "node scripts/build-dispatch-fixture.mjs",
     "dispatch:native": "node scripts/run-dispatch-conformance.mjs",
     "storage:inspect": "node scripts/inspect-opfs.mjs",

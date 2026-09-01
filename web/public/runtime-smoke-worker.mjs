@@ -1,5 +1,6 @@
 import { PacketKind, copyFrontPacket, discardFrontPacket, packetSummary } from "./rpcs3-webgpu-packet.mjs";
 import { createPpuDispatcher } from "./rpcs3-ppu-dispatcher.mjs";
+import { createSpuDispatcher } from "./rpcs3-spu-dispatcher.mjs";
 
 const scope = self;
 let module;
@@ -22,6 +23,7 @@ let progressIntervalMs = 250;
 let progressTimer;
 let dispatchLines = [];
 let ppuDispatcher;
+let spuDispatcher;
 let padState = { digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 };
 
 function recordLog(line) {
@@ -48,6 +50,7 @@ async function captureDispatch(expectedVerdict = "", timeoutMs = 30_000) {
       const snapshot = ppuDispatcher.runBatch(256);
       aotSnapshot = snapshot;
     }
+    if (spuDispatcher) spuDispatcher.runBatch(256);
     if (!ppuDispatcher || aotSnapshot?.context) refreshDispatchLines();
     terminal = dispatchLines.findLast((line) => / (PASS|FAIL) /.test(line)) ?? "";
     if (terminal) break;
@@ -84,6 +87,9 @@ async function captureDispatch(expectedVerdict = "", timeoutMs = 30_000) {
     atomicNotifyReentry,
     sparseVmProbe,
     ppuAot: ppuDispatcher?.snapshot() ?? null,
+    spuAot: spuDispatcher?.snapshot() ?? null,
+    spuAotAbi: Array.from({ length: 7 }, (_, field) =>
+      module.ccall("rpcs3_web_spu_aot_abi", "number", ["number"], [field]) >>> 0),
     elapsedMs: performance.now() - bootStartedAt,
     logs: logs.slice(-300),
     detail: terminal || `dispatch protocol did not finish within ${timeoutMs} ms`,
@@ -288,6 +294,8 @@ scope.addEventListener("message", async (event) => {
       clearInterval(progressTimer);
       ppuDispatcher?.release();
       ppuDispatcher = undefined;
+      spuDispatcher?.release();
+      spuDispatcher = undefined;
       module?.ccall("rpcs3_web_stop", null, [], []);
       module?.PThread?.terminateAllThreads();
       scope.postMessage({ type: "runtime-shutdown", ok: true });
@@ -326,14 +334,14 @@ scope.addEventListener("message", async (event) => {
     const { default: createRPCS3 } = await import("./core/rpcs3-web.mjs");
     let mainInstance;
     let mainMemory;
-    let mainWasm;
-    let aotWasm;
-    if (event.data.ppuAot === true) {
-      [mainWasm, aotWasm] = await Promise.all([
-        WebAssembly.compileStreaming(fetch("./core/rpcs3-web.wasm")),
-        WebAssembly.compileStreaming(fetch("./fixtures/web_dispatch_conformance-aot.wasm")),
-      ]);
-    }
+    const [mainWasm, aotWasm, spuAotWasm] = await Promise.all([
+      event.data.ppuAot === true || event.data.spuAot === true
+        ? WebAssembly.compileStreaming(fetch("./core/rpcs3-web.wasm")) : undefined,
+      event.data.ppuAot === true
+        ? WebAssembly.compileStreaming(fetch("./fixtures/web_dispatch_conformance-aot.wasm")) : undefined,
+      event.data.spuAot === true
+        ? WebAssembly.compileStreaming(fetch("./fixtures/web_dispatch_conformance-spu-aot.wasm")) : undefined,
+    ]);
     module = await createRPCS3({
       locateFile: (name) => new URL(`./core/${name}`, scope.location.href).href,
       print: recordLog,
@@ -373,6 +381,7 @@ scope.addEventListener("message", async (event) => {
     ]);
     module.ccall("rpcs3_web_set_watch_address", null, ["number"], [watchAddress]);
     if (aotWasm) module.ccall("rpcs3_web_set_ppu_aot_handoff", null, ["number"], [1]);
+    if (spuAotWasm) module.ccall("rpcs3_web_set_spu_aot_handoff", null, ["number"], [1]);
     if (event.data.path) fixtureBytes = Number(module.FS.stat(path).size);
     applyPadState(event.data.pad);
     bootResult = module.ccall("rpcs3_web_boot", "number", ["string"], [path]);
@@ -383,6 +392,14 @@ scope.addEventListener("message", async (event) => {
         mainMemory,
         aotModule: aotWasm,
         entryReadyAddress: mainInstance.exports.rpcs3_web_ppu_aot_entry_ready_address() >>> 0,
+      });
+    }
+    if (spuAotWasm) {
+      spuDispatcher = createSpuDispatcher({
+        module,
+        mainExports: mainInstance.exports,
+        mainMemory,
+        aotModules: [spuAotWasm],
       });
     }
     progress(true);

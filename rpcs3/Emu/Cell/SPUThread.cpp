@@ -67,6 +67,12 @@ atomic_t<u32> g_spu_web_last_pc[6]{};
 atomic_t<u64> g_spu_web_ls_boundary_count{0};
 atomic_t<u64> g_spu_web_ls_boundary_last{0};
 atomic_t<u64> g_spu_web_page_split_dma_count{0};
+atomic_t<u32> g_spu_web_aot_hold{0};
+atomic_t<u32> g_spu_web_aot_ready_mask{0};
+atomic_t<spu_thread*> g_spu_web_aot_context[6]{};
+atomic_t<u32> g_spu_web_aot_step_request[6]{};
+atomic_t<u32> g_spu_web_aot_step_complete[6]{};
+atomic_t<u32> g_spu_web_aot_step_result[6]{};
 
 static void spu_web_note_ls_boundary(u32 lsa, u32 size)
 {
@@ -1624,6 +1630,77 @@ void spu_thread::cpu_task()
 #endif
 		std::jmp_buf escape_context;
 		spu_web_set_escape_context(&escape_context);
+
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+		const u32 web_aot_slot = index % std::size(g_spu_web_aot_context);
+		const u32 web_aot_mask = 1u << web_aot_slot;
+		if (g_spu_web_aot_hold & web_aot_mask)
+		{
+			if (state && check_state())
+			{
+				spu_web_set_escape_context(nullptr);
+				allow_interrupts_in_cpu_work = false;
+				return;
+			}
+
+			g_spu_web_aot_context[web_aot_slot].release(this);
+			g_spu_web_aot_ready_mask.fetch_or(web_aot_mask);
+			g_spu_web_aot_ready_mask.notify_all();
+
+			while ((g_spu_web_aot_hold & web_aot_mask) && !Emu.IsStopped())
+			{
+				if (!g_spu_web_aot_step_request[web_aot_slot].exchange(0))
+				{
+					g_spu_web_aot_step_request[web_aot_slot].wait(0);
+					continue;
+				}
+
+				bool suspend = false;
+				if (!setjmp(escape_context))
+				{
+					if (state && check_state())
+					{
+						suspend = true;
+					}
+					else
+					{
+						if (_ref<u32>(pc) == 0x0u)
+						{
+							if (spu_thread::stop_and_signal(0x0))
+								pc += 4;
+						}
+						else
+						{
+							const u32 op = _ref<be_t<u32>>(pc);
+							if (table.decode(op)(*this, {op}))
+								pc += 4;
+						}
+						g_spu_web_instruction_count++;
+						g_spu_web_last_pc[web_aot_slot] = pc;
+					}
+				}
+
+				g_spu_web_aot_step_result[web_aot_slot] = pc;
+				if (suspend)
+				{
+					g_spu_web_aot_context[web_aot_slot] = nullptr;
+					g_spu_web_aot_ready_mask.fetch_and(~web_aot_mask);
+				}
+				g_spu_web_aot_step_complete[web_aot_slot].release(1);
+				g_spu_web_aot_step_complete[web_aot_slot].notify_one();
+				if (suspend)
+				{
+					spu_web_set_escape_context(nullptr);
+					allow_interrupts_in_cpu_work = false;
+					return;
+				}
+			}
+
+			g_spu_web_aot_context[web_aot_slot] = nullptr;
+			g_spu_web_aot_ready_mask.fetch_and(~web_aot_mask);
+		}
+#endif
+
 		while (true)
 		{
 			if (setjmp(escape_context))

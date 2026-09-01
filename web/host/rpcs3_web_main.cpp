@@ -4,6 +4,7 @@
 #include "Emu/Cell/PPUFunction.h"
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/Cell/SPUThread.h"
+#include "Emu/Cell/SPUWasmAbi.h"
 #include "Emu/Cell/timers.hpp"
 #include "Emu/RSX/GSFrameBase.h"
 #include "Emu/RSX/Null/NullGSRender.h"
@@ -70,6 +71,12 @@ extern atomic_t<u32> g_spu_web_last_pc[6];
 extern atomic_t<u64> g_spu_web_ls_boundary_count;
 extern atomic_t<u64> g_spu_web_ls_boundary_last;
 extern atomic_t<u64> g_spu_web_page_split_dma_count;
+extern atomic_t<u32> g_spu_web_aot_hold;
+extern atomic_t<u32> g_spu_web_aot_ready_mask;
+extern atomic_t<spu_thread*> g_spu_web_aot_context[6];
+extern atomic_t<u32> g_spu_web_aot_step_request[6];
+extern atomic_t<u32> g_spu_web_aot_step_complete[6];
+extern atomic_t<u32> g_spu_web_aot_step_result[6];
 extern u32 ppu_web_interpreter_step(ppu_thread& ppu);
 extern atomic_t<u32> g_ppu_web_aot_hold_entry;
 extern atomic_t<u32> g_ppu_web_aot_entry_ready;
@@ -80,6 +87,12 @@ extern u32 ppu_lwarx(ppu_thread& ppu, u32 addr);
 extern u64 ppu_ldarx(ppu_thread& ppu, u32 addr);
 extern bool ppu_stwcx(ppu_thread& ppu, u32 addr, u32 reg_value);
 extern bool ppu_stdcx(ppu_thread& ppu, u32 addr, u64 reg_value);
+#endif
+
+#ifdef RPCS3_WEB
+#define RPCS3_SPU_WASM_ABI_ASSERT(name, offset) static_assert(__builtin_offsetof(spu_thread, name) == offset);
+RPCS3_SPU_WASM_ABI_FIELDS(RPCS3_SPU_WASM_ABI_ASSERT)
+#undef RPCS3_SPU_WASM_ABI_ASSERT
 #endif
 
 // The desktop frontend owns these input-profile globals. The browser host is
@@ -976,6 +989,117 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_spu_page_split_dma_count()
 	{
 		return g_spu_web_page_split_dma_count;
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_spu_aot_handoff(s32 enabled)
+	{
+		if (!enabled)
+		{
+			g_spu_web_aot_hold = 0;
+			for (auto& request : g_spu_web_aot_step_request)
+			{
+				request.notify_all();
+			}
+			return;
+		}
+
+		g_spu_web_aot_ready_mask = 0;
+		for (u32 index = 0; index < std::size(g_spu_web_aot_context); index++)
+		{
+			g_spu_web_aot_context[index] = nullptr;
+			g_spu_web_aot_step_request[index] = 0;
+			g_spu_web_aot_step_complete[index] = 0;
+		}
+		g_spu_web_aot_hold = (1u << std::size(g_spu_web_aot_context)) - 1;
+		for (auto& request : g_spu_web_aot_step_request)
+		{
+			request.notify_all();
+		}
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_aot_ready_mask()
+	{
+		return g_spu_web_aot_ready_mask;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_aot_context(u32 index)
+	{
+		return index < std::size(g_spu_web_aot_context)
+			? static_cast<u32>(reinterpret_cast<uptr>(g_spu_web_aot_context[index].load())) : 0;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_aot_ls(u32 context)
+	{
+		const auto expected = reinterpret_cast<spu_thread*>(static_cast<uptr>(context));
+		for (const auto& candidate : g_spu_web_aot_context)
+		{
+			if (candidate.load() == expected)
+			{
+				return static_cast<u32>(reinterpret_cast<uptr>(expected->_ptr<u8>(0)));
+			}
+		}
+		return 0;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_aot_pc(u32 context)
+	{
+		const auto expected = reinterpret_cast<spu_thread*>(static_cast<uptr>(context));
+		for (const auto& candidate : g_spu_web_aot_context)
+		{
+			if (candidate.load() == expected)
+				return expected->pc;
+		}
+		return 0;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_aot_step(u32 index)
+	{
+		if (index >= std::size(g_spu_web_aot_context) || !g_spu_web_aot_context[index])
+			return 0;
+
+		g_spu_web_aot_step_complete[index] = 0;
+		g_spu_web_aot_step_request[index].release(1);
+		g_spu_web_aot_step_request[index].notify_one();
+		while (!g_spu_web_aot_step_complete[index])
+		{
+			g_spu_web_aot_step_complete[index].wait(0);
+		}
+		return g_spu_web_aot_step_result[index];
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_aot_terminal(u32 context)
+	{
+		const auto expected = reinterpret_cast<spu_thread*>(static_cast<uptr>(context));
+		for (const auto& candidate : g_spu_web_aot_context)
+		{
+			if (candidate.load() == expected)
+				return is_stopped(expected->state);
+		}
+		return 1;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_aot_release(u32 index)
+	{
+		if (index >= std::size(g_spu_web_aot_context))
+			return 0;
+		g_spu_web_aot_hold.fetch_and(~(1u << index));
+		g_spu_web_aot_step_request[index].notify_all();
+		return 1;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_aot_abi(u32 field)
+	{
+		switch (field)
+		{
+		case 0: return sizeof(spu_thread);
+		case 1: return ::offset32(&spu_thread::state);
+		case 2: return ::offset32(&spu_thread::pc);
+		case 3: return ::offset32(&spu_thread::gpr);
+		case 4: return ::offset32(&spu_thread::block_hash);
+		case 5: return ::offset32(&spu_thread::block_counter);
+		case 6: return ::offset32(&spu_thread::block_failure);
+		default: return umax;
+		}
 	}
 
 	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_vm_range_lock_bits(u32 exclusive)

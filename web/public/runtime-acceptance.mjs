@@ -107,6 +107,7 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       expectedVerdict: options.expectedVerdict ?? "",
       dispatchTimeoutMs: options.dispatchTimeoutMs ?? 30_000,
       ppuAot: options.ppuAot === true,
+      spuAot: options.spuAot === true,
       renderer: options.renderer ?? (options.render ? "webgpu" : "null"),
     });
   }).finally(() => { active = undefined; });

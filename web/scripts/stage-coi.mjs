@@ -29,6 +29,10 @@ await copyFile(
   path.join(fixtureOutput, "web_dispatch_conformance-aot.json"),
 );
 await copyFile(
+  path.join(root, "..", "bin", "test", "web_dispatch_conformance-spu-aot.wasm"),
+  path.join(fixtureOutput, "web_dispatch_conformance-spu-aot.wasm"),
+);
+await copyFile(
   path.join(root, "..", "bin", "test", "gs_gcm_basic_triangle.elf"),
   path.join(fixtureOutput, "gs_gcm_basic_triangle.elf"),
 );

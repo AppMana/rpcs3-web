@@ -1,0 +1,43 @@
+#pragma once
+
+#define RPCS3_SPU_WASM_ABI_FIELDS(X) \
+	X(block_hash, 8) \
+	X(state, 20) \
+	X(pc, 24) \
+	X(memory_base_addr, 36) \
+	X(memory_sudo_addr, 40) \
+	X(reserv_base_addr, 44) \
+	X(gpr, 48) \
+	X(ch_mfc_cmd, 2112) \
+	X(mfc_queue, 2128) \
+	X(mfc_size, 2384) \
+	X(mfc_barrier, 2388) \
+	X(mfc_fence, 2392) \
+	X(rtime, 2448) \
+	X(rdata, 2496) \
+	X(raddr, 2624) \
+	X(srr0, 2636) \
+	X(ch_tag_upd, 2640) \
+	X(ch_tag_mask, 2644) \
+	X(ch_tag_stat, 2656) \
+	X(ch_stall_mask, 2672) \
+	X(ch_stall_stat, 2688) \
+	X(ch_atomic_stat, 2704) \
+	X(ch_in_mbox, 2720) \
+	X(ch_out_mbox, 2752) \
+	X(ch_out_intr_mbox, 2768) \
+	X(ch_snr1, 2800) \
+	X(ch_snr2, 2816) \
+	X(ch_events, 2832) \
+	X(interrupts_enabled, 2840) \
+	X(ch_dec_start_timestamp, 2848) \
+	X(ch_dec_value, 2856) \
+	X(is_dec_frozen, 2860) \
+	X(thread_type, 3500) \
+	X(block_counter, 3592) \
+	X(block_failure, 3608) \
+	X(hv_ctx, 3616) \
+	X(last_faddr, 3776) \
+	X(last_getllar_lsa, 3820) \
+	X(stack_mirror, 3936) \
+	X(unsavable, 266128)

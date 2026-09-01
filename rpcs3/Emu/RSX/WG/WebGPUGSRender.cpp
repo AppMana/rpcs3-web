@@ -86,6 +86,18 @@ namespace
 		record.pitch = texture.pitch();
 		record.mip_count = texture.get_exact_mipmap_count();
 		record.dimension = static_cast<u32>(texture.get_extended_texture_dimension());
+		record.remap = texture.decoded_remap().encoded;
+		record.address_modes = static_cast<u32>(texture.wrap_s()) |
+			(static_cast<u32>(texture.wrap_t()) << 8) |
+			(static_cast<u32>(texture.wrap_r()) << 16);
+		u32 texel_controls = 0;
+		if constexpr (requires { texture.format_ex(); })
+		{
+			texel_controls = texture.format_ex().texel_remap_control;
+		}
+		record.filter_modes = static_cast<u32>(texture.min_filter()) |
+			(static_cast<u32>(texture.mag_filter()) << 8) |
+			((texel_controls & 0xffff) << 16);
 
 		const usz size = rsx::get_texture_size(texture);
 		const u32 address = rsx::get_address(texture.offset(), texture.location());

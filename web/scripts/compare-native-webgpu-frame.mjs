@@ -3,7 +3,7 @@ import { PNG } from "pngjs";
 
 function usage(message) {
   if (message) process.stderr.write(`${message}\n\n`);
-  process.stderr.write("usage: node scripts/compare-native-webgpu-frame.mjs <native.png> <browser-result.json> [--max-rmse <value>] [--min-close-pixels <fraction>]\n");
+  process.stderr.write("usage: node scripts/compare-native-webgpu-frame.mjs <native.png> <browser.png|browser-result.json> [--max-rmse <value>] [--min-close-pixels <fraction>]\n");
   process.exit(2);
 }
 
@@ -23,14 +23,22 @@ while (args.length) {
 }
 
 const native = PNG.sync.read(fs.readFileSync(nativePath));
-const browserDocument = JSON.parse(fs.readFileSync(browserPath, "utf8"));
-const browser = browserDocument.gpu ?? browserDocument;
-if (!browser.rgbaBase64) usage("browser result does not contain gpu.rgbaBase64; run with captureRgba: true");
+const browser = browserPath.toLowerCase().endsWith(".png")
+  ? PNG.sync.read(fs.readFileSync(browserPath))
+  : (() => {
+      const browserDocument = JSON.parse(fs.readFileSync(browserPath, "utf8"));
+      const result = browserDocument.gpu ?? browserDocument;
+      if (!result.rgbaBase64) usage("browser result does not contain gpu.rgbaBase64; run with captureRgba: true");
+      return {
+        ...result,
+        data: Buffer.from(result.rgbaBase64, "base64"),
+      };
+    })();
 if (native.width !== browser.width || native.height !== browser.height) {
   usage(`frame dimensions differ: native=${native.width}x${native.height}, browser=${browser.width}x${browser.height}`);
 }
 
-const web = Buffer.from(browser.rgbaBase64, "base64");
+const web = browser.data;
 const expectedBytes = native.width * native.height * 4;
 if (web.length !== expectedBytes) usage(`browser RGBA has ${web.length} bytes; expected ${expectedBytes}`);
 

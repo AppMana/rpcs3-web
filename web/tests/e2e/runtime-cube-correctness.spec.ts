@@ -67,11 +67,11 @@ test("renders the RPCS3 textured cube with depth and alpha-blended text", async 
       alpha: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
     },
   });
-  // The B8 font atlas uses the same component map as RPCS3's Vulkan backend:
-  // constant one in red and the texture value in green, blue, and alpha.
+  // The B8 font atlas packet's 0x0201 remap selects zero for RGB and the
+  // texture byte for alpha, matching the sampling semantics used by RPCS3.
   expect(gpu.drawDiagnostics[1]?.texture).toMatchObject({
-    channelMin: [255, 0, 0, 0],
-    channelMax: [255, 255, 255, 255],
+    channelMin: [0, 0, 0, 0],
+    channelMax: [0, 0, 0, 255],
   });
 
   const rgba = Buffer.from(gpu.rgbaBase64, "base64");

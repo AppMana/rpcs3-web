@@ -1,5 +1,5 @@
 export const DRAW_PACKET_MAGIC = 0x52444757;
-export const DRAW_PACKET_ABI = 2;
+export const DRAW_PACKET_ABI = 3;
 export const DRAW_PACKET_HEADER_SIZE = 192;
 export const TEXTURE_PACKET_RECORD_SIZE = 64;
 
@@ -69,6 +69,10 @@ export function decodeTextureRecords(bytes) {
       dataOffset,
       dataSize,
       contentHash: u32(view, offset + 48),
+      remap: u32(view, offset + 52),
+      addressModes: u32(view, offset + 56),
+      filterModes: u32(view, offset + 60),
+      texelControls: u32(view, offset + 60) >>> 16,
       bytes: bytes.subarray(dataOffset, dataOffset + dataSize),
     });
   }
@@ -82,7 +86,7 @@ export function decodeDrawPacket(bytes) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const byteSize = u32(view, 8);
   if (u32(view, 0) !== DRAW_PACKET_MAGIC || u32(view, 4) !== DRAW_PACKET_ABI || byteSize !== bytes.byteLength) {
-    throw new Error("invalid WebGPU packet header");
+    throw new Error(`invalid WebGPU packet header (magic=0x${u32(view, 0).toString(16)}, ABI=${u32(view, 4)}, declared=${byteSize}, actual=${bytes.byteLength})`);
   }
   const sections = [];
   for (let index = 0; index < 11; index += 1) {
@@ -223,6 +227,10 @@ export function packetSummary(packet) {
       dimension: texture.dimension,
       dataSize: texture.dataSize,
       hash: texture.contentHash.toString(16).padStart(8, "0"),
+      remap: `0x${texture.remap.toString(16).padStart(4, "0")}`,
+      addressModes: `0x${texture.addressModes.toString(16).padStart(6, "0")}`,
+      filterModes: `0x${texture.filterModes.toString(16).padStart(4, "0")}`,
+      texelControls: `0x${texture.texelControls.toString(16).padStart(4, "0")}`,
       nonzeroBytes: texture.bytes.reduce((count, value) => count + (value !== 0 ? 1 : 0), 0),
       bytes: hex(texture.bytes, 64),
     }));

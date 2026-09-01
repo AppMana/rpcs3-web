@@ -19,6 +19,7 @@
     "test": "vitest run",
     "test:e2e": "playwright test",
     "test:e2e:gpu": "playwright test --config playwright.gpu.config.ts",
+    "test:packet-fixture": "playwright test --config playwright.gpu.config.ts packet-replay.spec.ts",
     "test:units:browser": "npm run build && playwright test browser-units.spec.ts",
     "device:wip": "node scripts/run-wip-device.mjs",
     "device:runtime": "node scripts/run-full-runtime-device.mjs",

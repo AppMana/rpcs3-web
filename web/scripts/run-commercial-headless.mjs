@@ -1,7 +1,9 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { gzipSync } from "node:zlib";
 import { chromium } from "playwright";
+import { encodePacketFixture } from "../public/rpcs3-webgpu-fixture.mjs";
 
 const bootPath = process.argv[2];
 if (!bootPath?.startsWith("/opfs/")) {
@@ -29,6 +31,9 @@ const clockScale = Math.max(0, Math.min(3_000, Number(process.env.RPCS3_COMMERCI
 const captureRgba = process.env.RPCS3_COMMERCIAL_CAPTURE_RGBA === "1";
 const captureShaders = process.env.RPCS3_COMMERCIAL_CAPTURE_SHADERS === "1";
 const replayCount = Math.max(1, Math.min(10, Number(process.env.RPCS3_COMMERCIAL_REPLAY_COUNT) || 1));
+const packetFixturePath = process.env.RPCS3_COMMERCIAL_PACKET_FIXTURE
+  ? path.resolve(process.env.RPCS3_COMMERCIAL_PACKET_FIXTURE)
+  : undefined;
 const headed = process.env.RPCS3_HEADED === "1";
 
 const chromeArgs = [
@@ -46,10 +51,19 @@ const context = await chromium.launchPersistentContext(profilePath, {
   headless: !headed,
   args: chromeArgs,
 });
+let capturedPacketFrame;
 
 try {
   const pages = context.pages();
   const page = pages[0] ?? await context.newPage();
+  if (packetFixturePath) {
+    await page.exposeFunction("__rpcs3CapturePacketFrame", (packetBase64, metadata) => {
+      capturedPacketFrame = {
+        metadata,
+        packets: packetBase64.map((encoded) => new Uint8Array(Buffer.from(encoded, "base64"))),
+      };
+    });
+  }
   const browserConsole = [];
   page.on("console", (message) => {
     const line = `[${message.type()}] ${message.text()}`;
@@ -63,7 +77,7 @@ try {
   });
 
   await page.goto(`${baseURL}/storage.html`, { waitUntil: "domcontentloaded" });
-  const execution = await page.evaluate(async ({ bootPath: guestPath, timeout, requestedFrames, presentToCanvas, untilDraw, renderInterval, captureFrameRgba, captureShaderPrograms, repeatedRenders, watchedAddresses, tracedPc, tracedDelayPc, tracedDelayMs, watchedWriteAddress, guestClockScale }) => {
+  const execution = await page.evaluate(async ({ bootPath: guestPath, timeout, requestedFrames, presentToCanvas, untilDraw, renderInterval, captureFrameRgba, captureShaderPrograms, repeatedRenders, capturePacketFixture, watchedAddresses, tracedPc, tracedDelayPc, tracedDelayMs, watchedWriteAddress, guestClockScale }) => {
     const [{ decodeDrawPacket }, { prepareWebGPU, renderPacketsToWebGPU }] = await Promise.all([
       import("./rpcs3-webgpu-packet.mjs"),
       import("./rpcs3-webgpu-renderer.mjs"),
@@ -119,10 +133,30 @@ try {
         }
         if (serializable.type === "runtime-result" || serializable.type === "runtime-frame") {
           try {
-            const shouldRender = serializable.drawPacketCount > 0 || (renderInterval > 0 && frames.length % renderInterval === 0);
+            const nextFrameNumber = frames.length + 1;
+            const shouldRender = serializable.drawPacketCount > 0 && (
+              untilDraw ||
+              (renderInterval > 0 && (frames.length % renderInterval === 0 || nextFrameNumber === requestedFrames))
+            );
             const decodedPackets = shouldRender
               ? packetBuffers.map((buffer) => decodeDrawPacket(new Uint8Array(buffer)))
               : [];
+            if (capturePacketFixture && shouldRender && (untilDraw || nextFrameNumber === requestedFrames)) {
+              const packetBase64 = packetBuffers.map((buffer) => {
+                const bytes = new Uint8Array(buffer);
+                let binary = "";
+                for (let offset = 0; offset < bytes.byteLength; offset += 0x8000) {
+                  binary += String.fromCharCode(...bytes.subarray(offset, Math.min(bytes.byteLength, offset + 0x8000)));
+                }
+                return btoa(binary);
+              });
+              await globalThis.__rpcs3CapturePacketFrame(packetBase64, {
+                frameSequence: serializable.frameSequence,
+                packetCount: serializable.packetCount,
+                drawPacketCount: serializable.drawPacketCount,
+                flipPacketCount: serializable.flipPacketCount,
+              });
+            }
             const rendered = shouldRender
               ? await renderPacketsToWebGPU(gpu, decodedPackets, {
                   replayPresentation: false,
@@ -188,6 +222,7 @@ try {
     captureFrameRgba: captureRgba,
     captureShaderPrograms: captureShaders,
     repeatedRenders: replayCount,
+    capturePacketFixture: Boolean(packetFixturePath),
     watchedAddresses: debugAddresses,
     tracedPc: tracePc,
     tracedDelayPc: traceDelayPc,
@@ -203,6 +238,27 @@ try {
   if (outputPath) {
     await mkdir(path.dirname(outputPath), { recursive: true });
     await writeFile(outputPath, json);
+  }
+  if (packetFixturePath) {
+    if (!capturedPacketFrame) throw new Error("the requested commercial packet frame was not captured");
+    await mkdir(path.dirname(packetFixturePath), { recursive: true });
+    const fixture = gzipSync(encodePacketFixture(capturedPacketFrame.packets), { level: 9 });
+    await writeFile(packetFixturePath, fixture);
+    await writeFile(`${packetFixturePath}.json`, `${JSON.stringify({
+      bootPath,
+      ...capturedPacketFrame.metadata,
+      compressedBytes: fixture.byteLength,
+      uncompressedBytes: capturedPacketFrame.packets.reduce((sum, packet) => sum + packet.byteLength, 0),
+      gpu: run.terminal.gpu && {
+        width: run.terminal.gpu.width,
+        height: run.terminal.gpu.height,
+        draws: run.terminal.gpu.draws,
+        vertices: run.terminal.gpu.vertices,
+        changedPixels: run.terminal.gpu.changedPixels,
+        changedBounds: run.terminal.gpu.changedBounds,
+        frameHash: run.terminal.gpu.frameHash,
+      },
+    }, null, 2)}\n`);
   }
   if (!["runtime-result", "runtime-frame", "runtime-fatal"].includes(run.terminal.type)) process.exitCode = 1;
 } finally {

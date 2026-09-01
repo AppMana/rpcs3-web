@@ -412,18 +412,24 @@ function compileFragmentProgram(packet) {
     const registerFile = bits(words[0], 7, 1) ? "r16" : "r32";
     const conditionDestination = bits(words[1], 30, 1);
     const comparisons = [undefined, "<", "==", "<=", ">", "!=", ">=", undefined];
-    for (let component = 0; component < 4; component += 1) {
-      if (!bits(words[0], 9 + component, 1) || execution === 0) continue;
+    const writtenComponents = Array.from({ length: 4 }, (_, component) => component)
+      .filter((component) => bits(words[0], 9 + component, 1) && execution !== 0);
+    const instructionValue = `instructionValue${opcodes.length}`;
+    const instructionCondition = `instructionCondition${opcodes.length}`;
+    if (writtenComponents.length > 0) {
+      lines.push(`let ${instructionValue} = ${value};`);
+      if (execution !== 7) lines.push(`let ${instructionCondition} = ${condition};`);
+    }
+    for (const component of writtenComponents) {
       const channel = "xyzw"[component];
       const writes = [];
-      if (!noDestination) writes.push(`${registerFile}[${destination}].${channel} = (${value}).${channel};`);
+      if (!noDestination) writes.push(`${registerFile}[${destination}].${channel} = ${instructionValue}.${channel};`);
       if (setCondition) {
-        const conditionValue = noDestination ? `(${value}).${channel}` : `${registerFile}[${destination}].${channel}`;
-        writes.push(`cc[${conditionDestination}].${channel} = ${conditionValue};`);
+        writes.push(`cc[${conditionDestination}].${channel} = ${instructionValue}.${channel};`);
       }
       if (writes.length === 0) continue;
       if (execution === 7) lines.push(...writes);
-      else lines.push(`if (${condition}.${channel} ${comparisons[execution]} 0.0) { ${writes.join(" ")} }`);
+      else lines.push(`if (${instructionCondition}.${channel} ${comparisons[execution]} 0.0) { ${writes.join(" ")} }`);
     }
     opcodes.push(opcode);
     offset += hasConstant ? 32 : 16;
@@ -755,11 +761,28 @@ function uploadTexture2D(device, descriptor) {
           rgba[destination + 3] = sourceBytes[source];
         } else {
           const value = sourceBytes[source];
-          rgba[destination] = 255;
+          rgba[destination] = value;
           rgba[destination + 1] = value;
           rgba[destination + 2] = value;
-          rgba[destination + 3] = value;
+          rgba[destination + 3] = 255;
         }
+      }
+    }
+  }
+  const remapControl = descriptor.remap >>> 8;
+  const component = (argb, channel) => {
+    const control = (remapControl >>> (channel * 2)) & 3;
+    if (control === 0) return 0;
+    if (control === 1) return 255;
+    return argb[(descriptor.remap >>> (channel * 2)) & 3];
+  };
+  if ((descriptor.remap & 0xffff) !== 0xaae4) {
+    for (let y = 0; y < descriptor.height; y += 1) {
+      for (let x = 0; x < descriptor.width; x += 1) {
+        const destination = y * bytesPerRow + x * 4;
+        const argb = [rgba[destination + 3], rgba[destination], rgba[destination + 1], rgba[destination + 2]];
+        const remapped = [0, 1, 2, 3].map((channel) => component(argb, channel));
+        rgba.set([remapped[1], remapped[2], remapped[3], remapped[0]], destination);
       }
     }
   }
@@ -788,7 +811,16 @@ function uploadTexture2D(device, descriptor) {
     { bytesPerRow, rowsPerImage: descriptor.height },
     { width: descriptor.width, height: descriptor.height },
   );
-  const sampler = device.createSampler({ addressModeU: "repeat", addressModeV: "repeat", magFilter: "linear", minFilter: "linear" });
+  const addressMode = (value) => value === 1 ? "repeat" : value === 2 ? "mirror-repeat" : "clamp-to-edge";
+  const minFilter = descriptor.filterModes & 0xff;
+  const magFilter = (descriptor.filterModes >>> 8) & 0xff;
+  const sampler = device.createSampler({
+    addressModeU: addressMode(descriptor.addressModes & 0xff),
+    addressModeV: addressMode((descriptor.addressModes >>> 8) & 0xff),
+    addressModeW: addressMode((descriptor.addressModes >>> 16) & 0xff),
+    magFilter: magFilter === 1 ? "nearest" : "linear",
+    minFilter: minFilter === 1 || minFilter === 3 || minFilter === 5 ? "nearest" : "linear",
+  });
   return {
     texture,
     sampler,
@@ -814,6 +846,9 @@ function textureCacheKey(descriptor) {
     descriptor.pitch,
     descriptor.mipCount,
     descriptor.dimension,
+    descriptor.remap,
+    descriptor.addressModes,
+    descriptor.filterModes,
   ].join(":");
 }
 

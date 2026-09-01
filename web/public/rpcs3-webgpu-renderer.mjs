@@ -6,8 +6,9 @@ export function stopWebGPUPresentation() {
   if (!activePresentation) return;
   activePresentation.cancelled = true;
   if (activePresentation.animationFrame !== undefined) cancelAnimationFrame(activePresentation.animationFrame);
-  activePresentation.resources.forEach(({ buffer, textureResources = [] }) => {
+  activePresentation.resources.forEach(({ buffer, vertexStateBuffer, textureResources = [] }) => {
     buffer.destroy();
+    vertexStateBuffer?.destroy();
     textureResources.forEach(({ texture, cached }) => { if (!cached) texture.destroy(); });
   });
   activePresentation.depthTexture?.destroy();
@@ -127,6 +128,152 @@ function decodeVertexSource(words, sourceIndex, d0, d1, d3, inputs, temps, packe
   if (absolute) value = value.map(Math.abs);
   if (bits(source, 16, 1)) value = value.map((component) => -component);
   return value;
+}
+
+function compileVertexSource(words, sourceIndex, d1, d3) {
+  let source;
+  let absolute;
+  if (sourceIndex === 0) {
+    source = (bits(words[1], 0, 8) << 9) | bits(words[2], 23, 9);
+    absolute = Boolean(bits(words[0], 21, 1));
+  } else if (sourceIndex === 1) {
+    source = bits(words[2], 6, 17);
+    absolute = Boolean(bits(words[0], 22, 1));
+  } else {
+    source = (bits(words[2], 0, 6) << 11) | bits(words[3], 21, 11);
+    absolute = Boolean(bits(words[0], 23, 1));
+  }
+  const type = bits(source, 0, 2);
+  let expression;
+  if (type === 1) expression = `temporary[${bits(source, 2, 6)}]`;
+  else if (type === 2) expression = `input.attribute${d1.inputSource}`;
+  else if (type === 3) {
+    if (d3.indexConstant) throw new Error("indexed RSX vertex constants are not yet translated");
+    expression = `rsxVertexState.constants[${d1.constantSource}]`;
+  } else throw new Error("undefined RSX vertex source register");
+  const swizzleCode = bits(source, 8, 8);
+  if (swizzleCode !== 0x1b) {
+    const channels = [6, 4, 2, 0].map((shift) => "xyzw"[bits(swizzleCode, shift, 2)]).join("");
+    expression = `${expression}.${channels}`;
+  }
+  if (absolute) expression = `abs(${expression})`;
+  if (bits(source, 16, 1)) expression = `-(${expression})`;
+  return expression;
+}
+
+function compileVertexProgram(packet) {
+  const program = packet.sections[SectionKind.vertexProgram].bytes;
+  if (program.byteLength % 16 !== 0) throw new Error("unaligned RSX vertex program");
+  const view = new DataView(program.buffer, program.byteOffset, program.byteLength);
+  const lines = [
+    "var temporary: array<vec4f, 32>;",
+    "var destination: array<vec4f, 16>;",
+    ...Array.from({ length: 16 }, (_, index) => `destination[${index}] = vec4f(0.0, 0.0, 0.0, 1.0);`),
+  ];
+  const opcodes = [];
+  const scalarOpcodes = [];
+  let emitted = 0;
+  for (let instruction = packet.vertexProgramEntry; instruction * 16 < program.byteLength; instruction += 1) {
+    const base = instruction * 16;
+    const words = [0, 4, 8, 12].map((offset) => view.getUint32(base + offset, true));
+    const d0 = {
+      destinationTemp: bits(words[0], 15, 6),
+      saturate: Boolean(bits(words[0], 26, 1)),
+      vectorResult: Boolean(bits(words[0], 30, 1)),
+    };
+    const d1 = {
+      inputSource: bits(words[1], 8, 4),
+      constantSource: bits(words[1], 12, 10),
+      vectorOpcode: bits(words[1], 22, 5),
+      scalarOpcode: bits(words[1], 27, 5),
+    };
+    const d3 = {
+      end: Boolean(bits(words[3], 0, 1)),
+      indexConstant: Boolean(bits(words[3], 1, 1)),
+      destination: bits(words[3], 2, 5),
+      scalarDestinationTemp: bits(words[3], 7, 6),
+      vectorMask: [16, 15, 14, 13].map((bit) => Boolean(bits(words[3], bit, 1))),
+      scalarMask: [20, 19, 18, 17].map((bit) => Boolean(bits(words[3], bit, 1))),
+    };
+    if (d1.vectorOpcode !== 0) {
+      const a = compileVertexSource(words, 0, d1, d3);
+      let value;
+      if (d1.vectorOpcode === 1) value = a;
+      else if (d1.vectorOpcode === 2) value = `(${a} * ${compileVertexSource(words, 1, d1, d3)})`;
+      else if (d1.vectorOpcode === 3) value = `(${a} + ${compileVertexSource(words, 2, d1, d3)})`;
+      else if (d1.vectorOpcode === 4) value = `fma(${a}, ${compileVertexSource(words, 1, d1, d3)}, ${compileVertexSource(words, 2, d1, d3)})`;
+      else if (d1.vectorOpcode === 5) value = `vec4f(dot(${a}.xyz, ${compileVertexSource(words, 1, d1, d3)}.xyz))`;
+      else if (d1.vectorOpcode === 6) {
+        const b = compileVertexSource(words, 1, d1, d3);
+        value = `vec4f(dot(${a}.xyz, ${b}.xyz) + ${b}.w)`;
+      } else if (d1.vectorOpcode === 7) value = `vec4f(dot(${a}, ${compileVertexSource(words, 1, d1, d3)}))`;
+      else if (d1.vectorOpcode === 8) {
+        const b = compileVertexSource(words, 1, d1, d3);
+        value = `vec4f(1.0, ${a}.y * ${b}.y, ${a}.z, ${b}.w)`;
+      } else if (d1.vectorOpcode === 9) value = `min(${a}, ${compileVertexSource(words, 1, d1, d3)})`;
+      else if (d1.vectorOpcode === 10) value = `max(${a}, ${compileVertexSource(words, 1, d1, d3)})`;
+      else if ([11, 12, 16, 18, 19, 20].includes(d1.vectorOpcode)) {
+        const comparison = new Map([[11, "<"], [12, ">="], [16, "=="], [18, ">"], [19, "<="], [20, "!="]]).get(d1.vectorOpcode);
+        value = `select(vec4f(0.0), vec4f(1.0), ${a} ${comparison} ${compileVertexSource(words, 1, d1, d3)})`;
+      } else if (d1.vectorOpcode === 14) value = `fract(${a})`;
+      else if (d1.vectorOpcode === 15) value = `floor(${a})`;
+      else if (d1.vectorOpcode === 17) value = "vec4f(0.0)";
+      else if (d1.vectorOpcode === 21) value = "vec4f(1.0)";
+      else if (d1.vectorOpcode === 22) value = `sign(${a})`;
+      else throw new Error(`RSX vector vertex opcode ${d1.vectorOpcode} is not yet translated`);
+      if (d0.saturate) value = `clamp(${value}, vec4f(0.0), vec4f(1.0))`;
+      const result = `vertexVectorValue${emitted++}`;
+      lines.push(`let ${result} = ${value};`);
+      for (let component = 0; component < 4; component += 1) {
+        if (!d3.vectorMask[component]) continue;
+        const channel = "xyzw"[component];
+        if (d0.destinationTemp !== 0x3f) lines.push(`temporary[${d0.destinationTemp}].${channel} = ${result}.${channel};`);
+        if (d0.vectorResult && d3.destination < 16) lines.push(`destination[${d3.destination}].${channel} = ${result}.${channel};`);
+      }
+      opcodes.push(d1.vectorOpcode);
+    }
+    if (d1.scalarOpcode !== 0) {
+      const source = compileVertexSource(words, 2, d1, d3);
+      let value;
+      if (d1.scalarOpcode === 1) value = `vec4f(${source}.x)`;
+      else if (d1.scalarOpcode === 2) value = `vec4f(1.0 / ${source}.x)`;
+      else if (d1.scalarOpcode === 3) value = `vec4f(clamp(1.0 / ${source}.x, 5.42101e-20, 1.884467e19))`;
+      else if (d1.scalarOpcode === 4) value = `vec4f(inverseSqrt(${source}.x))`;
+      else if (d1.scalarOpcode === 5) value = `vec4f(exp(${source}.x))`;
+      else if (d1.scalarOpcode === 6) value = `vec4f(log(${source}.x))`;
+      else if (d1.scalarOpcode === 7) value = `vec4f(1.0, max(${source}.x, 0.0), select(0.0, exp2(${source}.w * log2(max(${source}.y, 1e-10))), ${source}.x > 0.0), 1.0)`;
+      else if (d1.scalarOpcode === 13) value = `vec4f(log2(${source}.x))`;
+      else if (d1.scalarOpcode === 14) value = `vec4f(exp2(${source}.x))`;
+      else if (d1.scalarOpcode === 15) value = `vec4f(sin(${source}.x))`;
+      else if (d1.scalarOpcode === 16) value = `vec4f(cos(${source}.x))`;
+      else throw new Error(`RSX scalar vertex opcode ${d1.scalarOpcode} is not yet translated`);
+      if (d0.saturate) value = `clamp(${value}, vec4f(0.0), vec4f(1.0))`;
+      const result = `vertexScalarValue${emitted++}`;
+      lines.push(`let ${result} = ${value};`);
+      for (let component = 0; component < 4; component += 1) {
+        if (!d3.scalarMask[component]) continue;
+        const channel = "xyzw"[component];
+        if (d3.scalarDestinationTemp !== 0x3f) lines.push(`temporary[${d3.scalarDestinationTemp}].${channel} = ${result}.${channel};`);
+        else if (!d0.vectorResult && d3.destination < 16) lines.push(`destination[${d3.destination}].${channel} = ${result}.${channel};`);
+      }
+      scalarOpcodes.push(d1.scalarOpcode);
+    }
+    if (d3.end) break;
+  }
+  if (packet.vertexProgramControl === 0) lines.push("destination[3] = destination[1];", "destination[4] = destination[2];");
+  lines.push(
+    "let rsxPosition = destination[0];",
+    "var transformedPosition = vec4f(",
+    "  dot(rsxVertexState.environment[0], rsxPosition),",
+    "  dot(rsxVertexState.environment[1], rsxPosition),",
+    "  dot(rsxVertexState.environment[2], rsxPosition),",
+    "  dot(rsxVertexState.environment[3], rsxPosition),",
+    ");",
+    "transformedPosition.y = -transformedPosition.y;",
+    "result.position = transformedPosition;",
+    ...VertexVaryings.map((name, index) => `result.${name} = destination[${VertexVaryingDestinations[index]}];`),
+  );
+  return { code: lines.join("\n"), opcodes: [...new Set(opcodes)].sort((a, b) => a - b), scalarOpcodes: [...new Set(scalarOpcodes)].sort((a, b) => a - b) };
 }
 
 // This follows RPCS3's existing GLSLInterpreter/VertexInterpreter.glsl decode
@@ -479,7 +626,7 @@ function primitiveTopology(packet) {
   }
 }
 
-function translateDraw(packet) {
+function translateDraw(packet, vertexDiagnostics = false, vertexBackend = "webgpu-wgsl") {
   if (packet.kind !== PacketKind.draw) throw new Error(`packet ${packet.sequence} is not an RSX draw`);
   // RPCS3's shared BufferUtils has already expanded line loops, fans, quads,
   // and polygons. Select the WebGPU topology for that mature output instead
@@ -489,35 +636,40 @@ function translateDraw(packet) {
   if (packet.flags & ~allowedFlags) throw new Error(`WebGPU draw closure cannot translate packet flags 0x${packet.flags.toString(16)}`);
   const descriptors = readVertexDescriptors(packet);
   const vertexOrder = drawVertexOrder(packet);
-  const output = new Float32Array(vertexOrder.length * VertexOutputStrideFloats);
-  const vertexOpcodeSet = new Set();
-  const scalarVertexOpcodeSet = new Set();
+  const input = new Float32Array(vertexOrder.length * VertexOutputStrideFloats);
+  const oracleOutput = vertexDiagnostics || vertexBackend === "cpu-oracle"
+    ? new Float32Array(vertexOrder.length * VertexOutputStrideFloats)
+    : undefined;
   for (let outputVertex = 0; outputVertex < vertexOrder.length; outputVertex += 1) {
     const vertex = vertexOrder[outputVertex];
-    const inputs = new Map();
+    const inputs = new Map(Array.from({ length: 16 }, (_, index) => [index, vector(0, 1)]));
     for (const [index, descriptor] of descriptors) inputs.set(index, readAttribute(packet, descriptor, vertex));
-    const executed = executeVertexProgram(packet, inputs);
-    executed.opcodes.forEach((opcode) => vertexOpcodeSet.add(opcode));
-    executed.scalarOpcodes.forEach((opcode) => scalarVertexOpcodeSet.add(opcode));
-    const position = applyVertexEnvironment(packet, executed.destinations[0]);
-    // RPCS3's Vulkan backend uses a positive-height viewport, whose framebuffer
-    // Y mapping is the inverse of WebGPU's clip-space mapping. Preserve the
-    // native backend's orientation after applying the shared RSX viewport
-    // scale/offset matrix.
-    position[1] = -position[1];
-    output.set([
-      ...position,
-      ...VertexVaryingDestinations.flatMap((destination) => executed.destinations[destination]),
-    ], outputVertex * VertexOutputStrideFloats);
+    input.set(Array.from({ length: 16 }).flatMap((_, index) => inputs.get(index)), outputVertex * VertexOutputStrideFloats);
+    if (oracleOutput) {
+      const executed = executeVertexProgram(packet, inputs);
+      const position = applyVertexEnvironment(packet, executed.destinations[0]);
+      // RPCS3's Vulkan backend uses a positive-height viewport, whose framebuffer
+      // Y mapping is the inverse of WebGPU's clip-space mapping.
+      position[1] = -position[1];
+      oracleOutput.set([
+        ...position,
+        ...VertexVaryingDestinations.flatMap((destination) => executed.destinations[destination]),
+      ], outputVertex * VertexOutputStrideFloats);
+    }
   }
+  const vertex = compileVertexProgram(packet);
   const fragment = compileFragmentProgram(packet);
   if (fragment.textured && packet.textures.length === 0) throw new Error("RSX fragment program samples a texture without a payload");
   return {
-    output,
+    input,
+    gpuInput: vertexBackend === "cpu-oracle" ? oracleOutput : input,
+    oracleOutput,
+    vertex,
+    vertexCount: vertexOrder.length,
     fragment,
     topology,
-    vertexOpcodes: [...vertexOpcodeSet].sort((a, b) => a - b),
-    scalarVertexOpcodes: [...scalarVertexOpcodeSet].sort((a, b) => a - b),
+    vertexOpcodes: vertex.opcodes,
+    scalarVertexOpcodes: vertex.scalarOpcodes,
     fragmentOpcodes: fragment.opcodes,
   };
 }
@@ -853,24 +1005,26 @@ function textureCacheKey(descriptor) {
 }
 
 function drawDiagnostics(draw) {
+  if (!draw.oracleOutput) return { vertexOracle: false };
   const result = {
+    vertexOracle: true,
     clipBounds: { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] },
     varyingBounds: Object.fromEntries(VertexVaryings.map((name) => [name, {
       min: [Infinity, Infinity, Infinity, Infinity],
       max: [-Infinity, -Infinity, -Infinity, -Infinity],
     }])),
   };
-  for (let offset = 0; offset < draw.output.length; offset += VertexOutputStrideFloats) {
-    const w = draw.output[offset + 3];
+  for (let offset = 0; offset < draw.oracleOutput.length; offset += VertexOutputStrideFloats) {
+    const w = draw.oracleOutput[offset + 3];
     for (let component = 0; component < 3; component += 1) {
-      const value = draw.output[offset + component] / w;
+      const value = draw.oracleOutput[offset + component] / w;
       result.clipBounds.min[component] = Math.min(result.clipBounds.min[component], value);
       result.clipBounds.max[component] = Math.max(result.clipBounds.max[component], value);
     }
     for (let varying = 0; varying < VertexVaryings.length; varying += 1) {
       const bounds = result.varyingBounds[VertexVaryings[varying]];
       for (let component = 0; component < 4; component += 1) {
-        const value = draw.output[offset + (varying + 1) * 4 + component];
+        const value = draw.oracleOutput[offset + (varying + 1) * 4 + component];
         bounds.min[component] = Math.min(bounds.min[component], value);
         bounds.max[component] = Math.max(bounds.max[component], value);
       }
@@ -887,7 +1041,11 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   const drawPackets = packets.filter((packet) => packet.kind === PacketKind.draw);
   if (!clearPacket) throw new Error("RPCS3 did not emit a clear packet");
   const clear = clearValue(clearPacket);
-  const translated = drawPackets.map(translateDraw);
+  const vertexBackend = options.vertexBackend ?? "webgpu-wgsl";
+  if (vertexBackend !== "webgpu-wgsl" && vertexBackend !== "cpu-oracle") {
+    throw new Error(`unknown RSX vertex backend ${vertexBackend}`);
+  }
+  const translated = drawPackets.map((packet) => translateDraw(packet, options.vertexDiagnostics === true, vertexBackend));
   const depthStates = drawPackets.map(depthState);
   const targetStates = drawPackets.map(renderTargetState);
   const rasterStates = drawPackets.map(rasterState);
@@ -905,11 +1063,23 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       `@group(0) @binding(${slot * 2}) var rsxTexture${slot}: texture_2d<f32>;`,
       `@group(0) @binding(${slot * 2 + 1}) var rsxSampler${slot}: sampler;`,
     ]).join("\n");
-    const vertexInputFields = ["@location(0) position: vec4f,", ...VertexVaryings.map((name, varying) => `@location(${varying + 1}) ${name}: vec4f,`)].join("\n");
+    const vertexInputFields = vertexBackend === "webgpu-wgsl"
+      ? Array.from({ length: 16 }, (_, attribute) => `@location(${attribute}) attribute${attribute}: vec4f,`).join("\n")
+      : ["@location(0) position: vec4f,", ...VertexVaryings.map((name, varying) => `@location(${varying + 1}) ${name}: vec4f,`)].join("\n");
     const vertexOutputFields = VertexVaryings.map((name, varying) => `@location(${varying}) ${name}: vec4f,`).join("\n");
-    const varyingAssignments = VertexVaryings.map((name) => `result.${name} = input.${name};`).join("\n");
+    const vertexDeclarations = vertexBackend === "webgpu-wgsl" ? `
+      struct RSXVertexState {
+        environment: array<vec4f, 6>,
+        constants: array<vec4f, 468>,
+      };
+      @group(0) @binding(32) var<uniform> rsxVertexState: RSXVertexState;
+    ` : "";
+    const vertexBody = vertexBackend === "webgpu-wgsl"
+      ? draw.vertex.code
+      : ["result.position = input.position;", ...VertexVaryings.map((name) => `result.${name} = input.${name};`)].join("\n");
     const shaderCode = `
       ${declarations}
+      ${vertexDeclarations}
       struct VertexIn {
         ${vertexInputFields}
       };
@@ -919,8 +1089,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       };
       @vertex fn vertex_main(input: VertexIn) -> VertexOut {
         var result: VertexOut;
-        result.position = input.position;
-        ${varyingAssignments}
+        ${vertexBody}
         return result;
       }
       @fragment fn fragment_main(input: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(0) vec4f {
@@ -975,10 +1144,22 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       });
       pipelineCache.set(pipelineKey, pipeline);
     }
-    const buffer = device.createBuffer({ size: draw.output.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    device.queue.writeBuffer(buffer, 0, draw.output.buffer, draw.output.byteOffset, draw.output.byteLength);
+    const buffer = device.createBuffer({ size: draw.gpuInput.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(buffer, 0, draw.gpuInput.buffer, draw.gpuInput.byteOffset, draw.gpuInput.byteLength);
+    let vertexStateBuffer;
+    if (vertexBackend === "webgpu-wgsl") {
+      const environment = drawPackets[index].sections[SectionKind.vertexEnvironment].bytes;
+      const constants = drawPackets[index].sections[SectionKind.vertexConstants].bytes;
+      if (environment.byteLength !== 96 || constants.byteLength !== 468 * 16) {
+        throw new Error("RPCS3 vertex-state packet has an invalid uniform layout");
+      }
+      const vertexState = new Uint8Array(environment.byteLength + constants.byteLength);
+      vertexState.set(environment);
+      vertexState.set(constants, environment.byteLength);
+      vertexStateBuffer = device.createBuffer({ size: vertexState.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(vertexStateBuffer, 0, vertexState);
+    }
     const textureResources = [];
-    let bindGroup;
     if (draw.fragment.textured) {
       for (const slot of draw.fragment.textureSlots) {
         const descriptor = drawPackets[index].textures.find((texture) => texture.stage === 0 && texture.slot === slot);
@@ -998,15 +1179,19 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
         frameTextureKeys.add(cacheKey);
         textureResources.push({ slot, ...resource, cacheKey, cached: true });
       }
-      bindGroup = device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries: textureResources.flatMap((resource) => [
-          { binding: resource.slot * 2, resource: resource.texture.createView() },
-          { binding: resource.slot * 2 + 1, resource: resource.sampler },
-        ]),
-      });
     }
-    return { pipeline, buffer, bindGroup, textureResources, shaderCode };
+    const bindEntries = [
+      ...(vertexStateBuffer ? [{ binding: 32, resource: { buffer: vertexStateBuffer } }] : []),
+      ...textureResources.flatMap((resource) => [
+        { binding: resource.slot * 2, resource: resource.texture.createView() },
+        { binding: resource.slot * 2 + 1, resource: resource.sampler },
+      ]),
+    ];
+    const bindGroup = bindEntries.length > 0 ? device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: bindEntries,
+    }) : undefined;
+    return { pipeline, buffer, vertexStateBuffer, bindGroup, textureResources, shaderCode };
   });
   const depthTexture = device.createTexture({
     label: "RPCS3 RSX depth target",
@@ -1032,7 +1217,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     pass.setVertexBuffer(0, resources[index].buffer);
     if (targetStates[index].blendEnabled) pass.setBlendConstant(targetStates[index].blendConstant);
     if (resources[index].bindGroup) pass.setBindGroup(0, resources[index].bindGroup);
-    pass.draw(translated[index].output.length / VertexOutputStrideFloats);
+    pass.draw(translated[index].vertexCount);
   }
   pass.end();
   const readbackEnabled = options.readback !== false;
@@ -1121,7 +1306,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
         presentationPass.setVertexBuffer(0, resources[index].buffer);
         if (targetStates[index].blendEnabled) presentationPass.setBlendConstant(targetStates[index].blendConstant);
         if (resources[index].bindGroup) presentationPass.setBindGroup(0, resources[index].bindGroup);
-        presentationPass.draw(translated[index].output.length / VertexOutputStrideFloats);
+        presentationPass.draw(translated[index].vertexCount);
       }
       presentationPass.end();
       device.queue.submit([presentationEncoder.finish()]);
@@ -1129,8 +1314,9 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     activePresentation = presentation;
     presentation.animationFrame = globalThis.requestAnimationFrame(present);
   } else if (!context || options.retainResources === false) {
-    resources.forEach(({ buffer, textureResources }) => {
+    resources.forEach(({ buffer, vertexStateBuffer, textureResources }) => {
       buffer.destroy();
+      vertexStateBuffer?.destroy();
       textureResources.forEach(({ texture: resourceTexture, cached }) => { if (!cached) resourceTexture.destroy(); });
     });
     depthTexture.destroy();
@@ -1150,7 +1336,8 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     width: canvas.width,
     height: canvas.height,
     draws: translated.length,
-    vertices: translated.reduce((sum, draw) => sum + draw.output.length / VertexOutputStrideFloats, 0),
+    vertices: translated.reduce((sum, draw) => sum + draw.vertexCount, 0),
+    vertexBackend,
     vertexOpcodes: [...new Set(translated.flatMap((draw) => draw.vertexOpcodes))].sort((a, b) => a - b),
     scalarVertexOpcodes: [...new Set(translated.flatMap((draw) => draw.scalarVertexOpcodes))].sort((a, b) => a - b),
     fragmentOpcodes: [...new Set(translated.flatMap((draw) => draw.fragmentOpcodes))].sort((a, b) => a - b),

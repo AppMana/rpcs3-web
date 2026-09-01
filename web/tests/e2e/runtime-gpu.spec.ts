@@ -6,10 +6,10 @@ test("renders an authentic RPCS3 RSX draw through hardware WebGPU", async ({ pag
   await page.goto("/runtime.html");
   const result = await page.evaluate(async () => {
     const runtime = (window as Window & {
-      __rpcs3Runtime?: { run(fixture?: string, options?: { render?: boolean }): Promise<Record<string, unknown>> };
+      __rpcs3Runtime?: { run(fixture?: string, options?: Record<string, unknown>): Promise<Record<string, unknown>> };
     }).__rpcs3Runtime;
     if (!runtime) return { ok: false, detail: "runtime acceptance API is unavailable" };
-    return runtime.run(undefined, { render: true });
+    return runtime.run(undefined, { render: true, compareVertexBackends: true });
   });
   await testInfo.attach("rpcs3-runtime-webgpu.json", {
     body: JSON.stringify(result, null, 2),
@@ -17,11 +17,22 @@ test("renders an authentic RPCS3 RSX draw through hardware WebGPU", async ({ pag
   });
   const gpu = result.gpu as {
     presented: boolean; adapter: string; draws: number; vertices: number; vertexOpcodes: number[];
-    fragmentOpcodes: number[]; changedPixels: number; clearPixels: number; frameHash: number;
+    fragmentOpcodes: number[]; changedPixels: number; clearPixels: number; frameHash: number; vertexBackend: string;
+    vertexBackendComparison: {
+      oracleBackend: string; oracleFrameHash: number; frameHashMatch: boolean; changedPixelsMatch: boolean;
+      oracleTimings: { translateMs: number };
+    };
   };
   expect(result.bootResult).toBe(0);
   expect(result.drawPacketCount).toBeGreaterThan(0);
   expect(gpu.presented).toBe(true);
+  expect(gpu.vertexBackend).toBe("webgpu-wgsl");
+  expect(gpu.vertexBackendComparison).toMatchObject({
+    oracleBackend: "cpu-oracle",
+    oracleFrameHash: 1_129_836_632,
+    frameHashMatch: true,
+    changedPixelsMatch: true,
+  });
   expect(gpu.adapter).not.toMatch(/SwiftShader|llvmpipe|software|CPU/i);
   expect(gpu.adapter).toMatch(/NVIDIA|AMD|Intel|discrete|integrated/i);
   expect(gpu.draws).toBeGreaterThan(0);
@@ -30,7 +41,7 @@ test("renders an authentic RPCS3 RSX draw through hardware WebGPU", async ({ pag
   expect(gpu.fragmentOpcodes).toEqual([1]);
   expect(gpu.changedPixels).toBeGreaterThan(100);
   expect(gpu.clearPixels).toBeGreaterThan(100);
-  expect(gpu.frameHash).toBeGreaterThan(0);
+  expect(gpu.frameHash).toBe(1_129_836_632);
   // The worker posts its result before Chromium's compositor necessarily
   // presents that task's OffscreenCanvas frame. Yield two browser paints so
   // the screenshot verifies the displayed surface, not just GPU readback.

@@ -86,6 +86,7 @@ async function renderFrame(message) {
     const packets = message.packetBuffers.map((buffer) => decodeDrawPacket(new Uint8Array(buffer)));
     const rendered = await renderPacketsToWebGPU(gpu, packets, {
       readback: false,
+      vertexDiagnostics: true,
       // The guest and RSX threads continue immediately; this only keeps the
       // latest GPU frame available to the browser compositor between flips.
       replayPresentation: true,

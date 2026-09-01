@@ -23,7 +23,9 @@ test("renders the RPCS3 textured cube with depth and alpha-blended text", async 
       __rpcs3Runtime?: { run(fixture?: string, options?: Record<string, unknown>): Promise<Record<string, unknown>> };
     }).__rpcs3Runtime;
     if (!runtime) return { ok: false, detail: "runtime acceptance API is unavailable" };
-    return runtime.run("fixtures/gs_gcm_cube.elf", { render: true, captureRgba: true, width: 320, height: 180 });
+    return runtime.run("fixtures/gs_gcm_cube.elf", {
+      render: true, captureRgba: true, width: 320, height: 180, compareVertexBackends: true,
+    });
   });
 
   const gpu = result.gpu as {
@@ -38,6 +40,11 @@ test("renders the RPCS3 textured cube with depth and alpha-blended text", async 
     changedBounds: { minX: number; minY: number; maxX: number; maxY: number } | null;
     drawDiagnostics: Array<{ texture?: { channelMin: number[]; channelMax: number[] } }>;
     rgbaBase64: string;
+    vertexBackend: string;
+    vertexBackendComparison: {
+      oracleBackend: string; oracleFrameHash: number; frameHashMatch: boolean; changedPixelsMatch: boolean;
+      oracleTimings: { translateMs: number };
+    };
   };
   const artifact = {
     ...result,
@@ -52,6 +59,13 @@ test("renders the RPCS3 textured cube with depth and alpha-blended text", async 
   expect(result.bootResult).toBe(0);
   expect(result.droppedPackets).toBe(0);
   expect(gpu.presented).toBe(true);
+  expect(gpu.vertexBackend).toBe("webgpu-wgsl");
+  expect(gpu.vertexBackendComparison).toMatchObject({
+    oracleBackend: "cpu-oracle",
+    oracleFrameHash: 427_351_212,
+    frameHashMatch: true,
+    changedPixelsMatch: true,
+  });
   expect(gpu.draws).toBe(2);
   expect(gpu.vertices).toBe(162);
   expect(gpu.depthStates).toEqual([

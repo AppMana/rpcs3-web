@@ -55,11 +55,37 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
           let gpu;
           if (preparedGpu) {
             activeGpu = await preparedGpu;
+            const decodedPackets = packetBuffers.map((buffer) => decodeDrawPacket(new Uint8Array(buffer)));
+            let vertexBackendComparison;
+            if (options.compareVertexBackends === true) {
+              const oracle = await renderPacketsToWebGPU(activeGpu, decodedPackets, {
+                captureRgba: Boolean(options.captureRgba),
+                replayPresentation: false,
+                vertexBackend: "cpu-oracle",
+                vertexDiagnostics: true,
+              });
+              vertexBackendComparison = {
+                oracleBackend: oracle.vertexBackend,
+                oracleFrameHash: oracle.frameHash,
+                oracleChangedPixels: oracle.changedPixels,
+                oracleTimings: oracle.timings,
+              };
+            }
             gpu = await renderPacketsToWebGPU(
               activeGpu,
-              packetBuffers.map((buffer) => decodeDrawPacket(new Uint8Array(buffer))),
-              { captureRgba: Boolean(options.captureRgba) },
+              decodedPackets,
+              {
+                captureRgba: Boolean(options.captureRgba),
+                vertexDiagnostics: options.vertexDiagnostics === true,
+              },
             );
+            if (vertexBackendComparison) {
+              gpu.vertexBackendComparison = {
+                ...vertexBackendComparison,
+                frameHashMatch: vertexBackendComparison.oracleFrameHash === gpu.frameHash,
+                changedPixelsMatch: vertexBackendComparison.oracleChangedPixels === gpu.changedPixels,
+              };
+            }
           }
           const frame = { ...eventWithoutPackets, gpu };
           frames.push(frame);

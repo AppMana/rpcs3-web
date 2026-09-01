@@ -9,7 +9,9 @@ test("advances successive full-RPCS3 cube frames instead of repainting one captu
       __rpcs3Runtime?: { run(fixture?: string, options?: Record<string, unknown>): Promise<Record<string, unknown>> };
     }).__rpcs3Runtime;
     if (!runtime) return { ok: false, detail: "runtime acceptance API is unavailable" };
-    return runtime.run("fixtures/gs_gcm_cube.elf", { render: true, frames: 3, width: 320, height: 180 });
+    return runtime.run("fixtures/gs_gcm_cube.elf", {
+      render: true, frames: 3, width: 320, height: 180, vertexDiagnostics: true,
+    });
   });
   const artifactPath = testInfo.outputPath("rpcs3-runtime-animation.json");
   writeFileSync(artifactPath, JSON.stringify(result, null, 2));

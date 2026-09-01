@@ -633,6 +633,20 @@ void WebGPUGSRender::emit_control_packet(rsx::webgpu::packet_kind kind, u32 valu
 		packet_ok = packet.append(rsx::webgpu::section_kind::raw_registers,
 			std::as_bytes(std::span(rsx::method_registers.registers))) && packet_ok;
 	}
+	if (kind == rsx::webgpu::packet_kind::clear)
+	{
+		// RPCS3 clears within the resolved scissor (VKGSRender::clear_surface
+		// clips the clear rectangle to m_scissor); ship it like a draw does.
+		(void)get_scissor(m_scissor, true);
+		const rsx::webgpu::raster_environment_packet raster_environment{
+			.scissor_x = m_scissor.x1,
+			.scissor_y = m_scissor.y1,
+			.scissor_width = m_scissor.width(),
+			.scissor_height = m_scissor.height(),
+		};
+		packet_ok = packet.append(rsx::webgpu::section_kind::raster_environment,
+			std::as_bytes(std::span{&raster_environment, 1})) && packet_ok;
+	}
 	if (packet_ok)
 	{
 		(void)rsx::webgpu::host_command_queue().push(packet.finish());

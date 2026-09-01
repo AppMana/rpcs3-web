@@ -28,6 +28,9 @@ export function releaseWebGPU(prepared) {
   prepared.bindGroupCache = undefined;
   prepared.pipelineCache = undefined;
   prepared.programCache = undefined;
+  prepared.clearPipelineCache = undefined;
+  prepared.clearBindGroup = undefined;
+  prepared.lastClear = undefined;
 }
 
 // Uniform layout shared by every translated program: RPCS3's vertex
@@ -1044,6 +1047,62 @@ export function fetchAttributesOnCPU(packet) {
   return result;
 }
 
+// An RSX clear as a draw: full-screen triangle, the resolved clear color to
+// the masked channels, the resolved depth through frag_depth, within the
+// resolved scissor. Blending is off and depth always passes.
+const CLEAR_WGSL = `
+struct RSXClear { color: vec4f, depth: f32 };
+@group(0) @binding(0) var<uniform> rsxClear: RSXClear;
+struct ClearOut { @builtin(position) position: vec4f };
+@vertex fn vertex_main(@builtin(vertex_index) index: u32) -> ClearOut {
+  var out: ClearOut;
+  let x = f32(i32(index & 1u) * 4 - 1);
+  let y = f32(i32(index >> 1u) * 4 - 1);
+  out.position = vec4f(x, y, 0.0, 1.0);
+  return out;
+}
+struct ClearFragment { @location(0) color: vec4f, @builtin(frag_depth) depth: f32 };
+@fragment fn fragment_main() -> ClearFragment {
+  var out: ClearFragment;
+  out.color = rsxClear.color;
+  out.depth = rsxClear.depth;
+  return out;
+}
+`;
+
+function getClearPipeline(prepared, format, writeMask, depthWrite) {
+  const cache = prepared.clearPipelineCache ??= new Map();
+  const key = `${format}|${writeMask}|${depthWrite}`;
+  let pipeline = cache.get(key);
+  if (pipeline) return pipeline;
+  const { device } = prepared;
+  prepared.clearModule ??= device.createShaderModule({ label: "RPCS3 RSX clear", code: CLEAR_WGSL });
+  prepared.clearBindGroupLayout ??= device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 32 } },
+  ] });
+  pipeline = device.createRenderPipeline({
+    label: `RPCS3 RSX clear ${key}`,
+    layout: device.createPipelineLayout({ bindGroupLayouts: [prepared.clearBindGroupLayout] }),
+    vertex: { module: prepared.clearModule, entryPoint: "vertex_main", buffers: [] },
+    fragment: { module: prepared.clearModule, entryPoint: "fragment_main", targets: [{ format, writeMask }] },
+    primitive: { topology: "triangle-list", cullMode: "none" },
+    depthStencil: { format: "depth24plus", depthWriteEnabled: depthWrite, depthCompare: "always" },
+  });
+  cache.set(key, pipeline);
+  return pipeline;
+}
+
+function getClearBindGroup(prepared, uniformRing) {
+  if (prepared.clearBindGroup?.generation === uniformRing.generation) return prepared.clearBindGroup.group;
+  getClearPipeline(prepared, prepared.format, 0, false);
+  const group = prepared.device.createBindGroup({
+    layout: prepared.clearBindGroupLayout,
+    entries: [{ binding: 0, resource: { buffer: uniformRing.buffer, offset: 0, size: 32 } }],
+  });
+  prepared.clearBindGroup = { generation: uniformRing.generation, group };
+  return group;
+}
+
 function getProgram(prepared, packet, vertexBackend) {
   const cache = prepared.programCache ??= new Map();
   const key = programKey(packet, vertexBackend);
@@ -1516,10 +1575,22 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   const renderStartedAt = performance.now();
   stopWebGPUPresentation();
   const { canvas, adapter, device, context, format } = prepared;
-  const clearPacket = packets.find((packet) => packet.kind === PacketKind.clear);
-  const drawPackets = packets.filter((packet) => packet.kind === PacketKind.draw);
-  if (!clearPacket) throw new Error("RPCS3 did not emit a clear packet");
-  const clear = clearValue(clearPacket);
+  // Clears and draws execute in packet order against a render target that
+  // persists across frames, as on the RSX: a clear is a scissored, masked
+  // write of the resolved clear values, and a frame without a clear draws
+  // over the previous contents.
+  const operations = packets.filter((packet) => packet.kind === PacketKind.draw || packet.kind === PacketKind.clear);
+  const drawPackets = operations.filter((packet) => packet.kind === PacketKind.draw);
+  const clearPackets = operations.filter((packet) => packet.kind === PacketKind.clear);
+  const clears = clearPackets.map((packet) => ({
+    ...clearValue(packet),
+    scissor: packet.sections[SectionKind.rasterEnvironment].bytes.byteLength === 16
+      ? scissorState(packet, canvas)
+      : { scaled: { x: 0, y: 0, width: canvas.width, height: canvas.height } },
+  }));
+  // Reference clear values for the readback statistics (changed vs clear pixels).
+  const clear = clears[0] ?? prepared.lastClear ?? { r: 0, g: 0, b: 0, a: 0, bytes: [0, 0, 0, 0], mask: 0, depth: 1, stencil: 0 };
+  if (clears[0]) prepared.lastClear = clears[0];
   const vertexBackend = options.vertexBackend ?? "webgpu-wgsl";
   if (vertexBackend !== "webgpu-wgsl" && vertexBackend !== "cpu-oracle") {
     throw new Error(`unknown RSX vertex backend ${vertexBackend}`);
@@ -1550,8 +1621,23 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   // ring; both persist across frames and grow to the largest frame seen.
   const drawCount = translated.length;
   const uniformStride = VERTEX_STATE_STRIDE + FRAGMENT_STATE_STRIDE;
-  const uniformRing = ensureRing(prepared, "uniformRing", GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, Math.max(1, drawCount) * uniformStride);
-  const uniformBytes = new Uint8Array(Math.max(1, drawCount) * uniformStride);
+  const clearBase = drawCount * uniformStride;
+  const uniformRing = ensureRing(prepared, "uniformRing", GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, Math.max(UNIFORM_ALIGNMENT, clearBase + clears.length * UNIFORM_ALIGNMENT));
+  const uniformBytes = new Uint8Array(Math.max(UNIFORM_ALIGNMENT, clearBase + clears.length * UNIFORM_ALIGNMENT));
+  // Clear operations: color and depth values in a 256-byte slot each.
+  const clearResources = clears.map((op, index) => {
+    const view = new DataView(uniformBytes.buffer, clearBase + index * UNIFORM_ALIGNMENT, 32);
+    view.setFloat32(0, op.r, true); view.setFloat32(4, op.g, true); view.setFloat32(8, op.b, true); view.setFloat32(12, op.a, true);
+    view.setFloat32(16, op.depth, true);
+    let writeMask = 0;
+    if (op.mask & ClearMask.red) writeMask |= GPUColorWrite.RED;
+    if (op.mask & ClearMask.green) writeMask |= GPUColorWrite.GREEN;
+    if (op.mask & ClearMask.blue) writeMask |= GPUColorWrite.BLUE;
+    if (op.mask & ClearMask.alpha) writeMask |= GPUColorWrite.ALPHA;
+    const depthWrite = Boolean(op.mask & ClearMask.depth);
+    return { pipeline: getClearPipeline(prepared, format, writeMask, depthWrite), offset: clearBase + index * UNIFORM_ALIGNMENT, scissor: op.scissor.scaled, writeMask, depthWrite };
+  });
+  const clearBindGroup = clears.length ? getClearBindGroup(prepared, uniformRing) : undefined;
   const vertexBytes = translated.reduce((sum, draw) => sum + (draw.gpuInput ? alignTo(draw.gpuInput.byteLength, UNIFORM_ALIGNMENT) : 0), 0);
   const vertexRing = ensureRing(prepared, "vertexRing", GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST, Math.max(UNIFORM_ALIGNMENT, vertexBytes));
   let vertexRingOffset = 0;
@@ -1720,11 +1806,23 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
 
   const encoder = device.createCommandEncoder({ label: "RPCS3 RSX packet frame" });
   const pass = encoder.beginRenderPass({ colorAttachments: [{
-    view: frameTarget.colorView, clearValue: clear, loadOp: "clear", storeOp: "store",
+    view: frameTarget.colorView, loadOp: "load", storeOp: "store",
   }], depthStencilAttachment: {
-    view: frameTarget.depthView, depthClearValue: clear.depth, depthLoadOp: "clear", depthStoreOp: "store",
+    view: frameTarget.depthView, depthLoadOp: "load", depthStoreOp: "store",
   } });
-  for (let index = 0; index < translated.length; index += 1) {
+  let drawIndex = 0;
+  let clearIndex = 0;
+  for (const operation of operations) {
+    if (operation.kind === PacketKind.clear) {
+      const op = clearResources[clearIndex++];
+      if (op.scissor.width === 0 || op.scissor.height === 0 || (op.writeMask === 0 && !op.depthWrite)) continue;
+      pass.setPipeline(op.pipeline);
+      pass.setScissorRect(op.scissor.x, op.scissor.y, op.scissor.width, op.scissor.height);
+      pass.setBindGroup(0, clearBindGroup, [op.offset]);
+      pass.draw(3);
+      continue;
+    }
+    const index = drawIndex++;
     const scissor = scissorStates[index].scaled;
     if (scissor.width === 0 || scissor.height === 0) continue;
     const resource = resources[index];

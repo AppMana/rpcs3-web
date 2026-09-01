@@ -89,6 +89,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
           if (!event.data.ok) throw new Error(`${event.data.detail}; events=${JSON.stringify(events.slice(-40))}`);
           let gpu;
           let packetFixture;
+          let renderError;
           if (preparedGpu && packetBuffers.length > 0) {
             activeGpu = await preparedGpu;
             const decodedPackets = packetBuffers.map((buffer) => decodeDrawPacket(new Uint8Array(buffer)));
@@ -103,6 +104,19 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
                 const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
                 [x, y, width, height].forEach((value, index) => view.setUint32(index * 4, value, true));
               }
+            }
+            if (options.capturePacketFixture) {
+              // The exact packet bytes of this frame, captured before rendering
+              // so an unsupported draw still leaves a replayable artifact for
+              // first-bad-draw bisection. Only the final frame is kept.
+              const encoded = encodePacketFixture(packetBuffers.map((buffer) => new Uint8Array(buffer)));
+              packetFixture = {
+                base64: base64Of(encoded),
+                bytes: encoded.byteLength,
+                packetCount: packetBuffers.length,
+                drawPacketCount: decodedPackets.filter((packet) => packet.kind === PacketKind.draw).length,
+                frameSequence: event.data.frameSequence,
+              };
             }
             let vertexBackendComparison;
             if (options.compareVertexBackends === true) {
@@ -119,7 +133,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
                 oracleTimings: oracle.timings,
               };
             }
-            gpu = await renderPacketsToWebGPU(
+            const renderOnce = () => renderPacketsToWebGPU(
               activeGpu,
               decodedPackets,
               {
@@ -132,19 +146,16 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
                 readback: options.readback !== false || Boolean(options.captureRgba),
               },
             );
-            if (options.capturePacketFixture) {
-              // The exact packet bytes of this frame, for hardware replay and
-              // first-bad-draw bisection. Only the final frame is kept.
-              const encoded = encodePacketFixture(packetBuffers.map((buffer) => new Uint8Array(buffer)));
-              packetFixture = {
-                base64: base64Of(encoded),
-                bytes: encoded.byteLength,
-                packetCount: packetBuffers.length,
-                drawPacketCount: decodedPackets.filter((packet) => packet.kind === PacketKind.draw).length,
-                frameSequence: event.data.frameSequence,
-              };
+            if (options.tolerateRenderErrors === true) {
+              // Commercial bring-up: an unsupported RSX feature ends the run
+              // with the frame's packets and the error recorded, not a throw.
+              try { gpu = await renderOnce(); } catch (error) {
+                renderError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+              }
+            } else {
+              gpu = await renderOnce();
             }
-            if (vertexBackendComparison) {
+            if (gpu && vertexBackendComparison) {
               gpu.vertexBackendComparison = {
                 ...vertexBackendComparison,
                 frameHashMatch: vertexBackendComparison.oracleFrameHash === gpu.frameHash,
@@ -155,19 +166,20 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
           const frame = {
             ...eventWithoutPackets,
             gpu,
+            renderError,
             hostTimings: { waitForPacketsMs: receivedAt - frameRequestedAt, renderMs: performance.now() - receivedAt },
           };
-          const finalFrame = dispatchCompletion || frames.length + 1 >= requestedFrames
+          const finalFrame = dispatchCompletion || frames.length + 1 >= requestedFrames || Boolean(renderError)
             || (untilDraw && (frame.drawPacketCount ?? 0) > 0 && packetBuffers.length > 0);
           frames.push(compactFrame(frame, keepDetail(frames.length, finalFrame)));
           firstResult ??= frames[0];
           if (!finalFrame) {
             frameRequestedAt = performance.now();
-            worker.postMessage({ type: "next-frame", discardPackets: !needsPackets(frames.length + 1) });
+            worker.postMessage({ type: "next-frame", discardPackets: !needsPackets(frames.length + 1), untilDraw });
             return;
           }
           clearTimeout(timeout);
-          const result = { ...firstResult, ...frames.at(-1), gpu, packetFixture, events, frames: requestedFrames > 1 || untilDraw ? frames : undefined };
+          const result = { ...firstResult, ...frames.at(-1), gpu, renderError, packetFixture, events, frames: requestedFrames > 1 || untilDraw ? frames : undefined };
           document.querySelector("#result").textContent = JSON.stringify(result, null, 2);
           // The worker waits up to 5 s for RPCS3's threads to exit and then
           // reports; allow that report to arrive before giving up on it.
@@ -208,6 +220,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       path: bootPath,
       returnPackets: Boolean(options.render),
       discardPackets: !needsPackets(1) && !dispatchCompletion,
+      untilDraw: untilDraw && !dispatchCompletion,
       diagnostics: options.diagnostics === true,
       presentLatestOnly: options.presentLatestOnly === true,
       debugAddresses: Array.isArray(options.debugAddresses) ? options.debugAddresses : [],

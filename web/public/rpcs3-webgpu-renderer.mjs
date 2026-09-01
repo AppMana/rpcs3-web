@@ -31,6 +31,8 @@ export function releaseWebGPU(prepared) {
   prepared.clearPipelineCache = undefined;
   prepared.clearBindGroup = undefined;
   prepared.lastClear = undefined;
+  prepared.nullTexture?.texture.destroy();
+  prepared.nullTexture = undefined;
 }
 
 // Uniform layout shared by every translated program: RPCS3's vertex
@@ -551,7 +553,7 @@ function compileFragmentProgram(packet) {
   const bytes = packet.sections[SectionKind.fragmentProgram].bytes;
   if (bytes.byteLength < 16 || bytes.byteLength % 16 !== 0) throw new Error("invalid RSX fragment program");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const lines = ["var r16: array<vec4f, 48>;", "var r32: array<vec4f, 48>;", "var cc: array<vec4f, 2>;"];
+  const lines = ["var r16: array<vec4f, 48>;", "var r32: array<vec4f, 48>;", "var cc: array<vec4f, 2>;", "var rsxDiscard = false;"];
   const opcodes = [];
   const textureSlots = new Set();
   let constantIndex = 0;
@@ -576,7 +578,7 @@ function compileFragmentProgram(packet) {
     const operandCounts = new Map([
       [1, 1], [2, 2], [3, 2], [4, 3], [5, 2], [6, 2], [7, 2], [8, 2], [9, 2],
       [0x0a, 2], [0x0b, 2], [0x0c, 2], [0x0d, 2], [0x0e, 2], [0x0f, 2],
-      [0x10, 1], [0x11, 1], [0x15, 1], [0x16, 1], [0x17, 1],
+      [0x10, 1], [0x11, 1], [0x12, 0], [0x15, 1], [0x16, 1], [0x17, 1],
       [0x1a, 1], [0x1b, 1], [0x1c, 1], [0x1d, 1], [0x1e, 1], [0x1f, 3],
       [0x20, 0], [0x21, 0], [0x22, 1], [0x23, 1], [0x2e, 3],
       [0x38, 2], [0x39, 1], [0x3a, 2], [0x3b, 2], [0x3c, 1],
@@ -588,6 +590,19 @@ function compileFragmentProgram(packet) {
     const conditionSwizzle = bits(words[1], 21, 8);
     const conditionChannels = [0, 2, 4, 6].map((shift) => "xyzw"[bits(conditionSwizzle, shift, 2)]).join("");
     const condition = `cc[${conditionRegister}].${conditionChannels}`;
+    if (opcode === 0x12) {
+      // KIL: RPCS3's AddFlowOp gates _kill() on the instruction's condition
+      // (unconditional for an all-set execution mask, dropped for a clear
+      // one, otherwise `if (any(cond))`); the ROP epilogue discards after
+      // the program completes.
+      const flowComparisons = [undefined, "<", "==", "<=", ">", "!=", ">=", undefined];
+      if (execution === 7) lines.push("rsxDiscard = true;");
+      else if (execution !== 0) lines.push(`if (any(${condition} ${flowComparisons[execution]} vec4f(0.0))) { rsxDiscard = true; }`);
+      opcodes.push(opcode);
+      offset += hasConstant ? 32 : 16;
+      if (end) break;
+      continue;
+    }
     const sources = Array.from({ length: operandCount }, (_, index) => fragmentSource(packet, words, index, inlineConstant));
     let value;
     if (opcode === 1) value = sources[0];
@@ -658,6 +673,7 @@ function compileFragmentProgram(packet) {
     offset += hasConstant ? 32 : 16;
     if (end) break;
   }
+  lines.push("if (rsxDiscard) { discard; }");
   lines.push(`return ${(packet.fragmentProgramControl & 0x40) !== 0 ? "r32" : "r16"}[0];`);
   if (constantIndex > FRAGMENT_CONSTANT_SLOTS) throw new Error(`RSX fragment program uses ${constantIndex} inline constants; the uniform holds ${FRAGMENT_CONSTANT_SLOTS}`);
   return {
@@ -755,7 +771,6 @@ function translateDraw(packet, program, vertexDiagnostics = false, vertexBackend
       ], outputVertex * VertexOutputStrideFloats);
     }
   }
-  if (program.fragment.textured && packet.textures.length === 0) throw new Error("RSX fragment program samples a texture without a payload");
   return {
     input,
     gpuInput: vertexBackend === "cpu-oracle" ? oracleOutput : undefined,
@@ -1069,6 +1084,28 @@ struct ClearFragment { @location(0) color: vec4f, @builtin(frag_depth) depth: f3
   return out;
 }
 `;
+
+// RPCS3's null texture for referenced-but-disabled samplers: a small
+// zero-filled RGBA8 image with a plain sampler.
+function getNullTexture(prepared) {
+  if (prepared.nullTexture) return prepared.nullTexture;
+  const { device } = prepared;
+  const texture = device.createTexture({
+    label: "RPCS3 RSX null texture",
+    size: { width: 4, height: 4 },
+    format: "rgba8unorm",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+  device.queue.writeTexture({ texture }, new Uint8Array(4 * 4 * 4), { bytesPerRow: 16, rowsPerImage: 4 }, { width: 4, height: 4 });
+  prepared.nullTexture = {
+    texture,
+    view: texture.createView(),
+    sampler: device.createSampler({ magFilter: "nearest", minFilter: "nearest" }),
+    byteSize: 64,
+    diagnostics: { width: 4, height: 4, nullTexture: true },
+  };
+  return prepared.nullTexture;
+}
 
 function getClearPipeline(prepared, format, writeMask, depthWrite) {
   const cache = prepared.clearPipelineCache ??= new Map();
@@ -1751,7 +1788,12 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     if (program.fragment.textured) {
       for (const slot of program.fragment.textureSlots) {
         const descriptor = packet.textures.find((texture) => texture.stage === 0 && texture.slot === slot);
-        if (!descriptor) throw new Error(`RPCS3 fragment texture ${slot} is missing`);
+        if (!descriptor) {
+          // A referenced sampler that the guest left disabled: RPCS3 binds its
+          // zero-filled null image (vk::null_image_view), so samples read 0.
+          textureResources.push({ slot, ...getNullTexture(prepared), cacheKey: "null", cached: true });
+          continue;
+        }
         const cacheKey = textureCacheKey(descriptor);
         let resource = textureCache.get(cacheKey);
         if (resource) {

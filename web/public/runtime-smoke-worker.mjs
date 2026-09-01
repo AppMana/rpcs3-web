@@ -270,7 +270,11 @@ async function waitForFlip(timeoutMs) {
   await new Promise((resolve) => setTimeout(resolve, 1));
 }
 
-async function captureFrame(type, discardPackets = false) {
+// untilDraw: keep consuming whole frames inside the worker, without a page
+// round trip, until one contains a draw packet (or the deadline passes).
+// Skipped frames are counted; nothing is transferred for them, so a title
+// that flips empty frames for seconds cannot back the host queue up.
+async function captureFrame(type, discardPackets = false, untilDraw = false) {
   let status = module.ccall("rpcs3_web_status", "number", [], []);
   let packetCount = 0;
   let drawPacketCount = 0;
@@ -294,8 +298,10 @@ async function captureFrame(type, discardPackets = false) {
       }
     }
   }
+  let skippedFrames = 0;
   // Capture exactly one coherent RSX frame. Stopping at the first draw can
   // omit overlays, while draining past a flip would blend independent frames.
+  for (;;) {
   while (bootResult === 0 && flipPacketCount === 0 && status !== 0 && performance.now() < packetDeadline) {
     if (discardPackets) {
       let kind;
@@ -321,6 +327,17 @@ async function captureFrame(type, discardPackets = false) {
     await waitForFlip(Math.min(250, packetDeadline - performance.now()));
     runHostTasks();
     status = module.ccall("rpcs3_web_status", "number", [], []);
+  }
+  if (untilDraw && flipPacketCount === 1 && drawPacketCount === 0 && bootResult === 0 && status !== 0 && performance.now() < packetDeadline) {
+    // Empty frame: drop it and capture the next one.
+    skippedFrames += 1;
+    packets.length = 0;
+    packetSummaries.length = 0;
+    packetCount = 0;
+    flipPacketCount = 0;
+    continue;
+  }
+  break;
   }
   frameSequence += 1;
   const captureMs = performance.now() - captureStartedAt;
@@ -351,6 +368,7 @@ async function captureFrame(type, discardPackets = false) {
     textureWords,
     droppedPackets: Number(module.ccall("rpcs3_webgpu_dropped_packets", "bigint", [], [])),
     presentedSkips,
+    skippedFrames,
     captureMs,
     workingSet: workingSet(),
     stackReport: stackReport(),
@@ -435,7 +453,7 @@ scope.addEventListener("message", async (event) => {
       return;
     }
     try {
-      await captureFrame("runtime-frame", event.data.discardPackets === true);
+      await captureFrame("runtime-frame", event.data.discardPackets === true, event.data.untilDraw === true);
     } catch (error) {
       scope.postMessage({ type: "runtime-frame", ok: false, detail: detail(error), logs: logs.slice(-200) });
     }
@@ -548,7 +566,7 @@ scope.addEventListener("message", async (event) => {
     if (event.data.completion === "dispatch") {
       await captureDispatch(String(event.data.expectedVerdict ?? ""), Number(event.data.dispatchTimeoutMs) || 30_000);
     } else {
-      await captureFrame("runtime-result", event.data.discardPackets === true);
+      await captureFrame("runtime-result", event.data.discardPackets === true, event.data.untilDraw === true);
     }
   } catch (error) {
     // Attach the tail of RPCS3's own log so a boot failure is diagnosable

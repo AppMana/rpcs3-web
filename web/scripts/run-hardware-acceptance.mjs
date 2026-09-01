@@ -35,8 +35,10 @@ const env = process.env;
 const profilePath = env.RPCS3_CHROME_PROFILE || path.join(homedir(), ".cache", "rpcs3-web-chrome-profile");
 const baseURL = env.RPCS3_WEB_URL || "http://127.0.0.1:4175";
 const headed = env.RPCS3_HEADED === "1";
-const frames = Math.max(1, Math.min(3600, Number(env.RPCS3_FRAMES) || 1));
 const untilDraw = env.RPCS3_UNTIL_DRAW === "1";
+// Until-draw runs keep going up to the page's 3600-frame cap unless a
+// smaller frame budget is given explicitly.
+const frames = Math.max(1, Math.min(3600, Number(env.RPCS3_FRAMES) || (untilDraw ? 3600 : 1)));
 const renderEvery = Math.max(1, Number(env.RPCS3_RENDER_EVERY) || 1);
 const timeoutMs = Math.max(5_000, Number(env.RPCS3_TIMEOUT_MS) || 120_000);
 const width = Number(env.RPCS3_WIDTH) || 1280;
@@ -62,6 +64,7 @@ const runOptions = {
   captureRgba,
   captureShaders,
   capturePacketFixture: Boolean(packetFixturePath),
+  tolerateRenderErrors: env.RPCS3_TOLERATE_RENDER_ERRORS !== "0",
   clockScale: env.RPCS3_CLOCK_SCALE ? Number(env.RPCS3_CLOCK_SCALE) : undefined,
   accurateSpuDma: env.RPCS3_ACCURATE_SPU_DMA ? env.RPCS3_ACCURATE_SPU_DMA === "1" : undefined,
   packetCaptureLevel: env.RPCS3_PACKET_CAPTURE_LEVEL ? Number(env.RPCS3_PACKET_CAPTURE_LEVEL) : undefined,
@@ -338,7 +341,7 @@ try {
   await stopTrace();
 
   const frameList = result.frames ?? [result];
-  const completed = Boolean(result.ok)
+  const completed = Boolean(result.ok) && !result.renderError
     && (untilDraw ? frameList.some((frame) => (frame.drawPacketCount ?? 0) > 0) : frameList.length >= frames);
   const { packetFixture, ...resultWithoutFixture } = result;
   const rgbaBase64 = result.gpu?.rgbaBase64;
@@ -367,6 +370,7 @@ try {
     },
     summary: {
       bootResult: result.bootResult,
+      renderError: result.renderError,
       moduleCreateMs: result.moduleCreateMs,
       droppedPackets: frameList.reduce((sum, frame) => sum + (frame.droppedPackets ?? 0), 0),
       presentedSkips: frameList.at(-1)?.presentedSkips,

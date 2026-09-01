@@ -12,7 +12,7 @@ test("boots the textured/depth gs_gcm_cube fixture through the complete RPCS3 Wa
     try {
       return await runtime.run("fixtures/gs_gcm_cube.elf", {
         render: true,
-        debugAddresses: [
+        diagnostics: true, debugAddresses: [
           0x14a4c0,
           0x49458,
         ],

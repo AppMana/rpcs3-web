@@ -146,6 +146,7 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       type: "boot",
       fixture,
       returnPackets: Boolean(options.render),
+      diagnostics: options.diagnostics === true,
       debugAddresses: Array.isArray(options.debugAddresses) ? options.debugAddresses : [],
       pad: options.pad ?? currentPad,
       completion: dispatchCompletion ? "dispatch" : "frame",

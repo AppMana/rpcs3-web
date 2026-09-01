@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -44,6 +45,16 @@ int main()
 
 	std::vector<std::byte> copy(queue.front_size());
 	assert(queue.copy_front(copy) == copy.size());
+	assert(queue.front_data() != nullptr);
+	assert(std::memcmp(queue.front_data(), copy.data(), copy.size()) == 0);
+	// A concurrent push must not move the front packet's storage.
+	const std::byte* front_before = queue.front_data();
+	assert(queue.push(make_packet(8)));
+	assert(queue.front_data() == front_before);
+	assert(queue.pop_front());
+	assert(queue.pop_front());
+	assert(queue.front_data() == nullptr);
+	assert(queue.push(make_packet(7)));
 	draw_packet_view view(copy);
 	assert(view.valid());
 	assert(view.header()->sequence == 7);

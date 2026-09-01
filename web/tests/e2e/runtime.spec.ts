@@ -4,10 +4,10 @@ test("boots PS3 homebrew through the complete RPCS3 Wasm runtime", async ({ page
   test.setTimeout(180_000);
   await page.goto("/runtime.html");
   const result = await page.evaluate(async () => {
-    const runtime = (window as Window & { __rpcs3Runtime?: { run(): Promise<Record<string, unknown>> } }).__rpcs3Runtime;
+    const runtime = (window as Window & { __rpcs3Runtime?: { run(fixture?: string, options?: Record<string, unknown>): Promise<Record<string, unknown>> } }).__rpcs3Runtime;
     if (!runtime) return { ok: false, detail: "runtime acceptance API is unavailable" };
     try {
-      return await runtime.run();
+      return await runtime.run("fixtures/gs_gcm_basic_triangle.elf", { diagnostics: true });
     } catch (error) {
       return {
         ok: false,

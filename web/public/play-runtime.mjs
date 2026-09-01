@@ -127,6 +127,7 @@ async function start() {
     type: "boot",
     ...(bootPath ? { path: bootPath } : { fixture: "fixtures/gs_gcm_tetris.elf" }),
     returnPackets: true,
+    presentLatestOnly: true,
     pad: controlState(),
   });
 }

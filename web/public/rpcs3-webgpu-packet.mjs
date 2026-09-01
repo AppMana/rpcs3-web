@@ -218,26 +218,27 @@ export function decodeDrawPacket(bytes) {
   return packet;
 }
 
+// One copy: straight from the queue's own storage into a transferable
+// JavaScript buffer. The host guarantees the front packet's address stays
+// valid until this (only) consumer pops it.
 export function copyFrontPacket(module) {
   const size = module.ccall("rpcs3_webgpu_front_size", "number", [], []) >>> 0;
   if (!size) return undefined;
-  const pointer = module._malloc(size);
-  if (!pointer) throw new Error(`could not allocate ${size} bytes for a WebGPU packet`);
-  try {
-    const copied = module.ccall("rpcs3_webgpu_copy_front", "number", ["number", "number"], [pointer, size]) >>> 0;
-    if (copied !== size) throw new Error(`WebGPU packet changed while copying (${size} -> ${copied})`);
+  const pointer = module.ccall("rpcs3_webgpu_front_data", "number", [], []) >>> 0;
+  if (!pointer) throw new Error("WebGPU packet disappeared before copy");
+  if (pointer + size > module.HEAPU8.byteLength) {
+    // Any ccall refreshes Emscripten's heap views after shared-memory growth.
+    module.ccall("rpcs3_web_ppu_last_function", "string", [], []);
     if (pointer + size > module.HEAPU8.byteLength) {
-      module.ccall("rpcs3_web_ppu_last_function", "string", [], []);
+      throw new Error(`Wasm heap view did not grow for a ${size}-byte WebGPU packet`);
     }
-    const bytes = module.HEAPU8.slice(pointer, pointer + size);
-    if (bytes.byteLength !== size) throw new Error(`Wasm heap view did not grow for a ${size}-byte WebGPU packet`);
-    if (module.ccall("rpcs3_webgpu_pop_front", "number", [], []) !== 1) {
-      throw new Error("WebGPU packet disappeared before pop");
-    }
-    return decodeDrawPacket(bytes);
-  } finally {
-    module._free(pointer);
   }
+  const bytes = new Uint8Array(size);
+  bytes.set(module.HEAPU8.subarray(pointer, pointer + size));
+  if (module.ccall("rpcs3_webgpu_pop_front", "number", [], []) !== 1) {
+    throw new Error("WebGPU packet disappeared before pop");
+  }
+  return decodeDrawPacket(bytes);
 }
 
 export function discardFrontPacket(module) {

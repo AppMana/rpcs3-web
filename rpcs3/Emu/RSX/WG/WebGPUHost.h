@@ -22,6 +22,10 @@ namespace rsx::webgpu
 		[[nodiscard]] std::uint32_t front_size() const;
 		[[nodiscard]] std::uint32_t front_kind() const;
 		[[nodiscard]] std::uint32_t copy_front(std::span<std::byte> destination) const;
+		// Address of the front packet's bytes. std::deque keeps element storage
+		// stable across push_back, and only the consumer pops or clears, so the
+		// consumer may copy from this address until it calls pop_front.
+		[[nodiscard]] const std::byte* front_data() const;
 		[[nodiscard]] bool pop_front();
 
 		[[nodiscard]] std::uint32_t packet_count() const;
@@ -60,6 +64,7 @@ extern "C"
 	std::uint32_t rpcs3_webgpu_front_size();
 	std::uint32_t rpcs3_webgpu_front_kind();
 	std::uint32_t rpcs3_webgpu_copy_front(void* destination, std::uint32_t capacity);
+	std::uint32_t rpcs3_webgpu_front_data();
 	std::uint32_t rpcs3_webgpu_pop_front();
 	std::uint64_t rpcs3_webgpu_queued_bytes();
 	std::uint64_t rpcs3_webgpu_peak_queued_bytes();

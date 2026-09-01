@@ -104,6 +104,12 @@ namespace rsx::webgpu
 		return required;
 	}
 
+	const std::byte* command_queue::front_data() const
+	{
+		std::lock_guard lock(m_mutex);
+		return m_packets.empty() ? nullptr : m_packets.front().data();
+	}
+
 	bool command_queue::pop_front()
 	{
 		std::lock_guard lock(m_mutex);
@@ -185,6 +191,12 @@ extern "C"
 		}
 		return rsx::webgpu::host_command_queue().copy_front(
 			{static_cast<std::byte*>(destination), capacity});
+	}
+
+	RPCS3_WEB_EXPORT std::uint32_t rpcs3_webgpu_front_data()
+	{
+		return static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(
+			rsx::webgpu::host_command_queue().front_data()));
 	}
 
 	RPCS3_WEB_EXPORT std::uint32_t rpcs3_webgpu_pop_front()

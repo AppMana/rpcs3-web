@@ -26,6 +26,11 @@ let ppuDispatcher;
 let spuDispatcher;
 let padState = { digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 };
 let moduleCreateMs = 0;
+let diagnostics = false;
+let presentLatestOnly = false;
+let consumedFlips = 0;
+let presentedSkips = 0;
+let frameCounterAddress = 0;
 
 function recordLog(line) {
   const text = String(line);
@@ -238,6 +243,25 @@ function applyPadState(next = {}) {
     [padState.digital1, padState.digital2, padState.leftX, padState.leftY, padState.rightX, padState.rightY]);
 }
 
+function pendingFlips() {
+  return (module.ccall("rpcs3_webgpu_frame_counter", "number", [], []) >>> 0) - consumedFlips;
+}
+
+// Sleep until RPCS3's RSX thread has pushed another flip (it notifies the
+// frame counter word), or until the timeout. This worker is the module main
+// thread that Emscripten proxies pthread creation through, so it must never
+// block in Atomics.wait; waitAsync yields to the event loop instead.
+async function waitForFlip(timeoutMs) {
+  const expected = consumedFlips;
+  if (frameCounterAddress && typeof Atomics.waitAsync === "function") {
+    const heap = new Int32Array(module.HEAPU8.buffer);
+    const result = Atomics.waitAsync(heap, frameCounterAddress >>> 2, expected, Math.max(1, timeoutMs));
+    if (result.async) await result.value;
+    return;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 1));
+}
+
 async function captureFrame(type, discardPackets = false) {
   let status = module.ccall("rpcs3_web_status", "number", [], []);
   let packetCount = 0;
@@ -247,6 +271,21 @@ async function captureFrame(type, discardPackets = false) {
   const packets = [];
   const captureStartedAt = performance.now();
   const packetDeadline = captureStartedAt + packetTimeoutMs;
+  // Interactive presentation only wants the newest complete frame. Skip
+  // older complete frames that queued while the page was busy; they are
+  // counted separately from host queue drops.
+  if (presentLatestOnly) {
+    let stale = pendingFlips() - 1;
+    while (stale > 0) {
+      const kind = discardFrontPacket(module);
+      if (!kind) break;
+      if (kind === PacketKind.flip) {
+        consumedFlips += 1;
+        presentedSkips += 1;
+        stale -= 1;
+      }
+    }
+  }
   // Capture exactly one coherent RSX frame. Stopping at the first draw can
   // omit overlays, while draining past a flip would blend independent frames.
   while (bootResult === 0 && flipPacketCount === 0 && status !== 0 && performance.now() < packetDeadline) {
@@ -256,7 +295,7 @@ async function captureFrame(type, discardPackets = false) {
         packetCount += 1;
         drawPacketCount += kind === PacketKind.draw ? 1 : 0;
         flipPacketCount += kind === PacketKind.flip ? 1 : 0;
-        if (kind === PacketKind.flip) break;
+        if (kind === PacketKind.flip) { consumedFlips += 1; break; }
       }
     }
     let packet;
@@ -264,15 +303,14 @@ async function captureFrame(type, discardPackets = false) {
       packetCount += 1;
       drawPacketCount += packet.kind === PacketKind.draw ? 1 : 0;
       flipPacketCount += packet.kind === PacketKind.flip ? 1 : 0;
-      packetSummaries.push(packetSummary(packet));
+      if (diagnostics) packetSummaries.push(packetSummary(packet));
       packets.push(packet);
-      if (packet.kind === PacketKind.flip) break;
+      if (packet.kind === PacketKind.flip) { consumedFlips += 1; break; }
     }
     if (flipPacketCount !== 0) break;
-    // Yield so pad messages and the browser's worker scheduler can run while
-    // RPCS3's PPU and RSX pthreads produce the next packet. This is polling,
-    // not guest or presentation pacing, and adds no fixed frame interval.
-    await new Promise((resolve) => setTimeout(resolve, 1));
+    // Wait for the RSX thread's flip notification (bounded so pad messages
+    // and status changes are still observed). This is not guest pacing.
+    await waitForFlip(Math.min(250, packetDeadline - performance.now()));
     status = module.ccall("rpcs3_web_status", "number", [], []);
   }
   frameSequence += 1;
@@ -282,11 +320,11 @@ async function captureFrame(type, discardPackets = false) {
     `0x${(address >>> 0).toString(16)}`,
     debugRead32(address >>> 0),
   ]));
-  const textureWords = Object.fromEntries(packets.flatMap((packet) => packet.textures.flatMap((texture) =>
+  const textureWords = diagnostics ? Object.fromEntries(packets.flatMap((packet) => packet.textures.flatMap((texture) =>
     [0, 4, 0x100, Math.max(0, texture.dataSize - 4)].map((offset) => {
       const address = (texture.address + offset) >>> 0;
       return [`0x${address.toString(16)}`, debugRead32(address)];
-    }))));
+    })))) : undefined;
   scope.postMessage({
     type,
     ok: initialized === 1 && bootResult === 0 && flipPacketCount === 1,
@@ -303,6 +341,7 @@ async function captureFrame(type, discardPackets = false) {
     debugWords,
     textureWords,
     droppedPackets: Number(module.ccall("rpcs3_webgpu_dropped_packets", "bigint", [], [])),
+    presentedSkips,
     captureMs,
     workingSet: workingSet(),
     stackReport: stackReport(),
@@ -377,6 +416,10 @@ scope.addEventListener("message", async (event) => {
   clockScale = Math.max(0, Math.min(3_000, Number(event.data.clockScale) || 0)) >>> 0;
   accurateSpuDma = typeof event.data.accurateSpuDma === "boolean" ? event.data.accurateSpuDma : undefined;
   packetTimeoutMs = Math.max(1_000, Math.min(300_000, Number(event.data.packetTimeoutMs) || 10_000));
+  diagnostics = event.data.diagnostics === true;
+  presentLatestOnly = event.data.presentLatestOnly === true;
+  consumedFlips = 0;
+  presentedSkips = 0;
   progressIntervalMs = Math.max(100, Math.min(10_000, Number(event.data.progressIntervalMs) || 250));
   try {
     // Keep Emscripten out of module evaluation so the host can acquire and
@@ -414,6 +457,7 @@ scope.addEventListener("message", async (event) => {
       } : {}),
     });
     moduleCreateMs = performance.now() - moduleCreateStartedAt;
+    frameCounterAddress = module.ccall("rpcs3_webgpu_frame_counter_address", "number", [], []) >>> 0;
     atomicNotifyReentry = module.ccall("rpcs3_web_atomic_notify_reentry_probe", "number", [], []);
     let path = event.data.path;
     if (!path) {

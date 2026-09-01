@@ -16,6 +16,7 @@ export default defineConfig({
     "runtime-gpu.spec.ts",
     "runtime-scissor.spec.ts",
     "runtime-sustained.spec.ts",
+    "input-trace.spec.ts",
   ],
   timeout: 30_000,
   use: {

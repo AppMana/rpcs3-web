@@ -18,7 +18,8 @@
 //   RPCS3_PACKET_FIXTURE=/path/frame.wgpf.gz   RPCS3_CAPTURE_RGBA=1   RPCS3_CAPTURE_SHADERS=1
 //   RPCS3_CPU_PROFILE=/path/run.cpuprofile   RPCS3_CPU_INTERVAL_US=10000   RPCS3_TRACE=/path/trace.json
 //   RPCS3_WATCH_ADDRESS / RPCS3_TRACE_PC / RPCS3_TRACE_DELAY_PC / RPCS3_TRACE_DELAY_MS / RPCS3_DEBUG_ADDRESSES=a,b
-import { mkdir, writeFile } from "node:fs/promises";
+//   RPCS3_INPUT_TRACE=/path/trace.json   frame-indexed pad states recorded on play.html
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
@@ -51,6 +52,7 @@ const cpuProfilePath = env.RPCS3_CPU_PROFILE ? path.resolve(env.RPCS3_CPU_PROFIL
 const cpuSamplingIntervalUs = Math.max(1_000, Math.min(100_000, Number(env.RPCS3_CPU_INTERVAL_US) || 10_000));
 const tracePath = env.RPCS3_TRACE ? path.resolve(env.RPCS3_TRACE) : undefined;
 const coreVariant = env.RPCS3_CORE === "profile" ? "profile" : "release";
+const inputTrace = env.RPCS3_INPUT_TRACE ? JSON.parse(await readFile(path.resolve(env.RPCS3_INPUT_TRACE), "utf8")).entries : undefined;
 const runOptions = {
   frames,
   untilDraw,
@@ -65,6 +67,7 @@ const runOptions = {
   captureShaders,
   capturePacketFixture: Boolean(packetFixturePath),
   tolerateRenderErrors: env.RPCS3_TOLERATE_RENDER_ERRORS !== "0",
+  inputTrace,
   clockScale: env.RPCS3_CLOCK_SCALE ? Number(env.RPCS3_CLOCK_SCALE) : undefined,
   accurateSpuDma: env.RPCS3_ACCURATE_SPU_DMA ? env.RPCS3_ACCURATE_SPU_DMA === "1" : undefined,
   packetCaptureLevel: env.RPCS3_PACKET_CAPTURE_LEVEL ? Number(env.RPCS3_PACKET_CAPTURE_LEVEL) : undefined,

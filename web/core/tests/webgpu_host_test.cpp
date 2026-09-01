@@ -77,6 +77,10 @@ int main()
 	assert(frames.push(make_packet(4, 16, packet_kind::flip)));
 	assert(frames.frame_counter() == 2);
 	assert(frames.frame_counter_address() != nullptr);
+	std::uint32_t observed = 0;
+	frames.set_flip_callback([&](std::uint32_t flips) { observed = flips; });
+	assert(frames.push(make_packet(5, 16, packet_kind::flip)));
+	assert(observed == 3);
 	assert(frames.peak_queued_bytes() == frames.queued_bytes());
 	assert(frames.pop_front());
 	assert(frames.peak_queued_bytes() > frames.queued_bytes());

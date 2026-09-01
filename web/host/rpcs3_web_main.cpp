@@ -9,6 +9,7 @@
 #include "Emu/RSX/GSFrameBase.h"
 #include "Emu/RSX/Null/NullGSRender.h"
 #include "Emu/RSX/WG/WebGPUGSRender.h"
+#include "Emu/RSX/WG/WebGPUHost.h"
 #include "Emu/Memory/vm.h"
 #include "Emu/Memory/vm_locking.h"
 #include "Emu/Audio/Null/NullAudioBackend.h"
@@ -126,6 +127,30 @@ namespace
 	std::atomic<bool> s_null_renderer{false};
 	std::mutex s_host_task_mutex;
 	std::deque<std::function<void()>> s_host_tasks;
+
+	// Frame-indexed pad schedule (input trace replay). Entries are applied on
+	// the RSX thread when the flip with the given index is produced, so a
+	// recorded trace replays at the same guest frames regardless of host timing.
+	struct pad_schedule_entry
+	{
+		u32 frame;
+		u32 digital1, digital2, left_x, left_y, right_x, right_y;
+	};
+	std::mutex s_pad_schedule_mutex;
+	std::vector<pad_schedule_entry> s_pad_schedule;
+	usz s_pad_schedule_cursor = 0;
+	std::atomic<u32> s_pad_schedule_applied{0};
+
+	void apply_pad_schedule(u32 flips)
+	{
+		std::lock_guard lock(s_pad_schedule_mutex);
+		while (s_pad_schedule_cursor < s_pad_schedule.size() && s_pad_schedule[s_pad_schedule_cursor].frame <= flips)
+		{
+			const auto& e = s_pad_schedule[s_pad_schedule_cursor++];
+			web_pad::set_state(e.digital1, e.digital2, e.left_x, e.left_y, e.right_x, e.right_y);
+			s_pad_schedule_applied++;
+		}
+	}
 	std::atomic<s32> s_storage_state{0};
 	std::atomic<u32> s_firmware_result{0};
 	std::atomic<u32> s_firmware_progress{0};
@@ -498,6 +523,7 @@ extern "C"
 		s_initialized = true;
 
 		Emu.SetCallbacks(make_web_callbacks());
+		rsx::webgpu::host_command_queue().set_flip_callback(apply_pad_schedule);
 		if (!s_log_listener)
 		{
 			s_log_listener = logs::make_file_listener("/opfs/cache/rpcs3/RPCS3.log", 32 * 1024 * 1024);
@@ -1193,6 +1219,26 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_pad(u32 digital1, u32 digital2, u32 left_x, u32 left_y, u32 right_x, u32 right_y)
 	{
 		web_pad::set_state(digital1, digital2, left_x, left_y, right_x, right_y);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_pad_schedule_clear()
+	{
+		std::lock_guard lock(s_pad_schedule_mutex);
+		s_pad_schedule.clear();
+		s_pad_schedule_cursor = 0;
+		s_pad_schedule_applied = 0;
+	}
+
+	// Entries must be added in non-decreasing frame order.
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_pad_schedule_add(u32 frame, u32 digital1, u32 digital2, u32 left_x, u32 left_y, u32 right_x, u32 right_y)
+	{
+		std::lock_guard lock(s_pad_schedule_mutex);
+		s_pad_schedule.push_back({frame, digital1, digital2, left_x, left_y, right_x, right_y});
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_pad_schedule_applied()
+	{
+		return s_pad_schedule_applied;
 	}
 
 	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_ppu_last_function()

@@ -123,11 +123,22 @@ async function start() {
     statusElement.textContent = "failed";
     detailElement.textContent = event.message;
   });
+  // ?trace=<url> replays a recorded input trace; inputs are always recorded
+  // so a session can be exported with __rpcs3Playable.exportInputTrace().
+  const traceUrl = new URL(location.href).searchParams.get("trace");
+  let inputTrace;
+  if (traceUrl) {
+    const response = await fetch(traceUrl);
+    if (!response.ok) throw new Error(`input trace fetch returned ${response.status}`);
+    inputTrace = (await response.json()).entries;
+  }
   worker.postMessage({
     type: "boot",
     ...(bootPath ? { path: bootPath } : { fixture: "fixtures/gs_gcm_tetris.elf" }),
     returnPackets: true,
     presentLatestOnly: true,
+    recordInputs: true,
+    inputTrace,
     pad: controlState(),
   });
 }
@@ -165,11 +176,34 @@ document.querySelectorAll("[data-control]").forEach((button) => {
   }
 });
 
+function exportInputTrace() {
+  const active = worker;
+  if (!active) return Promise.resolve(undefined);
+  return new Promise((resolve) => {
+    const onTrace = (event) => {
+      if (event.data?.type !== "input-trace") return;
+      active.removeEventListener("message", onTrace);
+      resolve({ schema: 1, target: bootPath ?? "fixtures/gs_gcm_tetris.elf", entries: event.data.entries, flipCounter: event.data.flipCounter });
+    };
+    active.addEventListener("message", onTrace);
+    active.postMessage({ type: "export-input-trace" });
+  });
+}
+
+document.querySelector("#export-trace")?.addEventListener("click", async () => {
+  const trace = await exportInputTrace();
+  if (!trace) return;
+  const json = JSON.stringify(trace);
+  try { await navigator.clipboard.writeText(json); } catch {}
+  detailElement.textContent = `input trace: ${trace.entries.length} entries through flip ${trace.flipCounter} (copied to clipboard)`;
+});
+
 window.__rpcs3Playable = {
   start,
   stop,
   status: () => ({ ...currentStatus }),
   setPad: (state) => worker?.postMessage({ type: "pad", state }),
+  exportInputTrace,
 };
 
 void start().catch((error) => {

@@ -2,7 +2,7 @@ import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   testDir: "tests/e2e",
-  testMatch: ["browser-units.spec.ts", "gpu.spec.ts", "runtime-gpu.spec.ts", "runtime-cube.spec.ts", "runtime-cube-correctness.spec.ts", "runtime-animation.spec.ts", "runtime-scissor.spec.ts", "runtime-sustained.spec.ts", "playable-tetris.spec.ts", "presentation.spec.ts", "frame-oracle.spec.ts", "packet-replay.spec.ts"],
+  testMatch: ["browser-units.spec.ts", "gpu.spec.ts", "runtime-gpu.spec.ts", "runtime-cube.spec.ts", "runtime-cube-correctness.spec.ts", "runtime-animation.spec.ts", "runtime-scissor.spec.ts", "runtime-sustained.spec.ts", "input-trace.spec.ts", "playable-tetris.spec.ts", "presentation.spec.ts", "frame-oracle.spec.ts", "packet-replay.spec.ts"],
   // These tests intentionally share one physical GPU. Running independent
   // RPCS3/WebGPU instances in parallel can starve the packet consumer and
   // measures cross-test contention rather than backend correctness.

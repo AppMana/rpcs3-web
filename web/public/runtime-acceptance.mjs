@@ -241,6 +241,8 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       progressIntervalMs: options.progressIntervalMs,
       pthreadPoolSize: options.pthreadPoolSize,
       coreUrl: options.coreUrl,
+      inputTrace: Array.isArray(options.inputTrace) ? options.inputTrace : undefined,
+      recordInputs: options.recordInputs === true,
       // RPCS3's WebGPU RSX backend always produces packets; page-side WebGPU
       // rendering is separately gated by options.render. Only an explicit
       // renderer: "null" selects NullGSRender (dispatch-only fixtures).
@@ -254,6 +256,21 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
 // runtime-progress event in the final result's event list.
 function snapshot() {
   activeWorker?.postMessage({ type: "snapshot" });
+}
+
+// Frame-indexed pad states recorded from setPad() during this run.
+function exportInputTrace() {
+  const worker = activeWorker;
+  if (!worker) return Promise.resolve(undefined);
+  return new Promise((resolve) => {
+    const onTrace = (event) => {
+      if (event.data?.type !== "input-trace") return;
+      worker.removeEventListener("message", onTrace);
+      resolve(event.data);
+    };
+    worker.addEventListener("message", onTrace);
+    worker.postMessage({ type: "export-input-trace" });
+  });
 }
 
 // Resolves with the worker's shutdown report (stack high-water marks per
@@ -278,4 +295,4 @@ function stop() {
   return shutdown;
 }
 
-window.__rpcs3Runtime = { run, stop, setPad, snapshot };
+window.__rpcs3Runtime = { run, stop, setPad, snapshot, exportInputTrace };

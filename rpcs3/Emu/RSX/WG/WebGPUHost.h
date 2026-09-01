@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <span>
 #include <vector>
@@ -38,6 +39,10 @@ namespace rsx::webgpu
 		// this word (Atomics.waitAsync) instead of polling; push() notifies it
 		// after every accepted flip.
 		[[nodiscard]] std::uint32_t frame_counter() const noexcept { return m_frame_counter.load(std::memory_order_acquire); }
+		// Invoked on the producer (RSX) thread with the new flip count after
+		// every accepted flip, outside the queue lock. Used to apply
+		// frame-indexed input schedules exactly at guest frame boundaries.
+		void set_flip_callback(std::function<void(std::uint32_t)> callback);
 		[[nodiscard]] const std::atomic<std::uint32_t>* frame_counter_address() const noexcept { return &m_frame_counter; }
 
 	private:
@@ -48,6 +53,8 @@ namespace rsx::webgpu
 		std::size_t m_peak_queued_bytes = 0;
 		std::uint64_t m_dropped_packets = 0;
 		alignas(4) std::atomic<std::uint32_t> m_frame_counter{0};
+		std::mutex m_callback_mutex;
+		std::function<void(std::uint32_t)> m_flip_callback;
 	};
 
 	command_queue& host_command_queue();

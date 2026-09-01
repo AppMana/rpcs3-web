@@ -39,28 +39,47 @@ namespace rsx::webgpu
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
-		if (packet.size() > m_byte_limit || packet.size() > m_byte_limit - m_queued_bytes)
-		{
-			++m_dropped_packets;
-			return false;
-		}
-
 		const bool is_flip = draw_packet_view(packet).header()->kind == packet_kind::flip;
-		m_queued_bytes += packet.size();
-		m_peak_queued_bytes = std::max(m_peak_queued_bytes, m_queued_bytes);
-		m_packets.emplace_back(std::move(packet));
+		std::uint32_t flips = 0;
+		{
+			std::lock_guard lock(m_mutex);
+			if (packet.size() > m_byte_limit || packet.size() > m_byte_limit - m_queued_bytes)
+			{
+				++m_dropped_packets;
+				return false;
+			}
+
+			m_queued_bytes += packet.size();
+			m_peak_queued_bytes = std::max(m_peak_queued_bytes, m_queued_bytes);
+			m_packets.emplace_back(std::move(packet));
+
+			if (is_flip)
+			{
+				flips = m_frame_counter.fetch_add(1, std::memory_order_acq_rel) + 1;
+#ifdef __EMSCRIPTEN__
+				__builtin_wasm_memory_atomic_notify(reinterpret_cast<int*>(&m_frame_counter), 0x7fffffff);
+#else
+				m_frame_counter.notify_all();
+#endif
+			}
+		}
 
 		if (is_flip)
 		{
-			m_frame_counter.fetch_add(1, std::memory_order_acq_rel);
-#ifdef __EMSCRIPTEN__
-			__builtin_wasm_memory_atomic_notify(reinterpret_cast<int*>(&m_frame_counter), 0x7fffffff);
-#else
-			m_frame_counter.notify_all();
-#endif
+			std::function<void(std::uint32_t)> callback;
+			{
+				std::lock_guard lock(m_callback_mutex);
+				callback = m_flip_callback;
+			}
+			if (callback) callback(flips);
 		}
 		return true;
+	}
+
+	void command_queue::set_flip_callback(std::function<void(std::uint32_t)> callback)
+	{
+		std::lock_guard lock(m_callback_mutex);
+		m_flip_callback = std::move(callback);
 	}
 
 	std::uint32_t command_queue::front_size() const

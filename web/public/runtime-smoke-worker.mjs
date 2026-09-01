@@ -26,6 +26,8 @@ let ppuDispatcher;
 let spuDispatcher;
 let padState = { digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 };
 let moduleCreateMs = 0;
+let recordInputs = false;
+const inputTrace = [];
 let diagnostics = false;
 let presentLatestOnly = false;
 let consumedFlips = 0;
@@ -369,6 +371,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     droppedPackets: Number(module.ccall("rpcs3_webgpu_dropped_packets", "bigint", [], [])),
     presentedSkips,
     skippedFrames,
+    padScheduleApplied: module.ccall("rpcs3_web_pad_schedule_applied", "number", [], []) >>> 0,
     captureMs,
     workingSet: workingSet(),
     stackReport: stackReport(),
@@ -403,6 +406,20 @@ scope.addEventListener("message", async (event) => {
   }
   if (event.data?.type === "pad") {
     applyPadState(event.data.state);
+    if (recordInputs && module) {
+      // Frame-indexed record: the state takes effect after this flip count.
+      inputTrace.push({ frame: module.ccall("rpcs3_webgpu_frame_counter", "number", [], []) >>> 0, ...padState });
+    }
+    return;
+  }
+  if (event.data?.type === "export-input-trace") {
+    scope.postMessage({
+      type: "input-trace",
+      schema: 1,
+      entries: inputTrace.slice(),
+      flipCounter: module ? module.ccall("rpcs3_webgpu_frame_counter", "number", [], []) >>> 0 : 0,
+      applied: module ? module.ccall("rpcs3_web_pad_schedule_applied", "number", [], []) >>> 0 : 0,
+    });
     return;
   }
   if (event.data?.type === "shutdown") {
@@ -471,6 +488,8 @@ scope.addEventListener("message", async (event) => {
   packetTimeoutMs = Math.max(1_000, Math.min(300_000, Number(event.data.packetTimeoutMs) || 10_000));
   diagnostics = event.data.diagnostics === true;
   presentLatestOnly = event.data.presentLatestOnly === true;
+  recordInputs = event.data.recordInputs === true;
+  inputTrace.length = 0;
   consumedFlips = 0;
   presentedSkips = 0;
   progressIntervalMs = Math.max(100, Math.min(10_000, Number(event.data.progressIntervalMs) || 250));
@@ -539,6 +558,14 @@ scope.addEventListener("message", async (event) => {
       Number(event.data.traceDelayMs) >>> 0,
     ]);
     module.ccall("rpcs3_web_set_watch_address", null, ["number"], [watchAddress]);
+    // Input trace replay: applied on the RSX thread at the recorded flips.
+    module.ccall("rpcs3_web_pad_schedule_clear", null, [], []);
+    for (const entry of [...(Array.isArray(event.data.inputTrace) ? event.data.inputTrace : [])].sort((a, b) => a.frame - b.frame)) {
+      module.ccall("rpcs3_web_pad_schedule_add", null, ["number", "number", "number", "number", "number", "number", "number"], [
+        Number(entry.frame) >>> 0, Number(entry.digital1 ?? 0) >>> 0, Number(entry.digital2 ?? 0) >>> 0,
+        Number(entry.leftX ?? 128) >>> 0, Number(entry.leftY ?? 128) >>> 0, Number(entry.rightX ?? 128) >>> 0, Number(entry.rightY ?? 128) >>> 0,
+      ]);
+    }
     if (aotWasm) module.ccall("rpcs3_web_set_ppu_aot_handoff", null, ["number"], [1]);
     if (spuAotWasm) module.ccall("rpcs3_web_set_spu_aot_handoff", null, ["number"], [1]);
     if (event.data.path) fixtureBytes = Number(module.FS.stat(path).size);

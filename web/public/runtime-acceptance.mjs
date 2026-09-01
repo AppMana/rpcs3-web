@@ -1,5 +1,5 @@
 import { decodeDrawPacket, PacketKind, SectionKind } from "./rpcs3-webgpu-packet.mjs";
-import { prepareWebGPU, renderPacketsToWebGPU, stopWebGPUPresentation } from "./rpcs3-webgpu-renderer.mjs";
+import { prepareWebGPU, releaseWebGPU, renderPacketsToWebGPU, stopWebGPUPresentation } from "./rpcs3-webgpu-renderer.mjs";
 
 let active;
 let activeWorker;
@@ -175,6 +175,7 @@ function stop() {
   worker?.postMessage({ type: "shutdown" });
   if (worker) setTimeout(() => worker.terminate(), 5_000);
   activeWorker = undefined;
+  releaseWebGPU(activeGpu);
   activeGpu = undefined;
 }
 

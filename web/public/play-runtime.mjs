@@ -1,5 +1,5 @@
 import { decodeDrawPacket } from "./rpcs3-webgpu-packet.mjs";
-import { prepareWebGPU, renderPacketsToWebGPU, stopWebGPUPresentation } from "./rpcs3-webgpu-renderer.mjs";
+import { prepareWebGPU, releaseWebGPU, renderPacketsToWebGPU, stopWebGPUPresentation } from "./rpcs3-webgpu-renderer.mjs";
 
 const Digital1 = Object.freeze({ select: 0x01, start: 0x08, up: 0x10, right: 0x20, down: 0x40, left: 0x80 });
 const Digital2 = Object.freeze({ l2: 0x01, r2: 0x02, l1: 0x04, r1: 0x08, triangle: 0x10, circle: 0x20, cross: 0x40, square: 0x80 });
@@ -137,6 +137,7 @@ function stop() {
   stopWebGPUPresentation();
   worker?.postMessage({ type: "shutdown" });
   worker = undefined;
+  releaseWebGPU(gpu);
   gpu = undefined;
   currentStatus = { ...currentStatus, state: "stopped" };
 }

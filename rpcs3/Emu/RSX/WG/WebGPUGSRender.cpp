@@ -6,6 +6,7 @@
 #include "Emu/RSX/Common/BufferUtils.h"
 #include "Emu/RSX/Common/TextureUtils.h"
 #include "Emu/RSX/Common/surface_store.h"
+#include "Emu/RSX/Program/ProgramStateCache.h"
 #include "Emu/RSX/color_utils.h"
 #include "Emu/RSX/rsx_methods.h"
 #include "Emu/RSX/rsx_utils.h"
@@ -42,6 +43,33 @@ namespace
 		default:
 			return false;
 		}
+	}
+
+	// Byte offsets of the inline-constant slots of a fragment program relative
+	// to its first instruction, in instruction order. This is the walk
+	// fragment_program_utils::analyse_fragment_program performs, using its
+	// is_any_src_constant rule, and matches the order the browser translator
+	// assigns constant indices in.
+	std::vector<u32> fragment_constant_offsets(const void* ucode, u32 ucode_length)
+	{
+		std::vector<u32> offsets;
+		const auto* bytes = static_cast<const u8*>(ucode);
+		for (u32 offset = 0; offset + 16 <= ucode_length;)
+		{
+			const v128 inst = v128::loadu(bytes + offset);
+			const bool end = (inst._u32[0] >> 8) & 0x1;
+			if (program_hash_util::fragment_program_utils::is_any_src_constant(inst))
+			{
+				offsets.push_back(offset + 16);
+				offset += 32;
+			}
+			else
+			{
+				offset += 16;
+			}
+			if (end) break;
+		}
+		return offsets;
 	}
 
 	struct vertex_upload
@@ -527,6 +555,18 @@ bool WebGPUGSRender::emit_draw_packet(u32 subdraw)
 	{
 		packet_ok = packet.append(rsx::webgpu::section_kind::fragment_program,
 			{static_cast<const std::byte*>(current_fragment_program.get_data()), current_fragment_program.ucode_length}) && packet_ok;
+
+		// Inline constants as RPCS3 uploads them to its own fragment constant
+		// buffers, so the browser binds a uniform instead of baking literals.
+		const auto constant_offsets = fragment_constant_offsets(
+			current_fragment_program.get_data(), current_fragment_program.ucode_length);
+		if (!constant_offsets.empty())
+		{
+			std::vector<f32> fragment_constants(constant_offsets.size() * 4);
+			rsx::write_fragment_constants_to_buffer(fragment_constants, current_fragment_program, constant_offsets, false);
+			packet_ok = packet.append(rsx::webgpu::section_kind::fragment_constants,
+				std::as_bytes(std::span(fragment_constants))) && packet_ok;
+		}
 	}
 	packet_ok = packet.append(rsx::webgpu::section_kind::vertex_constants, vertex_constants) && packet_ok;
 	packet_ok = packet.append(rsx::webgpu::section_kind::vertex_layout, layout) && packet_ok;

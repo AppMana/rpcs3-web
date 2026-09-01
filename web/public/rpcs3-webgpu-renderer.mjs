@@ -1,19 +1,49 @@
-import { ClearMask, PacketFlag, PacketKind, SectionKind } from "./rpcs3-webgpu-packet.mjs";
+import { ClearMask, PacketFlag, PacketKind, SectionKind, fnv1a32 } from "./rpcs3-webgpu-packet.mjs";
 
 let activePresentation;
 
+// Stops re-presenting the last frame. GPU resources (rings, frame target,
+// texture cache, pipelines) persist on the prepared device; see releaseWebGPU.
 export function stopWebGPUPresentation() {
   if (!activePresentation) return;
   activePresentation.cancelled = true;
   if (activePresentation.animationFrame !== undefined) cancelAnimationFrame(activePresentation.animationFrame);
-  activePresentation.resources.forEach(({ buffer, vertexStateBuffer, textureResources = [] }) => {
-    buffer.destroy();
-    vertexStateBuffer?.destroy();
-    textureResources.forEach(({ texture, cached }) => { if (!cached) texture.destroy(); });
-  });
-  activePresentation.depthTexture?.destroy();
   activePresentation = undefined;
 }
+
+// Releases every GPU resource the renderer keeps on a prepared device.
+export function releaseWebGPU(prepared) {
+  if (!prepared) return;
+  stopWebGPUPresentation();
+  for (const name of ["uniformRing", "vertexRing"]) {
+    prepared[name]?.buffer?.destroy();
+    prepared[name] = undefined;
+  }
+  prepared.frameTarget?.color.destroy();
+  prepared.frameTarget?.depth.destroy();
+  prepared.frameTarget = undefined;
+  prepared.textureCache?.forEach((resource) => resource.texture.destroy());
+  prepared.textureCache = undefined;
+  prepared.textureCacheBytes = 0;
+  prepared.bindGroupCache = undefined;
+  prepared.pipelineCache = undefined;
+  prepared.programCache = undefined;
+}
+
+// Uniform layout shared by every translated program: RPCS3's vertex
+// environment and 468-entry constant bank, then the fragment environment
+// (fill_fragment_state_buffer) and the program's inline constants as
+// write_fragment_constants_to_buffer emits them.
+const VERTEX_STATE_BYTES = 96 + 468 * 16;
+const FRAGMENT_CONSTANT_SLOTS = 256;
+const FRAGMENT_STATE_BYTES = 32 + FRAGMENT_CONSTANT_SLOTS * 16;
+const UNIFORM_ALIGNMENT = 256;
+const alignTo = (value, alignment) => Math.ceil(value / alignment) * alignment;
+const VERTEX_STATE_STRIDE = alignTo(VERTEX_STATE_BYTES, UNIFORM_ALIGNMENT);
+const FRAGMENT_STATE_STRIDE = alignTo(FRAGMENT_STATE_BYTES, UNIFORM_ALIGNMENT);
+const PROGRAM_CACHE_LIMIT = 256;
+const PIPELINE_CACHE_LIMIT = 512;
+const BIND_GROUP_CACHE_LIMIT = 1024;
 
 function base64(bytes) {
   let binary = "";
@@ -416,24 +446,11 @@ function fragmentWord(view, offset) {
   return (((raw & 0x00ff00ff) << 8) | ((raw & 0xff00ff00) >>> 8)) >>> 0;
 }
 
-function floatLiteral(word) {
-  const bitsView = new DataView(new ArrayBuffer(4));
-  bitsView.setUint32(0, word, true);
-  const value = bitsView.getFloat32(0, true);
-  if (!Number.isFinite(value)) throw new Error("non-finite RSX inline constants are not yet translated");
-  return Number.isInteger(value) ? `${value}.0` : `${value}`;
-}
-
-function fragmentWindowPosition(packet) {
-  const bytes = packet.sections[SectionKind.fragmentEnvironment].bytes;
-  if (bytes.byteLength < 32) throw new Error("RPCS3 fragment environment is truncated");
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const literal = (value) => Number.isInteger(value) ? `${value}.0` : `${value}`;
-  const scale = view.getFloat32(20, true);
-  const biasX = view.getFloat32(24, true);
-  const biasY = view.getFloat32(28, true);
-  if (![scale, biasX, biasY].every(Number.isFinite)) throw new Error("non-finite RSX window-position transform");
-  return `vec4f(input.position.x * ${literal(Math.abs(scale))} + ${literal(biasX)}, input.position.y * ${literal(scale)} + ${literal(biasY)}, input.position.z, input.position.w)`;
+// RPCS3's fill_fragment_state_buffer stores the window-position scale at
+// float 5 and the biases at floats 6 and 7 of the fragment environment.
+function fragmentWindowPosition() {
+  return "vec4f(input.position.x * abs(rsxFragmentState.environment[1].y) + rsxFragmentState.environment[1].z, "
+    + "input.position.y * rsxFragmentState.environment[1].y + rsxFragmentState.environment[1].w, input.position.z, input.position.w)";
 }
 
 function fragmentSource(packet, words, sourceIndex, inlineConstant) {
@@ -445,7 +462,7 @@ function fragmentSource(packet, words, sourceIndex, inlineConstant) {
     source = `${registerFile}[${bits(word, 2, 6)}]`;
   } else if (type === 1) {
     const attribute = bits(words[0], 13, 4);
-    if (attribute === 0) source = fragmentWindowPosition(packet);
+    if (attribute === 0) source = fragmentWindowPosition();
     else if (attribute === 1) source = "select(input.backColor, input.frontColor, frontFacing)";
     else if (attribute === 2) source = "select(input.backSpecular, input.frontSpecular, frontFacing)";
     else if (attribute === 3) source = "input.fog";
@@ -480,13 +497,21 @@ function compileFragmentProgram(packet) {
   const lines = ["var r16: array<vec4f, 48>;", "var r32: array<vec4f, 48>;", "var cc: array<vec4f, 2>;"];
   const opcodes = [];
   const textureSlots = new Set();
+  let constantIndex = 0;
   for (let offset = 0; offset < bytes.byteLength;) {
     const words = [0, 4, 8, 12].map((wordOffset) => fragmentWord(view, offset + wordOffset));
     const opcode = bits(words[0], 24, 6);
     const end = Boolean(bits(words[0], 0, 1));
+    // Any source of type 2 means the next 16 bytes are an inline constant,
+    // regardless of opcode (fragment_program_utils::is_any_src_constant).
+    // RPCS3 uploads those constants in instruction order; the packet's
+    // fragment_constants section is indexed the same way.
+    const hasConstant = [1, 2, 3].some((index) => bits(words[index], 0, 2) === 2);
+    if (hasConstant && offset + 32 > bytes.byteLength) throw new Error("truncated RSX fragment inline constant");
+    const inlineConstant = hasConstant ? `rsxFragmentState.constants[${constantIndex++}]` : undefined;
     if (opcode === 0 || opcode === 0x3d || opcode === 0x3e) {
       opcodes.push(opcode);
-      offset += 16;
+      offset += hasConstant ? 32 : 16;
       if (end) break;
       continue;
     }
@@ -501,12 +526,6 @@ function compileFragmentProgram(packet) {
     ]);
     const operandCount = operandCounts.get(opcode);
     if (operandCount === undefined) throw new Error(`RSX fragment opcode ${opcode} is not yet translated`);
-    const hasConstant = Array.from({ length: operandCount }, (_, index) => bits(words[index + 1], 0, 2)).includes(2);
-    let inlineConstant;
-    if (hasConstant) {
-      if (offset + 32 > bytes.byteLength) throw new Error("truncated RSX fragment inline constant");
-      inlineConstant = `vec4f(${[0, 4, 8, 12].map((wordOffset) => floatLiteral(fragmentWord(view, offset + 16 + wordOffset))).join(", ")})`;
-    }
     const execution = bits(words[1], 18, 3);
     const conditionRegister = bits(words[1], 31, 1);
     const conditionSwizzle = bits(words[1], 21, 8);
@@ -583,7 +602,14 @@ function compileFragmentProgram(packet) {
     if (end) break;
   }
   lines.push(`return ${(packet.fragmentProgramControl & 0x40) !== 0 ? "r32" : "r16"}[0];`);
-  return { code: lines.join("\n"), textured: textureSlots.size > 0, textureSlots: [...textureSlots].sort((a, b) => a - b), opcodes };
+  if (constantIndex > FRAGMENT_CONSTANT_SLOTS) throw new Error(`RSX fragment program uses ${constantIndex} inline constants; the uniform holds ${FRAGMENT_CONSTANT_SLOTS}`);
+  return {
+    code: lines.join("\n"),
+    textured: textureSlots.size > 0,
+    textureSlots: [...textureSlots].sort((a, b) => a - b),
+    opcodes,
+    constantCount: constantIndex,
+  };
 }
 
 function drawVertexOrder(packet) {
@@ -626,7 +652,7 @@ function primitiveTopology(packet) {
   }
 }
 
-function translateDraw(packet, vertexDiagnostics = false, vertexBackend = "webgpu-wgsl") {
+function translateDraw(packet, program, vertexDiagnostics = false, vertexBackend = "webgpu-wgsl") {
   if (packet.kind !== PacketKind.draw) throw new Error(`packet ${packet.sequence} is not an RSX draw`);
   // RPCS3's shared BufferUtils has already expanded line loops, fans, quads,
   // and polygons. Select the WebGPU topology for that mature output instead
@@ -657,21 +683,153 @@ function translateDraw(packet, vertexDiagnostics = false, vertexBackend = "webgp
       ], outputVertex * VertexOutputStrideFloats);
     }
   }
-  const vertex = compileVertexProgram(packet);
-  const fragment = compileFragmentProgram(packet);
-  if (fragment.textured && packet.textures.length === 0) throw new Error("RSX fragment program samples a texture without a payload");
+  if (program.fragment.textured && packet.textures.length === 0) throw new Error("RSX fragment program samples a texture without a payload");
   return {
     input,
     gpuInput: vertexBackend === "cpu-oracle" ? oracleOutput : input,
     oracleOutput,
-    vertex,
+    program,
     vertexCount: vertexOrder.length,
-    fragment,
     topology,
-    vertexOpcodes: vertex.opcodes,
-    scalarVertexOpcodes: vertex.scalarOpcodes,
-    fragmentOpcodes: fragment.opcodes,
+    vertexOpcodes: program.vertex.opcodes,
+    scalarVertexOpcodes: program.vertex.scalarOpcodes,
+    fragmentOpcodes: program.fragment.opcodes,
   };
+}
+
+// Translated programs are keyed by microcode content and the control words
+// that change the generated WGSL, so a frame that reuses a program never
+// re-translates it or rebuilds its shader module and bind group layout.
+function programKey(packet, vertexBackend) {
+  return [
+    vertexBackend,
+    fnv1a32(packet.sections[SectionKind.vertexProgram].bytes),
+    packet.vertexProgramEntry,
+    packet.vertexProgramControl,
+    packet.vertexProgramOutputMask,
+    fnv1a32(packet.sections[SectionKind.fragmentProgram].bytes),
+    packet.fragmentProgramControl,
+  ].join(":");
+}
+
+function assembleShader(vertex, fragment, vertexBackend) {
+  const declarations = fragment.textureSlots.flatMap((slot) => [
+    `@group(0) @binding(${slot * 2}) var rsxTexture${slot}: texture_2d<f32>;`,
+    `@group(0) @binding(${slot * 2 + 1}) var rsxSampler${slot}: sampler;`,
+  ]).join("\n");
+  const vertexInputFields = vertexBackend === "webgpu-wgsl"
+    ? Array.from({ length: 16 }, (_, attribute) => `@location(${attribute}) attribute${attribute}: vec4f,`).join("\n")
+    : ["@location(0) position: vec4f,", ...VertexVaryings.map((name, varying) => `@location(${varying + 1}) ${name}: vec4f,`)].join("\n");
+  const vertexOutputFields = VertexVaryings.map((name, varying) => `@location(${varying}) ${name}: vec4f,`).join("\n");
+  const vertexDeclarations = vertexBackend === "webgpu-wgsl" ? `
+    struct RSXVertexState {
+      environment: array<vec4f, 6>,
+      constants: array<vec4f, 468>,
+    };
+    @group(0) @binding(32) var<uniform> rsxVertexState: RSXVertexState;
+  ` : "";
+  const vertexBody = vertexBackend === "webgpu-wgsl"
+    ? vertex.code
+    : ["result.position = input.position;", ...VertexVaryings.map((name) => `result.${name} = input.${name};`)].join("\n");
+  return `
+    ${declarations}
+    ${vertexDeclarations}
+    struct RSXFragmentState {
+      environment: array<vec4f, 2>,
+      constants: array<vec4f, ${FRAGMENT_CONSTANT_SLOTS}>,
+    };
+    @group(0) @binding(33) var<uniform> rsxFragmentState: RSXFragmentState;
+    struct VertexIn {
+      ${vertexInputFields}
+    };
+    struct VertexOut {
+      @builtin(position) position: vec4f,
+      ${vertexOutputFields}
+    };
+    @vertex fn vertex_main(input: VertexIn) -> VertexOut {
+      var result: VertexOut;
+      ${vertexBody}
+      return result;
+    }
+    @fragment fn fragment_main(input: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(0) vec4f {
+      ${fragment.code}
+    }
+  `;
+}
+
+function getProgram(prepared, packet, vertexBackend) {
+  const cache = prepared.programCache ??= new Map();
+  const key = programKey(packet, vertexBackend);
+  let program = cache.get(key);
+  if (program) {
+    cache.delete(key);
+    cache.set(key, program);
+    return program;
+  }
+  const vertex = compileVertexProgram(packet);
+  const fragment = compileFragmentProgram(packet);
+  const shaderCode = assembleShader(vertex, fragment, vertexBackend);
+  const { device } = prepared;
+  const module = device.createShaderModule({ label: `RPCS3 translated RSX program ${key}`, code: shaderCode });
+  const bindGroupLayout = device.createBindGroupLayout({
+    label: `RPCS3 RSX bind group layout ${key}`,
+    entries: [
+      ...(vertexBackend === "webgpu-wgsl" ? [{
+        binding: 32, visibility: GPUShaderStage.VERTEX,
+        buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: VERTEX_STATE_BYTES },
+      }] : []),
+      {
+        binding: 33, visibility: GPUShaderStage.FRAGMENT,
+        buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: FRAGMENT_STATE_BYTES },
+      },
+      ...fragment.textureSlots.flatMap((slot) => [
+        { binding: slot * 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+        { binding: slot * 2 + 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+      ]),
+    ],
+  });
+  const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+  program = { key, vertex, fragment, shaderCode, module, bindGroupLayout, pipelineLayout };
+  cache.set(key, program);
+  if (cache.size > PROGRAM_CACHE_LIMIT) cache.delete(cache.keys().next().value);
+  return program;
+}
+
+// A buffer that grows to the largest frame seen and is rewritten in place;
+// queue.writeBuffer is ordered after previously submitted work, so reuse is
+// safe without fences. generation changes when the buffer is replaced.
+function ensureRing(prepared, name, usage, bytes) {
+  const ring = prepared[name] ??= { buffer: undefined, size: 0, generation: 0 };
+  if (ring.size < bytes) {
+    ring.buffer?.destroy();
+    ring.size = Math.max(bytes, ring.size * 2, 64 * 1024);
+    ring.buffer = prepared.device.createBuffer({ label: `RPCS3 RSX ${name}`, size: ring.size, usage });
+    ring.generation += 1;
+  }
+  return ring;
+}
+
+// The frame is rendered into an owned color/depth pair that persists across
+// frames of the same size; presentation copies it into the canvas texture.
+function ensureFrameTarget(prepared, width, height, format) {
+  const current = prepared.frameTarget;
+  if (current && current.width === width && current.height === height && current.format === format) return current;
+  current?.color.destroy();
+  current?.depth.destroy();
+  const { device } = prepared;
+  const color = device.createTexture({
+    label: "RPCS3 RSX color target",
+    size: { width, height },
+    format,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING,
+  });
+  const depth = device.createTexture({
+    label: "RPCS3 RSX depth target",
+    size: { width, height },
+    format: "depth24plus",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+  return prepared.frameTarget = { width, height, format, color, depth, colorView: color.createView(), depthView: depth.createView() };
 }
 
 // Clear values come from RPCS3's clear_surface resolution (surface-format
@@ -796,7 +954,7 @@ export async function prepareWebGPU(canvas, options = {}) {
   const context = presentation ? canvas.getContext("webgpu") : undefined;
   if (presentation && !context) throw new Error("OffscreenCanvas WebGPU context is unavailable");
   const format = presentation ? navigator.gpu.getPreferredCanvasFormat() : (options.format ?? "rgba8unorm");
-  context?.configure({ device, format, alphaMode: "opaque", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+  context?.configure({ device, format, alphaMode: "opaque", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST });
   return { canvas, adapter, device, context, format };
 }
 
@@ -886,7 +1044,7 @@ function decodeBcTexture(descriptor, baseFormat, rgba, bytesPerRow) {
   }
 }
 
-function uploadTexture2D(device, descriptor) {
+function uploadTexture2D(device, descriptor, withStatistics = false) {
   const baseFormat = descriptor.format & ~(0x20 | 0x40);
   const bytesPerTexel = baseFormat === 0x85 ? 4 : baseFormat === 0x8b ? 2 : baseFormat === 0x81 ? 1 : 0;
   const compressed = baseFormat >= 0x86 && baseFormat <= 0x88;
@@ -947,16 +1105,20 @@ function uploadTexture2D(device, descriptor) {
       }
     }
   }
+  // Per-channel statistics are diagnostics for the acceptance specs, not
+  // part of the upload.
   const channelMin = [255, 255, 255, 255];
   const channelMax = [0, 0, 0, 0];
   const channelSum = [0, 0, 0, 0];
-  for (let y = 0; y < descriptor.height; y += 1) {
-    for (let x = 0; x < descriptor.width; x += 1) {
-      const destination = y * bytesPerRow + x * 4;
-      for (let channel = 0; channel < 4; channel += 1) {
-        channelMin[channel] = Math.min(channelMin[channel], rgba[destination + channel]);
-        channelMax[channel] = Math.max(channelMax[channel], rgba[destination + channel]);
-        channelSum[channel] += rgba[destination + channel];
+  if (withStatistics) {
+    for (let y = 0; y < descriptor.height; y += 1) {
+      for (let x = 0; x < descriptor.width; x += 1) {
+        const destination = y * bytesPerRow + x * 4;
+        for (let channel = 0; channel < 4; channel += 1) {
+          channelMin[channel] = Math.min(channelMin[channel], rgba[destination + channel]);
+          channelMax[channel] = Math.max(channelMax[channel], rgba[destination + channel]);
+          channelSum[channel] += rgba[destination + channel];
+        }
       }
     }
   }
@@ -984,14 +1146,17 @@ function uploadTexture2D(device, descriptor) {
   });
   return {
     texture,
+    view: texture.createView(),
     sampler,
     byteSize: descriptor.width * descriptor.height * 4,
     diagnostics: {
       width: descriptor.width,
       height: descriptor.height,
-      channelMin,
-      channelMax,
-      channelMean: channelSum.map((sum) => sum / (descriptor.width * descriptor.height)),
+      ...(withStatistics ? {
+        channelMin,
+        channelMax,
+        channelMean: channelSum.map((sum) => sum / (descriptor.width * descriptor.height)),
+      } : {}),
     },
   };
 }
@@ -1054,78 +1219,59 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   if (vertexBackend !== "webgpu-wgsl" && vertexBackend !== "cpu-oracle") {
     throw new Error(`unknown RSX vertex backend ${vertexBackend}`);
   }
-  const translated = drawPackets.map((packet) => translateDraw(packet, options.vertexDiagnostics === true, vertexBackend));
+  const vertexDiagnostics = options.vertexDiagnostics === true;
+  const textureDiagnostics = vertexDiagnostics || options.textureDiagnostics === true;
+  const programs = drawPackets.map((packet) => getProgram(prepared, packet, vertexBackend));
+  const translated = drawPackets.map((packet, index) => translateDraw(packet, programs[index], vertexDiagnostics, vertexBackend));
   const depthStates = drawPackets.map(depthState);
   const targetStates = drawPackets.map(renderTargetState);
   const rasterStates = drawPackets.map(rasterState);
   const scissorStates = drawPackets.map((packet) => scissorState(packet, canvas));
   const translatedAt = performance.now();
+
   const pipelineCache = prepared.pipelineCache ??= new Map();
+  const bindGroupCache = prepared.bindGroupCache ??= new Map();
   const textureCache = prepared.textureCache ??= new Map();
   const textureCacheBudget = options.textureCacheBytes ?? 128 * 1024 * 1024;
   const frameTextureKeys = new Set();
   let pipelineCacheHits = 0;
   let pipelineCacheMisses = 0;
+  let bindGroupCacheHits = 0;
+  let bindGroupCacheMisses = 0;
   let textureCacheHits = 0;
   let textureCacheMisses = 0;
+
+  // One uniform ring for the frame (dynamic offsets per draw) and one vertex
+  // ring; both persist across frames and grow to the largest frame seen.
+  const drawCount = translated.length;
+  const uniformStride = VERTEX_STATE_STRIDE + FRAGMENT_STATE_STRIDE;
+  const uniformRing = ensureRing(prepared, "uniformRing", GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, Math.max(1, drawCount) * uniformStride);
+  const uniformBytes = new Uint8Array(Math.max(1, drawCount) * uniformStride);
+  const vertexBytes = translated.reduce((sum, draw) => sum + alignTo(draw.gpuInput.byteLength, UNIFORM_ALIGNMENT), 0);
+  const vertexRing = ensureRing(prepared, "vertexRing", GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST, Math.max(UNIFORM_ALIGNMENT, vertexBytes));
+  let vertexRingOffset = 0;
+
   const resources = translated.map((draw, index) => {
-    const declarations = draw.fragment.textureSlots.flatMap((slot) => [
-      `@group(0) @binding(${slot * 2}) var rsxTexture${slot}: texture_2d<f32>;`,
-      `@group(0) @binding(${slot * 2 + 1}) var rsxSampler${slot}: sampler;`,
-    ]).join("\n");
-    const vertexInputFields = vertexBackend === "webgpu-wgsl"
-      ? Array.from({ length: 16 }, (_, attribute) => `@location(${attribute}) attribute${attribute}: vec4f,`).join("\n")
-      : ["@location(0) position: vec4f,", ...VertexVaryings.map((name, varying) => `@location(${varying + 1}) ${name}: vec4f,`)].join("\n");
-    const vertexOutputFields = VertexVaryings.map((name, varying) => `@location(${varying}) ${name}: vec4f,`).join("\n");
-    const vertexDeclarations = vertexBackend === "webgpu-wgsl" ? `
-      struct RSXVertexState {
-        environment: array<vec4f, 6>,
-        constants: array<vec4f, 468>,
-      };
-      @group(0) @binding(32) var<uniform> rsxVertexState: RSXVertexState;
-    ` : "";
-    const vertexBody = vertexBackend === "webgpu-wgsl"
-      ? draw.vertex.code
-      : ["result.position = input.position;", ...VertexVaryings.map((name) => `result.${name} = input.${name};`)].join("\n");
-    const shaderCode = `
-      ${declarations}
-      ${vertexDeclarations}
-      struct VertexIn {
-        ${vertexInputFields}
-      };
-      struct VertexOut {
-        @builtin(position) position: vec4f,
-        ${vertexOutputFields}
-      };
-      @vertex fn vertex_main(input: VertexIn) -> VertexOut {
-        var result: VertexOut;
-        ${vertexBody}
-        return result;
-      }
-      @fragment fn fragment_main(input: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(0) vec4f {
-        ${draw.fragment.code}
-      }
-    `;
-    const pipelineKey = JSON.stringify([
-      shaderCode,
-      format,
-      draw.topology,
-      rasterStates[index],
-      depthStates[index],
-      targetStates[index].blend,
-      targetStates[index].writeMask,
-    ]);
+    const packet = drawPackets[index];
+    const { program } = draw;
+    const target = targetStates[index];
+    const depth = depthStates[index];
+    const raster = rasterStates[index];
+    const blend = target.blend;
+    const blendKey = blend
+      ? [blend.color.srcFactor, blend.color.dstFactor, blend.color.operation, blend.alpha.srcFactor, blend.alpha.dstFactor, blend.alpha.operation].join(",")
+      : "none";
+    const pipelineKey = [program.key, format, draw.topology, raster.frontFace, raster.cullMode, depth.writeEnabled, depth.comparison, target.writeMask, blendKey].join("|");
     let pipeline = pipelineCache.get(pipelineKey);
     if (pipeline) {
       pipelineCacheHits += 1;
     } else {
       pipelineCacheMisses += 1;
-      const shader = device.createShaderModule({ label: `RPCS3 translated RSX program ${index}`, code: shaderCode });
       pipeline = device.createRenderPipeline({
-        label: `RPCS3 RSX WebGPU pipeline ${index}`,
-        layout: "auto",
+        label: `RPCS3 RSX WebGPU pipeline ${pipelineKey}`,
+        layout: program.pipelineLayout,
         vertex: {
-          module: shader,
+          module: program.module,
           entryPoint: "vertex_main",
           buffers: [{
             arrayStride: VertexOutputStrideFloats * 4,
@@ -1137,42 +1283,45 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
           }],
         },
         fragment: {
-          module: shader,
+          module: program.module,
           entryPoint: "fragment_main",
-          targets: [{ format, blend: targetStates[index].blend, writeMask: targetStates[index].writeMask }],
+          targets: [{ format, blend, writeMask: target.writeMask }],
         },
-        primitive: {
-          topology: draw.topology,
-          frontFace: rasterStates[index].frontFace,
-          cullMode: rasterStates[index].cullMode,
-        },
-        depthStencil: {
-          format: "depth24plus",
-          depthWriteEnabled: depthStates[index].writeEnabled,
-          depthCompare: depthStates[index].comparison,
-        },
+        primitive: { topology: draw.topology, frontFace: raster.frontFace, cullMode: raster.cullMode },
+        depthStencil: { format: "depth24plus", depthWriteEnabled: depth.writeEnabled, depthCompare: depth.comparison },
       });
       pipelineCache.set(pipelineKey, pipeline);
+      if (pipelineCache.size > PIPELINE_CACHE_LIMIT) pipelineCache.delete(pipelineCache.keys().next().value);
     }
-    const buffer = device.createBuffer({ size: draw.gpuInput.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    device.queue.writeBuffer(buffer, 0, draw.gpuInput.buffer, draw.gpuInput.byteOffset, draw.gpuInput.byteLength);
-    let vertexStateBuffer;
+
+    const vertexOffset = vertexRingOffset;
+    vertexRingOffset += alignTo(draw.gpuInput.byteLength, UNIFORM_ALIGNMENT);
+    device.queue.writeBuffer(vertexRing.buffer, vertexOffset, draw.gpuInput.buffer, draw.gpuInput.byteOffset, draw.gpuInput.byteLength);
+
+    const uniformBase = index * uniformStride;
+    const fragmentBase = uniformBase + VERTEX_STATE_STRIDE;
     if (vertexBackend === "webgpu-wgsl") {
-      const environment = drawPackets[index].sections[SectionKind.vertexEnvironment].bytes;
-      const constants = drawPackets[index].sections[SectionKind.vertexConstants].bytes;
+      const environment = packet.sections[SectionKind.vertexEnvironment].bytes;
+      const constants = packet.sections[SectionKind.vertexConstants].bytes;
       if (environment.byteLength !== 96 || constants.byteLength !== 468 * 16) {
         throw new Error("RPCS3 vertex-state packet has an invalid uniform layout");
       }
-      const vertexState = new Uint8Array(environment.byteLength + constants.byteLength);
-      vertexState.set(environment);
-      vertexState.set(constants, environment.byteLength);
-      vertexStateBuffer = device.createBuffer({ size: vertexState.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-      device.queue.writeBuffer(vertexStateBuffer, 0, vertexState);
+      uniformBytes.set(environment, uniformBase);
+      uniformBytes.set(constants, uniformBase + 96);
     }
+    const fragmentEnvironment = packet.sections[SectionKind.fragmentEnvironment].bytes;
+    if (fragmentEnvironment.byteLength !== 32) throw new Error("RPCS3 fragment environment is truncated");
+    uniformBytes.set(fragmentEnvironment, fragmentBase);
+    const fragmentConstants = packet.sections[SectionKind.fragmentConstants].bytes;
+    if (fragmentConstants.byteLength !== program.fragment.constantCount * 16) {
+      throw new Error(`RPCS3 fragment constants (${fragmentConstants.byteLength} bytes) do not match the program's ${program.fragment.constantCount} inline constants`);
+    }
+    uniformBytes.set(fragmentConstants, fragmentBase + 32);
+
     const textureResources = [];
-    if (draw.fragment.textured) {
-      for (const slot of draw.fragment.textureSlots) {
-        const descriptor = drawPackets[index].textures.find((texture) => texture.stage === 0 && texture.slot === slot);
+    if (program.fragment.textured) {
+      for (const slot of program.fragment.textureSlots) {
+        const descriptor = packet.textures.find((texture) => texture.stage === 0 && texture.slot === slot);
         if (!descriptor) throw new Error(`RPCS3 fragment texture ${slot} is missing`);
         const cacheKey = textureCacheKey(descriptor);
         let resource = textureCache.get(cacheKey);
@@ -1181,7 +1330,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
           textureCache.set(cacheKey, resource);
           textureCacheHits += 1;
         } else {
-          resource = uploadTexture2D(device, descriptor);
+          resource = uploadTexture2D(device, descriptor, textureDiagnostics);
           textureCache.set(cacheKey, resource);
           prepared.textureCacheBytes = (prepared.textureCacheBytes ?? 0) + resource.byteSize;
           textureCacheMisses += 1;
@@ -1190,49 +1339,56 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
         textureResources.push({ slot, ...resource, cacheKey, cached: true });
       }
     }
-    const bindEntries = [
-      ...(vertexStateBuffer ? [{ binding: 32, resource: { buffer: vertexStateBuffer } }] : []),
-      ...textureResources.flatMap((resource) => [
-        { binding: resource.slot * 2, resource: resource.texture.createView() },
-        { binding: resource.slot * 2 + 1, resource: resource.sampler },
-      ]),
-    ];
-    const bindGroup = bindEntries.length > 0 ? device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: bindEntries,
-    }) : undefined;
-    return { pipeline, buffer, vertexStateBuffer, bindGroup, textureResources, shaderCode };
+
+    const bindGroupKey = `${program.key}|${uniformRing.generation}|${textureResources.map((resource) => resource.cacheKey).join(",")}`;
+    let bindGroup = bindGroupCache.get(bindGroupKey);
+    if (bindGroup) {
+      bindGroupCacheHits += 1;
+    } else {
+      bindGroupCacheMisses += 1;
+      bindGroup = device.createBindGroup({
+        layout: program.bindGroupLayout,
+        entries: [
+          ...(vertexBackend === "webgpu-wgsl" ? [{ binding: 32, resource: { buffer: uniformRing.buffer, offset: 0, size: VERTEX_STATE_BYTES } }] : []),
+          { binding: 33, resource: { buffer: uniformRing.buffer, offset: 0, size: FRAGMENT_STATE_BYTES } },
+          ...textureResources.flatMap((resource) => [
+            { binding: resource.slot * 2, resource: resource.view },
+            { binding: resource.slot * 2 + 1, resource: resource.sampler },
+          ]),
+        ],
+      });
+      bindGroupCache.set(bindGroupKey, bindGroup);
+      if (bindGroupCache.size > BIND_GROUP_CACHE_LIMIT) bindGroupCache.delete(bindGroupCache.keys().next().value);
+    }
+    const dynamicOffsets = vertexBackend === "webgpu-wgsl" ? [uniformBase, fragmentBase] : [fragmentBase];
+    return { pipeline, vertexOffset, vertexSize: draw.gpuInput.byteLength, bindGroup, dynamicOffsets, textureResources, shaderCode: program.shaderCode };
   });
-  const depthTexture = device.createTexture({
-    label: "RPCS3 RSX depth target",
-    size: { width: canvas.width, height: canvas.height },
-    format: "depth24plus",
-    usage: GPUTextureUsage.RENDER_ATTACHMENT,
-  });
+  device.queue.writeBuffer(uniformRing.buffer, 0, uniformBytes);
+  const frameTarget = ensureFrameTarget(prepared, canvas.width, canvas.height, format);
   const resourcesReadyAt = performance.now();
-  const texture = context ? context.getCurrentTexture() : device.createTexture({
-    label: "RPCS3 RSX headless color target",
-    size: { width: canvas.width, height: canvas.height },
-    format,
-    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
-  });
+
   const encoder = device.createCommandEncoder({ label: "RPCS3 RSX packet frame" });
   const pass = encoder.beginRenderPass({ colorAttachments: [{
-    view: texture.createView(), clearValue: clear, loadOp: "clear", storeOp: "store",
+    view: frameTarget.colorView, clearValue: clear, loadOp: "clear", storeOp: "store",
   }], depthStencilAttachment: {
-    view: depthTexture.createView(), depthClearValue: clear.depth, depthLoadOp: "clear", depthStoreOp: "store",
+    view: frameTarget.depthView, depthClearValue: clear.depth, depthLoadOp: "clear", depthStoreOp: "store",
   } });
   for (let index = 0; index < translated.length; index += 1) {
     const scissor = scissorStates[index].scaled;
     if (scissor.width === 0 || scissor.height === 0) continue;
-    pass.setPipeline(resources[index].pipeline);
-    pass.setVertexBuffer(0, resources[index].buffer);
+    const resource = resources[index];
+    pass.setPipeline(resource.pipeline);
+    pass.setVertexBuffer(0, vertexRing.buffer, resource.vertexOffset, resource.vertexSize);
     pass.setScissorRect(scissor.x, scissor.y, scissor.width, scissor.height);
     if (targetStates[index].blendEnabled) pass.setBlendConstant(targetStates[index].blendConstant);
-    if (resources[index].bindGroup) pass.setBindGroup(0, resources[index].bindGroup);
+    pass.setBindGroup(0, resource.bindGroup, resource.dynamicOffsets);
     pass.draw(translated[index].vertexCount);
   }
   pass.end();
+  const texture = frameTarget.color;
+  if (context) {
+    encoder.copyTextureToTexture({ texture }, { texture: context.getCurrentTexture() }, { width: canvas.width, height: canvas.height });
+  }
   const readbackEnabled = options.readback !== false;
   const bytesPerRow = readbackEnabled ? Math.ceil((canvas.width * 4) / 256) * 256 : 0;
   const readback = readbackEnabled ? device.createBuffer({
@@ -1300,52 +1456,30 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       textureCache.delete(cacheKey);
       prepared.textureCacheBytes -= resource.byteSize;
       resource.texture.destroy();
+      for (const key of [...bindGroupCache.keys()]) {
+        if (key.includes(cacheKey)) bindGroupCache.delete(key);
+      }
     }
   }
 
   if (context && options.replayPresentation !== false && typeof globalThis.requestAnimationFrame === "function") {
-    // WebGPU canvas textures are not retained bitmaps. Keep presenting the
-    // most recent RSX frame until a newer frame replaces it, just as the live
-    // emulator loop will. This is presentation scheduling only: guest/RSX
-    // execution above is neither delayed nor paced by requestAnimationFrame.
-    const presentation = { cancelled: false, animationFrame: undefined, resources, depthTexture };
+    // WebGPU canvas textures are not retained bitmaps. Keep copying the
+    // rendered frame into the canvas until a newer frame replaces it. This is
+    // presentation scheduling only: guest/RSX execution is neither delayed nor
+    // paced by requestAnimationFrame, and no draw is re-encoded.
+    const presentation = { cancelled: false, animationFrame: undefined };
     const present = () => {
       if (presentation.cancelled) return;
       presentation.animationFrame = globalThis.requestAnimationFrame(present);
-      const presentationEncoder = device.createCommandEncoder({ label: "RPCS3 RSX compositor frame" });
-      const presentationPass = presentationEncoder.beginRenderPass({ colorAttachments: [{
-        view: context.getCurrentTexture().createView(), clearValue: clear, loadOp: "clear", storeOp: "store",
-      }], depthStencilAttachment: {
-        view: depthTexture.createView(), depthClearValue: clear.depth, depthLoadOp: "clear", depthStoreOp: "store",
-      } });
-      for (let index = 0; index < translated.length; index += 1) {
-        const scissor = scissorStates[index].scaled;
-        if (scissor.width === 0 || scissor.height === 0) continue;
-        presentationPass.setPipeline(resources[index].pipeline);
-        presentationPass.setVertexBuffer(0, resources[index].buffer);
-        presentationPass.setScissorRect(scissor.x, scissor.y, scissor.width, scissor.height);
-        if (targetStates[index].blendEnabled) presentationPass.setBlendConstant(targetStates[index].blendConstant);
-        if (resources[index].bindGroup) presentationPass.setBindGroup(0, resources[index].bindGroup);
-        presentationPass.draw(translated[index].vertexCount);
-      }
-      presentationPass.end();
+      const current = prepared.frameTarget;
+      const canvasTexture = context.getCurrentTexture();
+      if (!current || canvasTexture.width !== current.width || canvasTexture.height !== current.height) return;
+      const presentationEncoder = device.createCommandEncoder({ label: "RPCS3 RSX present" });
+      presentationEncoder.copyTextureToTexture({ texture: current.color }, { texture: canvasTexture }, { width: current.width, height: current.height });
       device.queue.submit([presentationEncoder.finish()]);
     };
     activePresentation = presentation;
     presentation.animationFrame = globalThis.requestAnimationFrame(present);
-  } else if (!context || options.retainResources === false) {
-    resources.forEach(({ buffer, vertexStateBuffer, textureResources }) => {
-      buffer.destroy();
-      vertexStateBuffer?.destroy();
-      textureResources.forEach(({ texture: resourceTexture, cached }) => { if (!cached) resourceTexture.destroy(); });
-    });
-    depthTexture.destroy();
-    if (!context) texture.destroy();
-  } else {
-    // Interactive presentation submits once per actual guest flip. Retain the
-    // resources until the next guest frame replaces them, without a browser
-    // animation timer or a texture readback in the hot path.
-    activePresentation = { cancelled: false, animationFrame: undefined, resources, depthTexture };
   }
   const info = adapter.info ?? {};
   return {
@@ -1386,6 +1520,8 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       totalMs: readbackScannedAt - renderStartedAt,
     },
     pipelineCache: { hits: pipelineCacheHits, misses: pipelineCacheMisses, size: pipelineCache.size },
+    programCache: { size: prepared.programCache?.size ?? 0 },
+    bindGroupCache: { hits: bindGroupCacheHits, misses: bindGroupCacheMisses, size: bindGroupCache.size },
     textureCache: {
       hits: textureCacheHits,
       misses: textureCacheMisses,
@@ -1393,6 +1529,8 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       bytes: prepared.textureCacheBytes ?? 0,
       budget: textureCacheBudget,
     },
+    uniformRingBytes: uniformRing.size,
+    vertexRingBytes: vertexRing.size,
     rgbaBase64: rgba ? base64(rgba) : undefined,
   };
 }

@@ -29,7 +29,8 @@
     "device:wip": "node scripts/run-wip-device.mjs",
     "device:runtime": "node scripts/run-full-runtime-device.mjs",
     "device:units": "node scripts/run-unit-device.mjs",
-    "check": "npm test && npm run build"
+    "check": "npm test && npm run build",
+    "device:origin": "node scripts/run-origin-device.mjs"
   },
   "dependencies": {
     "coi-serviceworker": "0.1.7"

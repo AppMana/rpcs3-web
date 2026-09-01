@@ -23,11 +23,20 @@ export default defineConfig({
     baseURL: `http://127.0.0.1:4173${process.env.BASE_PATH ?? "/"}`,
     trace: "retain-on-failure",
   },
-  webServer: {
-    command: "npm run preview -- --port 4173",
-    port: 4173,
-    reuseExistingServer: !process.env.CI,
-  },
+  webServer: [
+    {
+      // Same-origin library for the OPFS import tests; the preview server
+      // proxies /library/ to it. A running rpcs3-web-library.service is reused.
+      command: "node scripts/serve-library.mjs --port 4181 --dir public/fixtures",
+      port: 4181,
+      reuseExistingServer: !process.env.CI,
+    },
+    {
+      command: "npm run preview -- --port 4173",
+      port: 4173,
+      reuseExistingServer: !process.env.CI,
+    },
+  ],
   projects: [
     {
       name: "chromium",

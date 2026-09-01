@@ -1,4 +1,7 @@
+import { DEFAULT_CHUNK_SIZE, formatRate } from "./library-import-core.mjs";
+
 export const RPCS3_OPFS_MOUNT = "/opfs";
+export { DEFAULT_CHUNK_SIZE, formatRate };
 
 export function normalizeRelativePath(value) {
   if (typeof value !== "string" || value.includes("\0")) throw new TypeError("Invalid storage path");
@@ -108,8 +111,14 @@ export async function listOPFS(maxEntries = 5000) {
       if (handle.kind === "directory") {
         await visit(handle, path);
       } else {
-        const file = await handle.getFile();
-        entries.push({ path, size: file.size, modified: file.lastModified });
+        try {
+          const file = await handle.getFile();
+          entries.push({ path, size: file.size, modified: file.lastModified });
+        } catch (error) {
+          // A file with an open sync access handle (an import in progress) is
+          // locked in Safari; report it rather than failing the whole listing.
+          entries.push({ path, size: undefined, modified: undefined, locked: true, error: error?.name });
+        }
       }
     }
   }
@@ -123,4 +132,112 @@ export function formatBytes(value) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   const unit = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
   return `${(bytes / (1024 ** unit)).toFixed(unit ? 2 : 0)} ${units[unit]}`;
+}
+
+// Same-origin library imports (HTTP Range downloads written to OPFS by
+// library-import-worker.mjs). Only one import runs at a time per page.
+
+export function defaultLibraryBase() {
+  return new URL("./library/", import.meta.url).href;
+}
+
+export async function fetchLibraryIndex(libraryBase = defaultLibraryBase()) {
+  const response = await fetch(new URL("index.json", libraryBase), { cache: "no-store" });
+  if (!response.ok) throw new Error(`Library index returned HTTP ${response.status}`);
+  return response.json();
+}
+
+let activeLibraryImport;
+
+function estimateSnapshot(state) {
+  return { quota: state.quota, usage: state.usage, persisted: state.persisted };
+}
+
+/**
+ * Downloads `name` from the library into OPFS `<destination>/<name>` with
+ * resumable Range requests and returns the verified report. Progress is
+ * available through `onProgress` and `libraryImportProgress()`.
+ */
+export function importFromLibrary(name, destination = "games", options = {}) {
+  if (typeof name !== "string" || !name || name.includes("/") || name.includes("\\")) throw new TypeError("Library names are plain file names");
+  const target = normalizeRelativePath(destination);
+  if (activeLibraryImport?.running) throw new Error(`An import of ${activeLibraryImport.name} is already running`);
+  if (!navigator.storage?.getDirectory) throw new Error("Origin-private file storage is unavailable");
+  const state = { running: true, name, destination: target, startedAt: Date.now(), progress: undefined, result: undefined, error: undefined, worker: undefined };
+  activeLibraryImport = state;
+  state.promise = (async () => {
+    const persistGranted = Boolean(await navigator.storage.persist?.().catch(() => false));
+    const before = estimateSnapshot(await storageStatus());
+    const worker = new Worker(new URL("./library-import-worker.mjs", import.meta.url), { type: "module" });
+    state.worker = worker;
+    try {
+      const report = await new Promise((resolve, reject) => {
+        worker.addEventListener("message", (event) => {
+          const message = event.data;
+          if (message?.type === "progress") {
+            state.progress = message;
+            options.onProgress?.(message);
+          } else if (message?.type === "done") {
+            resolve(message.report);
+          } else if (message?.type === "aborted" || message?.type === "error") {
+            reject(Object.assign(new Error(message.message), { name: message.type === "aborted" ? "AbortError" : "Error", report: message.report }));
+          }
+        });
+        worker.addEventListener("error", (event) => reject(new Error(event.message || "Library import worker failed")));
+        worker.postMessage({
+          type: "start",
+          name,
+          destination: target,
+          libraryBase: options.libraryBase ?? defaultLibraryBase(),
+          chunkSize: options.chunkSize ?? DEFAULT_CHUNK_SIZE,
+          prefetch: options.prefetch,
+          restart: Boolean(options.restart),
+          verify: Boolean(options.verify),
+        });
+      });
+      const after = estimateSnapshot(await storageStatus());
+      const result = {
+        ...report,
+        persistGranted,
+        estimateBefore: before,
+        estimateAfter: after,
+        usageDelta: after.usage - before.usage,
+        bootPath: gameBootPath([report.path]),
+      };
+      state.result = result;
+      return result;
+    } catch (error) {
+      const after = estimateSnapshot(await storageStatus().catch(() => ({})));
+      state.error = { name: error?.name, message: error?.message, report: error?.report, estimateBefore: before, estimateAfter: after };
+      throw error;
+    } finally {
+      state.running = false;
+      state.finishedAt = Date.now();
+      worker.terminate();
+    }
+  })();
+  return state.promise;
+}
+
+/** JSON-safe snapshot of the current or last library import for pollers such as the device runner. */
+export function libraryImportProgress() {
+  const state = activeLibraryImport;
+  if (!state) return { running: false };
+  return {
+    running: state.running,
+    name: state.name,
+    destination: state.destination,
+    startedAt: state.startedAt,
+    finishedAt: state.finishedAt,
+    progress: state.progress,
+    result: state.result,
+    error: state.error,
+  };
+}
+
+export function abortLibraryImport() {
+  const state = activeLibraryImport;
+  if (!state?.running) return false;
+  state.worker?.postMessage({ type: "abort" });
+  return true;
 }

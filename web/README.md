@@ -57,6 +57,43 @@ npm run device:units -- device-unit-evidence
 
 The device command requires an HTTPS, cross-origin-isolated page to already be open in Safari. It injects local JS/Wasm/ELF blobs through the USB inspector connection, renders on the device, reads back the raw WebGPU target, applies the cube acceptance checks, and saves `report.json`, `frame.png`, and `page.png`. No emulation or rendering is performed in the cloud.
 
+## Importing firmware and games from the same origin
+
+`storage.html` can fill the origin-private file system without a file picker
+by downloading from `/library/` on the page's own origin:
+
+- `scripts/serve-library.mjs` (`npm run library:serve`, port 4181, systemd user
+  unit `rpcs3-web-library.service`) serves an allowlist of files with exact HTTP
+  Range semantics (`206`/`416`, `Accept-Ranges`, strong ETags, `HEAD`),
+  `Cache-Control: no-store`, `Cross-Origin-Resource-Policy: same-origin`, and a
+  JSON index carrying each file's size and SHA-256 (hashed in the background and
+  cached under `~/.cache/rpcs3-web-library/`). On https://rpcs3.appmana.com the
+  Ingress routes `/library/` to it; `vite preview`/`vite dev` proxy the prefix.
+- `public/library-import-worker.mjs` fetches 16 MiB ranges with
+  `cache: "no-store"`, writes every body read straight into a
+  `FileSystemSyncAccessHandle` (Safari has no `createWritable`), and hashes it
+  as it goes (`library-import-core.mjs`: resumable SHA-256 in wasm with a
+  JavaScript fallback, both checked against Node's digest). A sidecar
+  `.rpcs3-imports/<destination>/<name>.json` records the source size/SHA-256/ETag
+  and the running hash state, so an interrupted import resumes from the bytes
+  already on disk (`Range: bytes=<size>-`), re-hashing any unrecorded tail
+  locally, and a changed source restarts from zero.
+- Page API: `window.__rpcs3Storage.importFromLibrary(name, destination)` returns
+  a report (bytes, elapsed, rate, requests, resume point, SHA-256 verdict,
+  `navigator.storage.estimate()` before and after); `importProgress()` and
+  `abortImport()` support pollers. `storage.html?import=<name>&destination=games|firmware`
+  starts one on load.
+- `npm run device:library -- https://rpcs3.appmana.com/ <outDir> <name> [destination] [--interrupt-after S]`
+  drives the same API on the attached iPad over the WebKit Inspector Protocol
+  and writes `report.json`; `--interrupt-after` reloads the page mid-transfer
+  and proves the resume.
+
+WebKit accounts OPFS quota by sync-access-handle capacity, which grows in
+powers of two below 256 MiB and in 128 MiB steps above, and does not shrink
+when a file is deleted within the session, so `estimate().usage` overstates
+small files; `truncate()` to a target size requests the next power of two, so
+the worker never pre-sizes files.
+
 ## Current limits
 
 - The full RPCS3 runtime can capture successive coherent frames on demand; a continuous presentation scheduler and pad input still need to be connected to this path.

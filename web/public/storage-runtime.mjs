@@ -1,7 +1,12 @@
 import {
+  abortLibraryImport,
+  fetchLibraryIndex,
   formatBytes,
+  formatRate,
   importFiles,
   importFirmware,
+  importFromLibrary,
+  libraryImportProgress,
   listOPFS,
   requestPersistentStorage,
   storageStatus,
@@ -26,7 +31,7 @@ async function updateCapacity() {
 async function refreshFiles() {
   const entries = await listOPFS();
   document.querySelector("#files").textContent = entries.length
-    ? entries.map((entry) => `${formatBytes(entry.size).padStart(11)}  ${entry.path}`).join("\n")
+    ? entries.map((entry) => `${(entry.locked ? "(importing)" : formatBytes(entry.size)).padStart(11)}  ${entry.path}`).join("\n")
     : "None";
 }
 
@@ -112,12 +117,97 @@ document.querySelector("#directory").addEventListener("change", (event) => {
 
 document.querySelector("#refresh").addEventListener("click", refreshFiles);
 
+const libraryFile = document.querySelector("#library-file");
+const libraryDestination = document.querySelector("#library-destination");
+const libraryImportButton = document.querySelector("#library-import");
+const libraryAbortButton = document.querySelector("#library-abort");
+const libraryStatus = document.querySelector("#library-status");
+
+async function refreshLibrary() {
+  try {
+    const index = await fetchLibraryIndex();
+    libraryFile.replaceChildren(...index.files.map((entry) => {
+      const option = document.createElement("option");
+      option.value = entry.name;
+      option.textContent = `${entry.name} · ${formatBytes(entry.size)}${entry.sha256 ? "" : " · hashing…"}`;
+      return option;
+    }));
+    if (!index.files.length) libraryFile.replaceChildren(new Option("Library is empty", ""));
+    return index;
+  } catch (error) {
+    libraryFile.replaceChildren(new Option(`Library unavailable: ${error.message}`, ""));
+    return undefined;
+  }
+}
+
+function describeProgress(message) {
+  const percent = message.total ? ((message.offset / message.total) * 100).toFixed(1) : "0.0";
+  const phase = message.phase === "verifying-local" ? "verifying stored bytes" : message.phase === "waiting-for-hash" ? "waiting for server hash" : "downloading";
+  const rate = message.instantRateBytesPerSecond ? ` · now ${formatRate(message.instantRateBytesPerSecond)}` : "";
+  return `${phase} · ${formatBytes(message.offset)} / ${formatBytes(message.total)} · ${percent}% · avg ${formatRate(message.rateBytesPerSecond ?? 0)}${rate} · ${message.requests ?? 0} requests`;
+}
+
+async function runLibraryImport(name, destination, options = {}) {
+  libraryImportButton.disabled = true;
+  libraryAbortButton.disabled = false;
+  transfer.className = "";
+  libraryStatus.className = "";
+  libraryStatus.textContent = `Preparing ${name}…`;
+  try {
+    const result = await runImport(() => importFromLibrary(name, destination, {
+      ...options,
+      onProgress: (message) => {
+        progress.max = Math.max(1, message.total);
+        progress.value = message.offset;
+        transfer.textContent = `${destination}/${name} · ${describeProgress(message)}`;
+        libraryStatus.textContent = describeProgress(message);
+        options.onProgress?.(message);
+      },
+    }));
+    libraryStatus.className = result.verified ? "good" : "warn";
+    libraryStatus.textContent = result.alreadyComplete
+      ? `${result.path} was already imported and verified (${formatBytes(result.size)})`
+      : `${result.path} · ${formatBytes(result.sessionBytes)} downloaded in ${(result.elapsedMs / 1000).toFixed(1)} s (${formatRate(result.rateBytesPerSecond)}) · resumed from ${formatBytes(result.resumedFrom)} · ${result.requests} range requests · SHA-256 ${result.verified ? "verified" : "MISMATCH"} · usage ${formatBytes(result.estimateBefore.usage)} → ${formatBytes(result.estimateAfter.usage)}`;
+    return result;
+  } catch (error) {
+    libraryStatus.className = "warn";
+    const partial = error?.report;
+    libraryStatus.textContent = `${error.name === "AbortError" ? "Aborted" : "Failed"}: ${error.message}${partial ? ` · ${formatBytes(partial.offset ?? 0)} stored; run again to resume` : ""}`;
+    throw error;
+  } finally {
+    libraryImportButton.disabled = false;
+    libraryAbortButton.disabled = true;
+  }
+}
+
+libraryImportButton.addEventListener("click", () => {
+  if (libraryFile.value) void runLibraryImport(libraryFile.value, libraryDestination.value).catch(() => {});
+});
+libraryAbortButton.addEventListener("click", () => abortLibraryImport());
+
 window.__rpcs3Storage = {
   status: storageStatus,
   persist: requestPersistentStorage,
   list: listOPFS,
   importFiles,
   importFirmware,
+  libraryIndex: fetchLibraryIndex,
+  importFromLibrary: (name, destination, options) => runLibraryImport(name, destination, options),
+  importProgress: libraryImportProgress,
+  abortImport: abortLibraryImport,
 };
 
-await Promise.all([updateCapacity(), refreshFiles()]);
+await Promise.all([updateCapacity(), refreshFiles(), refreshLibrary()]);
+
+const parameters = new URLSearchParams(location.search);
+const autoImport = parameters.get("import");
+if (autoImport) {
+  const destination = parameters.get("destination") || (/\.pup$/i.test(autoImport) ? "firmware" : "games");
+  libraryFile.value = autoImport;
+  libraryDestination.value = destination;
+  window.__rpcs3AutoImport = runLibraryImport(autoImport, destination, {
+    restart: parameters.get("restart") === "1",
+    verify: parameters.get("verify") === "1",
+    chunkSize: parameters.get("chunk") ? Number(parameters.get("chunk")) : undefined,
+  }).catch((error) => ({ failed: true, error: error.message }));
+}

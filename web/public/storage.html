@@ -13,6 +13,8 @@
       section { margin: 14px 0; padding: 16px; border: 1px solid #2a3447; border-radius: 10px; background: #111620; }
       h2 { margin-top: 0; font-size: 16px; }
       p, pre { color: #aeb9ca; font-size: 12px; line-height: 1.5; }
+      select { display: inline-block; max-width: 100%; margin: 5px 8px 5px 0; padding: 10px 12px; border: 1px solid #526078; border-radius: 7px; background: #1a2230; color: white; font: inherit; }
+      code { color: #cfd8e6; }
       label, button, a.action { display: inline-block; margin: 5px 8px 5px 0; padding: 10px 12px; border: 1px solid #526078; border-radius: 7px; background: #1a2230; color: white; font: inherit; text-decoration: none; }
       label:active, button:active, a.action:active { background: #4968ff; }
       input[type=file] { display: none; }
@@ -42,6 +44,18 @@
         <label>Select ISO<input id="iso" type="file" accept=".iso,.ISO,application/octet-stream" /></label>
         <label>Select extracted game<input id="directory" type="file" webkitdirectory multiple /></label>
         <a id="boot" class="action" hidden>Boot imported game</a>
+      </section>
+      <section>
+        <h2>Library</h2>
+        <p>Downloads firmware or a game from this origin's <code>/library/</code> with resumable HTTP Range requests, written straight into origin-private storage by a worker and verified against the server's SHA-256. Reloading or losing the connection keeps the bytes already stored; starting the same import again resumes. Open <code>storage.html?import=&lt;name&gt;&amp;destination=games|firmware</code> to start one without pressing anything.</p>
+        <select id="library-file"><option value="">Loading library index…</option></select>
+        <select id="library-destination">
+          <option value="games">games/</option>
+          <option value="firmware">firmware/</option>
+        </select>
+        <button id="library-import">Import from library</button>
+        <button id="library-abort" disabled>Abort</button>
+        <p id="library-status">Idle</p>
       </section>
       <section>
         <h2>Transfer</h2>

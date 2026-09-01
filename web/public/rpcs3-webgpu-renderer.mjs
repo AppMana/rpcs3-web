@@ -771,6 +771,24 @@ function rasterState(packet) {
   return { frontFace, cullMode };
 }
 
+function scissorState(packet, canvas) {
+  const bytes = packet.sections[SectionKind.rasterEnvironment].bytes;
+  if (bytes.byteLength !== 16) throw new Error("RPCS3 raster-environment packet is missing scissor state");
+  if (packet.width === 0 || packet.height === 0) throw new Error("RPCS3 draw packet has an empty framebuffer");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const raw = {
+    x: view.getUint32(0, true),
+    y: view.getUint32(4, true),
+    width: view.getUint32(8, true),
+    height: view.getUint32(12, true),
+  };
+  const x = Math.min(canvas.width, Math.floor(raw.x * canvas.width / packet.width));
+  const y = Math.min(canvas.height, Math.floor(raw.y * canvas.height / packet.height));
+  const x2 = Math.min(canvas.width, Math.floor((raw.x + raw.width) * canvas.width / packet.width));
+  const y2 = Math.min(canvas.height, Math.floor((raw.y + raw.height) * canvas.height / packet.height));
+  return { ...raw, scaled: { x, y, width: Math.max(0, x2 - x), height: Math.max(0, y2 - y) } };
+}
+
 export async function prepareWebGPU(canvas, options = {}) {
   if (!canvas || typeof canvas.getContext !== "function" || !Number.isInteger(canvas.width) || !Number.isInteger(canvas.height)) {
     throw new Error("an HTMLCanvasElement or OffscreenCanvas is required for WebGPU presentation");
@@ -1049,6 +1067,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   const depthStates = drawPackets.map(depthState);
   const targetStates = drawPackets.map(renderTargetState);
   const rasterStates = drawPackets.map(rasterState);
+  const scissorStates = drawPackets.map((packet) => scissorState(packet, canvas));
   const translatedAt = performance.now();
   const pipelineCache = prepared.pipelineCache ??= new Map();
   const textureCache = prepared.textureCache ??= new Map();
@@ -1213,8 +1232,11 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     view: depthTexture.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store",
   } });
   for (let index = 0; index < translated.length; index += 1) {
+    const scissor = scissorStates[index].scaled;
+    if (scissor.width === 0 || scissor.height === 0) continue;
     pass.setPipeline(resources[index].pipeline);
     pass.setVertexBuffer(0, resources[index].buffer);
+    pass.setScissorRect(scissor.x, scissor.y, scissor.width, scissor.height);
     if (targetStates[index].blendEnabled) pass.setBlendConstant(targetStates[index].blendConstant);
     if (resources[index].bindGroup) pass.setBindGroup(0, resources[index].bindGroup);
     pass.draw(translated[index].vertexCount);
@@ -1302,8 +1324,11 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
         view: depthTexture.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store",
       } });
       for (let index = 0; index < translated.length; index += 1) {
+        const scissor = scissorStates[index].scaled;
+        if (scissor.width === 0 || scissor.height === 0) continue;
         presentationPass.setPipeline(resources[index].pipeline);
         presentationPass.setVertexBuffer(0, resources[index].buffer);
+        presentationPass.setScissorRect(scissor.x, scissor.y, scissor.width, scissor.height);
         if (targetStates[index].blendEnabled) presentationPass.setBlendConstant(targetStates[index].blendConstant);
         if (resources[index].bindGroup) presentationPass.setBindGroup(0, resources[index].bindGroup);
         presentationPass.draw(translated[index].vertexCount);
@@ -1344,6 +1369,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     shaderPrograms: options.captureShaders ? [...new Set(resources.map(({ shaderCode }) => shaderCode))] : undefined,
     depthStates,
     rasterStates,
+    scissorStates,
     targetStates,
     drawDiagnostics: translated.map((draw, index) => ({
       ...drawDiagnostics(draw),

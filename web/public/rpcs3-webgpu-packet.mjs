@@ -1,6 +1,6 @@
 export const DRAW_PACKET_MAGIC = 0x52444757;
-export const DRAW_PACKET_ABI = 3;
-export const DRAW_PACKET_HEADER_SIZE = 192;
+export const DRAW_PACKET_ABI = 4;
+export const DRAW_PACKET_HEADER_SIZE = 200;
 export const TEXTURE_PACKET_RECORD_SIZE = 64;
 
 export const PacketKind = Object.freeze({ draw: 1, clear: 2, flip: 3 });
@@ -24,6 +24,7 @@ export const SectionKind = Object.freeze({
   volatileVertices: 8,
   indices: 9,
   textures: 10,
+  rasterEnvironment: 11,
 });
 
 function u32(view, offset) {
@@ -89,7 +90,7 @@ export function decodeDrawPacket(bytes) {
     throw new Error(`invalid WebGPU packet header (magic=0x${u32(view, 0).toString(16)}, ABI=${u32(view, 4)}, declared=${byteSize}, actual=${bytes.byteLength})`);
   }
   const sections = [];
-  for (let index = 0; index < 11; index += 1) {
+  for (let index = 0; index < 12; index += 1) {
     const offset = u32(view, 104 + index * 8);
     const size = u32(view, 108 + index * 8);
     if ((size === 0 && offset !== 0) || (size !== 0 && (offset < DRAW_PACKET_HEADER_SIZE || offset + size > byteSize))) {
@@ -223,6 +224,16 @@ export function packetSummary(packet) {
     summary.vertexConstantBytes = hex(packet.sections[SectionKind.vertexConstants].bytes, 128);
     summary.vertexConstant256Bytes = hex(packet.sections[SectionKind.vertexConstants].bytes.subarray(256 * 16), 64);
     summary.vertexEnvironmentBytes = hex(packet.sections[SectionKind.vertexEnvironment].bytes, 96);
+    const rasterEnvironment = packet.sections[SectionKind.rasterEnvironment].bytes;
+    if (rasterEnvironment.byteLength === 16) {
+      const rasterView = new DataView(rasterEnvironment.buffer, rasterEnvironment.byteOffset, rasterEnvironment.byteLength);
+      summary.scissor = {
+        x: rasterView.getUint32(0, true),
+        y: rasterView.getUint32(4, true),
+        width: rasterView.getUint32(8, true),
+        height: rasterView.getUint32(12, true),
+      };
+    }
     summary.textures = packet.textures.map((texture) => ({
       stage: texture.stage,
       slot: texture.slot,

@@ -22,10 +22,12 @@ int main()
 	const std::array<std::byte, 7> vertices{
 		std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}, std::byte{5}, std::byte{6}, std::byte{7}
 	};
+	const raster_environment_packet raster{16, 24, 640, 360};
 
 	draw_packet_builder builder(header);
 	assert(builder.append(section_kind::vertex_program, std::as_bytes(std::span(program))));
 	assert(builder.append(section_kind::persistent_vertices, vertices, 256));
+	assert(builder.append(section_kind::raster_environment, std::as_bytes(std::span{&raster, 1})));
 	auto bytes = builder.finish();
 
 	draw_packet_view view(bytes);
@@ -37,6 +39,8 @@ int main()
 	assert(view.header()->sections[static_cast<std::size_t>(section_kind::persistent_vertices)].offset % 256 == 0);
 	assert(view.section(section_kind::vertex_program).size() == sizeof(program));
 	assert(std::memcmp(view.section(section_kind::vertex_program).data(), program.data(), sizeof(program)) == 0);
+	assert(view.section(section_kind::raster_environment).size() == sizeof(raster));
+	assert(std::memcmp(view.section(section_kind::raster_environment).data(), &raster, sizeof(raster)) == 0);
 	assert(view.section(section_kind::persistent_vertices).size() == vertices.size());
 	assert(view.section(section_kind::indices).empty());
 

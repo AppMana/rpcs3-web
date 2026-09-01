@@ -1,4 +1,4 @@
-import { decodeDrawPacket } from "./rpcs3-webgpu-packet.mjs";
+import { decodeDrawPacket, PacketKind, SectionKind } from "./rpcs3-webgpu-packet.mjs";
 import { prepareWebGPU, renderPacketsToWebGPU, stopWebGPUPresentation } from "./rpcs3-webgpu-renderer.mjs";
 
 let active;
@@ -56,6 +56,18 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
           if (preparedGpu) {
             activeGpu = await preparedGpu;
             const decodedPackets = packetBuffers.map((buffer) => decodeDrawPacket(new Uint8Array(buffer)));
+            if (options.scissorOverride) {
+              const { x, y, width, height } = options.scissorOverride;
+              if (![x, y, width, height].every((value) => Number.isInteger(value) && value >= 0 && value <= 0xffffffff)) {
+                throw new Error("scissorOverride must contain unsigned 32-bit x, y, width, and height");
+              }
+              for (const packet of decodedPackets.filter((candidate) => candidate.kind === PacketKind.draw)) {
+                const bytes = packet.sections[SectionKind.rasterEnvironment].bytes;
+                if (bytes.byteLength !== 16) throw new Error("draw packet has no raster environment");
+                const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+                [x, y, width, height].forEach((value, index) => view.setUint32(index * 4, value, true));
+              }
+            }
             let vertexBackendComparison;
             if (options.compareVertexBackends === true) {
               const oracle = await renderPacketsToWebGPU(activeGpu, decodedPackets, {

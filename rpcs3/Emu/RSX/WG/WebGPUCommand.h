@@ -9,7 +9,7 @@
 namespace rsx::webgpu
 {
 	constexpr std::uint32_t draw_packet_magic = 0x52444757; // "WGDR" in little endian memory.
-	constexpr std::uint32_t draw_packet_abi = 3;
+	constexpr std::uint32_t draw_packet_abi = 4;
 
 	enum class packet_kind : std::uint32_t
 	{
@@ -52,6 +52,16 @@ namespace rsx::webgpu
 
 	static_assert(sizeof(texture_packet_record) == 64);
 
+	struct raster_environment_packet
+	{
+		std::uint32_t scissor_x = 0;
+		std::uint32_t scissor_y = 0;
+		std::uint32_t scissor_width = 0;
+		std::uint32_t scissor_height = 0;
+	};
+
+	static_assert(sizeof(raster_environment_packet) == 16);
+
 	enum class section_kind : std::uint32_t
 	{
 		registers,
@@ -65,6 +75,7 @@ namespace rsx::webgpu
 		volatile_vertices,
 		indices,
 		textures,
+		raster_environment,
 		count,
 	};
 
@@ -112,7 +123,7 @@ namespace rsx::webgpu
 	};
 
 	static_assert(sizeof(packet_section) == 8);
-	static_assert(sizeof(draw_packet_header) == 192);
+	static_assert(sizeof(draw_packet_header) == 200);
 
 	class draw_packet_builder
 	{

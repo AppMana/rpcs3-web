@@ -461,6 +461,14 @@ bool WebGPUGSRender::emit_draw_packet(u32 subdraw)
 	std::array<std::byte, 32> fragment_environment{};
 	m_draw_processor.fill_fragment_state_buffer(fragment_environment.data(), current_fragment_program);
 
+	(void)get_scissor(m_scissor, true);
+	const rsx::webgpu::raster_environment_packet raster_environment{
+		.scissor_x = m_scissor.x1,
+		.scissor_y = m_scissor.y1,
+		.scissor_width = m_scissor.width(),
+		.scissor_height = m_scissor.height(),
+	};
+
 	std::array<std::byte, 468 * 16> vertex_constants{};
 	m_draw_processor.fill_vertex_program_constants_data(vertex_constants.data(), {});
 	const u32 capture_level = rsx::webgpu::packet_capture_level();
@@ -517,6 +525,8 @@ bool WebGPUGSRender::emit_draw_packet(u32 subdraw)
 	packet_ok = packet.append(rsx::webgpu::section_kind::volatile_vertices, transient, 256) && packet_ok;
 	packet_ok = packet.append(rsx::webgpu::section_kind::indices, upload.indices, 4) && packet_ok;
 	packet_ok = packet.append(rsx::webgpu::section_kind::textures, textures.bytes, 16) && packet_ok;
+	packet_ok = packet.append(rsx::webgpu::section_kind::raster_environment,
+		std::as_bytes(std::span{&raster_environment, 1})) && packet_ok;
 
 	if (!packet_ok || !rsx::webgpu::host_command_queue().push(packet.finish()))
 	{

@@ -123,6 +123,9 @@ CMakeLists.txt.user
 /web/device-evidence/
 /web/device-runtime-evidence/
 /web/device-runtime-evidence-*/
+/web/device-origin-*-evidence*/
+/web/device-origin-evidence*/
+/web/device-tetris-evidence*/
 /web/device-storage-runtime-evidence-*/
 /web/device-tetris-evidence-*/
 /web/public/core/

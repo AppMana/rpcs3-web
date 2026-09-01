@@ -789,7 +789,17 @@ static auto ppu_load_exports(const ppu_module<lv2_obj>& _module, ppu_linkage_inf
 			continue;
 		}
 
-		const std::string module_name(&_module.get_ref<const char>(lib.name));
+		std::string module_name;
+#ifdef RPCS3_WEB
+		if (const char* name = &_module.get_ref<const char>(lib.name); vm::try_get_addr(name).second)
+		{
+			ensure(vm::read_string(lib.name.addr(), 4096, module_name));
+		}
+		else
+#endif
+		{
+			module_name = &_module.get_ref<const char>(lib.name);
+		}
 
 		if (unload_exports)
 		{
@@ -979,7 +989,17 @@ static import_result_t ppu_load_imports(const ppu_module<lv2_obj>& _module, std:
 	{
 		const auto& lib = _module.get_ref<const ppu_prx_module_info>(addr);
 
-		const std::string module_name(&_module.get_ref<const char>(lib.name));
+		std::string module_name;
+#ifdef RPCS3_WEB
+		if (const char* name = &_module.get_ref<const char>(lib.name); vm::try_get_addr(name).second)
+		{
+			ensure(vm::read_string(lib.name.addr(), 4096, module_name));
+		}
+		else
+#endif
+		{
+			module_name = &_module.get_ref<const char>(lib.name);
+		}
 
 		ppu_loader.notice("** Imported module '%s' (ver=0x%x, attr=0x%x, 0x%x, 0x%x) [0x%x]", module_name, lib.version, lib.attributes, lib.unk4, lib.unk5, addr);
 

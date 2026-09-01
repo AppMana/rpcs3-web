@@ -123,6 +123,16 @@ namespace
 		return true;
 	}
 
+	u32 hash_bytes(std::span<const std::byte> bytes)
+	{
+		u32 hash = 2166136261u;
+		for (const std::byte value : bytes)
+		{
+			hash = (hash ^ static_cast<u8>(value)) * 16777619u;
+		}
+		return hash;
+	}
+
 	texture_capture capture_textures(u32 fragment_mask, u32 vertex_mask)
 	{
 		std::vector<texture_source> sources;
@@ -162,13 +172,15 @@ namespace
 			auto& source = sources[index];
 			data_offset = align_up(data_offset, 16);
 			source.record.data_offset = static_cast<u32>(data_offset);
-			std::memcpy(result.bytes.data() + index * sizeof(source.record), &source.record, sizeof(source.record));
-			if (!copy_guest_bytes({result.bytes.data() + data_offset, source.record.data_size}, source.address))
+			const std::span texture_bytes{result.bytes.data() + data_offset, source.record.data_size};
+			if (!copy_guest_bytes(texture_bytes, source.address))
 			{
 				result.complete = false;
 				result.bytes.clear();
 				return result;
 			}
+			source.record.content_hash = hash_bytes(texture_bytes);
+			std::memcpy(result.bytes.data() + index * sizeof(source.record), &source.record, sizeof(source.record));
 			data_offset += source.record.data_size;
 		}
 

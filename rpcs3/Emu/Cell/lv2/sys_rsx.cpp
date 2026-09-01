@@ -70,7 +70,7 @@ static void set_rsx_dmactl(rsx::thread* render, u64 get_put)
 	if (auto cpu = cpu_thread::get_current())
 	{
 		// Wait for the first store to complete (or be aborted)
-		while (render->new_get_put != usz{umax})
+		while (render->new_get_put != u64{umax})
 		{
 			if (cpu->state & cpu_flag::exit)
 			{

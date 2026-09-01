@@ -54,11 +54,14 @@
 #endif
 
 #include <cfenv>
+#include <chrono>
 #include <cctype>
+#include <cstdlib>
 #include <span>
 #include <optional>
 #include <charconv>
 #include <unordered_map>
+#include <thread>
 
 #include "util/asm.hpp"
 #include "util/vm.hpp"
@@ -160,6 +163,12 @@ extern const ppu_decoder<ppu_iname> g_ppu_iname{};
 // atomic operation on every guest instruction.
 atomic_t<u64> g_ppu_web_instruction_count{0};
 atomic_t<u32> g_ppu_web_last_pc{0};
+atomic_t<u32> g_ppu_web_trace_pc{0};
+atomic_t<u32> g_ppu_web_trace_hits{0};
+atomic_t<u32> g_ppu_web_trace_delay_pc{0};
+atomic_t<u32> g_ppu_web_trace_delay_hits{0};
+atomic_t<u32> g_ppu_web_trace_delay_ms{0};
+atomic_t<u32> g_ppu_web_watch_address{0};
 #endif
 
 template <>
@@ -2872,6 +2881,45 @@ void ppu_thread::exec_task()
 		const u32 web_instruction_pc = cia;
 		const auto op = vm::_ptr<u32>(web_instruction_pc);
 		g_ppu_web_last_pc = web_instruction_pc;
+		if (const u32 delay_pc = g_ppu_web_trace_delay_pc; delay_pc && delay_pc == web_instruction_pc)
+		{
+			if (g_ppu_web_trace_delay_hits.fetch_add(1) == 0)
+			{
+				if (const u32 delay_ms = g_ppu_web_trace_delay_ms)
+				{
+					std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+				}
+			}
+		}
+		const u32 web_trace_match = g_ppu_web_watch_address;
+		if (const u32 trace_pc = g_ppu_web_trace_pc;
+			trace_pc && trace_pc == web_instruction_pc && (!web_trace_match || static_cast<u32>(gpr[25]) == web_trace_match || static_cast<u32>(gpr[29]) == web_trace_match))
+		{
+			const u32 hit = g_ppu_web_trace_hits.fetch_add(1);
+			if (hit < 64)
+			{
+				const auto read32 = [](u64 addr) -> u32
+				{
+					return addr <= 0xffff'ffffull && vm::check_addr<4>(static_cast<u32>(addr))
+						? static_cast<u32>(vm::read32(static_cast<u32>(addr))) : 0;
+				};
+				std::fprintf(stderr,
+					"RPCS3 Web PPU trace: pc=0x%08x id=0x%08x lr=0x%08llx ctr=0x%08llx r0=0x%08llx "
+					"r1=0x%08llx r2=0x%08llx r3=0x%08llx r4=0x%08llx r5=0x%08llx "
+					"r6=0x%08llx r7=0x%08llx r8=0x%08llx r9=0x%08llx r10=0x%08llx r11=0x%08llx r12=0x%08llx "
+					"r22=0x%08llx r23=0x%08llx r24=0x%08llx r25=0x%08llx r26=0x%08llx "
+					"r27=0x%08llx r28=0x%08llx r29=0x%08llx r30=0x%08llx r31=0x%08llx stack84=0x%08x "
+					"mem29=0x%08x mem3_18=0x%08x mem3_104=0x%08x mem3_108=0x%08x mem3_110=0x%08x "
+					"mem24_48=0x%08x mem24_5c=0x%08x mem24_60=0x%08x mem24_64=0x%08x mem25_18=0x%08x mem25_38=0x%08x\n",
+					web_instruction_pc, id, lr, ctr, gpr[0], gpr[1], gpr[2], gpr[3], gpr[4], gpr[5],
+					gpr[6], gpr[7], gpr[8], gpr[9], gpr[10], gpr[11], gpr[12], gpr[22], gpr[23],
+					gpr[24], gpr[25], gpr[26], gpr[27], gpr[28], gpr[29], gpr[30], gpr[31],
+					static_cast<u32>(vm::_ref<u32>(static_cast<u32>(gpr[1]) + 0x84)),
+					read32(gpr[29]), read32(gpr[3] + 0x18), read32(gpr[3] + 0x104), read32(gpr[3] + 0x108), read32(gpr[3] + 0x110),
+					read32(gpr[24] + 0x48), read32(gpr[24] + 0x5c), read32(gpr[24] + 0x60), read32(gpr[24] + 0x64),
+					read32(gpr[25] + 0x18), read32(gpr[25] + 0x38));
+			}
+		}
 		const auto fn = ppu_read(cia);
 		fn(*this, {*op}, op, &ppu_ret);
 		if (!web_reported_zero_pc && cia == 0 && web_instruction_pc != 0)
@@ -2887,10 +2935,43 @@ void ppu_thread::exec_task()
 			web_progress_batch = 0;
 		}
 #else
+		static const u32 native_trace_pc = []
+		{
+			const char* value = std::getenv("RPCS3_PPU_TRACE_PC");
+			return value ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0u;
+		}();
+		static const u32 native_trace_match = []
+		{
+			const char* value = std::getenv("RPCS3_PPU_TRACE_MATCH");
+			return value ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0u;
+		}();
+		static atomic_t<u32> native_trace_hits{0};
+		if (native_trace_pc && native_trace_pc == cia && (!native_trace_match || static_cast<u32>(gpr[25]) == native_trace_match || static_cast<u32>(gpr[29]) == native_trace_match) && native_trace_hits.fetch_add(1) < 64)
+		{
+			const auto read32 = [](u64 addr) -> u32
+			{
+				return addr <= 0xffff'ffffull && vm::check_addr<4>(static_cast<u32>(addr))
+					? static_cast<u32>(vm::read32(static_cast<u32>(addr))) : 0;
+			};
+			ppu_log.notice(
+				"PPU trace: pc=0x%08x id=0x%08x lr=0x%08x ctr=0x%08x r0=0x%08x r1=0x%08x r2=0x%08x "
+				"r3=0x%08x r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x r8=0x%08x "
+				"r9=0x%08x r10=0x%08x r11=0x%08x r12=0x%08x r22=0x%08x r23=0x%08x r24=0x%08x r25=0x%08x "
+				"r26=0x%08x r27=0x%08x r28=0x%08x r29=0x%08x r30=0x%08x r31=0x%08x stack84=0x%08x "
+				"mem29=0x%08x mem3_18=0x%08x mem3_104=0x%08x mem3_108=0x%08x mem3_110=0x%08x "
+				"mem24_48=0x%08x mem24_5c=0x%08x mem24_60=0x%08x mem24_64=0x%08x mem25_18=0x%08x mem25_38=0x%08x",
+				cia, id, lr, ctr, gpr[0], gpr[1], gpr[2], gpr[3], gpr[4], gpr[5], gpr[6], gpr[7], gpr[8],
+				gpr[9], gpr[10], gpr[11], gpr[12], gpr[22], gpr[23], gpr[24],
+				gpr[25], gpr[26], gpr[27], gpr[28], gpr[29], gpr[30], gpr[31],
+				static_cast<u32>(vm::_ref<u32>(static_cast<u32>(gpr[1]) + 0x84)),
+				read32(gpr[29]), read32(gpr[3] + 0x18), read32(gpr[3] + 0x104), read32(gpr[3] + 0x108), read32(gpr[3] + 0x110),
+				read32(gpr[24] + 0x48), read32(gpr[24] + 0x5c), read32(gpr[24] + 0x60), read32(gpr[24] + 0x64),
+				read32(gpr[25] + 0x18), read32(gpr[25] + 0x38));
+		}
 		const auto op = reinterpret_cast<be_t<u32>*>(mem_ + u64{cia});
 		const auto cache = vm::g_exec_addr;
 		const auto fn = reinterpret_cast<ppu_intrp_func*>(cache + u64{cia} * 2);
-		fn->fn(*this, {*op}, op, state ? &ppu_ret : fn + 1);
+		fn->fn(*this, {*op}, op, state || native_trace_pc ? &ppu_ret : fn + 1);
 #endif
 	}
 }

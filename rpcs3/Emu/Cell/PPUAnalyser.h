@@ -11,6 +11,10 @@
 #include "Utilities/bit_set.h"
 #include "PPUOpcodes.h"
 
+#ifdef RPCS3_WEB
+#include "Emu/Memory/vm.h"
+#endif
+
 // PPU Function Attributes
 enum class ppu_attr : u8
 {
@@ -218,6 +222,16 @@ struct ppu_module : public Type
 
 		if (seg_size >= std::max<usz>(size_bytes, 1) && addr <= utils::align<u32>(seg_addr + seg_size, 0x10000) - size_bytes)
 		{
+#ifdef RPCS3_WEB
+			// Loaded modules are represented by compact guest allocations rather
+			// than a 4 GiB linear alias. Translate every guest address instead of
+			// adding its sparse offset to the first segment pointer.
+			const auto [mapped_addr, is_guest_memory] = vm::try_get_addr(seg.ptr);
+			if (is_guest_memory && static_cast<u32>(mapped_addr) == seg_addr)
+			{
+				return reinterpret_cast<to_be_t<T>*>(vm::base(addr));
+			}
+#endif
 			return reinterpret_cast<to_be_t<T>*>(static_cast<u8*>(seg.ptr) + (addr - seg_addr));
 		}
 

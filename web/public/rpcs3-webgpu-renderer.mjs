@@ -6,9 +6,9 @@ export function stopWebGPUPresentation() {
   if (!activePresentation) return;
   activePresentation.cancelled = true;
   if (activePresentation.animationFrame !== undefined) cancelAnimationFrame(activePresentation.animationFrame);
-  activePresentation.resources.forEach(({ buffer, textureResource }) => {
+  activePresentation.resources.forEach(({ buffer, textureResources = [] }) => {
     buffer.destroy();
-    textureResource?.texture.destroy();
+    textureResources.forEach(({ texture, cached }) => { if (!cached) texture.destroy(); });
   });
   activePresentation.depthTexture?.destroy();
   activePresentation = undefined;
@@ -23,6 +23,13 @@ function base64(bytes) {
 }
 
 const VertexType = Object.freeze({ snorm16: 1, float32: 2, float16: 3, unorm8: 4, sint16: 5, cmp32: 6, uint8: 7 });
+const VertexVaryings = Object.freeze([
+  "frontColor", "frontSpecular", "backColor", "backSpecular", "fog",
+  "texcoord0", "texcoord1", "texcoord2", "texcoord3", "texcoord4",
+  "texcoord5", "texcoord6", "texcoord7", "texcoord8", "texcoord9",
+]);
+const VertexVaryingDestinations = Object.freeze([1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 6]);
+const VertexOutputStrideFloats = 64;
 
 function bits(value, offset, count) {
   return (value >>> offset) & (count === 32 ? 0xffffffff : (2 ** count) - 1);
@@ -133,6 +140,7 @@ function executeVertexProgram(packet, inputs) {
   const temps = Array.from({ length: 32 }, () => vector());
   const destinations = Array.from({ length: 16 }, () => vector(0, 1));
   const opcodes = [];
+  const scalarOpcodes = [];
   for (let instruction = packet.vertexProgramEntry; instruction * 16 < program.byteLength; instruction += 1) {
     const base = instruction * 16;
     const words = [0, 4, 8, 12].map((offset) => view.getUint32(base + offset, true));
@@ -151,9 +159,10 @@ function executeVertexProgram(packet, inputs) {
       end: Boolean(bits(words[3], 0, 1)),
       indexConstant: Boolean(bits(words[3], 1, 1)),
       destination: bits(words[3], 2, 5),
-      mask: [16, 15, 14, 13].map((bit) => Boolean(bits(words[3], bit, 1))),
+      scalarDestinationTemp: bits(words[3], 7, 6),
+      vectorMask: [16, 15, 14, 13].map((bit) => Boolean(bits(words[3], bit, 1))),
+      scalarMask: [20, 19, 18, 17].map((bit) => Boolean(bits(words[3], bit, 1))),
     };
-    if (d1.scalarOpcode !== 0) throw new Error(`RSX scalar vertex opcode ${d1.scalarOpcode} is not yet translated`);
     if (d1.vectorOpcode !== 0) {
       const a = decodeVertexSource(words, 0, d0, d1, d3, inputs, temps, packet);
       let value;
@@ -208,14 +217,42 @@ function executeVertexProgram(packet, inputs) {
         throw new Error(`RSX vector vertex opcode ${d1.vectorOpcode} is not yet translated`);
       }
       if (d0.saturate) value = value.map((component) => Math.max(0, Math.min(1, component)));
-      const write = (target) => d3.mask.forEach((enabled, component) => { if (enabled) target[component] = value[component]; });
+      const write = (target) => d3.vectorMask.forEach((enabled, component) => { if (enabled) target[component] = value[component]; });
       if (d0.destinationTemp !== 0x3f) write(temps[d0.destinationTemp]);
       if (d0.vectorResult && d3.destination < destinations.length) write(destinations[d3.destination]);
       opcodes.push(d1.vectorOpcode);
     }
+    if (d1.scalarOpcode !== 0) {
+      const source = decodeVertexSource(words, 2, d0, d1, d3, inputs, temps, packet);
+      let value;
+      if (d1.scalarOpcode === 1) value = vector(source[0]);
+      else if (d1.scalarOpcode === 2) value = vector(1 / source[0]);
+      else if (d1.scalarOpcode === 3) value = vector(Math.max(5.42101e-20, Math.min(1.884467e19, 1 / source[0])));
+      else if (d1.scalarOpcode === 4) value = vector(1 / Math.sqrt(source[0]));
+      else if (d1.scalarOpcode === 5) value = vector(Math.exp(source[0]));
+      else if (d1.scalarOpcode === 6) value = vector(Math.log(source[0]));
+      else if (d1.scalarOpcode === 7) {
+        const x = Math.max(source[0], 0);
+        const y = Math.max(source[1], 1e-10);
+        value = [1, x, x > 0 ? 2 ** (source[3] * Math.log2(y)) : 0, 1];
+      } else if (d1.scalarOpcode === 13) value = vector(Math.log2(source[0]));
+      else if (d1.scalarOpcode === 14) value = vector(2 ** source[0]);
+      else if (d1.scalarOpcode === 15) value = vector(Math.sin(source[0]));
+      else if (d1.scalarOpcode === 16) value = vector(Math.cos(source[0]));
+      else throw new Error(`RSX scalar vertex opcode ${d1.scalarOpcode} is not yet translated`);
+      if (d0.saturate) value = value.map((component) => Math.max(0, Math.min(1, component)));
+      const write = (target) => d3.scalarMask.forEach((enabled, component) => { if (enabled) target[component] = value[component]; });
+      if (d3.scalarDestinationTemp !== 0x3f) write(temps[d3.scalarDestinationTemp]);
+      else if (!d0.vectorResult && d3.destination < destinations.length) write(destinations[d3.destination]);
+      scalarOpcodes.push(d1.scalarOpcode);
+    }
     if (d3.end) break;
   }
-  return { destinations, opcodes };
+  if (packet.vertexProgramControl === 0) {
+    destinations[3] = [...destinations[1]];
+    destinations[4] = [...destinations[2]];
+  }
+  return { destinations, opcodes, scalarOpcodes };
 }
 
 function applyVertexEnvironment(packet, position) {
@@ -240,7 +277,19 @@ function floatLiteral(word) {
   return Number.isInteger(value) ? `${value}.0` : `${value}`;
 }
 
-function fragmentSource(words, sourceIndex, inlineConstant) {
+function fragmentWindowPosition(packet) {
+  const bytes = packet.sections[SectionKind.fragmentEnvironment].bytes;
+  if (bytes.byteLength < 32) throw new Error("RPCS3 fragment environment is truncated");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const literal = (value) => Number.isInteger(value) ? `${value}.0` : `${value}`;
+  const scale = view.getFloat32(20, true);
+  const biasX = view.getFloat32(24, true);
+  const biasY = view.getFloat32(28, true);
+  if (![scale, biasX, biasY].every(Number.isFinite)) throw new Error("non-finite RSX window-position transform");
+  return `vec4f(input.position.x * ${literal(Math.abs(scale))} + ${literal(biasX)}, input.position.y * ${literal(scale)} + ${literal(biasY)}, input.position.z, input.position.w)`;
+}
+
+function fragmentSource(packet, words, sourceIndex, inlineConstant) {
   const word = words[sourceIndex + 1];
   const type = bits(word, 0, 2);
   let source;
@@ -249,8 +298,12 @@ function fragmentSource(words, sourceIndex, inlineConstant) {
     source = `${registerFile}[${bits(word, 2, 6)}]`;
   } else if (type === 1) {
     const attribute = bits(words[0], 13, 4);
-    if (attribute === 1) source = "input.color";
-    else if (attribute >= 4 && attribute <= 11) source = `input.texcoord${attribute - 4}`;
+    if (attribute === 0) source = fragmentWindowPosition(packet);
+    else if (attribute === 1) source = "select(input.backColor, input.frontColor, frontFacing)";
+    else if (attribute === 2) source = "select(input.backSpecular, input.frontSpecular, frontFacing)";
+    else if (attribute === 3) source = "input.fog";
+    else if (attribute >= 4 && attribute <= 13) source = `input.texcoord${attribute - 4}`;
+    else if (attribute === 14) source = "vec4f(select(-1.0, 1.0, frontFacing))";
     else throw new Error(`RSX fragment input attribute ${attribute} is not yet translated`);
   } else if (type === 2) {
     if (!inlineConstant) throw new Error("missing RSX fragment inline constant");
@@ -277,9 +330,9 @@ function compileFragmentProgram(packet) {
   const bytes = packet.sections[SectionKind.fragmentProgram].bytes;
   if (bytes.byteLength < 16 || bytes.byteLength % 16 !== 0) throw new Error("invalid RSX fragment program");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const lines = ["var r16: array<vec4f, 48>;", "var r32: array<vec4f, 48>;"];
+  const lines = ["var r16: array<vec4f, 48>;", "var r32: array<vec4f, 48>;", "var cc: array<vec4f, 2>;"];
   const opcodes = [];
-  let textured = false;
+  const textureSlots = new Set();
   for (let offset = 0; offset < bytes.byteLength;) {
     const words = [0, 4, 8, 12].map((wordOffset) => fragmentWord(view, offset + wordOffset));
     const opcode = bits(words[0], 24, 6);
@@ -291,17 +344,28 @@ function compileFragmentProgram(packet) {
       continue;
     }
 
-    const operandCounts = new Map([[1, 1], [2, 2], [3, 2], [4, 3], [5, 2], [6, 2], [8, 2], [9, 2], [0x17, 1]]);
+    const operandCounts = new Map([
+      [1, 1], [2, 2], [3, 2], [4, 3], [5, 2], [6, 2], [7, 2], [8, 2], [9, 2],
+      [0x0a, 2], [0x0b, 2], [0x0c, 2], [0x0d, 2], [0x0e, 2], [0x0f, 2],
+      [0x10, 1], [0x11, 1], [0x15, 1], [0x16, 1], [0x17, 1],
+      [0x1a, 1], [0x1b, 1], [0x1c, 1], [0x1d, 1], [0x1e, 1], [0x1f, 3],
+      [0x20, 0], [0x21, 0], [0x22, 1], [0x23, 1], [0x2e, 3],
+      [0x38, 2], [0x39, 1], [0x3a, 2], [0x3b, 2], [0x3c, 1],
+    ]);
     const operandCount = operandCounts.get(opcode);
-    if (!operandCount) throw new Error(`RSX fragment opcode ${opcode} is not yet translated`);
+    if (operandCount === undefined) throw new Error(`RSX fragment opcode ${opcode} is not yet translated`);
     const hasConstant = Array.from({ length: operandCount }, (_, index) => bits(words[index + 1], 0, 2)).includes(2);
     let inlineConstant;
     if (hasConstant) {
       if (offset + 32 > bytes.byteLength) throw new Error("truncated RSX fragment inline constant");
       inlineConstant = `vec4f(${[0, 4, 8, 12].map((wordOffset) => floatLiteral(fragmentWord(view, offset + 16 + wordOffset))).join(", ")})`;
     }
-    if (bits(words[1], 18, 3) !== 7) throw new Error("conditional RSX fragment execution is not yet translated");
-    const sources = Array.from({ length: operandCount }, (_, index) => fragmentSource(words, index, inlineConstant));
+    const execution = bits(words[1], 18, 3);
+    const conditionRegister = bits(words[1], 31, 1);
+    const conditionSwizzle = bits(words[1], 21, 8);
+    const conditionChannels = [0, 2, 4, 6].map((shift) => "xyzw"[bits(conditionSwizzle, shift, 2)]).join("");
+    const condition = `cc[${conditionRegister}].${conditionChannels}`;
+    const sources = Array.from({ length: operandCount }, (_, index) => fragmentSource(packet, words, index, inlineConstant));
     let value;
     if (opcode === 1) value = sources[0];
     else if (opcode === 2) value = `(${sources[0]} * ${sources[1]})`;
@@ -311,28 +375,62 @@ function compileFragmentProgram(packet) {
     else if (opcode === 6) value = `vec4f(dot(${sources[0]}, ${sources[1]}))`;
     else if (opcode === 8) value = `min(${sources[0]}, ${sources[1]})`;
     else if (opcode === 9) value = `max(${sources[0]}, ${sources[1]})`;
+    else if (opcode === 7) value = `vec4f(1.0, ${sources[0]}.y * ${sources[1]}.y, ${sources[0]}.z, ${sources[1]}.w)`;
+    else if (opcode >= 0x0a && opcode <= 0x0f) {
+      const comparison = ["<", ">=", "<=", ">", "!=", "=="][opcode - 0x0a];
+      value = `select(vec4f(0.0), vec4f(1.0), ${sources[0]} ${comparison} ${sources[1]})`;
+    } else if (opcode === 0x10) value = `fract(${sources[0]})`;
+    else if (opcode === 0x11) value = `floor(${sources[0]})`;
+    else if (opcode === 0x15) value = `dpdx(${sources[0]})`;
+    else if (opcode === 0x16) value = `dpdy(${sources[0]})`;
     else if (opcode === 0x17) {
       const textureSlot = bits(words[0], 17, 4);
-      if (textureSlot !== 0) throw new Error(`RSX fragment texture slot ${textureSlot} is not yet translated`);
-      value = `textureSample(rsxTexture0, rsxSampler0, ${sources[0]}.xy)`;
-      textured = true;
-    }
+      value = `textureSample(rsxTexture${textureSlot}, rsxSampler${textureSlot}, ${sources[0]}.xy)`;
+      textureSlots.add(textureSlot);
+    } else if (opcode === 0x1a) value = `vec4f(1.0 / ${sources[0]}.x)`;
+    else if (opcode === 0x1b) value = `vec4f(inverseSqrt(abs(${sources[0]}.x)))`;
+    else if (opcode === 0x1c) value = `vec4f(exp2(${sources[0]}.x))`;
+    else if (opcode === 0x1d) value = `vec4f(log2(${sources[0]}.x))`;
+    else if (opcode === 0x1e) value = `vec4f(1.0, max(${sources[0]}.x, 0.0), select(0.0, exp2(${sources[0]}.w * log2(max(${sources[0]}.y, 1e-10))), ${sources[0]}.x > 0.0), 1.0)`;
+    else if (opcode === 0x1f) value = `mix(${sources[2]}, ${sources[1]}, ${sources[0]})`;
+    else if (opcode === 0x20) value = "vec4f(1.0)";
+    else if (opcode === 0x21) value = "vec4f(0.0)";
+    else if (opcode === 0x22) value = `vec4f(cos(${sources[0]}.x))`;
+    else if (opcode === 0x23) value = `vec4f(sin(${sources[0]}.x))`;
+    else if (opcode === 0x2e) value = `vec4f(dot(${sources[0]}.xy, ${sources[1]}.xy) + ${sources[2]}.x)`;
+    else if (opcode === 0x38) value = `vec4f(dot(${sources[0]}.xy, ${sources[1]}.xy))`;
+    else if (opcode === 0x39) value = `(select(${sources[0]}.xyz, normalize(${sources[0]}.xyz), length(${sources[0]}.xyz) > 0.0)).xyzz`;
+    else if (opcode === 0x3a) value = `(${sources[0]} / ${sources[1]}.xxxx)`;
+    else if (opcode === 0x3b) value = `select(${sources[0]}, ${sources[0]} / vec4f(sqrt(abs(${sources[1]}.x))), abs(${sources[0]}) > vec4f(0.0))`;
+    else if (opcode === 0x3c) value = `vec4f(1.0, ${sources[0]}.y, select(0.0, exp2(${sources[0]}.w), ${sources[0]}.y > 0.0), 1.0)`;
     const scale = [1, 2, 4, 8, 1, 0.5, 0.25, 0.125][bits(words[2], 28, 3)];
     if (scale !== 1) value = `(${value} * ${scale})`;
     if (bits(words[0], 31, 1)) value = `clamp(${value}, vec4f(0.0), vec4f(1.0))`;
-    if (!bits(words[0], 30, 1)) {
-      const destination = bits(words[0], 1, 6);
-      const registerFile = bits(words[0], 7, 1) ? "r16" : "r32";
-      for (let component = 0; component < 4; component += 1) {
-        if (bits(words[0], 9 + component, 1)) lines.push(`${registerFile}[${destination}].${"xyzw"[component]} = (${value}).${"xyzw"[component]};`);
+    const noDestination = Boolean(bits(words[0], 30, 1));
+    const setCondition = Boolean(bits(words[0], 8, 1));
+    const destination = bits(words[0], 1, 6);
+    const registerFile = bits(words[0], 7, 1) ? "r16" : "r32";
+    const conditionDestination = bits(words[1], 30, 1);
+    const comparisons = [undefined, "<", "==", "<=", ">", "!=", ">=", undefined];
+    for (let component = 0; component < 4; component += 1) {
+      if (!bits(words[0], 9 + component, 1) || execution === 0) continue;
+      const channel = "xyzw"[component];
+      const writes = [];
+      if (!noDestination) writes.push(`${registerFile}[${destination}].${channel} = (${value}).${channel};`);
+      if (setCondition) {
+        const conditionValue = noDestination ? `(${value}).${channel}` : `${registerFile}[${destination}].${channel}`;
+        writes.push(`cc[${conditionDestination}].${channel} = ${conditionValue};`);
       }
+      if (writes.length === 0) continue;
+      if (execution === 7) lines.push(...writes);
+      else lines.push(`if (${condition}.${channel} ${comparisons[execution]} 0.0) { ${writes.join(" ")} }`);
     }
     opcodes.push(opcode);
     offset += hasConstant ? 32 : 16;
     if (end) break;
   }
   lines.push(`return ${(packet.fragmentProgramControl & 0x40) !== 0 ? "r32" : "r16"}[0];`);
-  return { code: lines.join("\n"), textured, opcodes };
+  return { code: lines.join("\n"), textured: textureSlots.size > 0, textureSlots: [...textureSlots].sort((a, b) => a - b), opcodes };
 }
 
 function drawVertexOrder(packet) {
@@ -385,27 +483,37 @@ function translateDraw(packet) {
   if (packet.flags & ~allowedFlags) throw new Error(`WebGPU draw closure cannot translate packet flags 0x${packet.flags.toString(16)}`);
   const descriptors = readVertexDescriptors(packet);
   const vertexOrder = drawVertexOrder(packet);
-  const output = new Float32Array(vertexOrder.length * 12);
+  const output = new Float32Array(vertexOrder.length * VertexOutputStrideFloats);
   const vertexOpcodeSet = new Set();
+  const scalarVertexOpcodeSet = new Set();
   for (let outputVertex = 0; outputVertex < vertexOrder.length; outputVertex += 1) {
     const vertex = vertexOrder[outputVertex];
     const inputs = new Map();
     for (const [index, descriptor] of descriptors) inputs.set(index, readAttribute(packet, descriptor, vertex));
     const executed = executeVertexProgram(packet, inputs);
     executed.opcodes.forEach((opcode) => vertexOpcodeSet.add(opcode));
+    executed.scalarOpcodes.forEach((opcode) => scalarVertexOpcodeSet.add(opcode));
     const position = applyVertexEnvironment(packet, executed.destinations[0]);
     // RPCS3's Vulkan backend uses a positive-height viewport, whose framebuffer
     // Y mapping is the inverse of WebGPU's clip-space mapping. Preserve the
     // native backend's orientation after applying the shared RSX viewport
     // scale/offset matrix.
     position[1] = -position[1];
-    const color = executed.destinations[1];
-    const texcoord0 = executed.destinations[7];
-    output.set([...position, ...color, ...texcoord0], outputVertex * 12);
+    output.set([
+      ...position,
+      ...VertexVaryingDestinations.flatMap((destination) => executed.destinations[destination]),
+    ], outputVertex * VertexOutputStrideFloats);
   }
   const fragment = compileFragmentProgram(packet);
   if (fragment.textured && packet.textures.length === 0) throw new Error("RSX fragment program samples a texture without a payload");
-  return { output, fragment, topology, vertexOpcodes: [...vertexOpcodeSet].sort((a, b) => a - b), fragmentOpcodes: fragment.opcodes };
+  return {
+    output,
+    fragment,
+    topology,
+    vertexOpcodes: [...vertexOpcodeSet].sort((a, b) => a - b),
+    scalarVertexOpcodes: [...scalarVertexOpcodeSet].sort((a, b) => a - b),
+    fragmentOpcodes: fragment.opcodes,
+  };
 }
 
 function clearValue(packet) {
@@ -487,7 +595,25 @@ function renderTargetState(packet) {
   };
 }
 
-export async function prepareWebGPU(canvas) {
+function rasterState(packet) {
+  const registers = packet.sections[SectionKind.registers].bytes;
+  if (registers.byteLength < 0x1840) throw new Error("RPCS3 register packet is missing raster state");
+  const view = new DataView(registers.buffer, registers.byteOffset, registers.byteLength);
+  const frontFaceValue = view.getUint32(0x1834, true);
+  const frontFace = new Map([[0x0900, "ccw"], [0x0901, "cw"]]).get(frontFaceValue);
+  if (!frontFace) throw new Error(`unsupported RSX front-face mode 0x${frontFaceValue.toString(16)}`);
+  const cullEnabled = Boolean(view.getUint32(0x183c, true));
+  const cullFaceValue = view.getUint32(0x1830, true);
+  const cullMode = cullEnabled
+    ? new Map([[0x0404, "front"], [0x0405, "back"]]).get(cullFaceValue)
+    : "none";
+  if (cullEnabled && !cullMode) {
+    throw new Error(`unsupported RSX cull-face mode 0x${cullFaceValue.toString(16)}`);
+  }
+  return { frontFace, cullMode };
+}
+
+export async function prepareWebGPU(canvas, options = {}) {
   if (!canvas || typeof canvas.getContext !== "function" || !Number.isInteger(canvas.width) || !Number.isInteger(canvas.height)) {
     throw new Error("an HTMLCanvasElement or OffscreenCanvas is required for WebGPU presentation");
   }
@@ -499,50 +625,150 @@ export async function prepareWebGPU(canvas) {
   if (!adapter) adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error("WebGPU requestAdapter returned null");
   const device = await adapter.requestDevice();
-  const context = canvas.getContext("webgpu");
-  if (!context) throw new Error("OffscreenCanvas WebGPU context is unavailable");
-  const format = navigator.gpu.getPreferredCanvasFormat();
-  context.configure({ device, format, alphaMode: "opaque", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+  const presentation = options.presentation !== false;
+  const context = presentation ? canvas.getContext("webgpu") : undefined;
+  if (presentation && !context) throw new Error("OffscreenCanvas WebGPU context is unavailable");
+  const format = presentation ? navigator.gpu.getPreferredCanvasFormat() : (options.format ?? "rgba8unorm");
+  context?.configure({ device, format, alphaMode: "opaque", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
   return { canvas, adapter, device, context, format };
+}
+
+function deswizzle2D(bytes, width, height, bytesPerElement) {
+  const log2Width = Math.ceil(Math.log2(width));
+  const log2Height = Math.ceil(Math.log2(height));
+  const limitMask = 2 ** (Math.min(log2Width, log2Height) * 2);
+  const xMask = (0x55555555 | ~(limitMask - 1)) >>> 0;
+  const yMask = (0xaaaaaaaa & (limitMask - 1)) >>> 0;
+  const result = new Uint8Array(width * height * bytesPerElement);
+  let offsetY = 0;
+  let offsetX0 = 0;
+  for (let y = 0; y < height; y += 1) {
+    let offsetX = offsetX0;
+    for (let x = 0; x < width; x += 1) {
+      const source = (offsetY + offsetX) * bytesPerElement;
+      result.set(bytes.subarray(source, source + bytesPerElement), (y * width + x) * bytesPerElement);
+      offsetX = ((offsetX - xMask) & xMask) >>> 0;
+    }
+    offsetY = ((offsetY - yMask) & yMask) >>> 0;
+    if (offsetY === 0) offsetX0 += limitMask;
+  }
+  return result;
+}
+
+function color565(value) {
+  const r = (value >>> 11) & 31;
+  const g = (value >>> 5) & 63;
+  const b = value & 31;
+  return [(r << 3) | (r >>> 2), (g << 2) | (g >>> 4), (b << 3) | (b >>> 2), 255];
+}
+
+function decodeBcColor(bytes, offset, forceFourColors) {
+  const color0 = bytes[offset] | (bytes[offset + 1] << 8);
+  const color1 = bytes[offset + 2] | (bytes[offset + 3] << 8);
+  const colors = [color565(color0), color565(color1)];
+  if (color0 > color1 || forceFourColors) {
+    colors.push(colors[0].map((value, channel) => channel === 3 ? 255 : Math.floor((2 * value + colors[1][channel]) / 3)));
+    colors.push(colors[0].map((value, channel) => channel === 3 ? 255 : Math.floor((value + 2 * colors[1][channel]) / 3)));
+  } else {
+    colors.push(colors[0].map((value, channel) => channel === 3 ? 255 : Math.floor((value + colors[1][channel]) / 2)));
+    colors.push([0, 0, 0, 0]);
+  }
+  const indices = (bytes[offset + 4] | (bytes[offset + 5] << 8) | (bytes[offset + 6] << 16) | (bytes[offset + 7] << 24)) >>> 0;
+  return { colors, indices };
+}
+
+function decodeBcTexture(descriptor, baseFormat, rgba, bytesPerRow) {
+  const blockBytes = baseFormat === 0x86 ? 8 : 16;
+  const blockWidth = Math.max(1, Math.ceil(descriptor.width / 4));
+  const blockHeight = Math.max(1, Math.ceil(descriptor.height / 4));
+  const sourcePitch = descriptor.pitch || blockWidth * blockBytes;
+  if (descriptor.bytes.byteLength < sourcePitch * blockHeight) throw new Error("RPCS3 compressed texture payload is truncated");
+  for (let blockY = 0; blockY < blockHeight; blockY += 1) {
+    for (let blockX = 0; blockX < blockWidth; blockX += 1) {
+      const block = blockY * sourcePitch + blockX * blockBytes;
+      const colorOffset = baseFormat === 0x86 ? block : block + 8;
+      const { colors, indices } = decodeBcColor(descriptor.bytes, colorOffset, baseFormat !== 0x86);
+      let alphaBits = 0n;
+      let alphaPalette;
+      if (baseFormat === 0x88) {
+        const alpha0 = descriptor.bytes[block];
+        const alpha1 = descriptor.bytes[block + 1];
+        alphaPalette = [alpha0, alpha1];
+        const divisor = alpha0 > alpha1 ? 7 : 5;
+        const interpolated = alpha0 > alpha1 ? 6 : 4;
+        for (let index = 1; index <= interpolated; index += 1) {
+          alphaPalette.push(Math.floor(((divisor - index) * alpha0 + index * alpha1) / divisor));
+        }
+        if (alpha0 <= alpha1) alphaPalette.push(0, 255);
+        for (let byte = 0; byte < 6; byte += 1) alphaBits |= BigInt(descriptor.bytes[block + 2 + byte]) << BigInt(byte * 8);
+      }
+      for (let pixel = 0; pixel < 16; pixel += 1) {
+        const x = blockX * 4 + (pixel & 3);
+        const y = blockY * 4 + (pixel >>> 2);
+        if (x >= descriptor.width || y >= descriptor.height) continue;
+        const color = colors[(indices >>> (pixel * 2)) & 3];
+        const destination = y * bytesPerRow + x * 4;
+        rgba.set(color, destination);
+        if (baseFormat === 0x87) {
+          rgba[destination + 3] = ((descriptor.bytes[block + (pixel >>> 1)] >>> ((pixel & 1) * 4)) & 15) * 17;
+        } else if (baseFormat === 0x88) {
+          rgba[destination + 3] = alphaPalette[Number((alphaBits >> BigInt(pixel * 3)) & 7n)];
+        }
+      }
+    }
+  }
 }
 
 function uploadTexture2D(device, descriptor) {
   const baseFormat = descriptor.format & ~(0x20 | 0x40);
-  const bytesPerTexel = baseFormat === 0x85 ? 4 : baseFormat === 0x81 ? 1 : 0;
-  if (!bytesPerTexel || !(descriptor.format & 0x20) || descriptor.depth !== 1 || descriptor.mipCount !== 1) {
-    throw new Error(`current WebGPU texture closure requires linear B8 or A8R8G8B8 2D level zero (format=0x${descriptor.format.toString(16)})`);
-  }
-  const sourcePitch = descriptor.pitch || descriptor.width * bytesPerTexel;
-  if (sourcePitch < descriptor.width * bytesPerTexel || descriptor.bytes.byteLength < sourcePitch * descriptor.height) {
-    throw new Error("RPCS3 texture payload is truncated");
+  const bytesPerTexel = baseFormat === 0x85 ? 4 : baseFormat === 0x8b ? 2 : baseFormat === 0x81 ? 1 : 0;
+  const compressed = baseFormat >= 0x86 && baseFormat <= 0x88;
+  if ((!bytesPerTexel && !compressed) || descriptor.depth !== 1 || descriptor.dimension !== 1) {
+    throw new Error(`current WebGPU texture closure requires B8, G8B8, A8R8G8B8, or DXT 2D data (format=0x${descriptor.format.toString(16)})`);
   }
   const bytesPerRow = Math.ceil((descriptor.width * 4) / 256) * 256;
   const rgba = new Uint8Array(bytesPerRow * descriptor.height);
+  if (compressed) {
+    decodeBcTexture(descriptor, baseFormat, rgba, bytesPerRow);
+  } else {
+    const linear = Boolean(descriptor.format & 0x20);
+    const sourcePitch = linear ? (descriptor.pitch || descriptor.width * bytesPerTexel) : descriptor.width * bytesPerTexel;
+    if (sourcePitch < descriptor.width * bytesPerTexel || descriptor.bytes.byteLength < sourcePitch * descriptor.height) {
+      throw new Error("RPCS3 texture payload is truncated");
+    }
+    const sourceBytes = linear
+      ? descriptor.bytes
+      : deswizzle2D(descriptor.bytes, descriptor.width, descriptor.height, bytesPerTexel);
+    for (let y = 0; y < descriptor.height; y += 1) {
+      for (let x = 0; x < descriptor.width; x += 1) {
+        const source = y * sourcePitch + x * bytesPerTexel;
+        const destination = y * bytesPerRow + x * 4;
+        if (baseFormat === 0x85) {
+          rgba[destination] = sourceBytes[source + 1];
+          rgba[destination + 1] = sourceBytes[source + 2];
+          rgba[destination + 2] = sourceBytes[source + 3];
+          rgba[destination + 3] = sourceBytes[source];
+        } else if (baseFormat === 0x8b) {
+          rgba[destination] = sourceBytes[source + 1];
+          rgba[destination + 1] = sourceBytes[source];
+          rgba[destination + 2] = sourceBytes[source + 1];
+          rgba[destination + 3] = sourceBytes[source];
+        } else {
+          const value = sourceBytes[source];
+          rgba[destination] = 255;
+          rgba[destination + 1] = value;
+          rgba[destination + 2] = value;
+          rgba[destination + 3] = value;
+        }
+      }
+    }
+  }
   const channelMin = [255, 255, 255, 255];
   const channelMax = [0, 0, 0, 0];
   const channelSum = [0, 0, 0, 0];
   for (let y = 0; y < descriptor.height; y += 1) {
     for (let x = 0; x < descriptor.width; x += 1) {
-      const source = y * sourcePitch + x * 4;
       const destination = y * bytesPerRow + x * 4;
-      if (baseFormat === 0x85) {
-        // Guest A8R8G8B8 words remain big-endian in the packet: A,R,G,B.
-        // RPCS3's native upload converts the word before exposing BGRA host
-        // bytes; upload RGBA directly here for the same sampled channels.
-        rgba[destination] = descriptor.bytes[source + 1];
-        rgba[destination + 1] = descriptor.bytes[source + 2];
-        rgba[destination + 2] = descriptor.bytes[source + 3];
-        rgba[destination + 3] = descriptor.bytes[source];
-      } else {
-        // Match VKFormats::get_component_mapping(B8): the native view exposes
-        // the sole channel as G/B/A and forces R=1. Font shaders use the
-        // sampled alpha as glyph coverage.
-        const value = descriptor.bytes[y * sourcePitch + x];
-        rgba[destination] = 255;
-        rgba[destination + 1] = value;
-        rgba[destination + 2] = value;
-        rgba[destination + 3] = value;
-      }
       for (let channel = 0; channel < 4; channel += 1) {
         channelMin[channel] = Math.min(channelMin[channel], rgba[destination + channel]);
         channelMax[channel] = Math.max(channelMax[channel], rgba[destination + channel]);
@@ -566,6 +792,7 @@ function uploadTexture2D(device, descriptor) {
   return {
     texture,
     sampler,
+    byteSize: descriptor.width * descriptor.height * 4,
     diagnostics: {
       width: descriptor.width,
       height: descriptor.height,
@@ -576,22 +803,42 @@ function uploadTexture2D(device, descriptor) {
   };
 }
 
+function textureCacheKey(descriptor) {
+  return [
+    descriptor.address,
+    descriptor.contentHash,
+    descriptor.format,
+    descriptor.width,
+    descriptor.height,
+    descriptor.depth,
+    descriptor.pitch,
+    descriptor.mipCount,
+    descriptor.dimension,
+  ].join(":");
+}
+
 function drawDiagnostics(draw) {
   const result = {
     clipBounds: { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] },
-    texcoord0Bounds: { min: [Infinity, Infinity], max: [-Infinity, -Infinity] },
+    varyingBounds: Object.fromEntries(VertexVaryings.map((name) => [name, {
+      min: [Infinity, Infinity, Infinity, Infinity],
+      max: [-Infinity, -Infinity, -Infinity, -Infinity],
+    }])),
   };
-  for (let offset = 0; offset < draw.output.length; offset += 12) {
+  for (let offset = 0; offset < draw.output.length; offset += VertexOutputStrideFloats) {
     const w = draw.output[offset + 3];
     for (let component = 0; component < 3; component += 1) {
       const value = draw.output[offset + component] / w;
       result.clipBounds.min[component] = Math.min(result.clipBounds.min[component], value);
       result.clipBounds.max[component] = Math.max(result.clipBounds.max[component], value);
     }
-    for (let component = 0; component < 2; component += 1) {
-      const value = draw.output[offset + 8 + component];
-      result.texcoord0Bounds.min[component] = Math.min(result.texcoord0Bounds.min[component], value);
-      result.texcoord0Bounds.max[component] = Math.max(result.texcoord0Bounds.max[component], value);
+    for (let varying = 0; varying < VertexVaryings.length; varying += 1) {
+      const bounds = result.varyingBounds[VertexVaryings[varying]];
+      for (let component = 0; component < 4; component += 1) {
+        const value = draw.output[offset + (varying + 1) * 4 + component];
+        bounds.min[component] = Math.min(bounds.min[component], value);
+        bounds.max[component] = Math.max(bounds.max[component], value);
+      }
     }
   }
   return result;
@@ -603,38 +850,45 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   const { canvas, adapter, device, context, format } = prepared;
   const clearPacket = packets.find((packet) => packet.kind === PacketKind.clear);
   const drawPackets = packets.filter((packet) => packet.kind === PacketKind.draw);
-  if (!clearPacket || drawPackets.length === 0) throw new Error("RPCS3 did not emit a clear and draw packet");
+  if (!clearPacket) throw new Error("RPCS3 did not emit a clear packet");
   const clear = clearValue(clearPacket);
   const translated = drawPackets.map(translateDraw);
   const depthStates = drawPackets.map(depthState);
   const targetStates = drawPackets.map(renderTargetState);
+  const rasterStates = drawPackets.map(rasterState);
   const translatedAt = performance.now();
   const pipelineCache = prepared.pipelineCache ??= new Map();
+  const textureCache = prepared.textureCache ??= new Map();
+  const textureCacheBudget = options.textureCacheBytes ?? 128 * 1024 * 1024;
+  const frameTextureKeys = new Set();
   let pipelineCacheHits = 0;
   let pipelineCacheMisses = 0;
+  let textureCacheHits = 0;
+  let textureCacheMisses = 0;
   const resources = translated.map((draw, index) => {
-    const declarations = draw.fragment.textured
-      ? "@group(0) @binding(0) var rsxTexture0: texture_2d<f32>; @group(0) @binding(1) var rsxSampler0: sampler;"
-      : "";
+    const declarations = draw.fragment.textureSlots.flatMap((slot) => [
+      `@group(0) @binding(${slot * 2}) var rsxTexture${slot}: texture_2d<f32>;`,
+      `@group(0) @binding(${slot * 2 + 1}) var rsxSampler${slot}: sampler;`,
+    ]).join("\n");
+    const vertexInputFields = ["@location(0) position: vec4f,", ...VertexVaryings.map((name, varying) => `@location(${varying + 1}) ${name}: vec4f,`)].join("\n");
+    const vertexOutputFields = VertexVaryings.map((name, varying) => `@location(${varying}) ${name}: vec4f,`).join("\n");
+    const varyingAssignments = VertexVaryings.map((name) => `result.${name} = input.${name};`).join("\n");
     const shaderCode = `
       ${declarations}
+      struct VertexIn {
+        ${vertexInputFields}
+      };
       struct VertexOut {
         @builtin(position) position: vec4f,
-        @location(0) color: vec4f,
-        @location(1) texcoord0: vec4f,
+        ${vertexOutputFields}
       };
-      @vertex fn vertex_main(
-        @location(0) position: vec4f,
-        @location(1) color: vec4f,
-        @location(2) texcoord0: vec4f,
-      ) -> VertexOut {
+      @vertex fn vertex_main(input: VertexIn) -> VertexOut {
         var result: VertexOut;
-        result.position = position;
-        result.color = color;
-        result.texcoord0 = texcoord0;
+        result.position = input.position;
+        ${varyingAssignments}
         return result;
       }
-      @fragment fn fragment_main(input: VertexOut) -> @location(0) vec4f {
+      @fragment fn fragment_main(input: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(0) vec4f {
         ${draw.fragment.code}
       }
     `;
@@ -642,6 +896,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       shaderCode,
       format,
       draw.topology,
+      rasterStates[index],
       depthStates[index],
       targetStates[index].blend,
       targetStates[index].writeMask,
@@ -659,12 +914,12 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
           module: shader,
           entryPoint: "vertex_main",
           buffers: [{
-            arrayStride: 48,
-            attributes: [
-              { shaderLocation: 0, offset: 0, format: "float32x4" },
-              { shaderLocation: 1, offset: 16, format: "float32x4" },
-              { shaderLocation: 2, offset: 32, format: "float32x4" },
-            ],
+            arrayStride: VertexOutputStrideFloats * 4,
+            attributes: Array.from({ length: 16 }, (_, attribute) => ({
+              shaderLocation: attribute,
+              offset: attribute * 16,
+              format: "float32x4",
+            })),
           }],
         },
         fragment: {
@@ -672,7 +927,11 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
           entryPoint: "fragment_main",
           targets: [{ format, blend: targetStates[index].blend, writeMask: targetStates[index].writeMask }],
         },
-        primitive: { topology: draw.topology, cullMode: "none" },
+        primitive: {
+          topology: draw.topology,
+          frontFace: rasterStates[index].frontFace,
+          cullMode: rasterStates[index].cullMode,
+        },
         depthStencil: {
           format: "depth24plus",
           depthWriteEnabled: depthStates[index].writeEnabled,
@@ -683,21 +942,36 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     }
     const buffer = device.createBuffer({ size: draw.output.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(buffer, 0, draw.output.buffer, draw.output.byteOffset, draw.output.byteLength);
-    let textureResource;
+    const textureResources = [];
     let bindGroup;
     if (draw.fragment.textured) {
-      const descriptor = drawPackets[index].textures.find((texture) => texture.stage === 0 && texture.slot === 0);
-      if (!descriptor) throw new Error("RPCS3 fragment texture zero is missing");
-      textureResource = uploadTexture2D(device, descriptor);
+      for (const slot of draw.fragment.textureSlots) {
+        const descriptor = drawPackets[index].textures.find((texture) => texture.stage === 0 && texture.slot === slot);
+        if (!descriptor) throw new Error(`RPCS3 fragment texture ${slot} is missing`);
+        const cacheKey = textureCacheKey(descriptor);
+        let resource = textureCache.get(cacheKey);
+        if (resource) {
+          textureCache.delete(cacheKey);
+          textureCache.set(cacheKey, resource);
+          textureCacheHits += 1;
+        } else {
+          resource = uploadTexture2D(device, descriptor);
+          textureCache.set(cacheKey, resource);
+          prepared.textureCacheBytes = (prepared.textureCacheBytes ?? 0) + resource.byteSize;
+          textureCacheMisses += 1;
+        }
+        frameTextureKeys.add(cacheKey);
+        textureResources.push({ slot, ...resource, cacheKey, cached: true });
+      }
       bindGroup = device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: textureResource.texture.createView() },
-          { binding: 1, resource: textureResource.sampler },
-        ],
+        entries: textureResources.flatMap((resource) => [
+          { binding: resource.slot * 2, resource: resource.texture.createView() },
+          { binding: resource.slot * 2 + 1, resource: resource.sampler },
+        ]),
       });
     }
-    return { pipeline, buffer, bindGroup, textureResource };
+    return { pipeline, buffer, bindGroup, textureResources, shaderCode };
   });
   const depthTexture = device.createTexture({
     label: "RPCS3 RSX depth target",
@@ -706,7 +980,12 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     usage: GPUTextureUsage.RENDER_ATTACHMENT,
   });
   const resourcesReadyAt = performance.now();
-  const texture = context.getCurrentTexture();
+  const texture = context ? context.getCurrentTexture() : device.createTexture({
+    label: "RPCS3 RSX headless color target",
+    size: { width: canvas.width, height: canvas.height },
+    format,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
   const encoder = device.createCommandEncoder({ label: "RPCS3 RSX packet frame" });
   const pass = encoder.beginRenderPass({ colorAttachments: [{
     view: texture.createView(), clearValue: clear, loadOp: "clear", storeOp: "store",
@@ -718,7 +997,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     pass.setVertexBuffer(0, resources[index].buffer);
     if (targetStates[index].blendEnabled) pass.setBlendConstant(targetStates[index].blendConstant);
     if (resources[index].bindGroup) pass.setBindGroup(0, resources[index].bindGroup);
-    pass.draw(translated[index].output.length / 12);
+    pass.draw(translated[index].output.length / VertexOutputStrideFloats);
   }
   pass.end();
   const readbackEnabled = options.readback !== false;
@@ -777,8 +1056,17 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     frameHash >>>= 0;
   }
   const readbackScannedAt = performance.now();
+  if ((prepared.textureCacheBytes ?? 0) > textureCacheBudget) {
+    for (const [cacheKey, resource] of textureCache) {
+      if ((prepared.textureCacheBytes ?? 0) <= textureCacheBudget) break;
+      if (frameTextureKeys.has(cacheKey)) continue;
+      textureCache.delete(cacheKey);
+      prepared.textureCacheBytes -= resource.byteSize;
+      resource.texture.destroy();
+    }
+  }
 
-  if (options.replayPresentation !== false && typeof globalThis.requestAnimationFrame === "function") {
+  if (context && options.replayPresentation !== false && typeof globalThis.requestAnimationFrame === "function") {
     // WebGPU canvas textures are not retained bitmaps. Keep presenting the
     // most recent RSX frame until a newer frame replaces it, just as the live
     // emulator loop will. This is presentation scheduling only: guest/RSX
@@ -798,19 +1086,20 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
         presentationPass.setVertexBuffer(0, resources[index].buffer);
         if (targetStates[index].blendEnabled) presentationPass.setBlendConstant(targetStates[index].blendConstant);
         if (resources[index].bindGroup) presentationPass.setBindGroup(0, resources[index].bindGroup);
-        presentationPass.draw(translated[index].output.length / 12);
+        presentationPass.draw(translated[index].output.length / VertexOutputStrideFloats);
       }
       presentationPass.end();
       device.queue.submit([presentationEncoder.finish()]);
     };
     activePresentation = presentation;
     presentation.animationFrame = globalThis.requestAnimationFrame(present);
-  } else if (options.retainResources === false) {
-    resources.forEach(({ buffer, textureResource }) => {
+  } else if (!context || options.retainResources === false) {
+    resources.forEach(({ buffer, textureResources }) => {
       buffer.destroy();
-      textureResource?.texture.destroy();
+      textureResources.forEach(({ texture: resourceTexture, cached }) => { if (!cached) resourceTexture.destroy(); });
     });
     depthTexture.destroy();
+    if (!context) texture.destroy();
   } else {
     // Interactive presentation submits once per actual guest flip. Retain the
     // resources until the next guest frame replaces them, without a browser
@@ -820,19 +1109,24 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   const info = adapter.info ?? {};
   return {
     presented: true,
+    surface: context ? "canvas" : "texture",
     format,
     adapter: [info.vendor, info.architecture, info.device, info.description, info.backend, info.type].filter(Boolean).join(" · "),
     width: canvas.width,
     height: canvas.height,
     draws: translated.length,
-    vertices: translated.reduce((sum, draw) => sum + draw.output.length / 12, 0),
+    vertices: translated.reduce((sum, draw) => sum + draw.output.length / VertexOutputStrideFloats, 0),
     vertexOpcodes: [...new Set(translated.flatMap((draw) => draw.vertexOpcodes))].sort((a, b) => a - b),
+    scalarVertexOpcodes: [...new Set(translated.flatMap((draw) => draw.scalarVertexOpcodes))].sort((a, b) => a - b),
     fragmentOpcodes: [...new Set(translated.flatMap((draw) => draw.fragmentOpcodes))].sort((a, b) => a - b),
+    shaderPrograms: options.captureShaders ? [...new Set(resources.map(({ shaderCode }) => shaderCode))] : undefined,
     depthStates,
+    rasterStates,
     targetStates,
     drawDiagnostics: translated.map((draw, index) => ({
       ...drawDiagnostics(draw),
-      texture: resources[index].textureResource?.diagnostics,
+      texture: resources[index].textureResources[0]?.diagnostics,
+      textures: resources[index].textureResources.map(({ slot, diagnostics }) => ({ slot, ...diagnostics })),
     })),
     changedPixels,
     clearPixels,
@@ -846,6 +1140,13 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       totalMs: readbackScannedAt - renderStartedAt,
     },
     pipelineCache: { hits: pipelineCacheHits, misses: pipelineCacheMisses, size: pipelineCache.size },
+    textureCache: {
+      hits: textureCacheHits,
+      misses: textureCacheMisses,
+      size: textureCache.size,
+      bytes: prepared.textureCacheBytes ?? 0,
+      budget: textureCacheBudget,
+    },
     rgbaBase64: rgba ? base64(rgba) : undefined,
   };
 }

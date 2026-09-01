@@ -2856,6 +2856,10 @@ void thread_base::initialize(void (*error_cb)())
 	});
 
 	set_name(thread_ctrl::get_name_cached());
+#ifdef __EMSCRIPTEN__
+	std::fprintf(stderr, "RPCS3 Web pthread ready: id=0x%llx name=%s\n",
+		static_cast<u64>(pthread_self()), thread_ctrl::get_name_cached().c_str());
+#endif
 }
 
 void thread_base::set_name(std::string name)
@@ -3011,6 +3015,9 @@ thread_base::native_entry thread_base::finalize(u64 _self) noexcept
 
 #ifdef _WIN32
 	_endthreadex(0);
+#elif defined(__EMSCRIPTEN__)
+	thread_ctrl::g_tls_this_thread = nullptr;
+	return nullptr;
 #else
 	pthread_exit(nullptr);
 #endif

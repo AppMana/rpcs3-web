@@ -12,6 +12,7 @@ const keyControls = new Map([
 const canvas = document.querySelector("#gpu-output");
 const statusElement = document.querySelector("#status");
 const detailElement = document.querySelector("#detail");
+const bootPath = new URLSearchParams(location.search).get("boot");
 const keys = new Set();
 const touches = new Map();
 let worker;
@@ -123,7 +124,7 @@ async function start() {
   });
   worker.postMessage({
     type: "boot",
-    fixture: "fixtures/gs_gcm_tetris.elf",
+    ...(bootPath ? { path: bootPath } : { fixture: "fixtures/gs_gcm_tetris.elf" }),
     returnPackets: true,
     pad: controlState(),
   });

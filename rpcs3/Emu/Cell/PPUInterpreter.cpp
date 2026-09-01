@@ -51,6 +51,50 @@ void ppubreak(ppu_thread& ppu)
 #define PPU_WRITE_64(addr, value) vm::write64(addr, value);
 #endif
 
+#ifdef RPCS3_WEB
+extern atomic_t<u32> g_ppu_web_watch_address;
+#endif
+
+static inline u32 ppu_watch_address()
+{
+#ifdef RPCS3_WEB
+	return g_ppu_web_watch_address;
+#else
+	static const u32 address = []
+	{
+		const char* value = std::getenv("RPCS3_PPU_WATCH_ADDRESS");
+		return value ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0u;
+	}();
+	return address;
+#endif
+}
+
+static inline void ppu_trace_write32(ppu_thread& ppu, u32 addr, u32 value)
+{
+	const u32 watch_address = ppu_watch_address();
+	const u32 old_value = watch_address == addr ? static_cast<u32>(vm::read32(addr)) : value;
+#ifdef RPCS3_HAS_MEMORY_BREAKPOINTS
+	vm::write32(addr, value, &ppu);
+#else
+	vm::write32(addr, value);
+#endif
+	if (watch_address == addr)
+	{
+		std::fprintf(stderr,
+			"RPCS3 PPU watch: address=0x%08x old=0x%08x value=0x%08x pc=0x%08x id=0x%08x lr=0x%08llx "
+			"r0=0x%08llx r1=0x%08llx r3=0x%08llx r4=0x%08llx r5=0x%08llx r24=0x%08llx r25=0x%08llx r29=0x%08llx r30=0x%08llx\n",
+			addr, old_value, value, ppu.cia, ppu.id, static_cast<unsigned long long>(ppu.lr),
+			static_cast<unsigned long long>(ppu.gpr[0]), static_cast<unsigned long long>(ppu.gpr[1]),
+			static_cast<unsigned long long>(ppu.gpr[3]), static_cast<unsigned long long>(ppu.gpr[4]),
+			static_cast<unsigned long long>(ppu.gpr[5]), static_cast<unsigned long long>(ppu.gpr[24]),
+			static_cast<unsigned long long>(ppu.gpr[25]), static_cast<unsigned long long>(ppu.gpr[29]),
+			static_cast<unsigned long long>(ppu.gpr[30]));
+	}
+}
+
+#undef PPU_WRITE_32
+#define PPU_WRITE_32(addr, value) ppu_trace_write32(ppu, (addr), (value));
+
 extern bool is_debugger_present();
 
 extern const ppu_decoder<ppu_itype> g_ppu_itype;

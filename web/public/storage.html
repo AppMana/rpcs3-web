@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>RPCS3 Web · Storage</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: #080a0f; color: #e8ecf4; }
+      main { width: min(900px, 100%); margin: auto; padding: max(16px, env(safe-area-inset-top)) 16px; }
+      h1 { font-size: clamp(20px, 4vw, 30px); }
+      section { margin: 14px 0; padding: 16px; border: 1px solid #2a3447; border-radius: 10px; background: #111620; }
+      h2 { margin-top: 0; font-size: 16px; }
+      p, pre { color: #aeb9ca; font-size: 12px; line-height: 1.5; }
+      label, button, a.action { display: inline-block; margin: 5px 8px 5px 0; padding: 10px 12px; border: 1px solid #526078; border-radius: 7px; background: #1a2230; color: white; font: inherit; text-decoration: none; }
+      label:active, button:active, a.action:active { background: #4968ff; }
+      input[type=file] { display: none; }
+      progress { width: 100%; height: 16px; }
+      #files { max-height: 280px; overflow: auto; white-space: pre-wrap; }
+      .good { color: #92f3b4; }
+      .warn { color: #ffd17d; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>RPCS3 browser storage</h1>
+      <section>
+        <h2>Device capacity</h2>
+        <p id="capacity">Inspecting origin-private storage…</p>
+        <button id="persist">Request persistent storage</button>
+      </section>
+      <section>
+        <h2>Firmware</h2>
+        <p>Copies a Sony PS3UPDAT.PUP into persistent storage without buffering it in Wasm memory.</p>
+        <label>Select PS3UPDAT.PUP<input id="firmware" type="file" accept=".pup,.PUP,application/octet-stream" /></label>
+        <button id="install-firmware">Install stored firmware</button>
+      </section>
+      <section>
+        <h2>Game</h2>
+        <p>Select an unencrypted ISO, or an extracted disc directory containing PS3_GAME/USRDIR/EBOOT.BIN.</p>
+        <label>Select ISO<input id="iso" type="file" accept=".iso,.ISO,application/octet-stream" /></label>
+        <label>Select extracted game<input id="directory" type="file" webkitdirectory multiple /></label>
+        <a id="boot" class="action" hidden>Boot imported game</a>
+      </section>
+      <section>
+        <h2>Transfer</h2>
+        <progress id="progress" max="1" value="0"></progress>
+        <p id="transfer">Idle</p>
+      </section>
+      <section>
+        <h2>Stored files</h2>
+        <button id="refresh">Refresh</button>
+        <pre id="files">None</pre>
+      </section>
+    </main>
+    <script type="module" src="./storage-runtime.mjs"></script>
+  </body>
+</html>

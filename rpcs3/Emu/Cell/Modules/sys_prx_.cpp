@@ -37,9 +37,35 @@ error_code sys_prx_load_module(ppu_thread& ppu, vm::cptr<char> path, u64 flags, 
 {
 	sysPrxForUser.warning("sys_prx_load_module(path=%s, flags=0x%x, pOpt=*0x%x)", path, flags, pOpt);
 
+#ifdef RPCS3_WEB
+	std::fprintf(stderr, "RPCS3 Web sys_prx_load_module: locking path=%s\n", path.get_ptr());
+	if (g_ppu_prx_lwm->vars.owner.load() == 0 && g_ppu_prx_lwm->sleep_queue == 0)
+	{
+		vm::var<sys_lwmutex_attribute_t> attributes;
+		attributes->protocol = SYS_SYNC_PRIORITY;
+		attributes->recursive = SYS_SYNC_RECURSIVE;
+		attributes->name_u64 = "_lv2prx\0"_u64;
+		const error_code initialize_result = sys_lwmutex_create(ppu, g_ppu_prx_lwm, attributes);
+		std::fprintf(stderr, "RPCS3 Web sys_prx_load_module: lazy mutex initialization=0x%x\n", initialize_result + 0u);
+		if (initialize_result != CELL_OK)
+		{
+			return initialize_result;
+		}
+	}
+	const error_code lock_result = sys_lwmutex_lock(ppu, g_ppu_prx_lwm, 0);
+	std::fprintf(stderr, "RPCS3 Web sys_prx_load_module: lock result=0x%x\n", lock_result + 0u);
+	if (lock_result != CELL_OK)
+	{
+		return lock_result;
+	}
+	const error_code result = _sys_prx_load_module(ppu, path, flags, pOpt);
+	const error_code unlock_result = sys_lwmutex_unlock(ppu, g_ppu_prx_lwm);
+	std::fprintf(stderr, "RPCS3 Web sys_prx_load_module: result=0x%x unlock=0x%x\n", result + 0u, unlock_result + 0u);
+	return unlock_result == CELL_OK ? result : unlock_result;
+#else
 	sys_lwmutex_locker lock(ppu, g_ppu_prx_lwm);
-
 	return _sys_prx_load_module(ppu, path, flags, pOpt);
+#endif
 }
 
 error_code sys_prx_load_module_by_fd(ppu_thread& ppu, s32 fd, u64 offset, u64 flags, vm::ptr<sys_prx_load_module_option_t> pOpt)

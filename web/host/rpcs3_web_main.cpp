@@ -1,12 +1,17 @@
 #include "Emu/System.h"
 #include "Emu/IdManager.h"
+#include "Emu/VFS.h"
 #include "Emu/Cell/PPUFunction.h"
+#include "Emu/Cell/PPUThread.h"
+#include "Emu/Cell/SPUThread.h"
 #include "Emu/RSX/GSFrameBase.h"
 #include "Emu/RSX/WG/WebGPUGSRender.h"
 #include "Emu/Memory/vm.h"
 #include "Emu/Audio/Null/NullAudioBackend.h"
 #include "Emu/Audio/Null/null_enumerator.h"
 #include "Emu/Io/Null/null_camera_handler.h"
+#include "Emu/Io/Null/NullKeyboardHandler.h"
+#include "Emu/Io/Null/NullMouseHandler.h"
 #include "Emu/Io/Null/null_music_handler.h"
 #include "Emu/Io/pad_config.h"
 #include "Input/pad_thread.h"
@@ -16,12 +21,22 @@
 #include "Emu/Cell/Modules/sceNp.h"
 #include "Emu/Cell/Modules/sceNpTrophy.h"
 #include "Emu/system_config.h"
+#include "Emu/vfs_config.h"
+#include "Crypto/key_vault.h"
+#include "Crypto/unself.h"
+#include "Loader/PUP.h"
+#include "Loader/TAR.h"
 #include "Utilities/Thread.h"
+#include "util/serialization.hpp"
+#include "util/logs.hpp"
 #include "util/video_source.h"
 
 #include <emscripten.h>
+#include <emscripten/wasmfs.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -33,9 +48,19 @@
 #include <thread>
 #include <utility>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #ifdef RPCS3_WEB
 extern atomic_t<u64> g_ppu_web_instruction_count;
 extern atomic_t<u32> g_ppu_web_last_pc;
+extern atomic_t<u32> g_ppu_web_trace_pc;
+extern atomic_t<u32> g_ppu_web_trace_hits;
+extern atomic_t<u32> g_ppu_web_trace_delay_pc;
+extern atomic_t<u32> g_ppu_web_trace_delay_hits;
+extern atomic_t<u32> g_ppu_web_trace_delay_ms;
+extern atomic_t<u32> g_ppu_web_watch_address;
 extern std::vector<std::string> g_ppu_function_names;
 #endif
 
@@ -47,7 +72,12 @@ std::string g_input_config_override;
 namespace
 {
 	std::atomic<bool> s_initialized{false};
+	std::atomic<s32> s_storage_state{0};
+	std::atomic<u32> s_firmware_result{0};
+	std::atomic<u32> s_firmware_progress{0};
+	std::atomic<u32> s_firmware_total{0};
 	std::atomic<u32> s_last_boot_result{static_cast<u32>(game_boot_result::nothing_to_boot)};
+	std::unique_ptr<logs::listener> s_log_listener;
 
 	EM_JS(void, notify_host_event, (const char* event, u32 value), {
 		const message = { type: UTF8ToString(event), value };
@@ -57,6 +87,132 @@ namespace
 			globalThis.dispatchEvent(new CustomEvent(message.type, { detail: message }));
 		}
 	});
+
+	bool initialize_storage()
+	{
+		if (s_storage_state.load() == 1)
+		{
+			return true;
+		}
+
+		backend_t opfs = wasmfs_create_opfs_backend();
+		if (!opfs || wasmfs_create_directory("/opfs", 0777, opfs) != 0)
+		{
+			s_storage_state = -1;
+			notify_host_event("rpcs3-storage-failed", static_cast<u32>(errno));
+			return false;
+		}
+
+		// All firmware, caches, saves, and configuration live outside the Wasm
+		// heap. The JavaScript importer writes to the same origin-private root,
+		// so large games never need to fit in linear memory.
+		::setenv("XDG_CONFIG_HOME", "/opfs", 1);
+		::setenv("XDG_CACHE_HOME", "/opfs/cache", 1);
+		::mkdir("/opfs/cache", 0777);
+		::mkdir("/opfs/cache/rpcs3", 0777);
+		::mkdir("/opfs/games", 0777);
+		::mkdir("/opfs/rpcs3", 0777);
+
+		s_storage_state = 1;
+		notify_host_event("rpcs3-storage-ready", 1);
+		return true;
+	}
+
+	u32 install_firmware(const char* path)
+	{
+		s_firmware_progress = 0;
+		s_firmware_total = 0;
+		s_firmware_result = 1;
+		if (!path || !*path || !s_initialized)
+		{
+			return 1;
+		}
+
+		{
+			fs::file pup_file(path);
+			if (!pup_file)
+			{
+				return s_firmware_result = 2;
+			}
+
+			pup_object pup(std::move(pup_file));
+			if (pup.operator pup_error() != pup_error::ok)
+			{
+				return s_firmware_result = 3;
+			}
+
+			fs::file update_file = pup.get_file(0x300);
+			if (!update_file || !update_file.size())
+			{
+				return s_firmware_result = 4;
+			}
+
+			tar_object update_files(update_file);
+			auto filenames = update_files.get_filenames();
+			filenames.erase(std::remove_if(filenames.begin(), filenames.end(), [](const std::string& name)
+			{
+				return name.find("dev_flash_") == std::string::npos;
+			}), filenames.end());
+			if (filenames.empty())
+			{
+				return s_firmware_result = 5;
+			}
+
+			if (!vfs::mount("/dev_flash", g_cfg_vfs.get_dev_flash()))
+			{
+				return s_firmware_result = 6;
+			}
+			std::printf("RPCS3 Web firmware target: %s\n", g_cfg_vfs.get_dev_flash().c_str());
+
+			s_firmware_total = static_cast<u32>(filenames.size());
+			notify_host_event("rpcs3-firmware-started", s_firmware_total);
+			for (const std::string& filename : filenames)
+			{
+				auto stream = update_files.get_file(filename);
+				if (!stream)
+				{
+					return s_firmware_result = 7;
+				}
+				if (stream->m_file_handler &&
+					!stream->m_file_handler->handle_file_op(*stream, 0, stream->get_size(umax), nullptr))
+				{
+					return s_firmware_result = 7;
+				}
+
+				fs::file package = fs::make_stream(std::move(stream->data));
+				SCEDecrypter decrypter(package);
+				if (!decrypter.LoadHeaders() || !decrypter.LoadMetadata(SCEPKG_ERK, SCEPKG_RIV) || !decrypter.DecryptData())
+				{
+					return s_firmware_result = 8;
+				}
+
+				auto files = decrypter.MakeFile();
+				if (files.size() < 3 || files[2].size() < 3)
+				{
+					return s_firmware_result = 9;
+				}
+				tar_object archive(files[2]);
+				const auto entries = archive.get_filenames();
+				std::printf("RPCS3 Web firmware package: %s (%u entries)\n", filename.c_str(), static_cast<u32>(entries.size()));
+				if (entries.empty() || !archive.extract())
+				{
+					return s_firmware_result = 9;
+				}
+
+				const u32 progress = ++s_firmware_progress;
+				notify_host_event("rpcs3-firmware-progress", progress);
+			}
+
+			update_file.close();
+			if (!fs::is_file(g_cfg_vfs.get_dev_flash() + "sys/external/liblv2.sprx"))
+			{
+				return s_firmware_result = 11;
+			}
+			s_firmware_result = 0;
+			notify_host_event("rpcs3-firmware-installed", s_firmware_progress);
+			return 0;
+		}
+	}
 
 	class web_gs_frame final : public GSFrameBase
 	{
@@ -124,8 +280,14 @@ namespace
 
 		// Browser keyboard and touch state enters through RPCS3's normal pad
 		// thread. Pointer devices are not required by the current fixtures.
-		callbacks.init_kb_handler = [] {};
-		callbacks.init_mouse_handler = [] {};
+		callbacks.init_kb_handler = []
+		{
+			ensure(g_fxo->init<KeyboardHandlerBase, NullKeyboardHandler>(Emu.DeserialManager()));
+		};
+		callbacks.init_mouse_handler = []
+		{
+			ensure(g_fxo->init<MouseHandlerBase, NullMouseHandler>(Emu.DeserialManager()));
+		};
 		callbacks.init_pad_handler = [](std::string_view title_id)
 		{
 			ensure(g_fxo->init<named_thread<pad_thread>>(nullptr, nullptr, title_id));
@@ -212,12 +374,21 @@ extern "C"
 {
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_init()
 	{
-		if (s_initialized.exchange(true))
+		if (s_initialized.load())
 		{
 			return 1;
 		}
+		if (!initialize_storage())
+		{
+			return 0;
+		}
+		s_initialized = true;
 
 		Emu.SetCallbacks(make_web_callbacks());
+		if (!s_log_listener)
+		{
+			s_log_listener = logs::make_file_listener("/opfs/cache/rpcs3/RPCS3.log", 32 * 1024 * 1024);
+		}
 		Emu.SetHasGui(false);
 		Emu.SetHeadless(false);
 		Emu.SetSupportedRenderers({video_renderer::webgpu});
@@ -226,6 +397,43 @@ extern "C"
 		Emu.Init();
 		notify_host_event("rpcs3-initialized", 0);
 		return 1;
+	}
+
+	EMSCRIPTEN_KEEPALIVE s32 rpcs3_web_storage_state()
+	{
+		return s_storage_state;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_install_firmware(const char* path)
+	{
+		return install_firmware(path);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_firmware_result()
+	{
+		return s_firmware_result;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_firmware_progress()
+	{
+		return s_firmware_progress;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_firmware_total()
+	{
+		return s_firmware_total;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_has_firmware()
+	{
+		return s_initialized && fs::is_file(g_cfg_vfs.get_dev_flash() + "sys/external/liblv2.sprx");
+	}
+
+	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_dev_flash_path()
+	{
+		static std::string path;
+		path = s_initialized ? g_cfg_vfs.get_dev_flash() : "";
+		return path.c_str();
 	}
 
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_boot(const char* path)
@@ -247,6 +455,11 @@ extern "C"
 		return static_cast<u32>(Emu.GetStatus(false));
 	}
 
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_sync_logs()
+	{
+		logs::listener::sync_all();
+	}
+
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_last_boot_result()
 	{
 		return s_last_boot_result;
@@ -260,6 +473,34 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_last_pc()
 	{
 		return g_ppu_web_last_pc;
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_clock_scale(u32 percent)
+	{
+		g_cfg.core.clocks_scale.set(std::clamp(percent, 10u, 3000u));
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_trace_pc(u32 pc)
+	{
+		g_ppu_web_trace_hits = 0;
+		g_ppu_web_trace_pc = pc;
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_trace_delay(u32 pc, u32 delay_ms)
+	{
+		g_ppu_web_trace_delay_hits = 0;
+		g_ppu_web_trace_delay_pc = pc;
+		g_ppu_web_trace_delay_ms = std::min(delay_ms, 10'000u);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_trace_hits()
+	{
+		return g_ppu_web_trace_hits;
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_watch_address(u32 address)
+	{
+		g_ppu_web_watch_address = address;
 	}
 
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_debug_read32(u32 addr)
@@ -288,6 +529,39 @@ extern "C"
 
 		const u32 index = (pc - base) / 8;
 		return index < g_ppu_function_names.size() ? g_ppu_function_names[index].c_str() : "";
+	}
+
+	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_thread_snapshot()
+	{
+		static std::string snapshot;
+		snapshot.clear();
+		if (const auto render = rsx::get_current_renderer())
+		{
+			const u64 get_put = render->new_get_put;
+			fmt::append(snapshot,
+				"RSX running=%u initialized=%u state=0x%x pause-lock=%u pause-ack=%u interrupts=0x%x new-get=0x%08x new-put=0x%08x fifo=%u\n",
+				static_cast<u32>(render->rsx_thread_running.load()), render->is_initialized.load(),
+				static_cast<u32>(+render->state), render->external_interrupt_lock.load(),
+				static_cast<u32>(render->external_interrupt_ack.load()),
+				static_cast<u32>(render->m_eng_interrupt_mask.load()), static_cast<u32>(get_put),
+				static_cast<u32>(get_put >> 32), static_cast<u32>(render->fifo_ctrl != nullptr));
+		}
+		idm::select<named_thread<ppu_thread>>([&](u32 id, ppu_thread& ppu)
+		{
+			const auto name = ppu.ppu_tname.load();
+			fmt::append(snapshot, "PPU id=0x%08x name=%s pc=0x%08x lr=0x%llx ctr=0x%llx state=0x%x current=%s last=%s args=[0x%llx,0x%llx,0x%llx,0x%llx]\n",
+				id, name ? name->c_str() : "", ppu.cia, ppu.lr, ppu.ctr, static_cast<u32>(+ppu.state),
+				ppu.current_function ? ppu.current_function : "", ppu.last_function ? ppu.last_function : "",
+				ppu.gpr[3], ppu.gpr[4], ppu.gpr[5], ppu.gpr[6]);
+		});
+		idm::select<named_thread<spu_thread>>([&](u32, spu_thread& spu)
+		{
+			const auto name = spu.spu_tname.load();
+			fmt::append(snapshot, "SPU id=0x%08x name=%s pc=0x%05x state=0x%x current=%s\n",
+				spu.lv2_id, name ? name->c_str() : "", spu.pc, static_cast<u32>(+spu.state),
+				spu.current_func ? spu.current_func : "");
+		});
+		return snapshot.c_str();
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_stop()

@@ -45,7 +45,8 @@ if(RPCS3_WEB)
 		${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_main.cpp)
 	target_link_libraries(rpcs3_web_runtime PRIVATE
 		rpcs3_emu
-		3rdparty::fusion)
+		3rdparty::fusion
+		3rdparty::zlib)
 	set_target_properties(rpcs3_web_runtime PROPERTIES
 		OUTPUT_NAME "rpcs3-web"
 		SUFFIX ".mjs")
@@ -57,10 +58,11 @@ if(RPCS3_WEB)
 		"-sEXPORT_NAME=createRPCS3"
 		"-sENVIRONMENT=web,worker"
 		"-sALLOW_MEMORY_GROWTH=1"
+		"-sWASMFS=1"
 		"-sMAXIMUM_MEMORY=2147483648"
 		"-sINITIAL_MEMORY=536870912"
 		"-sSTACK_SIZE=8388608"
-		"-sPTHREAD_POOL_SIZE=16"
+		"-sPTHREAD_POOL_SIZE=32"
 		"-sNO_EXIT_RUNTIME=1"
 		"-sFORCE_FILESYSTEM=1"
 		"-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8','PThread']"

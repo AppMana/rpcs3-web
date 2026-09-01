@@ -540,6 +540,35 @@ lv2_fs_object::lv2_fs_object(utils::serial& ar, bool)
 
 u64 lv2_file::op_read(const fs::file& file, vm::ptr<void> buf, u64 size, u64 opt_pos)
 {
+#ifdef RPCS3_WEB
+	// Wasm32 maps guest pages independently. Adjacent guest addresses are not
+	// guaranteed to have adjacent host backing, so never expose a multi-page
+	// guest pointer to native file I/O.
+	u64 result = 0;
+
+	while (result < size && result <= 0xffff'ffffull - buf.addr())
+	{
+		const u32 addr = buf.addr() + static_cast<u32>(result);
+		const u64 block = std::min<u64>(size - result, 0x1000 - (addr & 0xfff));
+
+		if (!vm::check_addr(addr, vm::page_writable, static_cast<u32>(block)))
+		{
+			break;
+		}
+
+		const u64 nread = opt_pos == umax
+			? file.read(vm::get_super_ptr(addr), block)
+			: file.read_at(opt_pos + result, vm::get_super_ptr(addr), block);
+		result += nread;
+
+		if (nread < block)
+		{
+			break;
+		}
+	}
+
+	return result;
+#else
 	if (u64 region = buf.addr() >> 28, region_end = (buf.addr() + size) >> 28;
 		size < u32{umax} && region == region_end && (region == 0 || region == 0xD) && vm::check_addr(buf.addr(), vm::page_writable, static_cast<u32>(size)))
 	{
@@ -568,10 +597,35 @@ u64 lv2_file::op_read(const fs::file& file, vm::ptr<void> buf, u64 size, u64 opt
 	}
 
 	return result;
+#endif
 }
 
 u64 lv2_file::op_write(const fs::file& file, vm::cptr<void> buf, u64 size)
 {
+#ifdef RPCS3_WEB
+	u64 result = 0;
+
+	while (result < size && result <= 0xffff'ffffull - buf.addr())
+	{
+		const u32 addr = buf.addr() + static_cast<u32>(result);
+		const u64 block = std::min<u64>(size - result, 0x1000 - (addr & 0xfff));
+
+		if (!vm::check_addr(addr, vm::page_readable, static_cast<u32>(block)))
+		{
+			break;
+		}
+
+		const u64 nwrite = file.write(vm::get_super_ptr(addr), block);
+		result += nwrite;
+
+		if (nwrite < block)
+		{
+			break;
+		}
+	}
+
+	return result;
+#else
 	if (u64 region = buf.addr() >> 28, region_end = (buf.addr() + size) >> 28;
 		size < u32{umax} && region == region_end && (region == 0 || region == 0xD) && vm::check_addr(buf.addr(), vm::page_readable, static_cast<u32>(size)))
 	{
@@ -599,6 +653,7 @@ u64 lv2_file::op_write(const fs::file& file, vm::cptr<void> buf, u64 size)
 	}
 
 	return result;
+#endif
 }
 
 lv2_file::lv2_file(utils::serial& ar)

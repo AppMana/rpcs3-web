@@ -1,7 +1,7 @@
 export const DRAW_PACKET_MAGIC = 0x52444757;
-export const DRAW_PACKET_ABI = 1;
+export const DRAW_PACKET_ABI = 2;
 export const DRAW_PACKET_HEADER_SIZE = 192;
-export const TEXTURE_PACKET_RECORD_SIZE = 48;
+export const TEXTURE_PACKET_RECORD_SIZE = 64;
 
 export const PacketKind = Object.freeze({ draw: 1, clear: 2, flip: 3 });
 export const PacketFlag = Object.freeze({
@@ -68,6 +68,7 @@ export function decodeTextureRecords(bytes) {
       dimension: u32(view, offset + 36),
       dataOffset,
       dataSize,
+      contentHash: u32(view, offset + 48),
       bytes: bytes.subarray(dataOffset, dataOffset + dataSize),
     });
   }
@@ -134,7 +135,11 @@ export function copyFrontPacket(module) {
   try {
     const copied = module.ccall("rpcs3_webgpu_copy_front", "number", ["number", "number"], [pointer, size]) >>> 0;
     if (copied !== size) throw new Error(`WebGPU packet changed while copying (${size} -> ${copied})`);
+    if (pointer + size > module.HEAPU8.byteLength) {
+      module.ccall("rpcs3_web_ppu_last_function", "string", [], []);
+    }
     const bytes = module.HEAPU8.slice(pointer, pointer + size);
+    if (bytes.byteLength !== size) throw new Error(`Wasm heap view did not grow for a ${size}-byte WebGPU packet`);
     if (module.ccall("rpcs3_webgpu_pop_front", "number", [], []) !== 1) {
       throw new Error("WebGPU packet disappeared before pop");
     }
@@ -217,7 +222,7 @@ export function packetSummary(packet) {
       mipCount: texture.mipCount,
       dimension: texture.dimension,
       dataSize: texture.dataSize,
-      hash: fnv1a32(texture.bytes).toString(16).padStart(8, "0"),
+      hash: texture.contentHash.toString(16).padStart(8, "0"),
       nonzeroBytes: texture.bytes.reduce((count, value) => count + (value !== 0 ? 1 : 0), 0),
       bytes: hex(texture.bytes, 64),
     }));

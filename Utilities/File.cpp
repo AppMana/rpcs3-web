@@ -1574,6 +1574,25 @@ bool fs::truncate_file(const std::string& path, u64 length)
 	CloseHandle(handle);
 	return true;
 #else
+#ifdef RPCS3_WEB
+	const int fd = ::open(path.c_str(), O_WRONLY);
+	if (fd < 0)
+	{
+		g_tls_error = to_error(errno);
+		return false;
+	}
+
+	const int result = ::ftruncate(fd, length);
+	const int error = errno;
+	::close(fd);
+	if (result != 0)
+	{
+		g_tls_error = to_error(error);
+		return false;
+	}
+
+	return true;
+#else
 	if (::truncate(path.c_str(), length) != 0)
 	{
 		g_tls_error = to_error(errno);
@@ -1581,6 +1600,7 @@ bool fs::truncate_file(const std::string& path, u64 length)
 	}
 
 	return true;
+#endif
 #endif
 }
 
@@ -2293,6 +2313,9 @@ const std::string& fs::get_config_dir([[maybe_unused]] bool get_config_subdirect
 		dir.resize(dir.rfind('/') + 1);
 #else
 
+#ifdef RPCS3_WEB
+		dir = "/opfs";
+#else
 #ifdef __APPLE__
 		if (const char* home = ::getenv("HOME"))
 			dir = home + "/Library/Application Support"s;
@@ -2304,13 +2327,16 @@ const std::string& fs::get_config_dir([[maybe_unused]] bool get_config_subdirect
 #endif
 		else // Just in case
 			dir = "./config";
+#endif
 
 		dir += "/rpcs3/";
 
+#ifndef RPCS3_WEB
 		if (!create_path(dir))
 		{
 			std::printf("Failed to create configuration directory '%s' (%d).\n", dir.c_str(), errno);
 		}
+#endif
 #endif
 
 		return dir;
@@ -2341,6 +2367,9 @@ const std::string& fs::get_cache_dir()
 		dir = get_config_dir();
 #else
 
+#ifdef RPCS3_WEB
+		dir = "/opfs/cache";
+#else
 #ifdef __APPLE__
 		if (const char* home = ::getenv("HOME"))
 			dir = home + "/Library/Caches"s;
@@ -2354,13 +2383,16 @@ const std::string& fs::get_cache_dir()
 #endif
 		else // Just in case
 			dir = "./cache";
+#endif
 
 		dir += "/rpcs3/";
 
+#ifndef RPCS3_WEB
 		if (!create_path(dir))
 		{
 			std::printf("Failed to create configuration directory '%s' (%d).\n", dir.c_str(), errno);
 		}
+#endif
 #endif
 
 		return dir;

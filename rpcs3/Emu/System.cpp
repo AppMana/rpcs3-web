@@ -491,6 +491,9 @@ void Emulator::Init()
 	// Reset defaults, cache them
 	g_cfg_vfs.from_default();
 	g_cfg.from_default();
+#ifdef RPCS3_WEB
+	g_cfg.core.clocks_scale.set(10);
+#endif
 	g_cfg.name.clear();
 
 	// Not all renderers are known at compile time, so set a provided default if possible

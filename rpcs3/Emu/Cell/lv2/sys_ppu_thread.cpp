@@ -83,6 +83,10 @@ void _sys_ppu_thread_exit(ppu_thread& ppu, u64 errorcode)
 	u64 writer_mask = 0;
 
 	sys_ppu_thread.trace("_sys_ppu_thread_exit(errorcode=0x%llx)", errorcode);
+#ifdef RPCS3_WEB
+	sys_ppu_thread.notice("Web PPU exit: id=0x%x, name=\"%s\", errorcode=0x%llx, cia=0x%x, lr=0x%llx", ppu.id,
+		*ppu.ppu_tname.load(), errorcode, ppu.cia, ppu.lr);
+#endif
 
 	ppu_join_status old_status;
 

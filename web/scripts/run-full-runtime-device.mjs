@@ -120,8 +120,10 @@ async function upload(connection, name, bytes, mimeType) {
 const root = path.resolve(import.meta.dirname, "..");
 const source = async (relative) => readFile(path.join(root, "public", relative));
 let coreSource = (await source("core/rpcs3-web.mjs")).toString("utf8");
-const pthreadConstructor = 'new Worker(new URL("rpcs3-web.mjs", import.meta.url), {';
-if (!coreSource.includes(pthreadConstructor)) throw new Error("Emscripten pthread worker constructor changed");
+// The release glue is whitespace-minified; match the pthread worker
+// constructor with or without spaces.
+const pthreadConstructor = /new Worker\(new URL\("rpcs3-web\.mjs",\s*import\.meta\.url\),\s*\{/;
+if (!pthreadConstructor.test(coreSource)) throw new Error("Emscripten pthread worker constructor changed");
 coreSource = coreSource.replace(pthreadConstructor, "new Worker(import.meta.url, {");
 
 let rendererSource = (await source("rpcs3-webgpu-renderer.mjs")).toString("utf8");
@@ -130,11 +132,18 @@ if (!rendererSource.includes("__DEVICE_PACKET_URL__")) throw new Error("renderer
 
 // The worker honours coreUrl/wasmUrl/fixtureUrl from the boot message, so
 // only the static packet import needs to point at the injected Blob URL.
+// A Blob URL module cannot resolve relative specifiers, so every static import
+// of the worker is uploaded and rewritten to its own Blob URL.
 let workerSource = (await source("runtime-smoke-worker.mjs")).toString("utf8");
-workerSource = workerSource.replace('"./rpcs3-webgpu-packet.mjs"', '"__DEVICE_PACKET_URL__"');
-for (const marker of ["__DEVICE_PACKET_URL__", "event.data.coreUrl", "event.data.wasmUrl", "event.data.fixtureUrl"]) {
+workerSource = workerSource
+  .replace('"./rpcs3-webgpu-packet.mjs"', '"__DEVICE_PACKET_URL__"')
+  .replace('"./rpcs3-ppu-dispatcher.mjs"', '"__DEVICE_PPU_DISPATCHER_URL__"')
+  .replace('"./rpcs3-spu-dispatcher.mjs"', '"__DEVICE_SPU_DISPATCHER_URL__"');
+for (const marker of ["__DEVICE_PACKET_URL__", "__DEVICE_PPU_DISPATCHER_URL__", "__DEVICE_SPU_DISPATCHER_URL__", "event.data.coreUrl", "event.data.wasmUrl", "event.data.fixtureUrl"]) {
   if (!workerSource.includes(marker)) throw new Error(`worker rewrite failed for ${marker}`);
 }
+const ppuDispatcherSource = await source("rpcs3-ppu-dispatcher.mjs");
+const spuDispatcherSource = await source("rpcs3-spu-dispatcher.mjs");
 
 let { device, page } = await discoverPage();
 let connection = await new WebKitConnection(page.webSocketDebuggerUrl).open();
@@ -201,6 +210,8 @@ try {
     globalThis.__rpcs3DeviceUrls = [];
   `);
   await upload(connection, "packet", await source("rpcs3-webgpu-packet.mjs"), "text/javascript");
+  await upload(connection, "ppuDispatcher", ppuDispatcherSource, "text/javascript");
+  await upload(connection, "spuDispatcher", spuDispatcherSource, "text/javascript");
   await upload(connection, "renderer", Buffer.from(rendererSource), "text/javascript");
   await upload(connection, "worker", Buffer.from(workerSource), "text/javascript");
   await upload(connection, "core", Buffer.from(coreSource), "text/javascript");
@@ -226,7 +237,12 @@ try {
     const coreUrl = blob([decode(globalThis.__rpcs3DeviceUpload.core.parts)], "text/javascript");
     const wasmUrl = blob([decode(globalThis.__rpcs3DeviceUpload.wasm.parts)], "application/wasm");
     const fixtureUrl = blob([decode(globalThis.__rpcs3DeviceUpload.fixture.parts)], "application/octet-stream");
-    const workerUrl = blob([text("worker").replaceAll("__DEVICE_PACKET_URL__", packetUrl)], "text/javascript");
+    const ppuDispatcherUrl = blob([decode(globalThis.__rpcs3DeviceUpload.ppuDispatcher.parts)], "text/javascript");
+    const spuDispatcherUrl = blob([decode(globalThis.__rpcs3DeviceUpload.spuDispatcher.parts)], "text/javascript");
+    const workerUrl = blob([text("worker")
+      .replaceAll("__DEVICE_PACKET_URL__", packetUrl)
+      .replaceAll("__DEVICE_PPU_DISPATCHER_URL__", ppuDispatcherUrl)
+      .replaceAll("__DEVICE_SPU_DISPATCHER_URL__", spuDispatcherUrl)], "text/javascript");
     globalThis.__rpcs3DeviceUpload = undefined;
 
     const old = document.querySelector("#full-rpcs3-device-test");
@@ -251,7 +267,7 @@ try {
       const timer = setTimeout(() => reject(new Error("full RPCS3 device runtime timed out")), ${timeoutMs});
       const onError = (event) => {
         clearTimeout(timer);
-        reject(new Error(event.message || "full RPCS3 device worker failed"));
+        reject(new Error("full RPCS3 device worker failed: " + (event.message || "") + " " + (event.filename || "") + ":" + (event.lineno || 0) + " " + String(event.error || "")));
       };
       const onMessage = async (event) => {
         if (event.data?.type !== expectedType) return;
@@ -289,12 +305,14 @@ try {
     const frames = [await firstFrame];
     let runtime;
     if (isTetris) {
-      while (frames.at(-1).gpu.draws < 9 && frames.length < 120) {
+      // Queued frames arrive without a round trip now, so the title screen's
+      // guest-time countdown spans several hundred flips of harness time.
+      while (frames.at(-1).gpu.draws < 9 && frames.length < 900) {
         const nextFrame = receiveFrame("runtime-frame", false);
         worker.postMessage({ type: "next-frame" });
         frames.push(await nextFrame);
       }
-      if (frames.at(-1).gpu.draws < 9) throw new Error("Tetris did not enter gameplay within 120 guest flips");
+      if (frames.at(-1).gpu.draws < 9) throw new Error("Tetris did not enter gameplay within " + frames.length + " guest flips: draws=" + JSON.stringify(frames.map((f) => f.gpu.draws)) + " ppu=" + JSON.stringify(frames.map((f) => f.ppuInstructions)) + " skips=" + JSON.stringify(frames.map((f) => f.presentedSkips)));
       const center = (frame) => frame.gpu.drawDiagnostics.slice(-4)
         .reduce((sum, draw) => sum + (draw.clipBounds.min[0] + draw.clipBounds.max[0]) / 2, 0) / 4;
       // Output-based movement evidence: the mean column of green block pixels
@@ -438,8 +456,12 @@ try {
     && result.gpu?.depthStates?.[0]?.comparison === "less"
     && result.gpu?.targetStates?.[1]?.blendEnabled === true
     && result.animationFrames?.length === 3
-    && result.animationFrames[1]?.ppuInstructions > result.animationFrames[0]?.ppuInstructions
-    && result.animationFrames[2]?.ppuInstructions > result.animationFrames[1]?.ppuInstructions
+    // Frames may already be queued when requested (RSX runs ahead of the
+    // harness), so consecutive captures can share a PPU count; the run as a
+    // whole must still advance, and every frame must be a distinct guest frame.
+    && result.animationFrames[1]?.ppuInstructions >= result.animationFrames[0]?.ppuInstructions
+    && result.animationFrames[2]?.ppuInstructions >= result.animationFrames[1]?.ppuInstructions
+    && result.animationFrames[2]?.ppuInstructions > result.animationFrames[0]?.ppuInstructions
     && new Set(result.animationFrames.map((frame) => frame.frameHash)).size === result.animationFrames.length
     && new Set(result.animationFrames.map((frame) => JSON.stringify(frame.cubeClipBounds))).size === result.animationFrames.length
     && result.animationFrames.every((frame) => frame.droppedPackets === 0)

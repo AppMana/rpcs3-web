@@ -525,42 +525,66 @@ namespace
 {
 	struct ppu_web_dispatch_page
 	{
-		std::atomic<ppu_intrp_func_t> entries[0x10000 / sizeof(u32)]{};
+		std::atomic<ppu_intrp_func_t> hooks[0x10000 / sizeof(u32)]{};
+		std::atomic<u64> decoded[0x10000 / sizeof(u32)]{};
 	};
 
 	std::array<std::atomic<ppu_web_dispatch_page*>, 0x10000> s_ppu_web_dispatch_pages{};
 	std::mutex s_ppu_web_dispatch_mutex;
+
+	ppu_web_dispatch_page* ppu_web_dispatch_page_for(u32 addr, bool create)
+	{
+		auto& page_slot = s_ppu_web_dispatch_pages[addr >> 16];
+		auto page = page_slot.load(std::memory_order_acquire);
+		if (!page && create)
+		{
+			std::lock_guard lock(s_ppu_web_dispatch_mutex);
+			page = page_slot.load(std::memory_order_relaxed);
+			if (!page)
+			{
+				page = new ppu_web_dispatch_page;
+				page_slot.store(page, std::memory_order_release);
+			}
+		}
+		return page;
+	}
+}
+
+static inline ppu_intrp_func_t ppu_read(u32 addr, u32 opcode)
+{
+	const u32 index = (addr & 0xffff) / sizeof(u32);
+	auto page = ppu_web_dispatch_page_for(addr, true);
+	if (const auto function = page->hooks[index].load(std::memory_order_acquire))
+	{
+		return function;
+	}
+
+	const u64 cached = page->decoded[index].load(std::memory_order_acquire);
+	if (static_cast<u32>(cached >> 32) == opcode && static_cast<u32>(cached))
+	{
+		return reinterpret_cast<ppu_intrp_func_t>(static_cast<uptr>(static_cast<u32>(cached)));
+	}
+
+	const auto function = g_fxo->get<ppu_interpreter_rt>().decode(opcode);
+	static_assert(sizeof(function) <= sizeof(u32));
+	page->decoded[index].store(u64{opcode} << 32 | static_cast<u32>(reinterpret_cast<uptr>(function)), std::memory_order_release);
+	return function;
 }
 
 static inline ppu_intrp_func_t ppu_read(u32 addr)
 {
-	if (const auto page = s_ppu_web_dispatch_pages[addr >> 16].load(std::memory_order_acquire))
-	{
-		if (const auto function = page->entries[(addr & 0xffff) / sizeof(u32)].load(std::memory_order_acquire))
-		{
-			return function;
-		}
-	}
-	return ppu_cache(addr);
+	return ppu_read(addr, vm::read32(addr));
 }
 
 static inline void ppu_write(u32 addr, ppu_intrp_func_t function)
 {
-	auto& page_slot = s_ppu_web_dispatch_pages[addr >> 16];
-	auto page = page_slot.load(std::memory_order_acquire);
-	if (!page && function)
-	{
-		std::lock_guard lock(s_ppu_web_dispatch_mutex);
-		page = page_slot.load(std::memory_order_relaxed);
-		if (!page)
-		{
-			page = new ppu_web_dispatch_page;
-			page_slot.store(page, std::memory_order_release);
-		}
-	}
-
+	auto page = ppu_web_dispatch_page_for(addr, function != nullptr);
 	if (page)
-		page->entries[(addr & 0xffff) / sizeof(u32)].store(function, std::memory_order_release);
+	{
+		const u32 index = (addr & 0xffff) / sizeof(u32);
+		page->decoded[index].store(0, std::memory_order_release);
+		page->hooks[index].store(function, std::memory_order_release);
+	}
 }
 #else
 static inline ppu_intrp_func_t ppu_read(u32 addr)
@@ -932,9 +956,9 @@ extern void ppu_register_function_at(u32 addr, u32 size, ppu_intrp_func_t ptr = 
 	}
 
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
-	// Decoded instructions are not cached by address in Wasm. Preserve an
-	// explicit hook if one exists; ordinary code observes guest writes on the
-	// next dispatch automatically.
+	// Ordinary browser dispatch uses an opcode-validated cache. Preserve only
+	// explicit function hooks here; guest writes invalidate cached decoding by
+	// changing the opcode observed on the next dispatch.
 	return;
 #else
 	size = utils::align<u32>(size + addr % 4, 4);
@@ -2931,8 +2955,9 @@ void ppu_thread::exec_task()
 					read32(gpr[25] + 0x18), read32(gpr[25] + 0x38));
 			}
 		}
-		const auto fn = ppu_read(cia);
-		fn(*this, {*op}, op, &ppu_ret);
+		const u32 opcode = *op;
+		const auto fn = ppu_read(cia, opcode);
+		fn(*this, {opcode}, op, &ppu_ret);
 		if (!web_reported_zero_pc && cia == 0 && web_instruction_pc != 0)
 		{
 			web_reported_zero_pc = true;

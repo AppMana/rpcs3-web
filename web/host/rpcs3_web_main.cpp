@@ -78,6 +78,22 @@ std::string g_input_config_override;
 
 namespace
 {
+	using web_v128 = u8 __attribute__((vector_size(16)));
+
+	template <typename T>
+	T read_guest_raw(u32 addr) noexcept
+	{
+		T value{};
+		vm::web_copy_range(addr, &value, sizeof(value), false);
+		return value;
+	}
+
+	template <typename T>
+	void write_guest_raw(u32 addr, T value) noexcept
+	{
+		vm::web_copy_range(addr, &value, sizeof(value), true);
+	}
+
 	std::atomic<bool> s_initialized{false};
 	std::atomic<bool> s_null_renderer{false};
 	std::atomic<s32> s_storage_state{0};
@@ -551,6 +567,62 @@ extern "C"
 		std::free(first);
 		std::free(second);
 		return result;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u8 rpcs3_web_vm_read8_raw(u32 addr)
+	{
+		return read_guest_raw<u8>(addr);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u16 rpcs3_web_vm_read16_raw(u32 addr)
+	{
+		return read_guest_raw<u16>(addr);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_vm_read32_raw(u32 addr)
+	{
+		return read_guest_raw<u32>(addr);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_vm_read64_raw(u32 addr)
+	{
+		return read_guest_raw<u64>(addr);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_vm_read128_raw(u32 addr, web_v128* output)
+	{
+		if (output)
+		{
+			*output = read_guest_raw<web_v128>(addr);
+		}
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_vm_write8_raw(u32 addr, u8 value)
+	{
+		write_guest_raw(addr, value);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_vm_write16_raw(u32 addr, u16 value)
+	{
+		write_guest_raw(addr, value);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_vm_write32_raw(u32 addr, u32 value)
+	{
+		write_guest_raw(addr, value);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_vm_write64_raw(u32 addr, u64 value)
+	{
+		write_guest_raw(addr, value);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_vm_write128_raw(u32 addr, const web_v128* value)
+	{
+		if (value)
+		{
+			write_guest_raw(addr, *value);
+		}
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_sync_logs()

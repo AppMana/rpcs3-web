@@ -5,7 +5,7 @@ import { basename, join, resolve } from "node:path";
 
 const [inputArg, outputArg, ...options] = process.argv.slice(2);
 if (!inputArg || !outputArg) {
-  throw new Error("usage: compile-ppu-ir-to-wasm.mjs INPUT.ll OUTPUT.wasm [--export=NAME | --export-all]");
+  throw new Error("usage: compile-ppu-ir-to-wasm.mjs INPUT.ll OUTPUT.wasm [--pic] [--export=NAME | --export-all]");
 }
 
 function findTool(environmentName, name) {
@@ -28,6 +28,7 @@ const input = resolve(inputArg);
 const output = resolve(outputArg);
 const exports = options.filter((option) => option.startsWith("--export="));
 const exportAll = options.includes("--export-all") || exports.length === 0;
+const pic = options.includes("--pic");
 const llvmAs = findTool("RPCS3_LLVM_AS", "llvm-as");
 const llc = findTool("RPCS3_LLC", "llc");
 const wasmLd = findTool("RPCS3_WASM_LD", "wasm-ld");
@@ -40,20 +41,21 @@ try {
   execFileSync(llc, [
     "-mtriple=wasm32-unknown-unknown",
     "-mattr=+atomics,+bulk-memory,+mutable-globals,+sign-ext,+simd128",
+    pic ? "-relocation-model=pic" : undefined,
     "-O2",
     "-filetype=obj",
     bitcode,
     "-o",
     object,
-  ], { stdio: "inherit" });
+  ].filter(Boolean), { stdio: "inherit" });
 
   const linkOptions = [
-    "--no-entry",
+    pic ? "--shared" : "--no-entry",
     "--import-memory",
     "--shared-memory",
-    "--initial-memory=16777216",
+    pic ? undefined : "--initial-memory=16777216",
     "--max-memory=2147483648",
-    "--global-base=12582912",
+    pic ? undefined : "--global-base=12582912",
     "--allow-undefined",
     exportAll ? "--export-all" : undefined,
     ...exports,
@@ -68,6 +70,7 @@ try {
   process.stdout.write(`${JSON.stringify({
     input,
     output,
+    pic,
     bytes: bytes.byteLength,
     imports: WebAssembly.Module.imports(module),
     exports: WebAssembly.Module.exports(module),

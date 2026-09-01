@@ -6358,7 +6358,26 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 		std::string result;
 		raw_string_ostream out(result);
 		out << *_module;
-		fs::write_file(cache_path + obj_name + ".wasm.ll", fs::rewrite, out.str());
+		std::string output_path = cache_path + obj_name + ".wasm.ll";
+		if (const char* output_dir = std::getenv("RPCS3_PPU_WASM_AOT_DIR"))
+		{
+			std::string directory = output_dir;
+			if (!directory.empty())
+			{
+				if (!directory.ends_with('/'))
+				{
+					directory += '/';
+				}
+				if (!fs::create_path(directory) && !fs::is_dir(directory))
+				{
+					ppu_log.error("LLVM: Failed to create Wasm AOT output directory %s", directory);
+					return;
+				}
+				const std::string filename = module_part.path.substr(module_part.path.find_last_of('/') + 1);
+				output_path = directory + filename + "-" + obj_name + ".wasm.ll";
+			}
+		}
+		fs::write_file(output_path, fs::rewrite, out.str());
 		return;
 	}
 

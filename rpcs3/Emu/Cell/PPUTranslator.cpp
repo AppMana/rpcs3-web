@@ -889,6 +889,29 @@ void PPUTranslator::TestAborted()
 Value* PPUTranslator::ReadMemory(Value* addr, Type* type, bool is_be, u32 align)
 {
 	const u32 size = ::narrow<u32>(+type->getPrimitiveSizeInBits());
+	if (m_wasm_aot)
+	{
+		const auto guest_addr = Trunc(addr, GetType<u32>());
+		Value* value;
+		if (size == 128)
+		{
+			const auto storage = m_ir->CreateAlloca(GetType<u8[16]>());
+			Call(GetType<void>(), "rpcs3_web_vm_read128_raw", guest_addr, storage);
+			value = m_ir->CreateLoad(GetType<u8[16]>(), storage);
+		}
+		else
+		{
+			const auto int_type = m_ir->getIntNTy(size);
+			value = Call(int_type, fmt::format("rpcs3_web_vm_read%u_raw", size), guest_addr);
+		}
+
+		if (is_be ^ m_is_be && size > 8)
+		{
+			const auto int_type = m_ir->getIntNTy(size);
+			value = Call(int_type, fmt::format("llvm.bswap.i%u", size), bitcast(value, int_type));
+		}
+		return bitcast(value, type);
+	}
 
 	if (m_may_be_mmio && size == 32)
 	{
@@ -957,6 +980,28 @@ void PPUTranslator::WriteMemory(Value* addr, Value* value, bool is_be, u32 align
 {
 	const auto type = value->getType();
 	const u32 size = ::narrow<u32>(+type->getPrimitiveSizeInBits());
+	if (m_wasm_aot)
+	{
+		if (is_be ^ m_is_be && size > 8)
+		{
+			const auto int_type = m_ir->getIntNTy(size);
+			value = Call(int_type, fmt::format("llvm.bswap.i%u", size), bitcast(value, int_type));
+		}
+
+		const auto guest_addr = Trunc(addr, GetType<u32>());
+		if (size == 128)
+		{
+			const auto storage = m_ir->CreateAlloca(GetType<u8[16]>());
+			m_ir->CreateStore(bitcast(value, GetType<u8[16]>()), storage);
+			Call(GetType<void>(), "rpcs3_web_vm_write128_raw", guest_addr, storage);
+		}
+		else
+		{
+			const auto int_type = m_ir->getIntNTy(size);
+			Call(GetType<void>(), fmt::format("rpcs3_web_vm_write%u_raw", size), guest_addr, bitcast(value, int_type));
+		}
+		return;
+	}
 
 	if (is_be ^ m_is_be && size > 8)
 	{

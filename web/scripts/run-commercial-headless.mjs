@@ -42,6 +42,8 @@ const packetFixturePath = process.env.RPCS3_COMMERCIAL_PACKET_FIXTURE
 const cpuProfilePath = process.env.RPCS3_COMMERCIAL_CPU_PROFILE
   ? path.resolve(process.env.RPCS3_COMMERCIAL_CPU_PROFILE)
   : undefined;
+const cpuSamplingIntervalUs = Math.max(1_000, Math.min(100_000,
+  Number(process.env.RPCS3_COMMERCIAL_CPU_INTERVAL_US) || 10_000));
 const tracePath = process.env.RPCS3_COMMERCIAL_TRACE
   ? path.resolve(process.env.RPCS3_COMMERCIAL_TRACE)
   : undefined;
@@ -66,73 +68,129 @@ let capturedPacketFrame;
 let workerProfiler;
 let traceSession;
 let traceComplete;
+let activePage;
+
+function workSampleCount(profile) {
+  const waitNodes = new Set(profile.nodes
+    .filter(({ callFrame }) => ["(idle)", "emscripten_futex_wait"].includes(callFrame.functionName))
+    .map(({ id }) => id));
+  return (profile.samples || []).reduce((count, id) => count + !waitNodes.has(id), 0);
+}
 
 async function writeCpuProfiles(targets) {
   if (!cpuProfilePath) return;
   const ranked = targets
     .filter(({ profile }) => profile)
-    .sort((left, right) => (right.profile.samples?.length || 0) - (left.profile.samples?.length || 0));
+    .sort((left, right) => workSampleCount(right.profile) - workSampleCount(left.profile));
   await mkdir(path.dirname(cpuProfilePath), { recursive: true });
-  if (ranked.length) await writeFile(cpuProfilePath, `${JSON.stringify(ranked[0].profile)}\n`);
+  const profilePaths = new Map();
+  await Promise.all(ranked.map(async (target, index) => {
+    const profilePath = index === 0 ? cpuProfilePath : `${cpuProfilePath}.${index}`;
+    profilePaths.set(target, profilePath);
+    await writeFile(profilePath, `${JSON.stringify(target.profile)}\n`);
+  }));
   await writeFile(`${cpuProfilePath}.targets.json`, `${JSON.stringify({
+    samplingIntervalUs: cpuSamplingIntervalUs,
     selected: ranked[0]?.targetInfo,
-    targets: targets.map(({ targetInfo, profile, error }) => ({
-      targetInfo,
-      samples: profile?.samples?.length || 0,
-      error,
+    targets: targets.map((target) => ({
+      targetInfo: target.targetInfo,
+      profilePath: profilePaths.get(target),
+      samples: target.profile?.samples?.length || 0,
+      workSamples: target.profile ? workSampleCount(target.profile) : 0,
+      started: Boolean(target.started),
+      recursiveAttachError: target.recursiveAttachError,
+      error: target.error,
     })),
   }, null, 2)}\n`);
 }
 
-function createWorkerProfiler(session) {
+function createWorkerProfiler(session, samplingIntervalUs) {
   let commandId = 0;
   const pending = new Map();
   const targets = new Map();
+  const parents = new Map();
   const starts = [];
 
   const send = async (sessionId, method, params = {}) => {
     const id = ++commandId;
     const key = `${sessionId}:${id}`;
     const response = new Promise((resolve, reject) => pending.set(key, { resolve, reject }));
-    await session.send("Target.sendMessageToTarget", {
-      sessionId,
-      message: JSON.stringify({ id, method, params }),
-    });
+    response.catch(() => {});
+    const message = JSON.stringify({ id, method, params });
+    try {
+      const parentSessionId = parents.get(sessionId);
+      if (parentSessionId) {
+        await send(parentSessionId, "Target.sendMessageToTarget", { sessionId, message });
+      } else {
+        await session.send("Target.sendMessageToTarget", { sessionId, message });
+      }
+    } catch (error) {
+      pending.delete(key);
+      throw error;
+    }
     return response;
   };
 
-  session.on("Target.receivedMessageFromTarget", ({ sessionId, message }) => {
-    const payload = JSON.parse(message);
-    if (!payload.id) return;
-    const waiter = pending.get(`${sessionId}:${payload.id}`);
-    if (!waiter) return;
-    pending.delete(`${sessionId}:${payload.id}`);
-    if (payload.error) waiter.reject(new Error(`${payload.error.code}: ${payload.error.message}`));
-    else waiter.resolve(payload.result || {});
-  });
-  session.on("Target.detachedFromTarget", ({ sessionId }) => {
+  const handleDetached = (sessionId) => {
     const target = targets.get(sessionId);
-    if (target && !target.profile) target.error = "target detached before profile collection";
+    if (target && !target.profile) target.error ??= "target detached before profile collection";
     for (const [key, waiter] of pending) {
       if (!key.startsWith(`${sessionId}:`)) continue;
       pending.delete(key);
       waiter.reject(new Error("target detached"));
     }
-  });
-  session.on("Target.attachedToTarget", ({ sessionId, targetInfo }) => {
-    if (targetInfo.type !== "worker") return;
+  };
+
+  const handleAttached = (sessionId, targetInfo, parentSessionId) => {
+    if (targetInfo.type !== "worker" || targets.has(sessionId)) return;
+    parents.set(sessionId, parentSessionId);
     const target = { sessionId, targetInfo };
     targets.set(sessionId, target);
     starts.push((async () => {
       try {
+        await send(sessionId, "Target.setAutoAttach", {
+          autoAttach: true,
+          waitForDebuggerOnStart: false,
+          flatten: false,
+        });
+      } catch (error) {
+        target.recursiveAttachError = error instanceof Error ? error.message : String(error);
+      }
+      try {
         await send(sessionId, "Profiler.enable");
-        await send(sessionId, "Profiler.setSamplingInterval", { interval: 1_000 });
+        await send(sessionId, "Profiler.setSamplingInterval", { interval: samplingIntervalUs });
         await send(sessionId, "Profiler.start");
         target.started = true;
       } catch (error) {
         target.error = error instanceof Error ? error.message : String(error);
       }
     })());
+  };
+
+  const handleMessage = (sessionId, message) => {
+    const payload = JSON.parse(message);
+    if (payload.id) {
+      const waiter = pending.get(`${sessionId}:${payload.id}`);
+      if (!waiter) return;
+      pending.delete(`${sessionId}:${payload.id}`);
+      if (payload.error) waiter.reject(new Error(`${payload.error.code}: ${payload.error.message}`));
+      else waiter.resolve(payload.result || {});
+      return;
+    }
+    if (payload.method === "Target.receivedMessageFromTarget") {
+      handleMessage(payload.params.sessionId, payload.params.message);
+    } else if (payload.method === "Target.attachedToTarget") {
+      handleAttached(payload.params.sessionId, payload.params.targetInfo, sessionId);
+    } else if (payload.method === "Target.detachedFromTarget") {
+      handleDetached(payload.params.sessionId);
+    }
+  };
+  session.on("Target.receivedMessageFromTarget", ({ sessionId, message }) => {
+    handleMessage(sessionId, message);
+  });
+  session.on("Target.detachedFromTarget", ({ sessionId }) => handleDetached(sessionId));
+  session.on("Target.attachedToTarget", ({ sessionId, targetInfo }) => {
+    handleAttached(sessionId, targetInfo, undefined);
   });
 
   return {
@@ -184,6 +242,7 @@ async function stopTrace() {
 try {
   const pages = context.pages();
   const page = pages[0] ?? await context.newPage();
+  activePage = page;
   if (packetFixturePath) {
     await page.exposeFunction("__rpcs3CapturePacketFrame", (packetBase64, metadata) => {
       capturedPacketFrame = {
@@ -206,7 +265,7 @@ try {
 
   if (cpuProfilePath) {
     const profilerSession = await context.newCDPSession(page);
-    workerProfiler = createWorkerProfiler(profilerSession);
+    workerProfiler = createWorkerProfiler(profilerSession, cpuSamplingIntervalUs);
     await workerProfiler.start();
   }
   if (tracePath) {
@@ -256,6 +315,7 @@ try {
     };
     const run = await new Promise((resolve) => {
       const worker = new Worker("./runtime-smoke-worker.mjs", { type: "module" });
+      globalThis.__rpcs3CommercialWorker = worker;
       const events = [];
       const frames = [];
       let lastProgress;
@@ -452,6 +512,14 @@ try {
   if (traceSession) {
     try {
       await stopTrace();
+    } catch {}
+  }
+  if (activePage) {
+    try {
+      await activePage.evaluate(() => {
+        globalThis.__rpcs3CommercialWorker?.terminate();
+        delete globalThis.__rpcs3CommercialWorker;
+      });
     } catch {}
   }
   await context.close();

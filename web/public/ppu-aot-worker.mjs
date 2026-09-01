@@ -50,10 +50,19 @@ scope.addEventListener("message", async (event) => {
     const mainExports = mainInstance.exports;
     const read32 = mainExports.rpcs3_web_vm_read32_raw;
     const write32 = mainExports.rpcs3_web_vm_write32_raw;
-    write32(0x30184, swap32(0x30200));
-    write32(0x30200, swap32(0x12345678));
-    write32(0x30204, swap32(0x38b50));
-    const guestMapped = read32(0x30184) === swap32(0x30200);
+    const originalImportSlot = read32(0x30184) >>> 0;
+    const originalImportDescriptor = swap32(originalImportSlot);
+    const originalImportTarget = swap32(read32(originalImportDescriptor) >>> 0);
+    const originalImportToc = swap32(read32(originalImportDescriptor + 4) >>> 0);
+    const resolvedImports = [];
+    for (let slot = 0x30168; slot <= 0x301a8; slot += 4) {
+      const descriptor = swap32(read32(slot) >>> 0);
+      resolvedImports.push({
+        slot: `0x${slot.toString(16)}`,
+        descriptor: `0x${descriptor.toString(16)}`,
+        target: `0x${swap32(read32(descriptor) >>> 0).toString(16)}`,
+      });
+    }
 
     const sideAllocationSize = 128 * 1024;
     const sideAllocation = module._malloc(sideAllocationSize + 15);
@@ -84,13 +93,62 @@ scope.addEventListener("message", async (event) => {
     }
 
     const aotInstance = new WebAssembly.Instance(aotWasm, { env });
+    const view = new DataView(mainMemory.buffer);
+    const initialStack = 0x35e00n;
+    const clearContext = () => module.HEAPU8.fill(0, context, context + 2048);
+    const contextState = (targetContext, pc, kind) => ({
+      kind,
+      pc: `0x${pc.toString(16)}`,
+      next: `0x${view.getUint32(targetContext + 1140, true).toString(16)}`,
+      r1: `0x${view.getBigUint64(targetContext + 32, true).toString(16)}`,
+      r2: `0x${view.getBigUint64(targetContext + 40, true).toString(16)}`,
+      r3: `0x${view.getBigUint64(targetContext + 48, true).toString(16)}`,
+      r13: `0x${view.getBigUint64(targetContext + 128, true).toString(16)}`,
+      lr: `0x${view.getBigUint64(targetContext + 1120, true).toString(16)}`,
+    });
+    const runBlock = (targetContext, pc, stackOverride) => {
+      const fn = aotInstance.exports[`__0x${pc.toString(16)}`];
+      if (typeof fn !== "function") return { pc: `0x${pc.toString(16)}`, missing: true };
+      fn(
+        0,
+        targetContext,
+        0n,
+        0,
+        view.getBigUint64(targetContext + 24, true),
+        stackOverride ?? view.getBigUint64(targetContext + 32, true),
+        view.getBigUint64(targetContext + 40, true),
+      );
+      return contextState(targetContext, pc, "aot");
+    };
+
+    clearContext();
+    const naturalBoundary = runBlock(context, 0x1022c, initialStack);
+
+    const probeDescriptor = 0x35f80;
+    write32(0x30184, swap32(probeDescriptor));
+    write32(probeDescriptor, swap32(0x10260));
+    write32(probeDescriptor + 4, swap32(0x38b50));
+    const guestMapped = (read32(0x30184) >>> 0) === swap32(probeDescriptor);
+    clearContext();
+    const dispatcherTrace = [];
+    let dispatchPc = 0x1022c;
+    for (let step = 0; step < 3; step += 1) {
+      const state = runBlock(context, dispatchPc, step === 0 ? initialStack : undefined);
+      dispatcherTrace.push(state);
+      if (state.missing) break;
+      dispatchPc = view.getUint32(context + 1140, true);
+    }
+
+    write32(probeDescriptor, swap32(0x12345678));
+    clearContext();
     const executionStartedAt = performance.now();
-    aotInstance.exports.__0x1022c(0, context, 0n, 0, 0n, 0x31000n, 0n);
+    runBlock(context, 0x1022c, initialStack);
     const aotExecutionMs = performance.now() - executionStartedAt;
 
-    const view = new DataView(mainMemory.buffer);
+    write32(0x30184, originalImportSlot);
     const result = {
       ok: initialized === 1 && sparseVmProbe === 1 && bootResult === 0 && guestMapped &&
+        dispatcherTrace[0]?.next === "0x10260" && dispatcherTrace[1]?.next === "0x103a8" &&
         view.getUint32(context + 1140, true) === 0x12345678 &&
         view.getBigUint64(context + 40, true) === 0x38b50n &&
         view.getBigUint64(context + 1120, true) === 0x103a8n &&
@@ -99,6 +157,12 @@ scope.addEventListener("message", async (event) => {
       sparseVmProbe,
       bootResult,
       guestMapped,
+      originalImportDescriptor: `0x${originalImportDescriptor.toString(16)}`,
+      originalImportTarget: `0x${originalImportTarget.toString(16)}`,
+      originalImportToc: `0x${originalImportToc.toString(16)}`,
+      resolvedImports,
+      naturalBoundary,
+      dispatcherTrace,
       cia: `0x${view.getUint32(context + 1140, true).toString(16)}`,
       r2: `0x${view.getBigUint64(context + 40, true).toString(16)}`,
       lr: `0x${view.getBigUint64(context + 1120, true).toString(16)}`,

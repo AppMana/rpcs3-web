@@ -21,7 +21,12 @@ test("runs RPCS3-translated PPU code against the full sparse Wasm runtime", asyn
     body: JSON.stringify(result, null, 2),
     contentType: "application/json",
   });
-  expect(result).toMatchObject({
+  const { dispatcherTrace, naturalBoundary, resolvedImports, ...summary } = result as Record<string, unknown> & {
+    dispatcherTrace: Array<Record<string, unknown>>;
+    naturalBoundary: Record<string, unknown>;
+    resolvedImports: Array<Record<string, unknown>>;
+  };
+  expect(summary).toMatchObject({
     ok: true,
     initialized: 1,
     sparseVmProbe: 1,
@@ -32,4 +37,12 @@ test("runs RPCS3-translated PPU code against the full sparse Wasm runtime", asyn
     lr: "0x103a8",
     state: 0,
   });
+  expect(dispatcherTrace).toHaveLength(3);
+  expect(dispatcherTrace[0]).toMatchObject({ pc: "0x1022c", next: "0x10260" });
+  expect(dispatcherTrace[1]).toMatchObject({ pc: "0x10260", next: "0x103a8" });
+  expect(naturalBoundary.next).toBe(summary.originalImportTarget);
+  expect(dispatcherTrace[2]).toMatchObject({ pc: "0x103a8" });
+  expect(dispatcherTrace[2]?.next).toBe(
+    resolvedImports.find((entry) => entry.slot === "0x30178")?.target,
+  );
 });

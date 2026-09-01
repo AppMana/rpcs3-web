@@ -48,16 +48,23 @@ const tracePath = process.env.RPCS3_COMMERCIAL_TRACE
   ? path.resolve(process.env.RPCS3_COMMERCIAL_TRACE)
   : undefined;
 const headed = process.env.RPCS3_HEADED === "1";
+// RPCS3_COMMERCIAL_CORE=profile selects the symbolized build staged by
+// `RPCS3_WEB_PROFILE=1 npm run build:runtime` for CPU profiles and traces.
+const coreVariant = process.env.RPCS3_COMMERCIAL_CORE === "profile" ? "profile" : "release";
+const coreUrl = coreVariant === "profile" ? "./core/profile/rpcs3-web.mjs" : "./core/rpcs3-web.mjs";
 
+// Match playwright.gpu.config.ts in both headed and headless mode so a
+// headless commercial report never silently measures SwiftShader.
 const chromeArgs = [
   "--no-sandbox",
   "--enable-unsafe-webgpu",
   "--enable-webgpu-developer-features",
   "--ignore-gpu-blocklist",
+  "--enable-features=Vulkan,VulkanFromANGLE,DefaultANGLEVulkan",
+  "--use-angle=vulkan",
 ];
-if (headed) {
-  chromeArgs.push("--enable-features=Vulkan,VulkanFromANGLE,DefaultANGLEVulkan", "--use-angle=vulkan");
-}
+// Same rejection rule as the hardware Playwright lane.
+const softwareAdapterPattern = /SwiftShader|llvmpipe|software|CPU/i;
 
 const context = await chromium.launchPersistentContext(profilePath, {
   executablePath: process.env.RPCS3_CHROME_PATH || "/usr/bin/google-chrome",
@@ -288,7 +295,7 @@ try {
   }
 
   await page.goto(`${baseURL}/storage.html`, { waitUntil: "domcontentloaded" });
-  const execution = await page.evaluate(async ({ bootPath: guestPath, timeout, requestedFrames, presentToCanvas, untilDraw, renderInterval, captureFrameRgba, captureShaderPrograms, repeatedRenders, capturePacketFixture, watchedAddresses, tracedPc, tracedDelayPc, tracedDelayMs, watchedWriteAddress, guestClockScale, guestAccurateSpuDma, guestRenderer, guestPacketCaptureLevel }) => {
+  const execution = await page.evaluate(async ({ bootPath: guestPath, timeout, requestedFrames, presentToCanvas, untilDraw, renderInterval, captureFrameRgba, captureShaderPrograms, repeatedRenders, capturePacketFixture, watchedAddresses, tracedPc, tracedDelayPc, tracedDelayMs, watchedWriteAddress, guestClockScale, guestCoreUrl, guestAccurateSpuDma, guestRenderer, guestPacketCaptureLevel }) => {
     const [{ decodeDrawPacket }, { prepareWebGPU, renderPacketsToWebGPU }] = await Promise.all([
       import("./rpcs3-webgpu-packet.mjs"),
       import("./rpcs3-webgpu-renderer.mjs"),
@@ -414,6 +421,7 @@ try {
       worker.postMessage({
         type: "boot",
         path: guestPath,
+        coreUrl: guestCoreUrl,
         packetTimeoutMs: Math.max(1_000, timeout - 5_000),
         progressIntervalMs: 1_000,
         debugAddresses: watchedAddresses,
@@ -446,6 +454,7 @@ try {
     tracedDelayMs: traceDelayMs,
     watchedWriteAddress: watchAddress,
     guestClockScale: clockScale,
+    guestCoreUrl: coreUrl,
     guestAccurateSpuDma: accurateSpuDma,
     guestRenderer: renderer,
     guestPacketCaptureLevel: packetCaptureLevel,
@@ -457,17 +466,30 @@ try {
     workerProfiler = undefined;
   }
   await stopTrace();
+  const adapterIdentity = [
+    capabilities.adapter.vendor,
+    capabilities.adapter.architecture,
+    capabilities.adapter.device,
+    capabilities.adapter.description,
+  ].filter(Boolean).join(" \u00b7 ");
+  const softwareAdapter = capabilities.adapter.isFallbackAdapter || softwareAdapterPattern.test(adapterIdentity);
   const completed = Boolean(
     run.terminal?.ok &&
+    !softwareAdapter &&
     (stopAtFirstDraw
       ? run.frames.some((frame) => frame.drawPacketCount > 0)
       : run.frames.length >= frameCount)
   );
   const report = {
     bootPath,
+    adapter: adapterIdentity,
+    softwareAdapter,
+    clockScale,
+    coreVariant,
     capabilities,
     acceptance: {
       completed,
+      softwareAdapterRejected: softwareAdapter,
       requestedFrames: frameCount,
       completedFrames: run.frames.length,
       stopAtFirstDraw,

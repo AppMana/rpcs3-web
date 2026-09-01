@@ -71,6 +71,12 @@ namespace vm
 
 	std::array<u8*, 0x100000> g_web_pages{};
 	std::array<u32, 0x100000> g_web_reverse_pages{};
+	static atomic_t<u32> g_web_mapped_pages{0};
+
+	u32 web_mapped_pages() noexcept
+	{
+		return g_web_mapped_pages;
+	}
 
 	void web_map(u32 addr, u32 size, u8* host_ptr)
 	{
@@ -84,6 +90,10 @@ namespace vm
 			const u32 host_page_index = reinterpret_cast<uptr>(host_page) >> 12;
 
 			ensure(!g_web_pages[guest_page] || g_web_pages[guest_page] == host_page);
+			if (!g_web_pages[guest_page])
+			{
+				g_web_mapped_pages++;
+			}
 			g_web_pages[guest_page] = host_page;
 
 			// Shared guest aliases can point at the same backing. Keep the first
@@ -109,6 +119,7 @@ namespace vm
 				continue;
 			}
 
+			g_web_mapped_pages--;
 			const u32 host_page_index = reinterpret_cast<uptr>(host_page) >> 12;
 
 			if (g_web_reverse_pages[host_page_index] == guest_page + 1)

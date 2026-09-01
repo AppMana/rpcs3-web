@@ -10,10 +10,12 @@
 
 namespace
 {
-	std::vector<std::byte> make_packet(std::uint64_t sequence, std::size_t payload_size = 16)
+	std::vector<std::byte> make_packet(std::uint64_t sequence, std::size_t payload_size = 16,
+		rsx::webgpu::packet_kind kind = rsx::webgpu::packet_kind::draw)
 	{
 		rsx::webgpu::draw_packet_header header{};
 		header.sequence = sequence;
+		header.kind = kind;
 		std::vector<std::byte> payload(payload_size, std::byte{0x5a});
 		rsx::webgpu::draw_packet_builder builder(header);
 		assert(builder.append(rsx::webgpu::section_kind::registers, payload));
@@ -52,6 +54,21 @@ int main()
 	command_queue bounded(256);
 	assert(!bounded.push(make_packet(8, 256)));
 	assert(bounded.dropped_packets() == 1);
+
+	// Flip packets advance the frame counter the browser waits on; draws do not.
+	command_queue frames(1024 * 1024);
+	assert(frames.frame_counter() == 0);
+	assert(frames.push(make_packet(1)));
+	assert(frames.frame_counter() == 0);
+	assert(frames.push(make_packet(2, 16, packet_kind::flip)));
+	assert(frames.frame_counter() == 1);
+	assert(frames.push(make_packet(3, 16, packet_kind::clear)));
+	assert(frames.push(make_packet(4, 16, packet_kind::flip)));
+	assert(frames.frame_counter() == 2);
+	assert(frames.frame_counter_address() != nullptr);
+	assert(frames.peak_queued_bytes() == frames.queued_bytes());
+	assert(frames.pop_front());
+	assert(frames.peak_queued_bytes() > frames.queued_bytes());
 
 	command_queue concurrent(1024 * 1024);
 	std::thread producer_a([&]

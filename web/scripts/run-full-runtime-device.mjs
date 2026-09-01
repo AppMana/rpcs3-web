@@ -128,12 +128,10 @@ let rendererSource = (await source("rpcs3-webgpu-renderer.mjs")).toString("utf8"
 rendererSource = rendererSource.replace('"./rpcs3-webgpu-packet.mjs"', '"__DEVICE_PACKET_URL__"');
 if (!rendererSource.includes("__DEVICE_PACKET_URL__")) throw new Error("renderer packet import changed");
 
+// The worker honours coreUrl/wasmUrl/fixtureUrl from the boot message, so
+// only the static packet import needs to point at the injected Blob URL.
 let workerSource = (await source("runtime-smoke-worker.mjs")).toString("utf8");
-workerSource = workerSource
-  .replace('"./rpcs3-webgpu-packet.mjs"', '"__DEVICE_PACKET_URL__"')
-  .replace('await import("./core/rpcs3-web.mjs")', "await import(event.data.coreUrl)")
-  .replace('new URL(`./core/${name}`, scope.location.href).href', "event.data.wasmUrl")
-  .replace('new URL(`./${event.data.fixture}`, scope.location.href)', "event.data.fixtureUrl");
+workerSource = workerSource.replace('"./rpcs3-webgpu-packet.mjs"', '"__DEVICE_PACKET_URL__"');
 for (const marker of ["__DEVICE_PACKET_URL__", "event.data.coreUrl", "event.data.wasmUrl", "event.data.fixtureUrl"]) {
   if (!workerSource.includes(marker)) throw new Error(`worker rewrite failed for ${marker}`);
 }
@@ -247,7 +245,9 @@ try {
 
     const worker = new Worker(workerUrl, { type: "module" });
     globalThis.__rpcs3DeviceWorker = worker;
+    let requestedAt = 0;
     const receiveFrame = (expectedType, captureRgba) => new Promise((resolve, reject) => {
+      requestedAt = performance.now();
       const timer = setTimeout(() => reject(new Error("full RPCS3 device runtime timed out")), ${timeoutMs});
       const onError = (event) => {
         clearTimeout(timer);
@@ -261,12 +261,16 @@ try {
         try {
           const { packetBuffers = [], ...runtimeResult } = event.data;
           if (!runtimeResult.ok) throw new Error(runtimeResult.detail);
+          const receivedAt = performance.now();
           const gpu = await renderer.renderPacketsToWebGPU(
             prepared,
             packetBuffers.map((buffer) => decodeDrawPacket(new Uint8Array(buffer))),
-            { captureRgba, readback: captureRgba || !isTetris, replayPresentation: true },
+            // The Tetris movement gate compares CPU clip bounds, which the WGSL
+            // vertex path only computes when explicitly requested.
+            { captureRgba, readback: captureRgba || !isTetris, replayPresentation: true, vertexDiagnostics: true },
           );
-          resolve({ ...runtimeResult, gpu });
+          const waitForPacketsMs = requestedAt ? receivedAt - requestedAt : 0;
+          resolve({ ...runtimeResult, gpu, hostTimings: { waitForPacketsMs, renderMs: performance.now() - receivedAt } });
         } catch (error) { reject(error); }
       };
       worker.addEventListener("error", onError, { once: true });
@@ -293,11 +297,34 @@ try {
       if (frames.at(-1).gpu.draws < 9) throw new Error("Tetris did not enter gameplay within 120 guest flips");
       const center = (frame) => frame.gpu.drawDiagnostics.slice(-4)
         .reduce((sum, draw) => sum + (draw.clipBounds.min[0] + draw.clipBounds.max[0]) / 2, 0) / 4;
+      // Output-based movement evidence: the mean column of green block pixels
+      // in the rendered frame, independent of CPU vertex diagnostics.
+      const blockCentroidX = (frame) => {
+        const rgba = Uint8Array.from(atob(frame.gpu.rgbaBase64), (character) => character.charCodeAt(0));
+        let sum = 0;
+        let count = 0;
+        for (let y = 0; y < frame.gpu.height; y += 1) {
+          for (let x = 0; x < frame.gpu.width; x += 1) {
+            const offset = (y * frame.gpu.width + x) * 4;
+            const red = rgba[offset], green = rgba[offset + 1], blue = rgba[offset + 2];
+            if (green > red * 1.4 && green > blue * 1.15) { sum += x; count += 1; }
+          }
+        }
+        return count ? sum / count : NaN;
+      };
+      // Capture one readback frame before input so the before/after
+      // comparison uses the same output-based measurement.
+      const beforeFrameCapture = receiveFrame("runtime-frame", true);
+      worker.postMessage({ type: "next-frame" });
+      frames.push(await beforeFrameCapture);
       const beforeInput = {
         frameSequence: frames.at(-1).frameSequence,
         ppuInstructions: frames.at(-1).ppuInstructions,
         activeCenterX: center(frames.at(-1)),
+        blockCentroidX: blockCentroidX(frames.at(-1)),
       };
+      delete frames.at(-1).gpu.rgbaBase64;
+      const inputStartedAt = performance.now();
       worker.postMessage({ type: "pad", state: { digital1: 0x20 } });
       for (let index = 0; index < 20; index += 1) {
         const nextFrame = receiveFrame("runtime-frame", index === 19);
@@ -306,9 +333,17 @@ try {
       }
       worker.postMessage({ type: "pad", state: { digital1: 0 } });
       const finalFrame = frames.at(-1);
+      const frameTimings = frames.slice(-20).map((frame) => ({
+        captureMs: frame.captureMs,
+        waitForPacketsMs: frame.hostTimings?.waitForPacketsMs,
+        renderMs: frame.hostTimings?.renderMs,
+        gpu: frame.gpu.timings,
+      }));
       runtime = {
         ...frames[0],
         gpu: finalFrame.gpu,
+        workingSet: finalFrame.workingSet,
+        stackReport: finalFrame.stackReport,
         tetris: {
           totalFrames: frames.length,
           beforeInput,
@@ -316,7 +351,10 @@ try {
             frameSequence: finalFrame.frameSequence,
             ppuInstructions: finalFrame.ppuInstructions,
             activeCenterX: center(finalFrame),
+            blockCentroidX: blockCentroidX(finalFrame),
           },
+          inputWindowMs: performance.now() - inputStartedAt,
+          frameTimings,
           elapsedMs: finalFrame.elapsedMs,
           droppedPackets: finalFrame.droppedPackets,
         },
@@ -334,10 +372,18 @@ try {
         droppedPackets: frame.droppedPackets,
         frameHash: frame.gpu.frameHash,
         timings: frame.gpu.timings,
+        hostTimings: frame.hostTimings,
+        captureMs: frame.captureMs,
         changedBounds: frame.gpu.changedBounds,
         cubeClipBounds: frame.gpu.drawDiagnostics[0]?.clipBounds,
       }));
-      runtime = { ...frames[0], gpu: frames.at(-1).gpu, animationFrames };
+      runtime = {
+        ...frames[0],
+        gpu: frames.at(-1).gpu,
+        workingSet: frames.at(-1).workingSet,
+        stackReport: frames.at(-1).stackReport,
+        animationFrames,
+      };
     }
     const rgba = Uint8Array.from(atob(runtime.gpu.rgbaBase64), (character) => character.charCodeAt(0));
     const colors = new Set();
@@ -380,13 +426,13 @@ try {
     && result.tetris?.totalFrames >= 21
     && result.tetris?.afterInput?.ppuInstructions > result.tetris?.beforeInput?.ppuInstructions
     && result.tetris?.afterInput?.activeCenterX > result.tetris?.beforeInput?.activeCenterX + 0.09
+    && result.tetris?.afterInput?.blockCentroidX > result.tetris?.beforeInput?.blockCentroidX
     && result.tetris?.droppedPackets === 0
     && result.gpu?.pipelineCache?.hits === 9
     && result.gpu?.pipelineCache?.misses === 0
     && result.imageEvidence?.backgroundPixels > 10_000
     && result.imageEvidence?.blockPixels > 100;
   const cubePassed = commonPassed
-    && result.gpu?.draws === 2
     && result.gpu?.draws === 2
     && result.gpu?.vertices === 162
     && result.gpu?.depthStates?.[0]?.comparison === "less"

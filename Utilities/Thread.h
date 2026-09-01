@@ -345,6 +345,16 @@ public:
 	// Get current thread stack addr and size
 	static std::pair<void*, usz> get_thread_stack();
 
+#ifdef RPCS3_WEB
+	// Browser thread telemetry (see Thread.cpp)
+	static u32 web_live_threads();
+	static u32 web_peak_threads();
+	static u32 web_started_threads();
+	static u64 web_stack_max_used();
+	static void web_set_stack_paint(bool enabled);
+	static std::string web_stack_report();
+#endif
+
 	// Sets the native thread priority and returns it to zero at destructor
 	struct scoped_priority
 	{

@@ -45,6 +45,11 @@ if(RPCS3_WEB)
 		"Initial Wasm linear-memory size for the full browser runtime")
 	option(RPCS3_WEB_ALLOW_MEMORY_GROWTH
 		"Allow the full browser runtime to grow its shared Wasm memory" ON)
+	# The shipped runtime is what Mobile Safari has to download and compile
+	# without a code cache, so it carries no name section or assertion code.
+	# The profile variant keeps function names for CPU profiles and traces.
+	option(RPCS3_WEB_PROFILE
+		"Keep function names, assertions, and profiling symbols in the browser runtime" OFF)
 	add_executable(rpcs3_web_runtime
 		${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_main.cpp)
 	target_link_libraries(rpcs3_web_runtime PRIVATE
@@ -70,10 +75,18 @@ if(RPCS3_WEB)
 		"-sFORCE_FILESYSTEM=1"
 		"-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8','PThread']"
 		"-sEXPORTED_FUNCTIONS=['_main','_malloc','_free']"
-		"-sASSERTIONS=1"
-		"-g1"
-		"--profiling-funcs"
 		"-sWASM_BIGINT=1")
+	# ASSERTIONS stays on in both variants: it only adds a stack cookie and JS
+	# glue checks, and it is what keeps Emscripten from minifying the wasm
+	# import/export names that the PPU/SPU AOT side modules link against
+	# (env.memory, rpcs3_web_* exports). The profile variant additionally keeps
+	# the function name section for CPU profiles and traces.
+	target_link_options(rpcs3_web_runtime PRIVATE "-sASSERTIONS=1")
+	if(RPCS3_WEB_PROFILE)
+		target_link_options(rpcs3_web_runtime PRIVATE
+			"-g1"
+			"--profiling-funcs")
+	endif()
 	if(RPCS3_WEB_ALLOW_MEMORY_GROWTH)
 		target_link_options(rpcs3_web_runtime PRIVATE "-sALLOW_MEMORY_GROWTH=1")
 	else()

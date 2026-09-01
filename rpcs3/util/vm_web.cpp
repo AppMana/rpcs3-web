@@ -16,6 +16,30 @@ namespace utils
 		return 4096;
 	}
 
+	// Bytes currently held by demand-allocated guest backing (shm and
+	// reservations). Reported to the browser so iPad working-set decisions
+	// rest on measurements.
+	static atomic_t<u64> g_web_backing_bytes{0};
+
+	u64 web_backing_bytes() noexcept
+	{
+		return g_web_backing_bytes;
+	}
+
+	static usz aligned_backing_size(usz size)
+	{
+		return (size + 0xffff) & ~usz{0xffff};
+	}
+
+	static void free_aligned(void* ptr, usz size)
+	{
+		if (ptr)
+		{
+			g_web_backing_bytes -= aligned_backing_size(size);
+			std::free(ptr);
+		}
+	}
+
 	static void* alloc_aligned(usz size)
 	{
 		if (!size)
@@ -28,12 +52,13 @@ namespace utils
 			return nullptr;
 		}
 
-		const usz aligned_size = (size + 0xffff) & ~usz{0xffff};
+		const usz aligned_size = aligned_backing_size(size);
 		void* ptr = std::aligned_alloc(0x10000, aligned_size);
 
 		if (ptr)
 		{
 			std::memset(ptr, 0, aligned_size);
+			g_web_backing_bytes += aligned_size;
 		}
 
 		return ptr;
@@ -71,9 +96,9 @@ namespace utils
 		}
 	}
 
-	void memory_release(void* pointer, usz)
+	void memory_release(void* pointer, usz size)
 	{
-		std::free(pointer);
+		free_aligned(pointer, size);
 	}
 
 	void memory_protect(void*, usz, protection)
@@ -127,6 +152,10 @@ namespace utils
 		{
 			std::memcpy(copy, backing, static_cast<usz>(m_size));
 		}
+		else
+		{
+			return nullptr;
+		}
 
 		return copy;
 	}
@@ -165,7 +194,7 @@ namespace utils
 			}
 			else
 			{
-				std::free(allocated);
+				free_aligned(allocated, static_cast<usz>(m_size));
 			}
 		}
 
@@ -176,7 +205,7 @@ namespace utils
 	{
 		if (ptr && ptr != +m_ptr)
 		{
-			std::free(ptr);
+			free_aligned(ptr, static_cast<usz>(m_size));
 		}
 	}
 
@@ -187,6 +216,6 @@ namespace utils
 
 	void shm::unmap_self()
 	{
-		std::free(m_ptr.exchange(nullptr));
+		free_aligned(m_ptr.exchange(nullptr), static_cast<usz>(m_size));
 	}
 }

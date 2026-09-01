@@ -44,6 +44,7 @@ namespace vm
 	extern std::array<u32, 0x100000> g_web_reverse_pages;
 	void web_map(u32 addr, u32 size, u8* host_ptr);
 	void web_unmap(u32 addr, u32 size);
+	u32 web_mapped_pages() noexcept;
 	bool web_is_contiguous(u32 addr, u32 size) noexcept;
 	bool web_copy_range(u32 addr, void* buffer, u32 size, bool is_write) noexcept;
 

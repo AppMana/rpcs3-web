@@ -46,8 +46,20 @@ namespace rsx::webgpu
 			return false;
 		}
 
+		const bool is_flip = draw_packet_view(packet).header()->kind == packet_kind::flip;
 		m_queued_bytes += packet.size();
+		m_peak_queued_bytes = std::max(m_peak_queued_bytes, m_queued_bytes);
 		m_packets.emplace_back(std::move(packet));
+
+		if (is_flip)
+		{
+			m_frame_counter.fetch_add(1, std::memory_order_acq_rel);
+#ifdef __EMSCRIPTEN__
+			__builtin_wasm_memory_atomic_notify(reinterpret_cast<int*>(&m_frame_counter), 0x7fffffff);
+#else
+			m_frame_counter.notify_all();
+#endif
+		}
 		return true;
 	}
 
@@ -117,6 +129,12 @@ namespace rsx::webgpu
 		return m_queued_bytes;
 	}
 
+	std::uint64_t command_queue::peak_queued_bytes() const
+	{
+		std::lock_guard lock(m_mutex);
+		return m_peak_queued_bytes;
+	}
+
 	std::uint64_t command_queue::dropped_packets() const
 	{
 		std::lock_guard lock(m_mutex);
@@ -179,9 +197,25 @@ extern "C"
 		return rsx::webgpu::host_command_queue().queued_bytes();
 	}
 
+	RPCS3_WEB_EXPORT std::uint64_t rpcs3_webgpu_peak_queued_bytes()
+	{
+		return rsx::webgpu::host_command_queue().peak_queued_bytes();
+	}
+
 	RPCS3_WEB_EXPORT std::uint64_t rpcs3_webgpu_dropped_packets()
 	{
 		return rsx::webgpu::host_command_queue().dropped_packets();
+	}
+
+	RPCS3_WEB_EXPORT std::uint32_t rpcs3_webgpu_frame_counter()
+	{
+		return rsx::webgpu::host_command_queue().frame_counter();
+	}
+
+	RPCS3_WEB_EXPORT std::uint32_t rpcs3_webgpu_frame_counter_address()
+	{
+		return static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(
+			rsx::webgpu::host_command_queue().frame_counter_address()));
 	}
 
 	RPCS3_WEB_EXPORT void rpcs3_webgpu_set_capture_level(std::uint32_t level)

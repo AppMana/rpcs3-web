@@ -12,12 +12,31 @@ elif ! command -v emcmake >/dev/null 2>&1; then
   exit 1
 fi
 
-emcmake cmake -S "${repo_root}" -B "${repo_root}/build-rpcs3-web" \
+# RPCS3_WEB_PROFILE=1 builds the symbolized profiling variant into a separate
+# build tree and stages it under web/public/core/profile/. The default build is
+# the stripped runtime that the iPad and the acceptance lanes use.
+if [[ "${RPCS3_WEB_PROFILE:-0}" == "1" ]]; then
+  build_dir="${repo_root}/build-rpcs3-web-profile"
+  stage_dir="${repo_root}/web/public/core/profile"
+  profile_flag=ON
+  targets=(rpcs3_web_runtime)
+else
+  build_dir="${repo_root}/build-rpcs3-web"
+  stage_dir="${repo_root}/web/public/core"
+  profile_flag=OFF
+  targets=(rpcs3_web_runtime rpcs3_web_unit_tests)
+fi
+
+emcmake cmake -S "${repo_root}" -B "${build_dir}" \
   -DRPCS3_WEB=ON \
+  -DRPCS3_WEB_PROFILE="${profile_flag}" \
   -DCMAKE_BUILD_TYPE=Release
-cmake --build "${repo_root}/build-rpcs3-web" --target rpcs3_web_runtime rpcs3_web_unit_tests --parallel "${build_jobs}"
-mkdir -p "${repo_root}/web/public/core"
-cmake -E copy_if_different "${repo_root}/build-rpcs3-web/bin/rpcs3-web.mjs" "${repo_root}/web/public/core/rpcs3-web.mjs"
-cmake -E copy_if_different "${repo_root}/build-rpcs3-web/bin/rpcs3-web.wasm" "${repo_root}/web/public/core/rpcs3-web.wasm"
-cmake -E copy_if_different "${repo_root}/build-rpcs3-web/bin/rpcs3-web-units.mjs" "${repo_root}/web/public/core/rpcs3-web-units.mjs"
-cmake -E copy_if_different "${repo_root}/build-rpcs3-web/bin/rpcs3-web-units.wasm" "${repo_root}/web/public/core/rpcs3-web-units.wasm"
+cmake --build "${build_dir}" --target "${targets[@]}" --parallel "${build_jobs}"
+mkdir -p "${stage_dir}"
+cmake -E copy_if_different "${build_dir}/bin/rpcs3-web.mjs" "${stage_dir}/rpcs3-web.mjs"
+cmake -E copy_if_different "${build_dir}/bin/rpcs3-web.wasm" "${stage_dir}/rpcs3-web.wasm"
+if [[ "${profile_flag}" == "OFF" ]]; then
+  cmake -E copy_if_different "${build_dir}/bin/rpcs3-web-units.mjs" "${stage_dir}/rpcs3-web-units.mjs"
+  cmake -E copy_if_different "${build_dir}/bin/rpcs3-web-units.wasm" "${stage_dir}/rpcs3-web-units.wasm"
+fi
+ls -l "${stage_dir}/rpcs3-web.wasm"

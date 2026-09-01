@@ -37,6 +37,7 @@
 
 #include <emscripten.h>
 #include <emscripten/wasmfs.h>
+#include <malloc.h>
 
 #include <algorithm>
 #include <atomic>
@@ -1186,6 +1187,62 @@ extern "C"
 
 		const u32 index = (pc - base) / 8;
 		return index < g_ppu_function_names.size() ? g_ppu_function_names[index].c_str() : "";
+	}
+
+	// Working-set telemetry consumed by the browser worker's progress reports.
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_live_thread_count()
+	{
+		return thread_ctrl::web_live_threads();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_peak_thread_count()
+	{
+		return thread_ctrl::web_peak_threads();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_started_thread_count()
+	{
+		return thread_ctrl::web_started_threads();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_stack_max_used()
+	{
+		return thread_ctrl::web_stack_max_used();
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_stack_paint(s32 enabled)
+	{
+		thread_ctrl::web_set_stack_paint(enabled != 0);
+	}
+
+	// name<TAB>max used bytes<TAB>stack size, one thread name per line
+	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_stack_report()
+	{
+		static std::string report;
+		report = thread_ctrl::web_stack_report();
+		return report.c_str();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_vm_mapped_pages()
+	{
+		return vm::web_mapped_pages();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_vm_backing_bytes()
+	{
+		return utils::web_backing_bytes();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_malloc_bytes()
+	{
+		const struct mallinfo info = mallinfo();
+		return static_cast<u64>(static_cast<unsigned>(info.uordblks));
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_malloc_arena_bytes()
+	{
+		const struct mallinfo info = mallinfo();
+		return static_cast<u64>(static_cast<unsigned>(info.arena));
 	}
 
 	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_thread_snapshot()

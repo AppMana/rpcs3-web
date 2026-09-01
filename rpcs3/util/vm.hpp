@@ -16,6 +16,11 @@ namespace utils
 	// Obtain system page size
 	long get_page_size();
 
+#ifdef RPCS3_WEB
+	// Bytes of demand-allocated guest backing currently held (Web only)
+	u64 web_backing_bytes() noexcept;
+#endif
+
 	// Memory protection type
 	enum class protection
 	{

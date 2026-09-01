@@ -14,6 +14,7 @@ export default defineConfig({
     "runtime-cube.spec.ts",
     "runtime-animation.spec.ts",
     "runtime-gpu.spec.ts",
+    "runtime-scissor.spec.ts",
   ],
   timeout: 30_000,
   use: {

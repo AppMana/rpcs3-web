@@ -28,6 +28,18 @@ test("boots PS3 homebrew through the complete RPCS3 Wasm runtime", async ({ page
   expect((result.events as Array<{ type?: string }>).some((event) => event.type === "rpcs3-running")).toBe(true);
   expect((result.logs as string[]).some((line) => line.includes("thread pool is exhausted"))).toBe(false);
   expect(result.packetCount).toBeGreaterThan(0);
+  const workingSet = result.workingSet as {
+    liveThreads: number; peakThreads: number; poolTotal: number; poolBusy: number;
+    vmMappedPages: number; vmBackingBytes: number; stackMaxUsedBytes: number; flipCounter: number;
+  };
+  expect(workingSet.liveThreads).toBeGreaterThan(0);
+  expect(workingSet.peakThreads).toBeGreaterThanOrEqual(workingSet.liveThreads);
+  expect(workingSet.poolTotal).toBeGreaterThanOrEqual(workingSet.poolBusy);
+  expect(workingSet.vmMappedPages).toBeGreaterThan(0);
+  expect(workingSet.vmBackingBytes).toBeGreaterThan(0);
+  expect(workingSet.stackMaxUsedBytes).toBeGreaterThan(0);
+  expect(workingSet.flipCounter).toBeGreaterThanOrEqual(1);
+  expect((result.stackReport as Array<{ name: string; usedBytes: number; stackBytes: number }>).length).toBeGreaterThan(0);
   expect(result.drawPacketCount).toBeGreaterThan(0);
   expect((result.packetSummaries as Array<{ kind: number; vertexCount: number }>).some(
     (packet) => packet.kind === 1 && packet.vertexCount >= 3,

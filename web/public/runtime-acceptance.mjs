@@ -46,10 +46,12 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       worker.terminate();
       reject(new Error(`real RPCS3 runtime timed out; events=${JSON.stringify(events)}`));
     }, 120_000);
+    let frameRequestedAt = performance.now();
     worker.addEventListener("message", async (event) => {
       const { packetBuffers = [], ...eventWithoutPackets } = event.data ?? {};
       events.push(eventWithoutPackets);
       if (event.data?.type === "runtime-result" || event.data?.type === "runtime-frame") {
+        const receivedAt = performance.now();
         try {
           if (!event.data.ok) throw new Error(`${event.data.detail}; events=${JSON.stringify(events)}`);
           let gpu;
@@ -99,10 +101,15 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
               };
             }
           }
-          const frame = { ...eventWithoutPackets, gpu };
+          const frame = {
+            ...eventWithoutPackets,
+            gpu,
+            hostTimings: { waitForPacketsMs: receivedAt - frameRequestedAt, renderMs: performance.now() - receivedAt },
+          };
           frames.push(frame);
           firstResult ??= frame;
           if (!dispatchCompletion && frames.length < requestedFrames) {
+            frameRequestedAt = performance.now();
             worker.postMessage({ type: "next-frame" });
             return;
           }
@@ -146,10 +153,19 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       dispatchTimeoutMs: options.dispatchTimeoutMs ?? 30_000,
       ppuAot: options.ppuAot === true,
       spuAot: options.spuAot === true,
-      renderer: options.renderer ?? (options.render ? "webgpu" : "null"),
+      // RPCS3's WebGPU RSX backend always produces packets; page-side WebGPU
+      // rendering is separately gated by options.render. Only an explicit
+      // renderer: "null" selects NullGSRender (dispatch-only fixtures).
+      renderer: options.renderer ?? "webgpu",
     });
   }).finally(() => { active = undefined; });
   return active;
+}
+
+// Ask the running worker for a thread/stack snapshot; it arrives as a
+// runtime-progress event in the final result's event list.
+function snapshot() {
+  activeWorker?.postMessage({ type: "snapshot" });
 }
 
 function stop() {
@@ -161,4 +177,4 @@ function stop() {
   activeGpu = undefined;
 }
 
-window.__rpcs3Runtime = { run, stop, setPad };
+window.__rpcs3Runtime = { run, stop, setPad, snapshot };

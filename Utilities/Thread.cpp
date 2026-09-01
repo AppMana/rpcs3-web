@@ -9,6 +9,8 @@
 #include "Thread.h"
 #include "Utilities/JIT.h"
 #include <cfenv>
+#include <map>
+#include <mutex>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/stack.h>
@@ -2757,6 +2759,144 @@ const bool s_terminate_handler_set = []() -> bool
 
 thread_local DECLARE(thread_ctrl::g_tls_this_thread) = nullptr;
 
+#ifdef RPCS3_WEB
+namespace
+{
+	// Browser thread telemetry. Emscripten pthreads are Web Workers with fixed
+	// heap-allocated stacks, so live/peak counts and per-thread stack
+	// high-water marks are the measurements that size the Mobile Safari worker
+	// pool and DEFAULT_PTHREAD_STACK_SIZE instead of guessing.
+	atomic_t<u32> g_web_threads_live{0};
+	atomic_t<u32> g_web_threads_peak{0};
+	atomic_t<u32> g_web_threads_started{0};
+	atomic_t<u32> g_web_stack_paint{1};
+	atomic_t<u64> g_web_stack_max_used{0};
+	constexpr u8 g_web_stack_pattern = 0xa5;
+	constexpr uptr g_web_stack_paint_margin = 4096;
+	// Emscripten keeps its stack-overflow cookie in the lowest words of the
+	// stack; leave that region untouched.
+	constexpr uptr g_web_stack_cookie_bytes = 16;
+	thread_local bool g_tls_web_stack_painted = false;
+	std::mutex g_web_stack_mutex;
+	std::map<std::string, std::pair<u64, u64>> g_web_stack_usage; // name -> {max used bytes, stack size}
+
+	void web_thread_started()
+	{
+		g_web_threads_started++;
+		const u32 live = ++g_web_threads_live;
+		g_web_threads_peak.fetch_op([&](u32& peak)
+		{
+			if (peak < live)
+			{
+				peak = live;
+				return true;
+			}
+			return false;
+		});
+	}
+
+	// Fill the unused part of this thread's stack with a pattern so the exit
+	// scan can report exactly how deep the thread went.
+	void web_stack_paint()
+	{
+		if (!g_web_stack_paint)
+		{
+			return;
+		}
+
+		const uptr base = emscripten_stack_get_base();
+		const uptr end = emscripten_stack_get_end();
+		const uptr current = emscripten_stack_get_current();
+
+		const uptr paint_begin = end + g_web_stack_cookie_bytes;
+		if (base <= end || current <= paint_begin + g_web_stack_paint_margin || current > base)
+		{
+			return;
+		}
+
+		std::memset(reinterpret_cast<void*>(paint_begin), g_web_stack_pattern, current - g_web_stack_paint_margin - paint_begin);
+		g_tls_web_stack_painted = true;
+	}
+
+	void web_stack_record(const std::string& name)
+	{
+		const uptr base = emscripten_stack_get_base();
+		const uptr end = emscripten_stack_get_end();
+		u64 used = 0;
+
+		if (g_tls_web_stack_painted && base > end + g_web_stack_cookie_bytes)
+		{
+			const uptr scan_begin = end + g_web_stack_cookie_bytes;
+			const u8* bytes = reinterpret_cast<const u8*>(scan_begin);
+			uptr first_touched = base;
+
+			for (uptr offset = 0; offset < base - scan_begin; offset++)
+			{
+				if (bytes[offset] != g_web_stack_pattern)
+				{
+					first_touched = scan_begin + offset;
+					break;
+				}
+			}
+
+			used = base - first_touched;
+			g_tls_web_stack_painted = false;
+		}
+
+		g_web_stack_max_used.fetch_op([&](u64& value)
+		{
+			if (value < used)
+			{
+				value = used;
+				return true;
+			}
+			return false;
+		});
+
+		std::lock_guard lock(g_web_stack_mutex);
+		auto& entry = g_web_stack_usage[name];
+		entry.first = std::max(entry.first, used);
+		entry.second = base > end ? base - end : 0;
+	}
+}
+
+u32 thread_ctrl::web_live_threads()
+{
+	return g_web_threads_live;
+}
+
+u32 thread_ctrl::web_peak_threads()
+{
+	return g_web_threads_peak;
+}
+
+u32 thread_ctrl::web_started_threads()
+{
+	return g_web_threads_started;
+}
+
+u64 thread_ctrl::web_stack_max_used()
+{
+	return g_web_stack_max_used;
+}
+
+void thread_ctrl::web_set_stack_paint(bool enabled)
+{
+	g_web_stack_paint = enabled ? 1 : 0;
+}
+
+std::string thread_ctrl::web_stack_report()
+{
+	std::string report;
+	std::lock_guard lock(g_web_stack_mutex);
+	for (const auto& [name, usage] : g_web_stack_usage)
+	{
+		fmt::append(report, "%s\t%u\t%u\n", name, usage.first, usage.second);
+	}
+	return report;
+}
+#endif
+
 thread_local DECLARE(thread_ctrl::g_tls_error_callback) = nullptr;
 
 DECLARE(thread_ctrl::g_native_core_layout) { native_core_arrangement::undefined };
@@ -2789,6 +2929,9 @@ void thread_base::start()
 #else
 	pthread_t thread_id{};
 	ensure(pthread_create(&thread_id, nullptr, entry_point, this) == 0);
+#ifdef RPCS3_WEB
+	web_thread_started();
+#endif
 #endif
 
 #ifndef _WIN32
@@ -2830,6 +2973,10 @@ void thread_base::initialize(void (*error_cb)())
 	thread_ctrl::g_tls_this_thread = this;
 
 	thread_ctrl::g_tls_error_callback = error_cb;
+
+#ifdef RPCS3_WEB
+	web_stack_paint();
+#endif
 
 	g_tls_log_prefix = []
 	{
@@ -2993,6 +3140,14 @@ u64 thread_base::finalize(thread_state result_state) noexcept
 		g_tls_wait_fail);
 
 	atomic_wait_engine::set_wait_callback(nullptr);
+
+#ifdef RPCS3_WEB
+	if (const auto name = m_tname.load())
+	{
+		web_stack_record(*name);
+	}
+	--g_web_threads_live;
+#endif
 
 	// Avoid race with the destructor
 	const u64 _self = m_thread;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -25,15 +26,24 @@ namespace rsx::webgpu
 
 		[[nodiscard]] std::uint32_t packet_count() const;
 		[[nodiscard]] std::uint64_t queued_bytes() const;
+		[[nodiscard]] std::uint64_t peak_queued_bytes() const;
 		[[nodiscard]] std::uint64_t dropped_packets() const;
 		void clear();
+
+		// Number of flip packets accepted so far.  The browser worker waits on
+		// this word (Atomics.waitAsync) instead of polling; push() notifies it
+		// after every accepted flip.
+		[[nodiscard]] std::uint32_t frame_counter() const noexcept { return m_frame_counter.load(std::memory_order_acquire); }
+		[[nodiscard]] const std::atomic<std::uint32_t>* frame_counter_address() const noexcept { return &m_frame_counter; }
 
 	private:
 		mutable std::mutex m_mutex;
 		std::deque<std::vector<std::byte>> m_packets;
 		std::size_t m_byte_limit;
 		std::size_t m_queued_bytes = 0;
+		std::size_t m_peak_queued_bytes = 0;
 		std::uint64_t m_dropped_packets = 0;
+		alignas(4) std::atomic<std::uint32_t> m_frame_counter{0};
 	};
 
 	command_queue& host_command_queue();
@@ -52,7 +62,10 @@ extern "C"
 	std::uint32_t rpcs3_webgpu_copy_front(void* destination, std::uint32_t capacity);
 	std::uint32_t rpcs3_webgpu_pop_front();
 	std::uint64_t rpcs3_webgpu_queued_bytes();
+	std::uint64_t rpcs3_webgpu_peak_queued_bytes();
 	std::uint64_t rpcs3_webgpu_dropped_packets();
+	std::uint32_t rpcs3_webgpu_frame_counter();
+	std::uint32_t rpcs3_webgpu_frame_counter_address();
 	void rpcs3_webgpu_set_capture_level(std::uint32_t level);
 	void rpcs3_webgpu_clear();
 }

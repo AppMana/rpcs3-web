@@ -25,6 +25,7 @@ let dispatchLines = [];
 let ppuDispatcher;
 let spuDispatcher;
 let padState = { digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 };
+let moduleCreateMs = 0;
 
 function recordLog(line) {
   const text = String(line);
@@ -138,12 +139,55 @@ function vmPpuLocks() {
   })).filter(({ id }) => id !== 0);
 }
 
+// Working-set telemetry. These are the numbers that decide the Mobile Safari
+// worker pool, stack size, and initial memory; they are recorded, never used
+// as a correctness oracle.
+function workingSet() {
+  if (!module) return undefined;
+  const u64 = (name) => Number(module.ccall(name, "bigint", [], []));
+  const u32 = (name) => module.ccall(name, "number", [], []) >>> 0;
+  const pthreads = module.PThread?.pthreads ? Object.keys(module.PThread.pthreads).length : 0;
+  const poolIdle = module.PThread?.unusedWorkers?.length ?? 0;
+  return {
+    heapBytes: module.HEAPU8?.byteLength ?? 0,
+    mallocBytes: u64("rpcs3_web_malloc_bytes"),
+    mallocArenaBytes: u64("rpcs3_web_malloc_arena_bytes"),
+    vmMappedPages: u32("rpcs3_web_vm_mapped_pages"),
+    vmBackingBytes: u64("rpcs3_web_vm_backing_bytes"),
+    liveThreads: u32("rpcs3_web_live_thread_count"),
+    peakThreads: u32("rpcs3_web_peak_thread_count"),
+    startedThreads: u32("rpcs3_web_started_thread_count"),
+    stackMaxUsedBytes: u64("rpcs3_web_stack_max_used"),
+    poolIdle,
+    poolBusy: pthreads,
+    poolTotal: poolIdle + pthreads,
+    queuedPacketBytes: u64("rpcs3_webgpu_queued_bytes"),
+    peakQueuedPacketBytes: u64("rpcs3_webgpu_peak_queued_bytes"),
+    droppedPackets: u64("rpcs3_webgpu_dropped_packets"),
+    flipCounter: u32("rpcs3_webgpu_frame_counter"),
+  };
+}
+
+function stackReport() {
+  if (!module) return [];
+  return module.ccall("rpcs3_web_stack_report", "string", [], [])
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [name, used, size] = line.split("\t");
+      return { name, usedBytes: Number(used), stackBytes: Number(size) };
+    })
+    .sort((a, b) => b.usedBytes - a.usedBytes);
+}
+
 function progress(includeThreads = false) {
   if (!module) return;
   scope.postMessage({
     type: "runtime-progress",
     bootResult,
     heapBytes: module.HEAPU8?.byteLength ?? 0,
+    workingSet: workingSet(),
+    stackReport: includeThreads ? stackReport() : undefined,
     ppuInstructions: Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], [])),
     ppuLastPc: module.ccall("rpcs3_web_ppu_last_pc", "number", [], []) >>> 0,
     ppuLastFunction: module.ccall("rpcs3_web_ppu_last_function", "string", [], []),
@@ -201,7 +245,8 @@ async function captureFrame(type, discardPackets = false) {
   let flipPacketCount = 0;
   const packetSummaries = [];
   const packets = [];
-  const packetDeadline = performance.now() + packetTimeoutMs;
+  const captureStartedAt = performance.now();
+  const packetDeadline = captureStartedAt + packetTimeoutMs;
   // Capture exactly one coherent RSX frame. Stopping at the first draw can
   // omit overlays, while draining past a flip would blend independent frames.
   while (bootResult === 0 && flipPacketCount === 0 && status !== 0 && performance.now() < packetDeadline) {
@@ -231,6 +276,7 @@ async function captureFrame(type, discardPackets = false) {
     status = module.ccall("rpcs3_web_status", "number", [], []);
   }
   frameSequence += 1;
+  const captureMs = performance.now() - captureStartedAt;
   const packetBuffers = packets.map((packet) => packet.bytes.buffer);
   const debugWords = Object.fromEntries(debugAddresses.map((address) => [
     `0x${(address >>> 0).toString(16)}`,
@@ -257,6 +303,9 @@ async function captureFrame(type, discardPackets = false) {
     debugWords,
     textureWords,
     droppedPackets: Number(module.ccall("rpcs3_webgpu_dropped_packets", "bigint", [], [])),
+    captureMs,
+    workingSet: workingSet(),
+    stackReport: stackReport(),
     ppuInstructions: Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], [])),
     ppuLastPc: module.ccall("rpcs3_web_ppu_last_pc", "number", [], []) >>> 0,
     ppuLastFunction: module.ccall("rpcs3_web_ppu_last_function", "string", [], []),
@@ -273,6 +322,7 @@ async function captureFrame(type, discardPackets = false) {
     entryOpd: [0x40250, 0x40254].map((address) => debugRead32(address)),
     entryCodeWord: debugRead32(0x1022c),
     elapsedMs: performance.now() - bootStartedAt,
+    moduleCreateMs,
     fixtureBytes,
     logs: logs.slice(-200),
     detail: `Emu.Init=${initialized}; System::BootGame=${bootResult}; frame=${frameSequence}`,
@@ -331,19 +381,27 @@ scope.addEventListener("message", async (event) => {
   try {
     // Keep Emscripten out of module evaluation so the host can acquire and
     // configure its WebGPU device before allocating the shared Wasm memory.
-    const { default: createRPCS3 } = await import("./core/rpcs3-web.mjs");
+    // coreUrl/wasmUrl/fixtureUrl let the iPad harness inject Blob URLs and let
+    // desktop profiling select the symbolized profile build.
+    const coreUrl = new URL(event.data.coreUrl ?? "./core/rpcs3-web.mjs", scope.location.href).href;
+    const resolveCoreFile = (name) => {
+      if (event.data.wasmUrl && name.endsWith(".wasm")) return event.data.wasmUrl;
+      try { return new URL(name, coreUrl).href; } catch { return name; }
+    };
+    const { default: createRPCS3 } = await import(coreUrl);
     let mainInstance;
     let mainMemory;
     const [mainWasm, aotWasm, spuAotWasm] = await Promise.all([
       event.data.ppuAot === true || event.data.spuAot === true
-        ? WebAssembly.compileStreaming(fetch("./core/rpcs3-web.wasm")) : undefined,
+        ? WebAssembly.compileStreaming(fetch(resolveCoreFile("rpcs3-web.wasm"))) : undefined,
       event.data.ppuAot === true
         ? WebAssembly.compileStreaming(fetch("./fixtures/web_dispatch_conformance-aot.wasm")) : undefined,
       event.data.spuAot === true
         ? WebAssembly.compileStreaming(fetch("./fixtures/web_dispatch_conformance-spu-aot.wasm")) : undefined,
     ]);
+    const moduleCreateStartedAt = performance.now();
     module = await createRPCS3({
-      locateFile: (name) => new URL(`./core/${name}`, scope.location.href).href,
+      locateFile: resolveCoreFile,
       print: recordLog,
       printErr: recordLog,
       ...(mainWasm ? {
@@ -355,10 +413,11 @@ scope.addEventListener("message", async (event) => {
         },
       } : {}),
     });
+    moduleCreateMs = performance.now() - moduleCreateStartedAt;
     atomicNotifyReentry = module.ccall("rpcs3_web_atomic_notify_reentry_probe", "number", [], []);
     let path = event.data.path;
     if (!path) {
-      const response = await fetch(new URL(`./${event.data.fixture}`, scope.location.href));
+      const response = await fetch(event.data.fixtureUrl ?? new URL(`./${event.data.fixture}`, scope.location.href));
       if (!response.ok) throw new Error(`fixture fetch returned ${response.status}`);
       const elf = new Uint8Array(await response.arrayBuffer());
       fixtureBytes = elf.byteLength;
@@ -410,6 +469,13 @@ scope.addEventListener("message", async (event) => {
       await captureFrame("runtime-result", event.data.discardPackets === true);
     }
   } catch (error) {
-    scope.postMessage({ type: "runtime-result", ok: false, detail: detail(error), logs: logs.slice(-200) });
+    // Attach the tail of RPCS3's own log so a boot failure is diagnosable
+    // without a second run.
+    let rpcs3Log = "";
+    try {
+      module?.ccall("rpcs3_web_sync_logs", null, [], []);
+      rpcs3Log = module.FS.readFile("/opfs/cache/rpcs3/RPCS3.log", { encoding: "utf8" }).slice(-4000);
+    } catch {}
+    scope.postMessage({ type: "runtime-result", ok: false, detail: detail(error), logs: logs.slice(-200), rpcs3Log });
   }
 });

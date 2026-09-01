@@ -1253,7 +1253,11 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       { width: canvas.width, height: canvas.height });
   }
   device.queue.submit([encoder.finish()]);
-  await device.queue.onSubmittedWorkDone();
+  const submittedAt = performance.now();
+  // A GPU sync is only needed to read the frame back; direct presentation
+  // leaves the queue asynchronous.
+  if (readback || options.gpuSync === true) await device.queue.onSubmittedWorkDone();
+  const gpuSyncedAt = performance.now();
   if (readback) await readback.mapAsync(GPUMapMode.READ);
   const readbackReadyAt = performance.now();
   const pixels = readback ? new Uint8Array(readback.getMappedRange()) : undefined;
@@ -1383,6 +1387,9 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     timings: {
       translateMs: translatedAt - renderStartedAt,
       resourceAndPipelineMs: resourcesReadyAt - translatedAt,
+      encodeSubmitMs: submittedAt - resourcesReadyAt,
+      gpuSyncMs: gpuSyncedAt - submittedAt,
+      readbackMapMs: readbackReadyAt - gpuSyncedAt,
       submitAndMappedReadbackMs: readbackReadyAt - resourcesReadyAt,
       readbackScanMs: readbackScannedAt - readbackReadyAt,
       totalMs: readbackScannedAt - renderStartedAt,

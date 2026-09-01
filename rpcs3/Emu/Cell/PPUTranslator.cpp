@@ -28,13 +28,22 @@ const ppu_decoder<PPUTranslator> s_ppu_decoder;
 extern const ppu_decoder<ppu_itype> g_ppu_itype;
 extern const ppu_decoder<ppu_iname> g_ppu_iname;
 
-PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_module<lv2_obj>& info, ExecutionEngine& engine)
+PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_module<lv2_obj>& info, ExecutionEngine& engine, bool wasm_aot)
 	: cpu_translator(_module, false)
 	, m_info(info)
 	, m_pure_attr()
+	, m_wasm_aot(wasm_aot)
 {
 	// Bind context
 	cpu_translator::initialize(context, engine);
+	if (m_wasm_aot)
+	{
+		m_use_ssse3 = false;
+		m_use_fma = false;
+		m_use_avx = false;
+		m_use_avx512 = false;
+		m_use_avx512_icl = false;
+	}
 
 	// Initialize transform passes
 	clear_transforms();
@@ -608,7 +617,7 @@ void PPUTranslator::CallFunction(u64 target, Value* indirect)
 			if (!indirect)
 			{
 				callee = m_module->getOrInsertFunction(fmt::format("__0x%x", target_last - base), type);
-				cast<Function>(callee.getCallee())->setCallingConv(CallingConv::GHC);
+				cast<Function>(callee.getCallee())->setCallingConv(m_wasm_aot ? CallingConv::C : CallingConv::GHC);
 
 				if (g_cfg.core.ppu_prof)
 				{
@@ -625,6 +634,12 @@ void PPUTranslator::CallFunction(u64 target, Value* indirect)
 	if (indirect)
 	{
 		m_ir->CreateStore(Trunc(indirect, GetType<u32>()), m_ir->CreateStructGEP(m_thread_type, m_thread, static_cast<uint>(&m_cia - m_locals)));
+
+		if (m_wasm_aot)
+		{
+			m_ir->CreateRetVoid();
+			return;
+		}
 
 		// Try to optimize
 		if (auto inst = dyn_cast_or_null<Instruction>(indirect))
@@ -651,7 +666,7 @@ void PPUTranslator::CallFunction(u64 target, Value* indirect)
 	m_ir->SetInsertPoint(block);
 	const auto c = m_ir->CreateCall(callee, {m_exec, m_thread, seg0, m_base, GetGpr(0), GetGpr(1), GetGpr(2)});
 	c->setTailCallKind(llvm::CallInst::TCK_Tail);
-	c->setCallingConv(CallingConv::GHC);
+	c->setCallingConv(m_wasm_aot ? CallingConv::C : CallingConv::GHC);
 	m_ir->CreateRetVoid();
 }
 
@@ -4760,6 +4775,14 @@ void PPUTranslator::FRSP(ppu_opcode_t op)
 void PPUTranslator::FCTIW(ppu_opcode_t op)
 {
 	const auto b = GetFpr(op.frb);
+	if (m_wasm_aot)
+	{
+		const auto rounded = Call(GetType<f64>(), "llvm.roundeven.f64", b);
+		const auto converted = Call(GetType<s32>(), "llvm.fptosi.sat.i32.f64", rounded);
+		const auto indefinite = ConstantInt::getSigned(GetType<s32>(), s32{smin});
+		SetFpr(op.frd, m_ir->CreateSelect(m_ir->CreateFCmpUNO(b, b), indefinite, converted));
+		return;
+	}
 
 #if defined(ARCH_X64)
 	const auto xormask = m_ir->CreateSExt(m_ir->CreateFCmpOGE(b, ConstantFP::get(GetType<f64>(), std::exp2l(31.))), GetType<s32>());
@@ -4781,6 +4804,13 @@ void PPUTranslator::FCTIW(ppu_opcode_t op)
 void PPUTranslator::FCTIWZ(ppu_opcode_t op)
 {
 	const auto b = GetFpr(op.frb);
+	if (m_wasm_aot)
+	{
+		const auto converted = Call(GetType<s32>(), "llvm.fptosi.sat.i32.f64", b);
+		const auto indefinite = ConstantInt::getSigned(GetType<s32>(), s32{smin});
+		SetFpr(op.frd, m_ir->CreateSelect(m_ir->CreateFCmpUNO(b, b), indefinite, converted));
+		return;
+	}
 
 #if defined(ARCH_X64)
 	const auto xormask = m_ir->CreateSExt(m_ir->CreateFCmpOGE(b, ConstantFP::get(GetType<f64>(), std::exp2l(31.))), GetType<s32>());
@@ -5064,6 +5094,14 @@ void PPUTranslator::FABS(ppu_opcode_t op)
 void PPUTranslator::FCTID(ppu_opcode_t op)
 {
 	const auto b = GetFpr(op.frb);
+	if (m_wasm_aot)
+	{
+		const auto rounded = Call(GetType<f64>(), "llvm.roundeven.f64", b);
+		const auto converted = Call(GetType<s64>(), "llvm.fptosi.sat.i64.f64", rounded);
+		const auto indefinite = ConstantInt::getSigned(GetType<s64>(), s64{smin});
+		SetFpr(op.frd, m_ir->CreateSelect(m_ir->CreateFCmpUNO(b, b), indefinite, converted));
+		return;
+	}
 
 #if defined(ARCH_X64)
 	const auto xormask = m_ir->CreateSExt(m_ir->CreateFCmpOGE(b, ConstantFP::get(GetType<f64>(), std::exp2l(63.))), GetType<s64>());
@@ -5086,6 +5124,13 @@ void PPUTranslator::FCTID(ppu_opcode_t op)
 void PPUTranslator::FCTIDZ(ppu_opcode_t op)
 {
 	const auto b = GetFpr(op.frb);
+	if (m_wasm_aot)
+	{
+		const auto converted = Call(GetType<s64>(), "llvm.fptosi.sat.i64.f64", b);
+		const auto indefinite = ConstantInt::getSigned(GetType<s64>(), s64{smin});
+		SetFpr(op.frd, m_ir->CreateSelect(m_ir->CreateFCmpUNO(b, b), indefinite, converted));
+		return;
+	}
 
 #if defined(ARCH_X64)
 	const auto xormask = m_ir->CreateSExt(m_ir->CreateFCmpOGE(b, ConstantFP::get(GetType<f64>(), std::exp2l(63.))), GetType<s64>());

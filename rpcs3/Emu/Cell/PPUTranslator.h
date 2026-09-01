@@ -74,6 +74,7 @@ class PPUTranslator final : public cpu_translator
 
 	llvm::Value* nan_vec4;
 	bool m_may_be_mmio = false;
+	bool m_wasm_aot = false;
 
 #define DEF_VALUE(loc, glb, pos)\
 	llvm::Value*& loc = m_locals[pos];\
@@ -336,7 +337,7 @@ public:
 	// Handle compilation errors
 	void CompilationError(std::string_view error);
 
-	PPUTranslator(llvm::LLVMContext& context, llvm::Module* _module, const ppu_module<lv2_obj>& info, llvm::ExecutionEngine& engine);
+	PPUTranslator(llvm::LLVMContext& context, llvm::Module* _module, const ppu_module<lv2_obj>& info, llvm::ExecutionEngine& engine, bool wasm_aot = false);
 	~PPUTranslator();
 
 	// Get thread context struct type

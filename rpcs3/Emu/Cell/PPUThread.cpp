@@ -5238,6 +5238,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 	bool compiled_new = false;
 
 	bool has_mfvscr = false;
+	const bool wasm_aot = !check_only && std::getenv("RPCS3_PPU_WASM_AOT_IR");
 
 	const bool is_being_used_in_emulation = vm::base(info.segs[0].addr) == info.segs[0].ptr;
 
@@ -5804,7 +5805,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		}
 
 		// Check object file
-		if (jit_compiler::check(cache_path + obj_name))
+		if (!wasm_aot && jit_compiler::check(cache_path + obj_name))
 		{
 			if (!is_being_used_in_emulation && !check_only)
 			{
@@ -5981,6 +5982,11 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		
 		thread_ctrl::set_name(old_name);
 		g_watchdog_hold_ctr--;
+	}
+
+	if (wasm_aot)
+	{
+		return true;
 	}
 
 	// Initialize compiler instance
@@ -6182,16 +6188,19 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 {
 #ifdef LLVM_AVAILABLE
 	using namespace llvm;
+	const bool wasm_aot = std::getenv("RPCS3_PPU_WASM_AOT_IR");
 
 	// Create LLVM module
 	std::unique_ptr<Module> _module = std::make_unique<Module>(obj_name, jit.get_context());
 
 	// Initialize target
-	_module->setTargetTriple(Triple(jit_compiler::triple1()));
-	_module->setDataLayout(jit.get_engine().getTargetMachine()->createDataLayout());
+	_module->setTargetTriple(Triple(wasm_aot ? "wasm32-unknown-unknown" : jit_compiler::triple1()));
+	_module->setDataLayout(wasm_aot
+		? DataLayout("e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128")
+		: jit.get_engine().getTargetMachine()->createDataLayout());
 
 	// Initialize translator
-	PPUTranslator translator(jit.get_context(), _module.get(), module_part, jit.get_engine());
+	PPUTranslator translator(jit.get_context(), _module.get(), module_part, jit.get_engine(), wasm_aot);
 
 	// Define some types
 	const auto _func = FunctionType::get(translator.get_type<void>(), {
@@ -6218,7 +6227,7 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 			}
 
 			const auto f = cast<Function>(_module->getOrInsertFunction(fmt::format("__0x%x", func.addr - reloc), _func).getCallee());
-			f->setCallingConv(CallingConv::GHC);
+			f->setCallingConv(wasm_aot ? CallingConv::C : CallingConv::GHC);
 			f->addParamAttr(1, llvm::Attribute::NoAlias);
 			f->addFnAttr(Attribute::NoUnwind);
 		}
@@ -6299,7 +6308,7 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 		}
 
 		// Run this only in one module for all functions compiled
-		if (module_part.jit_bounds)
+		if (module_part.jit_bounds && !wasm_aot)
 		{
 			if ([[maybe_unused]] const auto func = translator.GetSymbolResolver(module_part))
 			{
@@ -6342,6 +6351,15 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 		}
 
 		ppu_log.notice("LLVM: %zu functions generated (code_size=0x%x, num_func=%d, max_addr(-)min_addr=0x%x)", _module->getFunctionList().size(), guest_code_size, num_func, max_addr - min_addr);
+	}
+
+	if (wasm_aot)
+	{
+		std::string result;
+		raw_string_ostream out(result);
+		out << *_module;
+		fs::write_file(cache_path + obj_name + ".wasm.ll", fs::rewrite, out.str());
+		return;
 	}
 
 	// Load or compile module

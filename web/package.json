@@ -12,6 +12,7 @@
     "build:core": "bash scripts/build-core.sh",
     "build:runtime": "bash scripts/build-rpcs3-core.sh",
     "commercial:headless": "node scripts/run-commercial-headless.mjs",
+    "ppu:aot": "node scripts/compile-ppu-ir-to-wasm.mjs",
     "storage:inspect": "node scripts/inspect-opfs.mjs",
     "storage:import-host": "node scripts/import-host-opfs.mjs",
     "compare:frame": "node scripts/compare-native-webgpu-frame.mjs",

@@ -50,18 +50,26 @@ cpu_translator::cpu_translator(llvm::Module* _module, bool is_be)
 #error "Unimplemented"
 #endif
 		}
+		else if (llvm::Triple(m_module->getTargetTriple()).isWasm())
+		{
+			// i8x16.swizzle zeroes every lane whose index is out of range. Masking the index with 0x8f keeps
+			// PSHUFB's low nibble and turns its sign bit into an out-of-range lane, which is PSHUFB exactly.
+			const auto mask = llvm::ConstantInt::get(get_type<u8[16]>(), 0x8f);
+			return m_ir->CreateCall(get_intrinsic(llvm::Intrinsic::wasm_swizzle), {data0, m_ir->CreateAnd(index, mask)});
+		}
 		else
 		{
 			// Emulate PSHUFB (TODO)
-			const auto mask = m_ir->CreateAnd(index, 0xf);
-			const auto loop = llvm::BasicBlock::Create(m_context, "", m_ir->GetInsertBlock()->getParent());
 			const auto prev = ci->getParent();
 			const auto next = prev->splitBasicBlock(ci->getNextNode());
+			const auto loop = llvm::BasicBlock::Create(m_context, "", prev->getParent());
 
-			llvm::cast<llvm::BranchInst>(m_ir->GetInsertBlock()->getTerminator())->setOperand(0, loop);
+			// The lane mask must dominate the loop, so it goes at the end of the block that branches into it
+			m_ir->SetInsertPoint(prev->getTerminator());
+			const auto mask = m_ir->CreateAnd(index, 0xf);
+			llvm::cast<llvm::BranchInst>(prev->getTerminator())->setOperand(0, loop);
 
 			llvm::Value* result;
-			//m_ir->CreateBr(loop);
 			m_ir->SetInsertPoint(loop);
 			const auto i = m_ir->CreatePHI(get_type<u32>(), 2);
 			const auto v = m_ir->CreatePHI(get_type<u8[16]>(), 2);
@@ -459,86 +467,130 @@ llvm::Constant* cpu_translator::make_const_vector<v128>(v128 v, llvm::Type* t, u
 
 void cpu_translator::replace_intrinsics(llvm::Function& f)
 {
+	// Positions are instructions in function layout order; nullptr is the position past the last instruction.
+	// A replacement may split the current block (see x86_pshufb without SSSE3), so positions never rely on
+	// staying inside one block's instruction list.
+	const auto first_in_following_block = [](llvm::BasicBlock* bb) -> llvm::Instruction*
+	{
+		for (bb = bb->getNextNode(); bb; bb = bb->getNextNode())
+		{
+			if (!bb->empty())
+			{
+				return &bb->front();
+			}
+		}
+
+		return nullptr;
+	};
+
+	const auto advance = [&](llvm::Instruction* inst) -> llvm::Instruction*
+	{
+		if (llvm::Instruction* next = inst->getNextNode())
+		{
+			return next;
+		}
+
+		return first_in_following_block(inst->getParent());
+	};
+
+	std::set<std::string, std::less<>> names;
+
+	std::function<llvm::Instruction*(llvm::Instruction*)> fix_funcs;
+
+	fix_funcs = [&](llvm::Instruction* inst) -> llvm::Instruction*
+	{
+		auto ci = llvm::dyn_cast<llvm::CallInst>(inst);
+
+		if (!ci)
+		{
+			return advance(inst);
+		}
+
+		const auto cf = ci->getCalledFunction();
+
+		if (!cf)
+		{
+			return advance(inst);
+		}
+
+		std::string_view func_name{cf->getName().data(), cf->getName().size()};
+
+		const auto it = m_intrinsics.find(func_name);
+
+		if (it == m_intrinsics.end())
+		{
+			return advance(inst);
+		}
+
+		if (!names.empty())
+		{
+			llvm_log.trace("cpu_translator::replace_intrinsics(): function '%s' names_size=%d, names[0]=%s", func_name, names.size(), *names.begin());
+		}
+
+		if (names.contains(func_name))
+		{
+			fmt::throw_exception("cpu_translator::replace_intrinsics(): Recursion detected at function '%s'!", func_name);
+		}
+
+		names.emplace(std::string(func_name));
+
+		llvm::BasicBlock* const bb = ci->getParent();
+
+		// Set insert point after call instruction
+		// In order to obtain a clear range of the inserted instructions
+		if (llvm::Instruction* next = ci->getNextNode())
+		{
+			m_ir->SetInsertPoint(next);
+		}
+		else
+		{
+			m_ir->SetInsertPoint(bb);
+		}
+
+		ci->replaceAllUsesWith(it->second(ci));
+
+		// Everything inserted lies between the call and the insert point in layout order, across any blocks the replacement split off
+		llvm::Instruction* end = nullptr;
+
+		if (llvm::BasicBlock* end_bb = m_ir->GetInsertBlock())
+		{
+			const auto end_it = m_ir->GetInsertPoint();
+			end = end_it != end_bb->end() ? &*end_it : first_in_following_block(end_bb);
+		}
+
+		llvm::Instruction* inner = ci->getNextNode();
+
+		if (!inner)
+		{
+			inner = first_in_following_block(bb);
+		}
+
+		ci->eraseFromParent();
+
+		while (inner != end)
+		{
+			inner = fix_funcs(inner);
+		}
+
+		// TODO: Simplify in C++23 with 'names.erase(func_name);'
+		names.erase(ensure(names.find(func_name), FN(x != names.end())));
+		return end;
+	};
+
+	llvm::Instruction* inst = nullptr;
+
 	for (llvm::BasicBlock& bb : f)
 	{
-		std::set<std::string, std::less<>> names;
-
-		using InstListType = llvm::BasicBlock::InstListType;
-
-		std::function<InstListType::iterator(InstListType::iterator)> fix_funcs;
-
-		fix_funcs = [&](InstListType::iterator inst_bit)
+		if (!bb.empty())
 		{
-			auto ci = llvm::dyn_cast<llvm::CallInst>(&*inst_bit);
-
-			if (!ci)
-			{
-				return std::next(inst_bit);
-			}
-
-			const auto cf = ci->getCalledFunction();
-
-			if (!cf)
-			{
-				return std::next(inst_bit);
-			}
-
-			std::string_view func_name{cf->getName().data(), cf->getName().size()};
-
-			const auto it = m_intrinsics.find(func_name);
-
-			if (it == m_intrinsics.end())
-			{
-				return std::next(inst_bit);
-			}
-
-			if (!names.empty())
-			{
-				llvm_log.trace("cpu_translator::replace_intrinsics(): function '%s' names_size=%d, names[0]=%s", func_name, names.size(), *names.begin());
-			}
-
-			if (names.contains(func_name))
-			{
-				fmt::throw_exception("cpu_translator::replace_intrinsics(): Recursion detected at function '%s'!", func_name);
-			}
-
-			names.emplace(std::string(func_name));
-
-			// Set insert point after call instruction
-			// In order to obtain a clear range of the inserted instructions
-			if (llvm::Instruction* next = ci->getNextNode())
-			{
-				m_ir->SetInsertPoint(next);
-			}
-			else
-			{
-				m_ir->SetInsertPoint(std::addressof(bb));
-			}
-
-			ci->replaceAllUsesWith(it->second(ci));
-
-			InstListType::iterator end = m_ir->GetInsertPoint();
-
-			for (InstListType::iterator next_it = ci->eraseFromParent(), inner = next_it; inner != end;)
-			{
-				if (llvm::isa<llvm::CallInst>(&*inner))
-				{
-					inner = fix_funcs(inner);
-				}
-				else
-				{
-					inner++;
-				}
-			}
-
-			// TODO: Simplify in C++23 with 'names.erase(func_name);'
-			names.erase(ensure(names.find(func_name), FN(x != names.end())));
-			return end;
-		};
-
-		for (auto bit = bb.begin(); bit != bb.end(); bit = fix_funcs(bit))
-		{
+			inst = &bb.front();
+			break;
 		}
+	}
+
+	while (inst)
+	{
+		inst = fix_funcs(inst);
 	}
 }
 

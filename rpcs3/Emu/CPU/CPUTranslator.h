@@ -36,6 +36,7 @@
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/IntrinsicsX86.h"
+#include "llvm/IR/IntrinsicsWebAssembly.h"
 #ifdef ARCH_ARM64
 #include "llvm/IR/IntrinsicsAArch64.h"
 #endif

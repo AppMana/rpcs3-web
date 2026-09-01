@@ -1,5 +1,22 @@
 import { decodeDrawPacket, PacketKind, SectionKind } from "./rpcs3-webgpu-packet.mjs";
 import { prepareWebGPU, releaseWebGPU, renderPacketsToWebGPU, stopWebGPUPresentation } from "./rpcs3-webgpu-renderer.mjs";
+import { encodePacketFixture } from "./rpcs3-webgpu-fixture.mjs";
+
+function base64Of(bytes) {
+  let binary = "";
+  for (let offset = 0; offset < bytes.byteLength; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, Math.min(bytes.byteLength, offset + 0x8000)));
+  }
+  return btoa(binary);
+}
+
+// A frame record kept for long runs: counts, progress, timings, and the GPU
+// summary, without per-frame logs, stack reports, or packet summaries.
+function compactFrame(frame, keepDetail) {
+  if (keepDetail) return frame;
+  const { logs: _logs, stackReport: _stack, packetSummaries: _summaries, textureWords: _words, gpu, ...rest } = frame;
+  return { ...rest, gpu: gpu && { ...gpu, drawDiagnostics: undefined, shaderPrograms: undefined, rgbaBase64: undefined, depthStates: undefined, rasterStates: undefined, scissorStates: undefined, targetStates: undefined } };
+}
 
 let active;
 let activeWorker;
@@ -15,14 +32,30 @@ function setPad(state = {}) {
   activeWorker?.postMessage({ type: "pad", state: currentPad });
 }
 
-function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
+// target: a fixture path relative to this page ("fixtures/x.elf") or an
+// absolute guest boot path in origin-private storage ("/opfs/games/x.iso").
+// This one API serves the desktop lanes, the hosted-origin iPad runner, and
+// the hardware/commercial runner; runners differ only in how they launch a
+// browser and where they write evidence.
+function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
   if (active) return active;
   activeWorker?.terminate();
   active = new Promise((resolve, reject) => {
     const dispatchCompletion = options.completion === "dispatch";
+    const bootPath = typeof target === "string" && target.startsWith("/") ? target : undefined;
+    const fixture = bootPath ? undefined : target;
+    const untilDraw = options.untilDraw === true;
     const requestedFrames = dispatchCompletion
       ? 1
-      : Number.isInteger(options.frames) ? Math.max(1, Math.min(60, options.frames)) : 1;
+      : Number.isInteger(options.frames) ? Math.max(1, Math.min(3600, options.frames)) : (untilDraw ? 3600 : 1);
+    const renderEvery = Number.isInteger(options.renderEvery) ? Math.max(1, options.renderEvery) : 1;
+    // Frames that are neither rendered nor final are discarded in the worker
+    // (no packet copy, no transfer); RSX still executes them.
+    const needsPackets = (frameNumber) => untilDraw || frameNumber % renderEvery === 0 || frameNumber === requestedFrames;
+    // Runs up to the classic 60-frame cap keep every frame's full detail
+    // (diagnostics, logs); longer runs keep it for the first and final frame.
+    const keepDetail = (index, finalFrame) => requestedFrames <= 60 || index === 0 || finalFrame;
+    const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(1_000, options.timeoutMs) : 120_000;
     const canvas = document.querySelector("#gpu-output");
     if (options.render && !(canvas instanceof HTMLCanvasElement)) {
       reject(new Error("GPU output canvas is unavailable"));
@@ -44,18 +77,19 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
     let firstResult;
     const timeout = setTimeout(() => {
       worker.terminate();
-      reject(new Error(`real RPCS3 runtime timed out; events=${JSON.stringify(events)}`));
-    }, 120_000);
+      reject(new Error(`real RPCS3 runtime timed out; events=${JSON.stringify(events.slice(-40))}`));
+    }, timeoutMs);
     let frameRequestedAt = performance.now();
     worker.addEventListener("message", async (event) => {
       const { packetBuffers = [], ...eventWithoutPackets } = event.data ?? {};
-      events.push(eventWithoutPackets);
+      if (events.length < 4_000) events.push(compactFrame(eventWithoutPackets, requestedFrames <= 60 || events.length < 8));
       if (event.data?.type === "runtime-result" || event.data?.type === "runtime-frame") {
         const receivedAt = performance.now();
         try {
-          if (!event.data.ok) throw new Error(`${event.data.detail}; events=${JSON.stringify(events)}`);
+          if (!event.data.ok) throw new Error(`${event.data.detail}; events=${JSON.stringify(events.slice(-40))}`);
           let gpu;
-          if (preparedGpu) {
+          let packetFixture;
+          if (preparedGpu && packetBuffers.length > 0) {
             activeGpu = await preparedGpu;
             const decodedPackets = packetBuffers.map((buffer) => decodeDrawPacket(new Uint8Array(buffer)));
             if (options.scissorOverride) {
@@ -90,12 +124,26 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
               decodedPackets,
               {
                 captureRgba: Boolean(options.captureRgba),
+                captureShaders: Boolean(options.captureShaders),
                 vertexDiagnostics: options.vertexDiagnostics === true,
+                textureCacheBytes: options.textureCacheBytes,
                 // Readback (frame hash, changed pixels) stays on for the
                 // deterministic acceptance gates; sustained runs turn it off.
                 readback: options.readback !== false || Boolean(options.captureRgba),
               },
             );
+            if (options.capturePacketFixture) {
+              // The exact packet bytes of this frame, for hardware replay and
+              // first-bad-draw bisection. Only the final frame is kept.
+              const encoded = encodePacketFixture(packetBuffers.map((buffer) => new Uint8Array(buffer)));
+              packetFixture = {
+                base64: base64Of(encoded),
+                bytes: encoded.byteLength,
+                packetCount: packetBuffers.length,
+                drawPacketCount: decodedPackets.filter((packet) => packet.kind === PacketKind.draw).length,
+                frameSequence: event.data.frameSequence,
+              };
+            }
             if (vertexBackendComparison) {
               gpu.vertexBackendComparison = {
                 ...vertexBackendComparison,
@@ -109,21 +157,26 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
             gpu,
             hostTimings: { waitForPacketsMs: receivedAt - frameRequestedAt, renderMs: performance.now() - receivedAt },
           };
-          frames.push(frame);
-          firstResult ??= frame;
-          if (!dispatchCompletion && frames.length < requestedFrames) {
+          const finalFrame = dispatchCompletion || frames.length + 1 >= requestedFrames
+            || (untilDraw && (frame.drawPacketCount ?? 0) > 0 && packetBuffers.length > 0);
+          frames.push(compactFrame(frame, keepDetail(frames.length, finalFrame)));
+          firstResult ??= frames[0];
+          if (!finalFrame) {
             frameRequestedAt = performance.now();
-            worker.postMessage({ type: "next-frame" });
+            worker.postMessage({ type: "next-frame", discardPackets: !needsPackets(frames.length + 1) });
             return;
           }
           clearTimeout(timeout);
-          const result = { ...firstResult, gpu, events, frames: requestedFrames > 1 ? frames : undefined };
+          const result = { ...firstResult, ...frames.at(-1), gpu, packetFixture, events, frames: requestedFrames > 1 || untilDraw ? frames : undefined };
           document.querySelector("#result").textContent = JSON.stringify(result, null, 2);
+          // The worker waits up to 5 s for RPCS3's threads to exit and then
+          // reports; allow that report to arrive before giving up on it.
           const shutdownTimer = setTimeout(() => {
             worker.terminate();
             if (activeWorker === worker) activeWorker = undefined;
+            result.shutdown = { stoppedCleanly: false, detail: "no shutdown report within 8 s" };
             resolve(result);
-          }, 5_000);
+          }, 8_000);
           const onShutdown = (shutdownEvent) => {
             if (shutdownEvent.data?.type !== "runtime-shutdown") return;
             clearTimeout(shutdownTimer);
@@ -152,8 +205,11 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
     worker.postMessage({
       type: "boot",
       fixture,
+      path: bootPath,
       returnPackets: Boolean(options.render),
+      discardPackets: !needsPackets(1) && !dispatchCompletion,
       diagnostics: options.diagnostics === true,
+      presentLatestOnly: options.presentLatestOnly === true,
       debugAddresses: Array.isArray(options.debugAddresses) ? options.debugAddresses : [],
       pad: options.pad ?? currentPad,
       completion: dispatchCompletion ? "dispatch" : "frame",
@@ -161,6 +217,17 @@ function run(fixture = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       dispatchTimeoutMs: options.dispatchTimeoutMs ?? 30_000,
       ppuAot: options.ppuAot === true,
       spuAot: options.spuAot === true,
+      clockScale: options.clockScale,
+      accurateSpuDma: options.accurateSpuDma,
+      packetCaptureLevel: options.packetCaptureLevel,
+      tracePc: options.tracePc,
+      traceDelayPc: options.traceDelayPc,
+      traceDelayMs: options.traceDelayMs,
+      watchAddress: options.watchAddress,
+      packetTimeoutMs: options.packetTimeoutMs ?? Math.max(1_000, timeoutMs - 5_000),
+      progressIntervalMs: options.progressIntervalMs,
+      pthreadPoolSize: options.pthreadPoolSize,
+      coreUrl: options.coreUrl,
       // RPCS3's WebGPU RSX backend always produces packets; page-side WebGPU
       // rendering is separately gated by options.render. Only an explicit
       // renderer: "null" selects NullGSRender (dispatch-only fixtures).

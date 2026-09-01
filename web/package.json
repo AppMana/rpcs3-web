@@ -11,7 +11,7 @@
     "build": "npm run prepare:assets && tsc --noEmit && vite build",
     "build:core": "bash scripts/build-core.sh",
     "build:runtime": "bash scripts/build-rpcs3-core.sh",
-    "commercial:headless": "node scripts/run-commercial-headless.mjs",
+    "commercial:headless": "node scripts/run-hardware-acceptance.mjs",
     "ppu:aot": "node scripts/compile-ppu-ir-to-wasm.mjs",
     "ppu:aot:fixture": "node scripts/build-ppu-aot-fixture.mjs",
     "spu:aot:fixture": "node scripts/build-spu-aot-fixture.mjs",
@@ -30,7 +30,8 @@
     "device:runtime": "node scripts/run-full-runtime-device.mjs",
     "device:units": "node scripts/run-unit-device.mjs",
     "check": "npm test && npm run build",
-    "device:origin": "node scripts/run-origin-device.mjs"
+    "device:origin": "node scripts/run-origin-device.mjs",
+    "hardware:run": "node scripts/run-hardware-acceptance.mjs"
   },
   "dependencies": {
     "coi-serviceworker": "0.1.7"

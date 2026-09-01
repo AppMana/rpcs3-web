@@ -15,7 +15,7 @@ export function stopWebGPUPresentation() {
 export function releaseWebGPU(prepared) {
   if (!prepared) return;
   stopWebGPUPresentation();
-  for (const name of ["uniformRing", "vertexRing"]) {
+  for (const name of ["uniformRing", "vertexRing", "streamRing", "indexRing"]) {
     prepared[name]?.buffer?.destroy();
     prepared[name] = undefined;
   }
@@ -34,7 +34,8 @@ export function releaseWebGPU(prepared) {
 // environment and 468-entry constant bank, then the fragment environment
 // (fill_fragment_state_buffer) and the program's inline constants as
 // write_fragment_constants_to_buffer emits them.
-const VERTEX_STATE_BYTES = 96 + 468 * 16;
+const VERTEX_LAYOUT_BYTES = 144;
+const VERTEX_STATE_BYTES = 96 + 468 * 16 + VERTEX_LAYOUT_BYTES;
 const FRAGMENT_CONSTANT_SLOTS = 256;
 const FRAGMENT_STATE_BYTES = 32 + FRAGMENT_CONSTANT_SLOTS * 16;
 const UNIFORM_ALIGNMENT = 256;
@@ -97,30 +98,74 @@ function readVertexDescriptors(packet) {
   return descriptors;
 }
 
-function readAttribute(packet, descriptor, vertex) {
+const VertexElementSize = Object.freeze([0, 2, 4, 2, 1, 2, 4, 1]);
+const VertexScale = Object.freeze([1, 32767.5, 1, 1, 255, 1, 32767, 1]);
+
+function bitsToFloat32(word) {
+  return new Float32Array(new Uint32Array([word >>> 0]).buffer)[0];
+}
+
+function halfToFloat32(half) {
+  const sign = (half & 0x8000) ? -1 : 1;
+  const exponent = (half >>> 10) & 0x1f;
+  const mantissa = half & 0x3ff;
+  if (exponent === 0) return sign * mantissa * 2 ** -24;
+  if (exponent === 0x1f) return mantissa ? NaN : sign * Infinity;
+  return sign * (1 + mantissa / 1024) * 2 ** (exponent - 15);
+}
+
+// Signed 16-bit interpretation of a 16-bit field, as RSXVertexFetch.glsl's sext.
+function sext16(value) {
+  return value < 0x8000 ? value : value - 65536;
+}
+
+// CPU oracle of RPCS3's RSXVertexFetch.glsl read_location/fetch_attribute:
+// the same descriptor fields, vertex id rule, byte assembly, type decode and
+// scaling, so the GPU fetch below can be checked against it bit for bit.
+function readAttribute(packet, descriptor, vertexIndex, vertexBaseIndex, vertexIndexOffset) {
   const bytes = packet.sections[descriptor.volatile ? SectionKind.volatileVertices : SectionKind.persistentVertices].bytes;
-  const index = descriptor.frequency === 0 ? 0 : descriptor.modulo
-    ? vertex % descriptor.frequency
-    : Math.floor(vertex / descriptor.frequency);
-  let offset = descriptor.offset + index * descriptor.stride;
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const result = vector(0, 1);
-  for (let component = 0; component < descriptor.components; component += 1) {
-    if (descriptor.type === VertexType.float32) {
-      result[component] = view.getFloat32(offset, !descriptor.bigEndian);
-      offset += 4;
-    } else if (descriptor.type === VertexType.unorm8 || descriptor.type === VertexType.uint8) {
-      result[component] = view.getUint8(offset) / (descriptor.type === VertexType.unorm8 ? 255 : 1);
-      offset += 1;
-    } else if (descriptor.type === VertexType.snorm16 || descriptor.type === VertexType.sint16) {
-      const raw = view.getInt16(offset, !descriptor.bigEndian);
-      result[component] = descriptor.type === VertexType.snorm16 ? Math.max(-1, raw / 32767) : raw;
-      offset += 2;
-    } else {
-      throw new Error(`WebGPU vertex fetch does not yet support RSX type ${descriptor.type}`);
+  let vertexId;
+  if (descriptor.frequency === 0) vertexId = 0;
+  else if (descriptor.modulo) vertexId = ((vertexIndex + vertexIndexOffset) | 0) % descriptor.frequency;
+  else vertexId = Math.trunc(((vertexIndex - vertexBaseIndex) | 0) / descriptor.frequency);
+  const elementSize = VertexElementSize[descriptor.type];
+  const scale = VertexScale[descriptor.type];
+  let i = vertexId * descriptor.stride + descriptor.offset;
+  const byte = (index) => (index >= 0 && index < bytes.byteLength ? bytes[index] : 0);
+  const result = [0, 0, 0, 0];
+  for (let n = 0; n < descriptor.components; n += 1) {
+    let x = byte(i++);
+    if (elementSize === 2) {
+      const y = byte(i++);
+      x = descriptor.bigEndian ? (y | (x << 8)) : (x | (y << 8));
+    } else if (elementSize === 4) {
+      const y = byte(i++);
+      const z = byte(i++);
+      const w = byte(i++);
+      x = descriptor.bigEndian
+        ? ((w | (z << 8) | (y << 16) | (x << 24)) >>> 0)
+        : ((x | (y << 8) | (z << 16) | (w << 24)) >>> 0);
     }
+    result[n] = x >>> 0;
   }
-  return result;
+  let ret;
+  if (descriptor.type === VertexType.snorm16 || descriptor.type === VertexType.sint16) {
+    ret = result.map((value) => sext16(value) + (descriptor.type === VertexType.snorm16 ? 0.5 : 0));
+  } else if (descriptor.type === VertexType.float32) {
+    ret = result.map(bitsToFloat32);
+  } else if (descriptor.type === VertexType.float16) {
+    const a = ((result[0] & 0xffff) | ((result[1] & 0xffff) << 16)) >>> 0;
+    const b = ((result[2] & 0xffff) | ((result[3] & 0xffff) << 16)) >>> 0;
+    ret = [halfToFloat32(a & 0xffff), halfToFloat32(a >>> 16), halfToFloat32(b & 0xffff), halfToFloat32(b >>> 16)];
+  } else if (elementSize === 1) {
+    ret = result.map((value) => value);
+  } else {
+    const packed = result[0];
+    const fields = [packed & 0x7ff, (packed >>> 11) & 0x7ff, (packed >>> 22) & 0x3ff, scale >>> 0];
+    ret = [sext16((fields[0] << 5) & 0xffff), sext16((fields[1] << 5) & 0xffff), sext16((fields[2] << 6) & 0xffff), sext16(fields[3] & 0xffff)];
+  }
+  if (descriptor.components < 4) ret[3] = scale;
+  return ret.map((value) => value / scale);
 }
 
 function readConstant(packet, index) {
@@ -160,7 +205,7 @@ function decodeVertexSource(words, sourceIndex, d0, d1, d3, inputs, temps, packe
   return value;
 }
 
-function compileVertexSource(words, sourceIndex, d1, d3) {
+function compileVertexSource(words, sourceIndex, d1, d3, referencedInputs) {
   let source;
   let absolute;
   if (sourceIndex === 0) {
@@ -176,7 +221,10 @@ function compileVertexSource(words, sourceIndex, d1, d3) {
   const type = bits(source, 0, 2);
   let expression;
   if (type === 1) expression = `temporary[${bits(source, 2, 6)}]`;
-  else if (type === 2) expression = `input.attribute${d1.inputSource}`;
+  else if (type === 2) {
+    referencedInputs?.add(d1.inputSource);
+    expression = `input.attribute${d1.inputSource}`;
+  }
   else if (type === 3) {
     if (d3.indexConstant) throw new Error("indexed RSX vertex constants are not yet translated");
     expression = `rsxVertexState.constants[${d1.constantSource}]`;
@@ -202,6 +250,7 @@ function compileVertexProgram(packet) {
   ];
   const opcodes = [];
   const scalarOpcodes = [];
+  const referencedInputs = new Set();
   let emitted = 0;
   for (let instruction = packet.vertexProgramEntry; instruction * 16 < program.byteLength; instruction += 1) {
     const base = instruction * 16;
@@ -226,25 +275,25 @@ function compileVertexProgram(packet) {
       scalarMask: [20, 19, 18, 17].map((bit) => Boolean(bits(words[3], bit, 1))),
     };
     if (d1.vectorOpcode !== 0) {
-      const a = compileVertexSource(words, 0, d1, d3);
+      const a = compileVertexSource(words, 0, d1, d3, referencedInputs);
       let value;
       if (d1.vectorOpcode === 1) value = a;
-      else if (d1.vectorOpcode === 2) value = `(${a} * ${compileVertexSource(words, 1, d1, d3)})`;
-      else if (d1.vectorOpcode === 3) value = `(${a} + ${compileVertexSource(words, 2, d1, d3)})`;
-      else if (d1.vectorOpcode === 4) value = `fma(${a}, ${compileVertexSource(words, 1, d1, d3)}, ${compileVertexSource(words, 2, d1, d3)})`;
-      else if (d1.vectorOpcode === 5) value = `vec4f(dot(${a}.xyz, ${compileVertexSource(words, 1, d1, d3)}.xyz))`;
+      else if (d1.vectorOpcode === 2) value = `(${a} * ${compileVertexSource(words, 1, d1, d3, referencedInputs)})`;
+      else if (d1.vectorOpcode === 3) value = `(${a} + ${compileVertexSource(words, 2, d1, d3, referencedInputs)})`;
+      else if (d1.vectorOpcode === 4) value = `fma(${a}, ${compileVertexSource(words, 1, d1, d3, referencedInputs)}, ${compileVertexSource(words, 2, d1, d3, referencedInputs)})`;
+      else if (d1.vectorOpcode === 5) value = `vec4f(dot(${a}.xyz, ${compileVertexSource(words, 1, d1, d3, referencedInputs)}.xyz))`;
       else if (d1.vectorOpcode === 6) {
-        const b = compileVertexSource(words, 1, d1, d3);
+        const b = compileVertexSource(words, 1, d1, d3, referencedInputs);
         value = `vec4f(dot(${a}.xyz, ${b}.xyz) + ${b}.w)`;
-      } else if (d1.vectorOpcode === 7) value = `vec4f(dot(${a}, ${compileVertexSource(words, 1, d1, d3)}))`;
+      } else if (d1.vectorOpcode === 7) value = `vec4f(dot(${a}, ${compileVertexSource(words, 1, d1, d3, referencedInputs)}))`;
       else if (d1.vectorOpcode === 8) {
-        const b = compileVertexSource(words, 1, d1, d3);
+        const b = compileVertexSource(words, 1, d1, d3, referencedInputs);
         value = `vec4f(1.0, ${a}.y * ${b}.y, ${a}.z, ${b}.w)`;
-      } else if (d1.vectorOpcode === 9) value = `min(${a}, ${compileVertexSource(words, 1, d1, d3)})`;
-      else if (d1.vectorOpcode === 10) value = `max(${a}, ${compileVertexSource(words, 1, d1, d3)})`;
+      } else if (d1.vectorOpcode === 9) value = `min(${a}, ${compileVertexSource(words, 1, d1, d3, referencedInputs)})`;
+      else if (d1.vectorOpcode === 10) value = `max(${a}, ${compileVertexSource(words, 1, d1, d3, referencedInputs)})`;
       else if ([11, 12, 16, 18, 19, 20].includes(d1.vectorOpcode)) {
         const comparison = new Map([[11, "<"], [12, ">="], [16, "=="], [18, ">"], [19, "<="], [20, "!="]]).get(d1.vectorOpcode);
-        value = `select(vec4f(0.0), vec4f(1.0), ${a} ${comparison} ${compileVertexSource(words, 1, d1, d3)})`;
+        value = `select(vec4f(0.0), vec4f(1.0), ${a} ${comparison} ${compileVertexSource(words, 1, d1, d3, referencedInputs)})`;
       } else if (d1.vectorOpcode === 14) value = `fract(${a})`;
       else if (d1.vectorOpcode === 15) value = `floor(${a})`;
       else if (d1.vectorOpcode === 17) value = "vec4f(0.0)";
@@ -263,7 +312,7 @@ function compileVertexProgram(packet) {
       opcodes.push(d1.vectorOpcode);
     }
     if (d1.scalarOpcode !== 0) {
-      const source = compileVertexSource(words, 2, d1, d3);
+      const source = compileVertexSource(words, 2, d1, d3, referencedInputs);
       let value;
       if (d1.scalarOpcode === 1) value = `vec4f(${source}.x)`;
       else if (d1.scalarOpcode === 2) value = `vec4f(1.0 / ${source}.x)`;
@@ -303,7 +352,12 @@ function compileVertexProgram(packet) {
     "result.position = transformedPosition;",
     ...VertexVaryings.map((name, index) => `result.${name} = destination[${VertexVaryingDestinations[index]}];`),
   );
-  return { code: lines.join("\n"), opcodes: [...new Set(opcodes)].sort((a, b) => a - b), scalarOpcodes: [...new Set(scalarOpcodes)].sort((a, b) => a - b) };
+  return {
+    code: lines.join("\n"),
+    opcodes: [...new Set(opcodes)].sort((a, b) => a - b),
+    scalarOpcodes: [...new Set(scalarOpcodes)].sort((a, b) => a - b),
+    inputs: [...referencedInputs].sort((a, b) => a - b),
+  };
 }
 
 // This follows RPCS3's existing GLSLInterpreter/VertexInterpreter.glsl decode
@@ -612,19 +666,22 @@ function compileFragmentProgram(packet) {
   };
 }
 
+// Raw vertex index values of the draw, as the GPU sees them: 0..n-1 for
+// arrays, the index buffer contents for indexed draws.
 function drawVertexOrder(packet) {
-  if (packet.indexCount === 0) return Array.from({ length: packet.vertexCount }, (_, index) => index);
+  if (!(packet.flags & PacketFlag.indexed)) return Array.from({ length: packet.drawCount }, (_, index) => index);
   const bytes = packet.sections[SectionKind.indices].bytes;
   const elementSize = packet.indexType === 0 ? 4 : 2;
-  if (bytes.byteLength < packet.indexCount * elementSize) throw new Error("RPCS3 index packet is truncated");
+  if (bytes.byteLength < packet.drawCount * elementSize) throw new Error("RPCS3 index packet is truncated");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return Array.from({ length: packet.drawCount }, (_, index) =>
+    elementSize === 4 ? view.getUint32(index * 4, true) : view.getUint16(index * 2, true));
+}
+
+function vertexIndexing(packet) {
   const layout = packet.sections[SectionKind.vertexLayout].bytes;
-  const vertexIndexBase = new DataView(layout.buffer, layout.byteOffset, layout.byteLength).getUint32(0, true);
-  return Array.from({ length: packet.indexCount }, (_, index) => {
-    const value = elementSize === 4 ? view.getUint32(index * 4, true) : view.getUint16(index * 2, true);
-    if (value < vertexIndexBase || value - vertexIndexBase >= packet.vertexCount) throw new Error("RPCS3 index is outside the uploaded vertex range");
-    return value - vertexIndexBase;
-  });
+  const view = new DataView(layout.buffer, layout.byteOffset, layout.byteLength);
+  return { vertexBaseIndex: view.getUint32(0, true), vertexIndexOffset: view.getUint32(4, true) };
 }
 
 function primitiveTopology(packet) {
@@ -658,20 +715,32 @@ function translateDraw(packet, program, vertexDiagnostics = false, vertexBackend
   // and polygons. Select the WebGPU topology for that mature output instead
   // of independently rebuilding guest primitive winding here.
   const topology = primitiveTopology(packet);
-  const allowedFlags = PacketFlag.indexed | PacketFlag.primitiveExpanded | PacketFlag.usesFragmentTextures;
+  const allowedFlags = PacketFlag.indexed | PacketFlag.primitiveExpanded | PacketFlag.usesFragmentTextures | PacketFlag.primitiveRestart | PacketFlag.indexRestartSentinel;
   if (packet.flags & ~allowedFlags) throw new Error(`WebGPU draw closure cannot translate packet flags 0x${packet.flags.toString(16)}`);
-  const descriptors = readVertexDescriptors(packet);
-  const vertexOrder = drawVertexOrder(packet);
-  const input = new Float32Array(vertexOrder.length * VertexOutputStrideFloats);
-  const oracleOutput = vertexDiagnostics || vertexBackend === "cpu-oracle"
-    ? new Float32Array(vertexOrder.length * VertexOutputStrideFloats)
-    : undefined;
-  for (let outputVertex = 0; outputVertex < vertexOrder.length; outputVertex += 1) {
-    const vertex = vertexOrder[outputVertex];
-    const inputs = new Map(Array.from({ length: 16 }, (_, index) => [index, vector(0, 1)]));
-    for (const [index, descriptor] of descriptors) inputs.set(index, readAttribute(packet, descriptor, vertex));
-    input.set(Array.from({ length: 16 }).flatMap((_, index) => inputs.get(index)), outputVertex * VertexOutputStrideFloats);
-    if (oracleOutput) {
+  const indexed = Boolean(packet.flags & PacketFlag.indexed);
+  const primitiveRestart = Boolean(packet.flags & PacketFlag.primitiveRestart);
+  const indexFormat = packet.indexType === 0 ? "uint32" : "uint16";
+  // WebGPU treats the maximum index value as a restart marker on every
+  // indexed strip draw. RPCS3 reports when the stream contains that value; if
+  // the guest did not enable restart, the draw cannot be reproduced exactly.
+  if (indexed && topology.endsWith("-strip") && !primitiveRestart && (packet.flags & PacketFlag.indexRestartSentinel)) {
+    throw new Error("RSX strip index stream contains the restart sentinel without primitive restart enabled");
+  }
+  const needsCpuVertices = vertexBackend === "cpu-oracle" || vertexDiagnostics;
+  let input;
+  let oracleOutput;
+  if (needsCpuVertices) {
+    if (primitiveRestart) throw new Error("the CPU vertex oracle cannot expand a primitive-restart index stream");
+    const descriptors = readVertexDescriptors(packet);
+    const { vertexBaseIndex, vertexIndexOffset } = vertexIndexing(packet);
+    const vertexOrder = drawVertexOrder(packet);
+    input = new Float32Array(vertexOrder.length * VertexOutputStrideFloats);
+    oracleOutput = new Float32Array(vertexOrder.length * VertexOutputStrideFloats);
+    for (let outputVertex = 0; outputVertex < vertexOrder.length; outputVertex += 1) {
+      const vertex = vertexOrder[outputVertex];
+      const inputs = new Map(Array.from({ length: 16 }, (_, index) => [index, vector(0, 1)]));
+      for (const [index, descriptor] of descriptors) inputs.set(index, readAttribute(packet, descriptor, vertex, vertexBaseIndex, vertexIndexOffset));
+      input.set(Array.from({ length: 16 }).flatMap((_, index) => inputs.get(index)), outputVertex * VertexOutputStrideFloats);
       const executed = executeVertexProgram(packet, inputs);
       const position = applyVertexEnvironment(packet, executed.destinations[0]);
       // RPCS3's Vulkan backend uses a positive-height viewport, whose framebuffer
@@ -686,16 +755,111 @@ function translateDraw(packet, program, vertexDiagnostics = false, vertexBackend
   if (program.fragment.textured && packet.textures.length === 0) throw new Error("RSX fragment program samples a texture without a payload");
   return {
     input,
-    gpuInput: vertexBackend === "cpu-oracle" ? oracleOutput : input,
+    gpuInput: vertexBackend === "cpu-oracle" ? oracleOutput : undefined,
     oracleOutput,
     program,
-    vertexCount: vertexOrder.length,
+    vertexCount: packet.drawCount,
+    indexed,
+    indexFormat,
+    primitiveRestart,
     topology,
     vertexOpcodes: program.vertex.opcodes,
     scalarVertexOpcodes: program.vertex.scalarOpcodes,
     fragmentOpcodes: program.fragment.opcodes,
   };
 }
+
+// WGSL port of RPCS3's RSXVertexFetch.glsl (fetch_desc, fetch_attribute,
+// read_location). The attribute descriptors and index base/offset are the
+// 64-bit words fill_vertex_layout_state writes into the packet's vertex
+// layout section; the streams are RPCS3's persistent/volatile uploads bound
+// as byte arrays.
+const RSX_VERTEX_FETCH_WGSL = `
+fn rsxPersistentByte(index: u32) -> u32 {
+  return (rsxPersistentStream[index >> 2u] >> ((index & 3u) * 8u)) & 0xffu;
+}
+fn rsxVolatileByte(index: u32) -> u32 {
+  return (rsxVolatileStream[index >> 2u] >> ((index & 3u) * 8u)) & 0xffu;
+}
+fn rsxStreamByte(useVolatile: bool, index: u32) -> u32 {
+  if (useVolatile) { return rsxVolatileByte(index); }
+  return rsxPersistentByte(index);
+}
+fn rsxGenBits4(x: u32, y: u32, z: u32, w: u32, swap: bool) -> u32 {
+  if (swap) { return insertBits(insertBits(insertBits(w, z, 8u, 8u), y, 16u, 8u), x, 24u, 8u); }
+  return insertBits(insertBits(insertBits(x, y, 8u, 8u), z, 16u, 8u), w, 24u, 8u);
+}
+fn rsxGenBits2(x: u32, y: u32, swap: bool) -> u32 {
+  if (swap) { return insertBits(y, x, 8u, 8u); }
+  return insertBits(x, y, 8u, 8u);
+}
+fn rsxSext(bits: vec4i) -> vec4f {
+  return vec4f(select(bits - vec4i(65536), bits, bits < vec4i(0x8000)));
+}
+fn rsxFetchAttribute(attribType: u32, attributeSize: u32, startingOffset: u32, stride: u32, swapBytes: bool, useVolatile: bool, vertexId: i32) -> vec4f {
+  var elemSizeTable = array<i32, 8>(0, 2, 4, 2, 1, 2, 4, 1);
+  var scalingTable = array<f32, 8>(1.0, 32767.5, 1.0, 1.0, 255.0, 1.0, 32767.0, 1.0);
+  let elemSize = elemSizeTable[attribType];
+  let scale = vec4f(scalingTable[attribType]);
+  var result = vec4u(0u);
+  var i = u32(vertexId * i32(stride) + i32(startingOffset));
+  for (var n = 0u; n < attributeSize; n = n + 1u) {
+    var tmp = vec4u(0u);
+    tmp.x = rsxStreamByte(useVolatile, i); i = i + 1u;
+    if (elemSize == 2) {
+      tmp.y = rsxStreamByte(useVolatile, i); i = i + 1u;
+      tmp.x = rsxGenBits2(tmp.x, tmp.y, swapBytes);
+    } else if (elemSize == 4) {
+      tmp.y = rsxStreamByte(useVolatile, i); i = i + 1u;
+      tmp.z = rsxStreamByte(useVolatile, i); i = i + 1u;
+      tmp.w = rsxStreamByte(useVolatile, i); i = i + 1u;
+      tmp.x = rsxGenBits4(tmp.x, tmp.y, tmp.z, tmp.w, swapBytes);
+    }
+    result[n] = tmp.x;
+  }
+  var ret: vec4f;
+  if (attribType == 1u || attribType == 5u) {
+    ret = rsxSext(vec4i(result));
+    ret = fma(vec4f(0.5), vec4f(select(0.0, 1.0, attribType == 1u)), ret);
+  } else if (attribType == 2u) {
+    ret = bitcast<vec4f>(result);
+  } else if (attribType == 3u) {
+    let a = insertBits(result.x, result.y, 16u, 16u);
+    let b = insertBits(result.z, result.w, 16u, 16u);
+    ret = vec4f(unpack2x16float(a), unpack2x16float(b));
+  } else if (elemSize == 1) {
+    ret = vec4f(result);
+  } else {
+    let packed = vec4u(extractBits(result.x, 0u, 11u), extractBits(result.x, 11u, 11u), extractBits(result.x, 22u, 10u), u32(scale.x));
+    ret = rsxSext(vec4i(packed) << vec4u(5u, 5u, 6u, 0u));
+  }
+  if (attributeSize < 4u) { ret.w = scale.x; }
+  return ret / scale;
+}
+fn rsxReadLocation(location: u32, vertexIndex: u32) -> vec4f {
+  let wordIndex = 4u + location * 2u;
+  let attrib = vec2u(rsxVertexState.attributeLayout[wordIndex >> 2u][wordIndex & 3u], rsxVertexState.attributeLayout[(wordIndex + 1u) >> 2u][(wordIndex + 1u) & 3u]);
+  let stride = extractBits(attrib.x, 0u, 8u);
+  let frequency = extractBits(attrib.x, 8u, 16u);
+  let attribType = extractBits(attrib.x, 24u, 3u);
+  let attributeSize = extractBits(attrib.x, 27u, 3u);
+  let startingOffset = extractBits(attrib.y, 0u, 29u);
+  let swapBytes = extractBits(attrib.y, 29u, 1u) != 0u;
+  let useVolatile = extractBits(attrib.y, 30u, 1u) != 0u;
+  let modulo = extractBits(attrib.y, 31u, 1u) != 0u;
+  let vertexBaseIndex = rsxVertexState.attributeLayout[0].x;
+  let vertexIndexOffset = rsxVertexState.attributeLayout[0].y;
+  var vertexId: i32;
+  if (frequency == 0u) {
+    vertexId = 0;
+  } else if (modulo) {
+    vertexId = (i32(vertexIndex) + i32(vertexIndexOffset)) % i32(frequency);
+  } else {
+    vertexId = (i32(vertexIndex) - i32(vertexBaseIndex)) / i32(frequency);
+  }
+  return rsxFetchAttribute(attribType, attributeSize, startingOffset, stride, swapBytes, useVolatile, vertexId);
+}
+`;
 
 // Translated programs are keyed by microcode content and the control words
 // that change the generated WGSL, so a frame that reuses a program never
@@ -717,44 +881,167 @@ function assembleShader(vertex, fragment, vertexBackend) {
     `@group(0) @binding(${slot * 2}) var rsxTexture${slot}: texture_2d<f32>;`,
     `@group(0) @binding(${slot * 2 + 1}) var rsxSampler${slot}: sampler;`,
   ]).join("\n");
-  const vertexInputFields = vertexBackend === "webgpu-wgsl"
-    ? Array.from({ length: 16 }, (_, attribute) => `@location(${attribute}) attribute${attribute}: vec4f,`).join("\n")
-    : ["@location(0) position: vec4f,", ...VertexVaryings.map((name, varying) => `@location(${varying + 1}) ${name}: vec4f,`)].join("\n");
   const vertexOutputFields = VertexVaryings.map((name, varying) => `@location(${varying}) ${name}: vec4f,`).join("\n");
-  const vertexDeclarations = vertexBackend === "webgpu-wgsl" ? `
-    struct RSXVertexState {
-      environment: array<vec4f, 6>,
-      constants: array<vec4f, 468>,
-    };
-    @group(0) @binding(32) var<uniform> rsxVertexState: RSXVertexState;
-  ` : "";
-  const vertexBody = vertexBackend === "webgpu-wgsl"
-    ? vertex.code
-    : ["result.position = input.position;", ...VertexVaryings.map((name) => `result.${name} = input.${name};`)].join("\n");
-  return `
-    ${declarations}
-    ${vertexDeclarations}
+  const fragmentDeclarations = `
     struct RSXFragmentState {
       environment: array<vec4f, 2>,
       constants: array<vec4f, ${FRAGMENT_CONSTANT_SLOTS}>,
     };
     @group(0) @binding(33) var<uniform> rsxFragmentState: RSXFragmentState;
-    struct VertexIn {
-      ${vertexInputFields}
-    };
+  `;
+  let vertexStage;
+  if (vertexBackend === "webgpu-wgsl") {
+    // Attributes are fetched from RPCS3's raw vertex streams in the shader.
+    const attributeFields = Array.from({ length: 16 }, (_, attribute) => `attribute${attribute}: vec4f,`).join("\n");
+    const fetches = vertex.inputs.map((attribute) => `input.attribute${attribute} = rsxReadLocation(${attribute}u, vertexIn.vertexIndex);`).join("\n");
+    vertexStage = `
+      struct RSXVertexState {
+        environment: array<vec4f, 6>,
+        constants: array<vec4f, 468>,
+        attributeLayout: array<vec4u, ${VERTEX_LAYOUT_BYTES / 16}>,
+      };
+      @group(0) @binding(32) var<uniform> rsxVertexState: RSXVertexState;
+      @group(0) @binding(34) var<storage, read> rsxPersistentStream: array<u32>;
+      @group(0) @binding(35) var<storage, read> rsxVolatileStream: array<u32>;
+      ${RSX_VERTEX_FETCH_WGSL}
+      struct RSXVertexInputs {
+        ${attributeFields}
+      };
+      struct VertexIn {
+        @builtin(vertex_index) vertexIndex: u32,
+      };
+      @vertex fn vertex_main(vertexIn: VertexIn) -> VertexOut {
+        var input: RSXVertexInputs;
+        ${Array.from({ length: 16 }, (_, attribute) => `input.attribute${attribute} = vec4f(0.0, 0.0, 0.0, 1.0);`).join("\n")}
+        ${fetches}
+        var result: VertexOut;
+        ${vertex.code}
+        return result;
+      }
+    `;
+  } else {
+    // CPU oracle: the vertex program was executed in JavaScript; the stage
+    // only forwards position and varyings.
+    const vertexInputFields = ["@location(0) position: vec4f,", ...VertexVaryings.map((name, varying) => `@location(${varying + 1}) ${name}: vec4f,`)].join("\n");
+    vertexStage = `
+      struct VertexIn {
+        ${vertexInputFields}
+      };
+      @vertex fn vertex_main(input: VertexIn) -> VertexOut {
+        var result: VertexOut;
+        result.position = input.position;
+        ${VertexVaryings.map((name) => `result.${name} = input.${name};`).join("\n")}
+        return result;
+      }
+    `;
+  }
+  return `
+    ${declarations}
+    ${fragmentDeclarations}
     struct VertexOut {
       @builtin(position) position: vec4f,
       ${vertexOutputFields}
     };
-    @vertex fn vertex_main(input: VertexIn) -> VertexOut {
-      var result: VertexOut;
-      ${vertexBody}
-      return result;
-    }
+    ${vertexStage}
     @fragment fn fragment_main(input: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(0) vec4f {
       ${fragment.code}
     }
   `;
+}
+
+// Differential check of the WGSL vertex fetch: a compute pass runs
+// rsxReadLocation for every drawn vertex and location and returns the fetched
+// attributes, which the caller compares against the CPU oracle (readAttribute).
+export async function fetchAttributesOnGPU(prepared, packet) {
+  const { device } = prepared;
+  const indexed = Boolean(packet.flags & PacketFlag.indexed);
+  const count = packet.drawCount;
+  const code = `
+    struct RSXVertexState {
+      environment: array<vec4f, 6>,
+      constants: array<vec4f, 468>,
+      attributeLayout: array<vec4u, ${VERTEX_LAYOUT_BYTES / 16}>,
+    };
+    @group(0) @binding(32) var<uniform> rsxVertexState: RSXVertexState;
+    @group(0) @binding(34) var<storage, read> rsxPersistentStream: array<u32>;
+    @group(0) @binding(35) var<storage, read> rsxVolatileStream: array<u32>;
+    @group(0) @binding(36) var<storage, read_write> output: array<vec4f>;
+    @group(0) @binding(37) var<storage, read> indices: array<u32>;
+    ${RSX_VERTEX_FETCH_WGSL}
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+      let vertex = id.x;
+      if (vertex >= ${count}u) { return; }
+      var vertexIndex = vertex;
+      ${indexed ? (packet.indexType === 0
+        ? "vertexIndex = indices[vertex];"
+        : "vertexIndex = (indices[vertex >> 1u] >> ((vertex & 1u) * 16u)) & 0xffffu;") : ""}
+      for (var location = 0u; location < 16u; location = location + 1u) {
+        output[vertex * 16u + location] = rsxReadLocation(location, vertexIndex);
+      }
+    }
+  `;
+  const module = device.createShaderModule({ code });
+  const layout = device.createBindGroupLayout({ entries: [
+    { binding: 32, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+    { binding: 34, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+    { binding: 35, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+    { binding: 36, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+    { binding: 37, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+  ] });
+  const pipeline = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }), compute: { module, entryPoint: "main" } });
+  const upload = (bytes, usage, minimum = 16) => {
+    const size = Math.max(minimum, alignTo(bytes.byteLength, 4));
+    const buffer = device.createBuffer({ size, usage: usage | GPUBufferUsage.COPY_DST });
+    if (bytes.byteLength) writeSectionBytes(device, buffer, 0, bytes);
+    return buffer;
+  };
+  const state = new Uint8Array(VERTEX_STATE_BYTES);
+  state.set(packet.sections[SectionKind.vertexEnvironment].bytes, 0);
+  state.set(packet.sections[SectionKind.vertexConstants].bytes, 96);
+  state.set(packet.sections[SectionKind.vertexLayout].bytes, 96 + 468 * 16);
+  const uniform = upload(state, GPUBufferUsage.UNIFORM);
+  const persistent = upload(packet.sections[SectionKind.persistentVertices].bytes, GPUBufferUsage.STORAGE);
+  const volatileBuffer = upload(packet.sections[SectionKind.volatileVertices].bytes, GPUBufferUsage.STORAGE);
+  const indexBuffer = upload(packet.sections[SectionKind.indices].bytes, GPUBufferUsage.STORAGE);
+  const outputSize = Math.max(16, count * 16 * 16);
+  const output = device.createBuffer({ size: outputSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const readback = device.createBuffer({ size: outputSize, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const bindGroup = device.createBindGroup({ layout, entries: [
+    { binding: 32, resource: { buffer: uniform } },
+    { binding: 34, resource: { buffer: persistent } },
+    { binding: 35, resource: { buffer: volatileBuffer } },
+    { binding: 36, resource: { buffer: output } },
+    { binding: 37, resource: { buffer: indexBuffer } },
+  ] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(count / 64));
+  pass.end();
+  encoder.copyBufferToBuffer(output, 0, readback, 0, outputSize);
+  device.queue.submit([encoder.finish()]);
+  await readback.mapAsync(GPUMapMode.READ);
+  const result = new Float32Array(readback.getMappedRange().slice(0, count * 16 * 16));
+  readback.unmap();
+  for (const buffer of [uniform, persistent, volatileBuffer, indexBuffer, output, readback]) buffer.destroy();
+  return result;
+}
+
+// CPU oracle attributes for the same draw order and layout as fetchAttributesOnGPU.
+export function fetchAttributesOnCPU(packet) {
+  const descriptors = readVertexDescriptors(packet);
+  const { vertexBaseIndex, vertexIndexOffset } = vertexIndexing(packet);
+  const vertexOrder = drawVertexOrder(packet);
+  const result = new Float32Array(vertexOrder.length * 64);
+  vertexOrder.forEach((vertex, outputVertex) => {
+    for (let location = 0; location < 16; location += 1) {
+      const descriptor = descriptors.get(location);
+      const value = descriptor ? readAttribute(packet, descriptor, vertex, vertexBaseIndex, vertexIndexOffset) : vector(0, 1);
+      result.set(value, outputVertex * 64 + location * 4);
+    }
+  });
+  return result;
 }
 
 function getProgram(prepared, packet, vertexBackend) {
@@ -774,10 +1061,14 @@ function getProgram(prepared, packet, vertexBackend) {
   const bindGroupLayout = device.createBindGroupLayout({
     label: `RPCS3 RSX bind group layout ${key}`,
     entries: [
-      ...(vertexBackend === "webgpu-wgsl" ? [{
-        binding: 32, visibility: GPUShaderStage.VERTEX,
-        buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: VERTEX_STATE_BYTES },
-      }] : []),
+      ...(vertexBackend === "webgpu-wgsl" ? [
+        {
+          binding: 32, visibility: GPUShaderStage.VERTEX,
+          buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: VERTEX_STATE_BYTES },
+        },
+        { binding: 34, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+        { binding: 35, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      ] : []),
       {
         binding: 33, visibility: GPUShaderStage.FRAGMENT,
         buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: FRAGMENT_STATE_BYTES },
@@ -793,6 +1084,20 @@ function getProgram(prepared, packet, vertexBackend) {
   cache.set(key, program);
   if (cache.size > PROGRAM_CACHE_LIMIT) cache.delete(cache.keys().next().value);
   return program;
+}
+
+// queue.writeBuffer sizes must be multiples of 4; packet sections are
+// contiguous and aligned, so the padding bytes normally exist in the packet.
+function writeSectionBytes(device, buffer, offset, bytes) {
+  if (bytes.byteLength === 0) return;
+  const size = alignTo(bytes.byteLength, 4);
+  if (bytes.byteOffset + size <= bytes.buffer.byteLength) {
+    device.queue.writeBuffer(buffer, offset, bytes.buffer, bytes.byteOffset, size);
+    return;
+  }
+  const padded = new Uint8Array(size);
+  padded.set(bytes);
+  device.queue.writeBuffer(buffer, offset, padded);
 }
 
 // A buffer that grows to the largest frame seen and is rewritten in place;
@@ -1247,9 +1552,20 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   const uniformStride = VERTEX_STATE_STRIDE + FRAGMENT_STATE_STRIDE;
   const uniformRing = ensureRing(prepared, "uniformRing", GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, Math.max(1, drawCount) * uniformStride);
   const uniformBytes = new Uint8Array(Math.max(1, drawCount) * uniformStride);
-  const vertexBytes = translated.reduce((sum, draw) => sum + alignTo(draw.gpuInput.byteLength, UNIFORM_ALIGNMENT), 0);
+  const vertexBytes = translated.reduce((sum, draw) => sum + (draw.gpuInput ? alignTo(draw.gpuInput.byteLength, UNIFORM_ALIGNMENT) : 0), 0);
   const vertexRing = ensureRing(prepared, "vertexRing", GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST, Math.max(UNIFORM_ALIGNMENT, vertexBytes));
   let vertexRingOffset = 0;
+  // RPCS3's raw vertex streams and index streams, bound as-is for the WGSL
+  // fetch; every draw gets 256-aligned slots so bind groups can be cached
+  // by offset and size.
+  const streamSlot = (bytes) => Math.max(UNIFORM_ALIGNMENT, alignTo(bytes.byteLength, UNIFORM_ALIGNMENT));
+  const streamBytes = drawPackets.reduce((sum, packet) =>
+    sum + streamSlot(packet.sections[SectionKind.persistentVertices].bytes) + streamSlot(packet.sections[SectionKind.volatileVertices].bytes), 0);
+  const streamRing = ensureRing(prepared, "streamRing", GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, Math.max(UNIFORM_ALIGNMENT, streamBytes));
+  let streamRingOffset = 0;
+  const indexBytes = drawPackets.reduce((sum, packet) => sum + streamSlot(packet.sections[SectionKind.indices].bytes), 0);
+  const indexRing = ensureRing(prepared, "indexRing", GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST, Math.max(UNIFORM_ALIGNMENT, indexBytes));
+  let indexRingOffset = 0;
 
   const resources = translated.map((draw, index) => {
     const packet = drawPackets[index];
@@ -1261,7 +1577,8 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     const blendKey = blend
       ? [blend.color.srcFactor, blend.color.dstFactor, blend.color.operation, blend.alpha.srcFactor, blend.alpha.dstFactor, blend.alpha.operation].join(",")
       : "none";
-    const pipelineKey = [program.key, format, draw.topology, raster.frontFace, raster.cullMode, depth.writeEnabled, depth.comparison, target.writeMask, blendKey].join("|");
+    const stripIndexFormat = vertexBackend === "webgpu-wgsl" && draw.indexed && draw.topology.endsWith("-strip") ? draw.indexFormat : undefined;
+    const pipelineKey = [program.key, format, draw.topology, stripIndexFormat ?? "-", raster.frontFace, raster.cullMode, depth.writeEnabled, depth.comparison, target.writeMask, blendKey].join("|");
     let pipeline = pipelineCache.get(pipelineKey);
     if (pipeline) {
       pipelineCacheHits += 1;
@@ -1273,7 +1590,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
         vertex: {
           module: program.module,
           entryPoint: "vertex_main",
-          buffers: [{
+          buffers: vertexBackend === "webgpu-wgsl" ? [] : [{
             arrayStride: VertexOutputStrideFloats * 4,
             attributes: Array.from({ length: 16 }, (_, attribute) => ({
               shaderLocation: attribute,
@@ -1287,16 +1604,39 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
           entryPoint: "fragment_main",
           targets: [{ format, blend, writeMask: target.writeMask }],
         },
-        primitive: { topology: draw.topology, frontFace: raster.frontFace, cullMode: raster.cullMode },
+        primitive: { topology: draw.topology, frontFace: raster.frontFace, cullMode: raster.cullMode, stripIndexFormat },
         depthStencil: { format: "depth24plus", depthWriteEnabled: depth.writeEnabled, depthCompare: depth.comparison },
       });
       pipelineCache.set(pipelineKey, pipeline);
       if (pipelineCache.size > PIPELINE_CACHE_LIMIT) pipelineCache.delete(pipelineCache.keys().next().value);
     }
 
-    const vertexOffset = vertexRingOffset;
-    vertexRingOffset += alignTo(draw.gpuInput.byteLength, UNIFORM_ALIGNMENT);
-    device.queue.writeBuffer(vertexRing.buffer, vertexOffset, draw.gpuInput.buffer, draw.gpuInput.byteOffset, draw.gpuInput.byteLength);
+    let vertexOffset = 0;
+    let vertexSize = 0;
+    let indexOffset = 0;
+    let indexSize = 0;
+    const streams = { persistent: { offset: 0, size: 0 }, volatile: { offset: 0, size: 0 } };
+    if (draw.gpuInput) {
+      vertexOffset = vertexRingOffset;
+      vertexSize = draw.gpuInput.byteLength;
+      vertexRingOffset += alignTo(vertexSize, UNIFORM_ALIGNMENT);
+      device.queue.writeBuffer(vertexRing.buffer, vertexOffset, draw.gpuInput.buffer, draw.gpuInput.byteOffset, vertexSize);
+    }
+    if (vertexBackend === "webgpu-wgsl") {
+      for (const [name, section] of [["persistent", SectionKind.persistentVertices], ["volatile", SectionKind.volatileVertices]]) {
+        const bytes = packet.sections[section].bytes;
+        streams[name] = { offset: streamRingOffset, size: streamSlot(bytes) };
+        writeSectionBytes(device, streamRing.buffer, streamRingOffset, bytes);
+        streamRingOffset += streams[name].size;
+      }
+      if (draw.indexed) {
+        const bytes = packet.sections[SectionKind.indices].bytes;
+        indexOffset = indexRingOffset;
+        indexSize = bytes.byteLength;
+        indexRingOffset += streamSlot(bytes);
+        writeSectionBytes(device, indexRing.buffer, indexOffset, bytes);
+      }
+    }
 
     const uniformBase = index * uniformStride;
     const fragmentBase = uniformBase + VERTEX_STATE_STRIDE;
@@ -1306,8 +1646,11 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       if (environment.byteLength !== 96 || constants.byteLength !== 468 * 16) {
         throw new Error("RPCS3 vertex-state packet has an invalid uniform layout");
       }
+      const layout = packet.sections[SectionKind.vertexLayout].bytes;
+      if (layout.byteLength !== VERTEX_LAYOUT_BYTES) throw new Error("RPCS3 vertex-layout packet has an invalid size");
       uniformBytes.set(environment, uniformBase);
       uniformBytes.set(constants, uniformBase + 96);
+      uniformBytes.set(layout, uniformBase + 96 + constants.byteLength);
     }
     const fragmentEnvironment = packet.sections[SectionKind.fragmentEnvironment].bytes;
     if (fragmentEnvironment.byteLength !== 32) throw new Error("RPCS3 fragment environment is truncated");
@@ -1340,7 +1683,11 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       }
     }
 
-    const bindGroupKey = `${program.key}|${uniformRing.generation}|${textureResources.map((resource) => resource.cacheKey).join(",")}`;
+    const bindGroupKey = [
+      program.key, uniformRing.generation, streamRing.generation,
+      streams.persistent.offset, streams.persistent.size, streams.volatile.offset, streams.volatile.size,
+      textureResources.map((resource) => resource.cacheKey).join(","),
+    ].join("|");
     let bindGroup = bindGroupCache.get(bindGroupKey);
     if (bindGroup) {
       bindGroupCacheHits += 1;
@@ -1349,7 +1696,11 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       bindGroup = device.createBindGroup({
         layout: program.bindGroupLayout,
         entries: [
-          ...(vertexBackend === "webgpu-wgsl" ? [{ binding: 32, resource: { buffer: uniformRing.buffer, offset: 0, size: VERTEX_STATE_BYTES } }] : []),
+          ...(vertexBackend === "webgpu-wgsl" ? [
+            { binding: 32, resource: { buffer: uniformRing.buffer, offset: 0, size: VERTEX_STATE_BYTES } },
+            { binding: 34, resource: { buffer: streamRing.buffer, offset: streams.persistent.offset, size: streams.persistent.size } },
+            { binding: 35, resource: { buffer: streamRing.buffer, offset: streams.volatile.offset, size: streams.volatile.size } },
+          ] : []),
           { binding: 33, resource: { buffer: uniformRing.buffer, offset: 0, size: FRAGMENT_STATE_BYTES } },
           ...textureResources.flatMap((resource) => [
             { binding: resource.slot * 2, resource: resource.view },
@@ -1361,7 +1712,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       if (bindGroupCache.size > BIND_GROUP_CACHE_LIMIT) bindGroupCache.delete(bindGroupCache.keys().next().value);
     }
     const dynamicOffsets = vertexBackend === "webgpu-wgsl" ? [uniformBase, fragmentBase] : [fragmentBase];
-    return { pipeline, vertexOffset, vertexSize: draw.gpuInput.byteLength, bindGroup, dynamicOffsets, textureResources, shaderCode: program.shaderCode };
+    return { pipeline, vertexOffset, vertexSize, indexOffset, indexSize, bindGroup, dynamicOffsets, textureResources, shaderCode: program.shaderCode };
   });
   device.queue.writeBuffer(uniformRing.buffer, 0, uniformBytes);
   const frameTarget = ensureFrameTarget(prepared, canvas.width, canvas.height, format);
@@ -1377,12 +1728,22 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     const scissor = scissorStates[index].scaled;
     if (scissor.width === 0 || scissor.height === 0) continue;
     const resource = resources[index];
+    const draw = translated[index];
     pass.setPipeline(resource.pipeline);
-    pass.setVertexBuffer(0, vertexRing.buffer, resource.vertexOffset, resource.vertexSize);
     pass.setScissorRect(scissor.x, scissor.y, scissor.width, scissor.height);
     if (targetStates[index].blendEnabled) pass.setBlendConstant(targetStates[index].blendConstant);
     pass.setBindGroup(0, resource.bindGroup, resource.dynamicOffsets);
-    pass.draw(translated[index].vertexCount);
+    if (vertexBackend === "webgpu-wgsl") {
+      if (draw.indexed) {
+        pass.setIndexBuffer(indexRing.buffer, draw.indexFormat, resource.indexOffset, resource.indexSize);
+        pass.drawIndexed(draw.vertexCount);
+      } else {
+        pass.draw(draw.vertexCount);
+      }
+    } else {
+      pass.setVertexBuffer(0, vertexRing.buffer, resource.vertexOffset, resource.vertexSize);
+      pass.draw(draw.vertexCount);
+    }
   }
   pass.end();
   const texture = frameTarget.color;
@@ -1531,6 +1892,8 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     },
     uniformRingBytes: uniformRing.size,
     vertexRingBytes: vertexRing.size,
+    streamRingBytes: streamRing.size,
+    indexRingBytes: indexRing.size,
     rgbaBase64: rgba ? base64(rgba) : undefined,
   };
 }

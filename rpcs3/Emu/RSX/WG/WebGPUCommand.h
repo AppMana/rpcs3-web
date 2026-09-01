@@ -26,6 +26,8 @@ namespace rsx::webgpu
 		packet_uses_vertex_textures = 1u << 3,
 		packet_texture_payload_pending = 1u << 4,
 		packet_skipped = 1u << 5,
+		packet_primitive_restart = 1u << 6, // hardware restart applies (VKGSRender::decode_vertex_input_assembly_state rule)
+		packet_index_restart_sentinel = 1u << 7, // the index stream's maximum equals the type's restart sentinel
 	};
 
 	// Backend-neutral texture identity. Texture bytes are appended after the

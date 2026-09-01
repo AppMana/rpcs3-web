@@ -82,6 +82,7 @@ namespace
 		rsx::index_array_type index_type = rsx::index_array_type::u16;
 		bool indexed = false;
 		bool primitive_expanded = false;
+		bool index_restart_sentinel = false;
 		byte_vector indices;
 	};
 
@@ -329,6 +330,10 @@ namespace
 				}
 
 				result.indices.resize(written * index_size);
+				// WebGPU applies restart semantics to every indexed strip draw;
+				// report when the stream actually contains the sentinel so the
+				// browser can refuse a draw where the guest did not enable restart.
+				result.index_restart_sentinel = maximum == (index_size == 2 ? 0xffffu : 0xffffffffu);
 				result.first_vertex = rsx::get_index_from_base(minimum, rsx::method_registers.vertex_data_base_index());
 				result.allocated_vertex_count = maximum - minimum + 1;
 				result.draw_count = written;
@@ -518,6 +523,18 @@ bool WebGPUGSRender::emit_draw_packet(u32 subdraw)
 		(current_vp_metadata.referenced_textures_mask ? rsx::webgpu::packet_uses_vertex_textures : 0u) |
 		((capture_level < 4 && (current_fp_metadata.referenced_textures_mask || current_vp_metadata.referenced_textures_mask)) || !textures.complete
 			? rsx::webgpu::packet_texture_payload_pending : 0u);
+	// Primitive restart under the same conditions VKGSRender's
+	// decode_vertex_input_assembly_state enables it: indexed, non-disjoint,
+	// native primitive (expanded index streams already resolved restart).
+	if (rsx::method_registers.restart_index_enabled() && !clause.is_disjoint_primitive &&
+		clause.command == rsx::draw_command::indexed && !upload.primitive_expanded)
+	{
+		header.flags |= rsx::webgpu::packet_primitive_restart;
+	}
+	if (upload.index_restart_sentinel)
+	{
+		header.flags |= rsx::webgpu::packet_index_restart_sentinel;
+	}
 	header.first_vertex = upload.first_vertex;
 	header.vertex_count = upload.allocated_vertex_count;
 	header.index_count = upload.indexed ? upload.draw_count : 0;

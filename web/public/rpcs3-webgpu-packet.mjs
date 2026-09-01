@@ -25,6 +25,8 @@ export const PacketFlag = Object.freeze({
   usesVertexTextures: 1 << 3,
   texturePayloadPending: 1 << 4,
   skipped: 1 << 5,
+  primitiveRestart: 1 << 6,
+  indexRestartSentinel: 1 << 7,
 });
 export const SectionKind = Object.freeze({
   resolvedState: 0,

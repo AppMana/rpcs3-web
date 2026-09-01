@@ -616,6 +616,22 @@ static ppu_intrp_func ppu_ret = {[](ppu_thread& ppu, ppu_opcode_t, be_t<u32>* th
 	return;
 }};
 
+#ifdef RPCS3_WEB
+u32 ppu_web_interpreter_step(ppu_thread& ppu)
+{
+	if (!vm::check_addr<4>(ppu.cia, vm::page_executable))
+	{
+		return ppu.cia;
+	}
+
+	const u32 pc = ppu.cia;
+	const auto op = vm::_ptr<u32>(pc);
+	const u32 opcode = *op;
+	ppu_read(pc, opcode)(ppu, {opcode}, op, &ppu_ret);
+	return ppu.cia;
+}
+#endif
+
 static void ppu_fallback(ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, ppu_intrp_func* next_fn)
 {
 	const auto _pc = vm::get_addr(this_op);

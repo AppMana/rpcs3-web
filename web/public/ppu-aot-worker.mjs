@@ -40,16 +40,18 @@ scope.addEventListener("message", async (event) => {
         return mainInstance.exports;
       },
     });
-
     module.ccall("rpcs3_web_set_null_renderer", null, ["number"], [1]);
     const initialized = module.ccall("rpcs3_web_init", "number", [], []);
     const sparseVmProbe = module.ccall("rpcs3_web_sparse_vm_probe", "number", [], []);
+    module.ccall("rpcs3_web_set_hold_ppu_at_entry", null, ["number"], [1]);
     module.FS.writeFile("/ppu_thread.elf", elf);
     const bootResult = module.ccall("rpcs3_web_boot", "number", ["string"], ["/ppu_thread.elf"]);
 
     const mainExports = mainInstance.exports;
     const read32 = mainExports.rpcs3_web_vm_read32_raw;
     const write32 = mainExports.rpcs3_web_vm_write32_raw;
+    const bootStatus = mainExports.rpcs3_web_status();
+    const hybridContext = mainExports.rpcs3_web_ppu_aot_create_context(0x1022c, 0x38b50, 1) >>> 0;
     const originalImportSlot = read32(0x30184) >>> 0;
     const originalImportDescriptor = swap32(originalImportSlot);
     const originalImportTarget = swap32(read32(originalImportDescriptor) >>> 0);
@@ -87,9 +89,13 @@ scope.addEventListener("message", async (event) => {
     };
     for (const imported of WebAssembly.Module.imports(aotWasm)) {
       if (imported.kind !== "function" || imported.name in env) continue;
-      env[imported.name] = imported.name.startsWith("rpcs3_web_vm_")
-        ? mainExports[imported.name]
-        : () => 0;
+      if (imported.name.startsWith("rpcs3_web_vm_")) {
+        env[imported.name] = mainExports[imported.name];
+      } else if (/^(sys_|syscall_|__syscall)/.test(imported.name)) {
+        env[imported.name] = () => 0;
+      } else {
+        env[imported.name] = () => 0;
+      }
     }
 
     const aotInstance = new WebAssembly.Instance(aotWasm, { env });
@@ -146,9 +152,43 @@ scope.addEventListener("message", async (event) => {
     const aotExecutionMs = performance.now() - executionStartedAt;
 
     write32(0x30184, originalImportSlot);
+    const runHybridBlock = (pc) => {
+      if (!mainExports.rpcs3_web_ppu_aot_begin(hybridContext)) {
+        throw new Error("RPCS3 rejected the PPU AOT slice");
+      }
+      const sliceStartedAt = performance.now();
+      try {
+        const blockState = runBlock(hybridContext, pc);
+        blockState.sliceMs = performance.now() - sliceStartedAt;
+        return blockState;
+      } finally {
+        mainExports.rpcs3_web_ppu_aot_end(hybridContext);
+      }
+    };
+    const hybridTrace = [];
+    let hybridPc = hybridContext ? view.getUint32(hybridContext + 1140, true) : 0;
+    for (let step = 0; hybridContext && hybridPc && step < 16; step += 1) {
+      const state = typeof aotInstance.exports[`__0x${hybridPc.toString(16)}`] === "function"
+        ? runHybridBlock(hybridPc)
+        : (() => {
+            mainExports.rpcs3_web_ppu_aot_interpreter_step(hybridContext);
+            return contextState(hybridContext, hybridPc, "interpreter");
+          })();
+      hybridTrace.push(state);
+      const next = view.getUint32(hybridContext + 1140, true);
+      if (!next || next === hybridPc) break;
+      hybridPc = next;
+    }
+    const hybridOk = hybridTrace.length === 16 &&
+      hybridTrace[0]?.pc === "0x1022c" && hybridTrace[0]?.next === `0x${originalImportTarget.toString(16)}` &&
+      hybridTrace[1]?.kind === "interpreter" && hybridTrace[1]?.next === "0x103a8" &&
+      hybridTrace[3]?.kind === "interpreter" && hybridTrace[3]?.next === "0x19058" &&
+      hybridTrace[4]?.kind === "aot" && hybridTrace[4]?.next === "0x1907c" &&
+      hybridTrace[5]?.kind === "interpreter" && hybridTrace[5]?.next === "0x19080";
     const result = {
-      ok: initialized === 1 && sparseVmProbe === 1 && bootResult === 0 && guestMapped &&
+      ok: initialized === 1 && sparseVmProbe === 1 && bootResult === 0 && bootStatus === 6 && guestMapped &&
         dispatcherTrace[0]?.next === "0x10260" && dispatcherTrace[1]?.next === "0x103a8" &&
+        hybridOk &&
         view.getUint32(context + 1140, true) === 0x12345678 &&
         view.getBigUint64(context + 40, true) === 0x38b50n &&
         view.getBigUint64(context + 1120, true) === 0x103a8n &&
@@ -156,6 +196,7 @@ scope.addEventListener("message", async (event) => {
       initialized,
       sparseVmProbe,
       bootResult,
+      bootStatus,
       guestMapped,
       originalImportDescriptor: `0x${originalImportDescriptor.toString(16)}`,
       originalImportTarget: `0x${originalImportTarget.toString(16)}`,
@@ -163,6 +204,8 @@ scope.addEventListener("message", async (event) => {
       resolvedImports,
       naturalBoundary,
       dispatcherTrace,
+      hybridContext: `0x${hybridContext.toString(16)}`,
+      hybridTrace,
       cia: `0x${view.getUint32(context + 1140, true).toString(16)}`,
       r2: `0x${view.getBigUint64(context + 40, true).toString(16)}`,
       lr: `0x${view.getBigUint64(context + 1120, true).toString(16)}`,

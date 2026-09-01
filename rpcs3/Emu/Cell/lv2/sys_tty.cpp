@@ -128,6 +128,7 @@ error_code sys_tty_write([[maybe_unused]] ppu_thread& ppu, s32 ch, vm::cptr<char
 
 	sample = {}; // Remove reference to string
 
+#ifndef RPCS3_WEB
 	if (msg.size() >= 2u && [&]()
 	{
 		static thread_local u64 last_write = 0;
@@ -139,6 +140,7 @@ error_code sys_tty_write([[maybe_unused]] ppu_thread& ppu, s32 ch, vm::cptr<char
 	{
 		ppu_log.notice("\n%s", dump_useful_thread_info());
 	}
+#endif
 
 	// Hack: write to tty even on CEX mode, but disable all error checks
 	if (ch < 0 || ch > 15)

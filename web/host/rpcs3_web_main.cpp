@@ -69,6 +69,7 @@ extern atomic_t<u32> g_spu_web_last_pc[6];
 extern atomic_t<u64> g_spu_web_ls_boundary_count;
 extern atomic_t<u64> g_spu_web_ls_boundary_last;
 extern atomic_t<u64> g_spu_web_page_split_dma_count;
+extern u32 ppu_web_interpreter_step(ppu_thread& ppu);
 #endif
 
 // The desktop frontend owns these input-profile globals. The browser host is
@@ -104,6 +105,11 @@ namespace
 	std::unique_ptr<logs::listener> s_log_listener;
 	thread_local bool s_atomic_notify_reentry_observed = false;
 	std::atomic<bool> s_atomic_notify_watchdog_fired{false};
+	stx::shared_ptr<named_thread<ppu_thread>> s_aot_context_thread;
+	atomic_t<u32> s_aot_slice_active{0};
+	atomic_t<u32> s_aot_slice_ready{0};
+	atomic_t<u32> s_aot_slice_release{0};
+	atomic_t<u32> s_aot_slice_complete{0};
 
 	EM_JS(void, notify_host_event, (const char* event, u32 value), {
 		const message = { type: UTF8ToString(event), value };
@@ -492,6 +498,11 @@ extern "C"
 		return static_cast<u32>(result);
 	}
 
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_hold_ppu_at_entry(s32 enabled)
+	{
+		Emu.SetHoldAtEntry(enabled != 0);
+	}
+
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_status()
 	{
 		return static_cast<u32>(Emu.GetStatus(false));
@@ -623,6 +634,129 @@ extern "C"
 		{
 			write_guest_raw(addr, *value);
 		}
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_create_context(u32 entry, u32 rtoc, u32 tls)
+	{
+		if (s_aot_context_thread)
+		{
+			return static_cast<u32>(reinterpret_cast<uptr>(static_cast<ppu_thread*>(s_aot_context_thread.get())));
+		}
+
+		auto selected = idm::select<named_thread<ppu_thread>>([](u32, named_thread<ppu_thread>& ppu)
+		{
+			const auto name = ppu.ppu_tname.load();
+			return name && *name == "main_thread";
+		});
+		if (!selected.ptr)
+		{
+			return 0;
+		}
+
+		auto thread = std::move(selected.ptr);
+		s_aot_context_thread = std::move(thread);
+		auto expected = static_cast<ppu_thread*>(s_aot_context_thread.get());
+		atomic_t<u32> complete{0};
+		(*s_aot_context_thread)([expected, entry, rtoc, tls, &complete]
+		{
+			expected->cia = entry;
+			expected->gpr[2] = rtoc;
+			expected->gpr[13] = tls;
+			expected->stop_flag_removal_protection = true;
+			expected->state -= cpu_flag::notify;
+			complete.release(1);
+			complete.notify_one();
+		});
+		expected->state += cpu_flag::notify;
+		expected->notify();
+		while (!complete)
+		{
+			complete.wait(0);
+		}
+		return static_cast<u32>(reinterpret_cast<uptr>(static_cast<ppu_thread*>(s_aot_context_thread.get())));
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_begin(u32 context)
+	{
+		const auto expected = s_aot_context_thread
+			? static_cast<ppu_thread*>(s_aot_context_thread.get()) : nullptr;
+		if (!expected || reinterpret_cast<uptr>(expected) != context || !s_aot_slice_active.compare_and_swap_test(0, 1))
+		{
+			return 0;
+		}
+
+		s_aot_slice_ready = 0;
+		s_aot_slice_release = 0;
+		s_aot_slice_complete = 0;
+		(*s_aot_context_thread)([expected]
+		{
+			const auto idle_state = expected->state.exchange({});
+			s_aot_slice_ready.release(1);
+			s_aot_slice_ready.notify_one();
+			while (!s_aot_slice_release)
+			{
+				s_aot_slice_release.wait(0);
+			}
+			expected->state.store(idle_state - cpu_flag::notify);
+			s_aot_slice_complete.release(1);
+			s_aot_slice_complete.notify_one();
+		});
+		expected->state += cpu_flag::notify;
+		expected->notify();
+		while (!s_aot_slice_ready)
+		{
+			s_aot_slice_ready.wait(0);
+		}
+		return 1;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_end(u32 context)
+	{
+		const auto expected = s_aot_context_thread
+			? static_cast<ppu_thread*>(s_aot_context_thread.get()) : nullptr;
+		if (!expected || reinterpret_cast<uptr>(expected) != context || !s_aot_slice_active)
+		{
+			return 0;
+		}
+
+		s_aot_slice_release.release(1);
+		s_aot_slice_release.notify_one();
+		while (!s_aot_slice_complete)
+		{
+			s_aot_slice_complete.wait(0);
+		}
+		s_aot_slice_active = 0;
+		return 1;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_interpreter_step(u32 context)
+	{
+		const auto expected = s_aot_context_thread
+			? static_cast<ppu_thread*>(s_aot_context_thread.get()) : nullptr;
+		if (!expected || reinterpret_cast<uptr>(expected) != context)
+		{
+			return 0;
+		}
+
+		atomic_t<u32> next{0};
+		atomic_t<u32> complete{0};
+		(*s_aot_context_thread)([expected, &next, &complete]
+		{
+			const auto idle_state = expected->state.exchange(cpu_flag::wait + cpu_flag::memory);
+			static_cast<void>(expected->check_state());
+			next = ppu_web_interpreter_step(*expected);
+			vm::temporary_unlock(*expected);
+			expected->state.store(idle_state - cpu_flag::notify);
+			complete.release(1);
+			complete.notify_one();
+		});
+		expected->state += cpu_flag::notify;
+		expected->notify();
+		while (!complete)
+		{
+			complete.wait(0);
+		}
+		return next;
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_sync_logs()
@@ -791,9 +925,24 @@ extern "C"
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_stop()
 	{
+		if (s_aot_slice_active)
+		{
+			s_aot_slice_release.release(1);
+			s_aot_slice_release.notify_one();
+			while (!s_aot_slice_complete)
+			{
+				s_aot_slice_complete.wait(0);
+			}
+			s_aot_slice_active = 0;
+		}
+		s_aot_context_thread.reset();
 		if (s_initialized && !Emu.IsStopped())
 		{
 			Emu.Kill(false);
+			while (!Emu.IsStopped())
+			{
+				std::this_thread::yield();
+			}
 		}
 	}
 }

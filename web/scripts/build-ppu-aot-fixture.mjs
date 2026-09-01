@@ -67,6 +67,9 @@ try {
   if (!ir) throw new Error(`native RPCS3 did not emit ${basename(elf)} IR within 60 seconds`);
 
   child.kill("SIGTERM");
+  if (process.env.RPCS3_PPU_AOT_IR_OUTPUT) {
+    copyFileSync(ir, resolve(process.env.RPCS3_PPU_AOT_IR_OUTPUT));
+  }
   execFileSync(process.execPath, [
     join(webRoot, "scripts/compile-ppu-ir-to-wasm.mjs"),
     ir,

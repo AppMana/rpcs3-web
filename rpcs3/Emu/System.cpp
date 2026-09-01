@@ -1146,6 +1146,11 @@ void Emulator::SetForceBoot(bool force_boot)
 	m_force_boot = force_boot;
 }
 
+void Emulator::SetHoldAtEntry(bool hold_at_entry)
+{
+	m_hold_at_entry = hold_at_entry;
+}
+
 void Emulator::SetContinuousMode(bool continuous_mode)
 {
 	m_continuous_mode = continuous_mode;
@@ -2791,7 +2796,8 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 			}
 		}
 
-		const bool autostart = m_ar || (std::exchange(m_force_boot, false) || g_cfg.misc.autostart);
+		const bool autostart_requested = m_ar || (std::exchange(m_force_boot, false) || g_cfg.misc.autostart);
+		const bool autostart = autostart_requested && !m_hold_at_entry;
 
 		if (IsReady())
 		{

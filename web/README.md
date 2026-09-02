@@ -19,40 +19,56 @@ Memory64 could raise the host linear-memory ceiling in supporting browsers, but 
 
 ## Validation
 
+The harness is Yarn 4 through corepack (`corepack enable`, then `yarn install`).
+Storage, device lanes, the hardware runner, the native oracle runner, the
+frame comparator, and the Playwright configs come from the shared
+[web-emulator-kit](https://github.com/AppMana/web-emulator-kit) packages
+`@appmana-public/disc-images` and `@appmana-public/web-emulator-harness`,
+consumed as git workspace dependencies (`#workspace=…&commit=…`, pinned in
+`yarn.lock`); the scripts under `scripts/` are RPCS3's thin wrappers over
+them (judge callbacks, fixture lists, the `RPCS3_*` environment). Every run of
+`__rpcs3Runtime.run` resolves with the kit's report (`schema: 1`,
+`emulator: "rpcs3"`, `frames[]`, `gpu`, `events`, `workingSet`, `shutdown`)
+with RPCS3's counters under `emu`.
+
 ```sh
 # Wasm/TypeScript unit checks and production bundle
-npm run check
+yarn check
 
 # Browser tests that do not require WebGPU
-npm run test:e2e
+yarn test:e2e
 
 # Build the RPCS3 runtime and compiled C++ unit artifact, then run the latter
 # in Chromium. GoogleTest performs the assertions inside Wasm.
-npm run build:runtime
-npm run test:units:browser
+yarn build:runtime
+yarn test:units:browser
 
 # Full-RPCS3 cube correctness. Software WebGPU is allowed in this test so
 # shader, texture, depth, blending, and pixel regressions remain testable.
-npx playwright test runtime-cube-correctness.spec.ts \
+yarn playwright test runtime-cube-correctness.spec.ts \
   --config playwright.gpu.config.ts
 
 # Dedicated GPU lane. The strict runtime tests reject SwiftShader/llvmpipe.
-npm run test:e2e:gpu
+yarn test:e2e:gpu
 
 # Capture a raw frame and compare it with a same-size native reference PNG.
-RPCS3_CAPTURE_FRAME=1 npx playwright test frame-oracle.spec.ts \
+RPCS3_CAPTURE_FRAME=1 yarn playwright test frame-oracle.spec.ts \
   --config playwright.gpu.config.ts
-npm run compare:frame -- native-reference.png \
+yarn compare:frame native-reference.png \
   test-results/*/browser-frame.json --max-rmse 1 --min-close-pixels 0.99
 ```
+
+The lanes listen on 4173 (default), 4174 (GPU), and 4181 (library);
+`RPCS3_PREVIEW_PORT`, `RPCS3_GPU_PREVIEW_PORT`, `RPCS3_LIBRARY_PORT`, and
+`RPCS3_LIBRARY_PROXY` move them when those ports serve something else.
 
 With one trusted iPad visible through `usbmuxd` and `ios-webkit-debug-proxy`, the full local runtime can be transferred through WebKit Inspector without deployment:
 
 ```sh
-npm run device:runtime -- device-runtime-evidence gs_gcm_cube.elf
+yarn device:runtime device-runtime-evidence gs_gcm_cube.elf
 
 # Transfer the identical compiled GoogleTest artifact and run it in Safari.
-npm run device:units -- device-unit-evidence
+yarn device:units device-unit-evidence
 ```
 
 The device command requires an HTTPS, cross-origin-isolated page to already be open in Safari. It injects local JS/Wasm/ELF blobs through the USB inspector connection, renders on the device, reads back the raw WebGPU target, applies the cube acceptance checks, and saves `report.json`, `frame.png`, and `page.png`. No emulation or rendering is performed in the cloud.
@@ -62,28 +78,32 @@ The device command requires an HTTPS, cross-origin-isolated page to already be o
 `storage.html` can fill the origin-private file system without a file picker
 by downloading from `/library/` on the page's own origin:
 
-- `scripts/serve-library.mjs` (`npm run library:serve`, port 4181, systemd user
-  unit `rpcs3-web-library.service`) serves an allowlist of files with exact HTTP
-  Range semantics (`206`/`416`, `Accept-Ranges`, strong ETags, `HEAD`),
-  `Cache-Control: no-store`, `Cross-Origin-Resource-Policy: same-origin`, and a
-  JSON index carrying each file's size and SHA-256 (hashed in the background and
-  cached under `~/.cache/rpcs3-web-library/`). On https://rpcs3.appmana.com the
-  Ingress routes `/library/` to it; `vite preview`/`vite dev` proxy the prefix.
-- `public/library-import-worker.mjs` fetches 16 MiB ranges with
-  `cache: "no-store"`, writes every body read straight into a
-  `FileSystemSyncAccessHandle` (Safari has no `createWritable`), and hashes it
-  as it goes (`library-import-core.mjs`: resumable SHA-256 in wasm with a
-  JavaScript fallback, both checked against Node's digest). A sidecar
-  `.rpcs3-imports/<destination>/<name>.json` records the source size/SHA-256/ETag
-  and the running hash state, so an interrupted import resumes from the bytes
-  already on disk (`Range: bytes=<size>-`), re-hashing any unrecorded tail
-  locally, and a changed source restarts from zero.
+- `scripts/serve-library.mjs` (`yarn library:serve`, port 4181, systemd user
+  unit `rpcs3-web-library.service`) is the kit's `serve-library`: an allowlist
+  of files with exact HTTP Range semantics (`206`/`416`, `Accept-Ranges`,
+  strong ETags, `HEAD`), `Cache-Control: no-store`,
+  `Cross-Origin-Resource-Policy: same-origin`, and a JSON index carrying each
+  file's size and SHA-256 (hashed in the background and cached under
+  `~/.cache/rpcs3-web-library/`). On https://rpcs3.appmana.com the Ingress
+  routes `/library/` to it; `vite preview`/`vite dev` proxy the prefix.
+- `public/rpcs3-storage.mjs` is RPCS3's view of `@appmana-public/disc-images`
+  (staged into `public/vendor/disc-images/` by `scripts/stage-coi.mjs`, since
+  `public/` is served verbatim): the mount root `/opfs`, `gameBootPath` (which
+  imported file boots), and `importFirmware` (`firmware/PS3UPDAT.PUP`). The
+  package's worker fetches 16 MiB ranges with `cache: "no-store"`, writes every
+  body read straight into a `FileSystemSyncAccessHandle` (Safari has no
+  `createWritable` before 26), hashes as it goes (resumable SHA-256 in wasm
+  with a JavaScript fallback), and keeps a manifest
+  `.imports/<destination>/<name>.json` with the source size/SHA-256/ETag and the
+  running hash state, so an interrupted import resumes from the bytes already
+  on disk (`Range: bytes=<size>-` with `If-Range`), re-hashing any unrecorded
+  tail locally, and a changed source restarts from zero.
 - Page API: `window.__rpcs3Storage.importFromLibrary(name, destination)` returns
   a report (bytes, elapsed, rate, requests, resume point, SHA-256 verdict,
   `navigator.storage.estimate()` before and after); `importProgress()` and
   `abortImport()` support pollers. `storage.html?import=<name>&destination=games|firmware`
   starts one on load.
-- `npm run device:library -- https://rpcs3.appmana.com/ <outDir> <name> [destination] [--interrupt-after S]`
+- `yarn device:library https://rpcs3.appmana.com/ <outDir> <name> [destination] [--interrupt-after S]`
   drives the same API on the attached iPad over the WebKit Inspector Protocol
   and writes `report.json`; `--interrupt-after` reloads the page mid-transfer
   and proves the resume.

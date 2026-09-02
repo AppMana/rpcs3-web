@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { validateReport } from "@appmana-public/web-emulator-harness/report";
 import { PNG } from "pngjs";
 
 test("renders an authentic RPCS3 RSX draw through hardware WebGPU", async ({ page }, testInfo) => {
@@ -17,14 +18,15 @@ test("renders an authentic RPCS3 RSX draw through hardware WebGPU", async ({ pag
   });
   const gpu = result.gpu as {
     presented: boolean; adapter: string; draws: number; vertices: number; vertexOpcodes: number[];
-    fragmentOpcodes: number[]; changedPixels: number; clearPixels: number; frameHash: number; vertexBackend: string;
+    fragmentOpcodes: number[]; changedPixels: number; clearPixels: number; frameHash: string; vertexBackend: string;
     vertexBackendComparison: {
       oracleBackend: string; oracleFrameHash: number; frameHashMatch: boolean; changedPixelsMatch: boolean;
       oracleTimings: { translateMs: number };
     };
   };
+  expect(validateReport(result)).toEqual({ ok: true, errors: [] });
   expect(result.bootResult).toBe(0);
-  expect(result.drawPacketCount).toBeGreaterThan(0);
+  expect((result.emu as { drawPacketCount: number }).drawPacketCount).toBeGreaterThan(0);
   expect(gpu.presented).toBe(true);
   expect(gpu.vertexBackend).toBe("webgpu-wgsl");
   expect(gpu.vertexBackendComparison).toMatchObject({
@@ -41,7 +43,7 @@ test("renders an authentic RPCS3 RSX draw through hardware WebGPU", async ({ pag
   expect(gpu.fragmentOpcodes).toEqual([1]);
   expect(gpu.changedPixels).toBeGreaterThan(100);
   expect(gpu.clearPixels).toBeGreaterThan(100);
-  expect(gpu.frameHash).toBe(2_769_363_428);
+  expect(gpu.frameHash).toBe("2769363428");
   // The worker posts its result before Chromium's compositor necessarily
   // presents that task's OffscreenCanvas frame. Yield two browser paints so
   // the screenshot verifies the displayed surface, not just GPU readback.

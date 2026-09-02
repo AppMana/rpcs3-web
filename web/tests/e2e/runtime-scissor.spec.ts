@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 type GpuResult = {
-  frameHash: number;
+  frameHash: string;
   changedPixels: number;
   changedBounds: { minX: number; minY: number; maxX: number; maxY: number } | null;
   scissorStates: Array<{
@@ -48,7 +48,7 @@ test("applies RPCS3's resolved RSX scissor to WebGPU draws", async ({ page }, te
     x: 0, y: 0, width: 640, height: 720,
     scaled: { x: 0, y: 0, width: 640, height: 720 },
   });
-  expect(full.frameHash).toBe(2_769_363_428);
+  expect(full.frameHash).toBe("2769363428");
   expect(clipped.frameHash).not.toBe(full.frameHash);
   expect(clipped.changedPixels).toBeGreaterThan(0);
   expect(clipped.changedPixels).toBeLessThan(full.changedPixels);

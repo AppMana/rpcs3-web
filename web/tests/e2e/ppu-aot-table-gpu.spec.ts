@@ -35,12 +35,12 @@ test("renders the Tetris title identically with compiled PPU blocks", async ({ p
     expect(result.ok, JSON.stringify(result.detail ?? result, null, 2).slice(0, 4000)).toBe(true);
     expect((result.gpu as { adapter: string }).adapter).not.toMatch(/SwiftShader|llvmpipe|software|CPU/i);
   }
-  const before = interpreted.gpu as { frameHash: number; draws: number; changedPixels: number };
-  const after = compiled.gpu as { frameHash: number; draws: number; changedPixels: number };
+  const before = interpreted.gpu as { frameHash: string; draws: number; changedPixels: number };
+  const after = compiled.gpu as { frameHash: string; draws: number; changedPixels: number };
   expect(after.draws).toBe(before.draws);
   expect(after.changedPixels).toBe(before.changedPixels);
   expect(after.frameHash).toBe(before.frameHash);
-  const table = compiled.ppuAotTable as { blocks: number; dispatches: number };
+  const table = (compiled.emu as { ppuAotTable: { blocks: number; dispatches: number } }).ppuAotTable;
   expect(table.blocks).toBeGreaterThan(0);
   expect(table.dispatches).toBeGreaterThan(0);
 });

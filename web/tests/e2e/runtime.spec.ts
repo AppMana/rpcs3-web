@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { validateReport } from "@appmana-public/web-emulator-harness/report";
 
 test("boots PS3 homebrew through the complete RPCS3 Wasm runtime", async ({ page }, testInfo) => {
   test.setTimeout(180_000);
@@ -20,14 +21,19 @@ test("boots PS3 homebrew through the complete RPCS3 Wasm runtime", async ({ page
     contentType: "application/json",
   });
   expect(result.ok).toBe(true);
-  expect(result.initialized).toBe(1);
+  expect(validateReport(result)).toEqual({ ok: true, errors: [] });
+  expect(result.schema).toBe(1);
+  expect(result.emulator).toBe("rpcs3");
+  expect(result.frames).toHaveLength(1);
+  const emu = result.emu as Record<string, unknown>;
+  expect(emu.initialized).toBe(1);
   expect(result.bootResult).toBe(0);
-  expect(result.atomicNotifyReentry).toBe(1);
-  expect(result.sparseVmProbe).toBe(1);
-  expect(result.fixtureBytes).toBeGreaterThan(10_000);
+  expect(emu.atomicNotifyReentry).toBe(1);
+  expect(emu.sparseVmProbe).toBe(1);
+  expect(emu.fixtureBytes).toBeGreaterThan(10_000);
   expect((result.events as Array<{ type?: string }>).some((event) => event.type === "rpcs3-running")).toBe(true);
-  expect((result.logs as string[]).some((line) => line.includes("thread pool is exhausted"))).toBe(false);
-  expect(result.packetCount).toBeGreaterThan(0);
+  expect((emu.logs as string[]).some((line) => line.includes("thread pool is exhausted"))).toBe(false);
+  expect(emu.packetCount).toBeGreaterThan(0);
   const workingSet = result.workingSet as {
     liveThreads: number; peakThreads: number; poolTotal: number; poolBusy: number;
     vmMappedPages: number; vmBackingBytes: number; stackMaxUsedBytes: number; flipCounter: number;
@@ -39,9 +45,9 @@ test("boots PS3 homebrew through the complete RPCS3 Wasm runtime", async ({ page
   expect(workingSet.vmBackingBytes).toBeGreaterThan(0);
   expect(workingSet.stackMaxUsedBytes).toBeGreaterThan(0);
   expect(workingSet.flipCounter).toBeGreaterThanOrEqual(1);
-  expect((result.stackReport as Array<{ name: string; usedBytes: number; stackBytes: number }>).length).toBeGreaterThan(0);
-  expect(result.drawPacketCount).toBeGreaterThan(0);
-  expect((result.packetSummaries as Array<{ kind: number; vertexCount: number }>).some(
+  expect((emu.stackReport as Array<{ name: string; usedBytes: number; stackBytes: number }>).length).toBeGreaterThan(0);
+  expect(emu.drawPacketCount).toBeGreaterThan(0);
+  expect((emu.packetSummaries as Array<{ kind: number; vertexCount: number }>).some(
     (packet) => packet.kind === 1 && packet.vertexCount >= 3,
   )).toBe(true);
 });

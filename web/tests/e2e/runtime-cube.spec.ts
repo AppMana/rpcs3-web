@@ -27,9 +27,10 @@ test("boots the textured/depth gs_gcm_cube fixture through the complete RPCS3 Wa
   });
   expect(result.ok, JSON.stringify(result, null, 2)).toBe(true);
   expect(result.bootResult).toBe(0);
-  expect(result.fixtureBytes).toBe(356_532);
-  expect(result.drawPacketCount).toBeGreaterThan(0);
-  const draws = (result.packetSummaries as Array<{
+  const emu = result.emu as Record<string, unknown>;
+  expect(emu.fixtureBytes).toBe(356_532);
+  expect(emu.drawPacketCount).toBeGreaterThan(0);
+  const draws = (emu.packetSummaries as Array<{
     kind: number;
     flags: number;
     vertexCount: number;
@@ -57,7 +58,7 @@ test("boots the textured/depth gs_gcm_cube fixture through the complete RPCS3 Wa
   expect(firstDraw.flags & (1 << 4)).toBe(0);
   expect(firstTexture).toMatchObject({ stage: 0, slot: 0, address: 0xc0b50000, format: 0xa5, width: 256, height: 256, dataSize: 262_144 });
   expect(firstTexture.nonzeroBytes).toBeGreaterThan(1_000);
-  expect(result.debugWords).toMatchObject({ "0x14a4c0": 65_536, "0x49458": 196_608 });
+  expect(emu.debugWords).toMatchObject({ "0x14a4c0": 65_536, "0x49458": 196_608 });
   const gpu = result.gpu as {
     presented: boolean;
     adapter: string;
@@ -67,7 +68,7 @@ test("boots the textured/depth gs_gcm_cube fixture through the complete RPCS3 Wa
     fragmentOpcodes: number[];
     changedPixels: number;
     clearPixels: number;
-    frameHash: number;
+    frameHash: string;
     depthStates: Array<{ enabled: boolean; writeEnabled: boolean; comparison: string }>;
     targetStates: Array<{
       blendEnabled: boolean;
@@ -85,7 +86,7 @@ test("boots the textured/depth gs_gcm_cube fixture through the complete RPCS3 Wa
   expect(gpu.fragmentOpcodes).toContain(0x17);
   expect(gpu.changedPixels).toBeGreaterThan(100);
   expect(gpu.clearPixels).toBeGreaterThan(100);
-  expect(gpu.frameHash).toBeGreaterThan(0);
+  expect(gpu.frameHash).toMatch(/^[1-9]\d*$/);
   expect(gpu.depthStates).toEqual([
     { enabled: true, writeEnabled: true, comparison: "less" },
     { enabled: false, writeEnabled: false, comparison: "always" },
@@ -98,7 +99,7 @@ test("boots the textured/depth gs_gcm_cube fixture through the complete RPCS3 Wa
   });
   expect(gpu.adapter).not.toMatch(/SwiftShader|llvmpipe|software|CPU/i);
   expect(gpu.adapter).toMatch(/NVIDIA|AMD|Intel|discrete|integrated/i);
-  expect(result.droppedPackets).toBe(0);
+  expect(emu.droppedPackets).toBe(0);
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
   if (process.env.RPCS3_HEADED === "1") {
     const capture = await page.locator("#gpu-output").screenshot({ path: testInfo.outputPath("rpcs3-cube-webgpu.png") });

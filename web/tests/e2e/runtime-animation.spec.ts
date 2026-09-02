@@ -24,7 +24,7 @@ test("advances successive full-RPCS3 cube frames instead of repainting one captu
     drawPacketCount: number;
     flipPacketCount: number;
     gpu: {
-      frameHash: number;
+      frameHash: string;
       draws: number;
       vertices: number;
       drawDiagnostics: Array<{ clipBounds: { min: number[]; max: number[] } }>;

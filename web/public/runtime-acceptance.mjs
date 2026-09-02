@@ -18,6 +18,28 @@ function compactFrame(frame, keepDetail) {
   return { ...rest, gpu: gpu && { ...gpu, drawDiagnostics: undefined, shaderPrograms: undefined, surfaceDumps: undefined, rgbaBase64: undefined, depthStates: undefined, rasterStates: undefined, scissorStates: undefined, targetStates: undefined } };
 }
 
+// The result is the shared harness report (@appmana-public/web-emulator-harness
+// report.js: schema 1, emulator, ok, frames[], gpu, events, workingSet,
+// shutdown) with everything RPCS3 measures under `emu`. The renderer's FNV
+// frame hash is a number; the report carries hashes as strings.
+const REPORT_SCHEMA = 1;
+const EMULATOR = "rpcs3";
+const REPORT_KEYS = new Set(["ok", "detail", "bootResult", "moduleCreateMs", "frameSequence", "elapsedMs", "captureMs", "hostTimings", "workingSet", "gpu", "renderError"]);
+
+function reportGpu(gpu) {
+  return gpu && { ...gpu, frameHash: gpu.frameHash === undefined ? undefined : String(gpu.frameHash) };
+}
+
+function partitionRecord(record) {
+  const top = {};
+  const emu = {};
+  for (const [key, value] of Object.entries(record ?? {})) {
+    if (key === "type") continue;
+    (REPORT_KEYS.has(key) ? top : emu)[key] = value;
+  }
+  return { top, emu };
+}
+
 let active;
 let activeWorker;
 // Keep the device/context alive after run() resolves. A WebGPU canvas is a
@@ -203,6 +225,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
               if (options.captureRgba) gpu.rgbaBase64 = base64Of(pixels);
             }
           }
+          gpu = reportGpu(gpu);
           const frame = {
             ...eventWithoutPackets,
             gpu,
@@ -219,7 +242,20 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
             return;
           }
           clearTimeout(timeout);
-          const result = { ...firstResult, ...frames.at(-1), gpu, renderError, packetFixture, events, frames: requestedFrames > 1 || untilDraw ? frames : undefined };
+          const first = partitionRecord(firstResult);
+          const last = partitionRecord(frames.at(-1));
+          const result = {
+            schema: REPORT_SCHEMA,
+            emulator: EMULATOR,
+            ...first.top,
+            ...last.top,
+            gpu,
+            renderError,
+            packetFixture,
+            events,
+            frames,
+            emu: { ...first.emu, ...last.emu },
+          };
           document.querySelector("#result").textContent = JSON.stringify(result, null, 2);
           // The worker waits up to 5 s for RPCS3's threads to exit and then
           // reports; allow that report to arrive before giving up on it.

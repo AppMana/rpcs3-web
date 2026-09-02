@@ -27,8 +27,9 @@ test("matches the native oracle with compiled SPU programs dispatched on the SPU
   });
   await testInfo.attach("spu-aot-table-conformance.json", { body: JSON.stringify(result, null, 2), contentType: "application/json" });
   expect(result.ok, JSON.stringify(result, null, 2)).toBe(true);
-  expect(result.verdict).toBe("76ec98ba0e352b1c");
-  const table = result.spuAotTable as { programs: number; dispatches: number; fallbacks: number; idleWorkersReady: number; idleWorkers: number };
+  const emu = result.emu as Record<string, unknown>;
+  expect(emu.verdict).toBe("76ec98ba0e352b1c");
+  const table = emu.spuAotTable as { programs: number; dispatches: number; fallbacks: number; idleWorkersReady: number; idleWorkers: number };
   expect(table.programs).toBeGreaterThan(0);
   expect(table.dispatches, JSON.stringify(table)).toBeGreaterThan(0);
   expect(table.idleWorkersReady, JSON.stringify(table)).toBe(table.idleWorkers);

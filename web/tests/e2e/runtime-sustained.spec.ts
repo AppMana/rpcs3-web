@@ -22,7 +22,7 @@ test("sustains sixty Tetris frames through direct WebGPU presentation", async ({
   const frames = (result.frames ?? []) as Array<{
     droppedPackets: number; presentedSkips: number; captureMs: number;
     hostTimings: { waitForPacketsMs: number; renderMs: number };
-    gpu: { draws: number; frameHash: number | undefined; adapter: string; timings: Record<string, number>; pipelineCache: { misses: number } };
+    gpu: { draws: number; frameHash: string | undefined; adapter: string; timings: Record<string, number>; pipelineCache: { misses: number } };
     workingSet: Record<string, number>;
   }>;
   const shutdown = result.shutdown as { stoppedCleanly: boolean; stopMs: number; liveThreadNames: string[]; stackReport: Array<{ name: string; usedBytes: number }>; workingSet: Record<string, number> } | undefined;
@@ -41,7 +41,7 @@ test("sustains sixty Tetris frames through direct WebGPU presentation", async ({
     workingSet: frames.at(-1)?.workingSet,
     shutdown: shutdown && { stoppedCleanly: shutdown.stoppedCleanly, stopMs: shutdown.stopMs, liveThreadNames: shutdown.liveThreadNames, maxStackUsedBytes: Math.max(0, ...shutdown.stackReport.map((entry) => entry.usedBytes)), workingSet: shutdown.workingSet },
   };
-  const body = JSON.stringify({ evidence, result: { ...result, frames: undefined, events: undefined, logs: undefined } }, null, 2);
+  const body = JSON.stringify({ evidence, result: { ...result, frames: undefined, events: undefined, emu: { ...(result.emu as object), logs: undefined } } }, null, 2);
   await testInfo.attach("rpcs3-sustained.json", { body, contentType: "application/json" });
   // Also keep the evidence on disk for passing runs (traces are retained on failure only).
   await writeFile(testInfo.outputPath("rpcs3-sustained.json"), body);

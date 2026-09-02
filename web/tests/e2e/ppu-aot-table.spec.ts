@@ -31,8 +31,9 @@ test("matches the native oracle with compiled PPU blocks dispatched on the PPU t
   });
   await testInfo.attach("ppu-aot-table-conformance.json", { body: JSON.stringify(result, null, 2), contentType: "application/json" });
   expect(result.ok, JSON.stringify(result, null, 2)).toBe(true);
-  expect(result.verdict).toBe("76ec98ba0e352b1c");
-  const table = result.ppuAotTable as { blocks: number; dispatches: number; idleWorkersReady: number; idleWorkers: number };
+  const emu = result.emu as Record<string, unknown>;
+  expect(emu.verdict).toBe("76ec98ba0e352b1c");
+  const table = emu.ppuAotTable as { blocks: number; dispatches: number; idleWorkersReady: number; idleWorkers: number };
   expect(table.blocks).toBeGreaterThan(0);
   expect(table.dispatches).toBeGreaterThan(0);
   expect(table.idleWorkersReady, JSON.stringify(table)).toBe(table.idleWorkers);

@@ -24,8 +24,9 @@ test("matches the native PPU/SPU dispatch oracle in the full Wasm runtime", asyn
     contentType: "application/json",
   });
   expect(result.ok, JSON.stringify(result, null, 2)).toBe(true);
-  expect(result.verdict).toBe("76ec98ba0e352b1c");
-  expect(result.dispatchLines).toEqual([
+  const emu = result.emu as Record<string, unknown>;
+  expect(emu.verdict).toBe("76ec98ba0e352b1c");
+  expect(emu.dispatchLines).toEqual([
     "RPCS3-DISPATCH/1 BEGIN",
     "RPCS3-DISPATCH/1 CHECK ppu-control d8f0f90119313940",
     "RPCS3-DISPATCH/1 CHECK ppu-page-edge 0000000086a2b1c5",
@@ -33,10 +34,10 @@ test("matches the native PPU/SPU dispatch oracle in the full Wasm runtime", asyn
     "RPCS3-DISPATCH/1 CHECK spu-group 02022f2bcd8b3b2d",
     "RPCS3-DISPATCH/1 PASS 76ec98ba0e352b1c",
   ]);
-  expect(result.ppuInstructions).toBeGreaterThan(0);
-  expect(result.spuInstructions).toBeGreaterThan(0);
-  expect(result.spuLsBoundaryCount).toBe(0);
-  expect(result.sparseVmProbe).toBe(1);
+  expect(emu.ppuInstructions).toBeGreaterThan(0);
+  expect(emu.spuInstructions).toBeGreaterThan(0);
+  expect(emu.spuLsBoundaryCount).toBe(0);
+  expect(emu.sparseVmProbe).toBe(1);
 });
 
 test("matches the native oracle through RPCS3 LLVM PPU blocks compiled to Wasm", async ({ page }, testInfo) => {
@@ -64,13 +65,14 @@ test("matches the native oracle through RPCS3 LLVM PPU blocks compiled to Wasm",
     contentType: "application/json",
   });
   expect(result.ok).toBe(true);
-  expect(result.verdict).toBe("76ec98ba0e352b1c");
-  expect(result.dispatchLines).toHaveLength(6);
-  expect((result.ppuAot as { compiledBlocks?: number })?.compiledBlocks).toBeGreaterThan(0);
-  expect((result.ppuAot as { syscallBoundaries?: number })?.syscallBoundaries).toBeGreaterThan(0);
-  expect((result.ppuAot as { reservationLoads?: number })?.reservationLoads).toBeGreaterThan(0);
-  expect((result.ppuAot as { reservationStores?: number })?.reservationStores).toBeGreaterThan(0);
-  expect(result.spuInstructions).toBeGreaterThan(0);
+  const emu = result.emu as Record<string, unknown>;
+  expect(emu.verdict).toBe("76ec98ba0e352b1c");
+  expect(emu.dispatchLines).toHaveLength(6);
+  expect((emu.ppuAot as { compiledBlocks?: number })?.compiledBlocks).toBeGreaterThan(0);
+  expect((emu.ppuAot as { syscallBoundaries?: number })?.syscallBoundaries).toBeGreaterThan(0);
+  expect((emu.ppuAot as { reservationLoads?: number })?.reservationLoads).toBeGreaterThan(0);
+  expect((emu.ppuAot as { reservationStores?: number })?.reservationStores).toBeGreaterThan(0);
+  expect(emu.spuInstructions).toBeGreaterThan(0);
 });
 
 test("matches the native oracle through an RPCS3 LLVM SPU block compiled to Wasm", async ({ page }, testInfo) => {
@@ -98,10 +100,11 @@ test("matches the native oracle through an RPCS3 LLVM SPU block compiled to Wasm
     contentType: "application/json",
   });
   expect(result.ok, JSON.stringify(result, null, 2)).toBe(true);
-  expect(result.verdict).toBe("76ec98ba0e352b1c");
-  expect(result.dispatchLines).toHaveLength(6);
-  expect((result.spuAot as { compiledBlocks?: number })?.compiledBlocks).toBeGreaterThan(0);
-  expect((result.spuAot as { patchpointBoundaries?: number })?.patchpointBoundaries).toBeGreaterThan(0);
-  expect((result.spuAot as { interpreterSteps?: number })?.interpreterSteps).toBeGreaterThan(0);
-  expect(result.spuAotAbi).toEqual([315584, 20, 24, 48, 8, 3592, 3608]);
+  const emu = result.emu as Record<string, unknown>;
+  expect(emu.verdict).toBe("76ec98ba0e352b1c");
+  expect(emu.dispatchLines).toHaveLength(6);
+  expect((emu.spuAot as { compiledBlocks?: number })?.compiledBlocks).toBeGreaterThan(0);
+  expect((emu.spuAot as { patchpointBoundaries?: number })?.patchpointBoundaries).toBeGreaterThan(0);
+  expect((emu.spuAot as { interpreterSteps?: number })?.interpreterSteps).toBeGreaterThan(0);
+  expect(emu.spuAotAbi).toEqual([315584, 20, 24, 48, 8, 3592, 3608]);
 });

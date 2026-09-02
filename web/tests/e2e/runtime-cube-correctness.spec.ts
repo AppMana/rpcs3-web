@@ -57,7 +57,7 @@ test("renders the RPCS3 textured cube with depth and alpha-blended text", async 
 
   expect(result.ok, JSON.stringify(artifact, null, 2)).toBe(true);
   expect(result.bootResult).toBe(0);
-  expect(result.droppedPackets).toBe(0);
+  expect((result.emu as { droppedPackets: number }).droppedPackets).toBe(0);
   expect(gpu.presented).toBe(true);
   expect(gpu.vertexBackend).toBe("webgpu-wgsl");
   expect(gpu.vertexBackendComparison).toMatchObject({

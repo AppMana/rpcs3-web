@@ -155,6 +155,11 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
             } else {
               gpu = await renderOnce();
             }
+            if (gpu?.missingTextures?.length) {
+              // Payloads the renderer never received (dropped or skipped packets): let the
+              // packet builder forget them so the next reference carries the data again.
+              worker.postMessage({ type: "texture-forget", textures: gpu.missingTextures });
+            }
             if (gpu && vertexBackendComparison) {
               gpu.vertexBackendComparison = {
                 ...vertexBackendComparison,
@@ -201,6 +206,11 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
             resolve(result);
           };
           worker.addEventListener("message", onShutdown);
+          // A host (the acceptance runner) may need the pthread workers alive a moment longer,
+          // e.g. to stop CPU profilers attached to them, before RPCS3 releases them.
+          if (typeof window.__rpcs3BeforeShutdown === "function") {
+            try { await window.__rpcs3BeforeShutdown(); } catch (_) {}
+          }
           worker.postMessage({ type: "shutdown" });
         } catch (error) {
           clearTimeout(timeout);
@@ -232,6 +242,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       ppuAotBundle: typeof options.ppuAotBundle === "string" ? options.ppuAotBundle : undefined,
       spuAotBundle: typeof options.spuAotBundle === "string" ? options.spuAotBundle : undefined,
       spuTraceRange: Array.isArray(options.spuTraceRange) ? options.spuTraceRange : undefined,
+      spuFallbackHistogram: options.spuFallbackHistogram === true,
       spuAot: options.spuAot === true,
       clockScale: options.clockScale,
       accurateSpuDma: options.accurateSpuDma,

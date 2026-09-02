@@ -28,6 +28,12 @@ namespace rsx::webgpu
 		// consumer may copy from this address until it calls pop_front.
 		[[nodiscard]] const std::byte* front_data() const;
 		[[nodiscard]] bool pop_front();
+		// Called by the host exports before a packet leaves the queue: delivered is false when the
+		// host discards it unrendered (or the queue is cleared), so the producer can retract
+		// per-packet state such as texture residency.
+		using pop_hook = void (*)(bool delivered);
+		void set_pop_hook(pop_hook hook) noexcept { m_pop_hook.store(hook); }
+		[[nodiscard]] pop_hook get_pop_hook() const noexcept { return m_pop_hook.load(); }
 
 		[[nodiscard]] std::uint32_t packet_count() const;
 		[[nodiscard]] std::uint64_t queued_bytes() const;
@@ -52,6 +58,7 @@ namespace rsx::webgpu
 		std::size_t m_queued_bytes = 0;
 		std::size_t m_peak_queued_bytes = 0;
 		std::uint64_t m_dropped_packets = 0;
+		std::atomic<pop_hook> m_pop_hook{nullptr};
 		alignas(4) std::atomic<std::uint32_t> m_frame_counter{0};
 		std::mutex m_callback_mutex;
 		std::function<void(std::uint32_t)> m_flip_callback;

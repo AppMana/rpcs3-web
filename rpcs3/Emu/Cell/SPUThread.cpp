@@ -81,6 +81,59 @@ struct spu_web_aot_list
 static std::array<atomic_t<spu_web_aot_list*>, SPU_LS_SIZE / 4> g_spu_web_aot_lists{};
 atomic_t<u64> g_spu_web_aot_dispatch_count{0};
 atomic_t<u64> g_spu_web_aot_fallback_count{0};
+
+// Diagnosis: per-pc counts of dispatch attempts whose candidates all failed verification
+// ("listed") and of interpreter iterations at pcs without compiled candidates ("unlisted").
+atomic_t<u32> g_spu_web_fallback_histogram{0};
+static atomic_t<u32> g_spu_web_fallback_listed[SPU_LS_SIZE / 4];
+static atomic_t<u32> g_spu_web_fallback_unlisted[SPU_LS_SIZE / 4];
+// First local-store words seen at a listed pc whose candidates all failed (diagnosis)
+struct spu_web_fallback_sample { u32 pc; u32 words[8]; };
+static shared_mutex g_spu_web_fallback_sample_mutex;
+static std::vector<spu_web_fallback_sample> g_spu_web_fallback_samples;
+
+static void spu_web_note_fallback_sample(spu_thread& spu)
+{
+	std::lock_guard lock(g_spu_web_fallback_sample_mutex);
+	if (g_spu_web_fallback_samples.size() >= 4096) return;
+	for (const auto& sample : g_spu_web_fallback_samples) if (sample.pc == spu.pc) return;
+	spu_web_fallback_sample sample{spu.pc};
+	for (u32 i = 0; i < 8; i++) sample.words[i] = spu._ref<be_t<u32>>((spu.pc + i * 4) & 0x3fffc);
+	g_spu_web_fallback_samples.push_back(sample);
+}
+
+std::string spu_web_aot_fallback_report(u32 top)
+{
+	std::vector<std::pair<u32, u32>> listed, unlisted;
+	for (u32 i = 0; i < SPU_LS_SIZE / 4; i++)
+	{
+		if (const u32 n = g_spu_web_fallback_listed[i].load()) listed.emplace_back(n, i * 4);
+		if (const u32 n = g_spu_web_fallback_unlisted[i].load()) unlisted.emplace_back(n, i * 4);
+	}
+	const auto by_count = [](const auto& a, const auto& b) { return a.first > b.first; };
+	std::sort(listed.begin(), listed.end(), by_count);
+	std::sort(unlisted.begin(), unlisted.end(), by_count);
+	std::string out;
+	for (u32 i = 0; i < top && i < listed.size(); i++)
+	{
+		const auto list = g_spu_web_aot_lists[listed[i].second / 4].load();
+		fmt::append(out, "listed pc=0x%05x count=%u candidates=%u ls=", listed[i].second, listed[i].first, list ? list->count : 0);
+		{
+			std::lock_guard lock(g_spu_web_fallback_sample_mutex);
+			for (const auto& sample : g_spu_web_fallback_samples)
+			{
+				if (sample.pc != listed[i].second) continue;
+				for (u32 w = 0; w < 8; w++) fmt::append(out, "%08x ", sample.words[w]);
+			}
+		}
+		out += '\n';
+	}
+	for (u32 i = 0; i < top && i < unlisted.size(); i++)
+	{
+		fmt::append(out, "unlisted pc=0x%05x count=%u\n", unlisted[i].second, unlisted[i].first);
+	}
+	return out;
+}
 extern "C" int rpcs3_web_spu_aot_worker_ready();
 
 // (entry address, table index) pairs; several programs may start at one address
@@ -1610,6 +1663,16 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 				}
 
 				g_spu_web_aot_fallback_count++;
+
+				if (g_spu_web_fallback_histogram)
+				{
+					g_spu_web_fallback_listed[(spu.pc & 0x3fffc) / 4]++;
+					spu_web_note_fallback_sample(spu);
+				}
+			}
+			else if (g_spu_web_fallback_histogram)
+			{
+				g_spu_web_fallback_unlisted[(spu.pc & 0x3fffc) / 4]++;
 			}
 		}
 
@@ -3207,7 +3270,29 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 				// 1. Unset stall-and-notify bit on all 6 elements
 				// 2. Equality of transfer size across all 6 elements
 				// 3. Be in the same 512mb region, this is because this case is not expected to be broken usually and we need to ensure MMIO is not involved in any of the transfers (assumes MMIO to be so rare that this is the last check)
-				if (ored == anded && items[0].ea < RAW_SPU_BASE_ADDR && items[1].ea < RAW_SPU_BASE_ADDR)
+#ifdef RPCS3_WEB
+				// Wasm32 has no flat guest aperture: every element must be host-contiguous so its
+				// chunks translate through the page table (SRC below). Otherwise the generic path
+				// runs, and an unmapped page faults there as it does on native hardware.
+				const auto web_fast_ok = [&](u32 element_size)
+				{
+					for (const auto& item : items)
+					{
+						if (element_size && !vm::web_is_contiguous(item.ea, element_size))
+						{
+							return false;
+						}
+					}
+
+					return true;
+				};
+#endif
+
+				if (ored == anded && items[0].ea < RAW_SPU_BASE_ADDR && items[1].ea < RAW_SPU_BASE_ADDR
+#ifdef RPCS3_WEB
+					&& web_fast_ok(std::bit_cast<be_t<u32>>(s_size) & ts_mask)
+#endif
+				)
 				{
 					// Execute the postponed byteswapping and masking
 					s_size = std::bit_cast<be_t<u32>>(s_size) & ts_mask;
@@ -3216,7 +3301,12 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 					spu_web_note_ls_boundary(arg_lsa, fetch_size * utils::align<u32>(s_size, 16));
 #endif
 
+#ifdef RPCS3_WEB
+#define SRC(ea) vm::web_base(static_cast<u32>(ea))
+#else
 					u8* src = vm::_ptr<u8>(0);
+#define SRC(ea) (src + (ea))
+#endif
 					u8* dst = this->ls + arg_lsa;
 
 					// Assume success, prepare the next elements
@@ -3228,8 +3318,8 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 					constexpr usz _128 = 128;
 
 					// This whole function relies on many constraints to be met (crashes real MFC), we can a have minor optimization assuming EA alignment to be +16 with +16 byte transfers
-#define MOV_T(type, index, _ea) { const usz ea = _ea; *reinterpret_cast<type*>(dst + index * utils::align<u32>(sizeof(type), 16) + ea % (sizeof(type) < 16 ? 16 : 1)) = *reinterpret_cast<const type*>(src + ea); } void()
-#define MOV_128(index, ea) mov_rdata(*reinterpret_cast<decltype(rdata)*>(dst + index * _128), *reinterpret_cast<const decltype(rdata)*>(src + (ea)))
+#define MOV_T(type, index, _ea) { const usz ea = _ea; *reinterpret_cast<type*>(dst + index * utils::align<u32>(sizeof(type), 16) + ea % (sizeof(type) < 16 ? 16 : 1)) = *reinterpret_cast<const type*>(SRC(ea)); } void()
+#define MOV_128(index, ea) mov_rdata(*reinterpret_cast<decltype(rdata)*>(dst + index * _128), *reinterpret_cast<const decltype(rdata)*>(SRC(ea)))
 
 					switch (s_size)
 					{
@@ -3476,6 +3566,7 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 						break;
 					}
 					}
+#undef SRC
 #undef MOV_T
 #undef MOV_128
 					// Optimization miss, revert changes

@@ -545,6 +545,16 @@ function fragmentSource(packet, words, sourceIndex, inlineConstant) {
   return source;
 }
 
+// rsx::texture_dimension_extended of the fragment texture bound to a slot: 0 = 1D, 1 = 2D,
+// 2 = cube, 3 = 3D. A disabled sampler binds RPCS3's 2D null image.
+function textureDimension(packet, slot) {
+  const descriptor = packet.textures.find((texture) => texture.stage === 0 && texture.slot === slot);
+  return descriptor ? descriptor.dimension : 1;
+}
+
+const WGSL_TEXTURE_TYPES = ["texture_1d<f32>", "texture_2d<f32>", "texture_cube<f32>", "texture_3d<f32>"];
+const TEXTURE_VIEW_DIMENSIONS = ["1d", "2d", "cube", "3d"];
+
 // Compile the RSX fragment instruction stream into WGSL using the same bit
 // fields and execution rules as RPCS3's existing GLSL fragment interpreter.
 // The closure is intentionally strict: unsupported instructions fail instead
@@ -556,6 +566,7 @@ function compileFragmentProgram(packet) {
   const lines = ["var r16: array<vec4f, 48>;", "var r32: array<vec4f, 48>;", "var cc: array<vec4f, 2>;", "var rsxDiscard = false;"];
   const opcodes = [];
   const textureSlots = new Set();
+  const textureDimensions = new Map();
   let constantIndex = 0;
   for (let offset = 0; offset < bytes.byteLength;) {
     const words = [0, 4, 8, 12].map((wordOffset) => fragmentWord(view, offset + wordOffset));
@@ -578,7 +589,9 @@ function compileFragmentProgram(packet) {
     const operandCounts = new Map([
       [1, 1], [2, 2], [3, 2], [4, 3], [5, 2], [6, 2], [7, 2], [8, 2], [9, 2],
       [0x0a, 2], [0x0b, 2], [0x0c, 2], [0x0d, 2], [0x0e, 2], [0x0f, 2],
-      [0x10, 1], [0x11, 1], [0x12, 0], [0x15, 1], [0x16, 1], [0x17, 1],
+      [0x10, 1], [0x11, 1], [0x12, 0], [0x13, 1], [0x14, 1], [0x15, 1], [0x16, 1], [0x17, 1], [0x18, 1], [0x19, 3],
+      [0x24, 1], [0x25, 1], [0x27, 1], [0x28, 1], [0x29, 1], [0x2a, 1], [0x2b, 3],
+      [0x2f, 2], [0x31, 2], [0x33, 3], [0x34, 3], [0x36, 2],
       [0x1a, 1], [0x1b, 1], [0x1c, 1], [0x1d, 1], [0x1e, 1], [0x1f, 3],
       [0x20, 0], [0x21, 0], [0x22, 1], [0x23, 1], [0x2e, 3],
       [0x38, 2], [0x39, 1], [0x3a, 2], [0x3b, 2], [0x3c, 1],
@@ -621,10 +634,38 @@ function compileFragmentProgram(packet) {
     else if (opcode === 0x11) value = `floor(${sources[0]})`;
     else if (opcode === 0x15) value = `dpdx(${sources[0]})`;
     else if (opcode === 0x16) value = `dpdy(${sources[0]})`;
-    else if (opcode === 0x17) {
+    else if (opcode === 0x13) value = `vec4f(bitcast<f32>(pack4x8snorm(${sources[0]})))`;
+    else if (opcode === 0x14) value = `unpack4x8snorm(bitcast<u32>(${sources[0]}.x))`;
+    else if (opcode === 0x24) value = `vec4f(bitcast<f32>(pack2x16float(${sources[0]}.xy)))`;
+    else if (opcode === 0x25) value = `unpack2x16float(bitcast<u32>(${sources[0]}.x)).xyxy`;
+    else if (opcode === 0x27) value = `vec4f(bitcast<f32>(pack4x8unorm(${sources[0]})))`;
+    else if (opcode === 0x28) value = `unpack4x8unorm(bitcast<u32>(${sources[0]}.x))`;
+    else if (opcode === 0x29) value = `vec4f(bitcast<f32>(pack2x16unorm(${sources[0]}.xy)))`;
+    else if (opcode === 0x2a) value = `unpack2x16unorm(bitcast<u32>(${sources[0]}.x)).xyxy`;
+    else if (opcode === 0x2b) value = `(${sources[0]}.xyxy + ${sources[1]}.xxxx * ${sources[2]}.xzxz + ${sources[1]}.yyyy * ${sources[2]}.ywyw)`;
+    else if (opcode === 0x36) value = `reflect(${sources[0]}, ${sources[1]})`;
+    else if (opcode === 0x17 || opcode === 0x18 || opcode === 0x19 || opcode === 0x2f || opcode === 0x31 || opcode === 0x33 || opcode === 0x34) {
+      // TEX/TXP/TXD/TXL/TXB follow RPCS3's TEX2D, TEX2D_PROJ, TEX2D_GRAD, TEX2D_LOD and TEX2D_BIAS
+      // (RSXFragmentTextureOps.glsl): source 0 carries the coordinate, TXP divides by w, TXD takes
+      // the derivatives from sources 1 and 2, TXL the level and TXB the bias from source 1.x.
+      // TEXBEM/TXPBEM first form the bump-mapped coordinate x2d (RSX_FP_OPCODE_BEM) from sources
+      // 0..2 and then sample like TEX/TXP (FragmentProgramDecompiler.cpp).
+      // The coordinate width follows the bound texture's dimension the way RPCS3 picks the
+      // TEX1D/TEX2D/TEX3D (cube) function family from get_texture_dimension().
       const textureSlot = bits(words[0], 17, 4);
-      value = `textureSample(rsxTexture${textureSlot}, rsxSampler${textureSlot}, ${sources[0]}.xy)`;
+      const dimension = textureDimension(packet, textureSlot);
+      const coord = dimension === 0 ? "x" : dimension === 1 ? "xy" : "xyz";
+      const texture = `rsxTexture${textureSlot}, rsxSampler${textureSlot}`;
+      const x2d = `(${sources[0]}.xyxy + ${sources[1]}.xxxx * ${sources[2]}.xzxz + ${sources[1]}.yyyy * ${sources[2]}.ywyw)`;
+      if (opcode === 0x17) value = `textureSample(${texture}, ${sources[0]}.${coord})`;
+      else if (opcode === 0x18) value = `textureSample(${texture}, ${sources[0]}.${coord} / ${sources[0]}.w)`;
+      else if (opcode === 0x19) value = `textureSampleGrad(${texture}, ${sources[0]}.${coord}, ${sources[1]}.${coord}, ${sources[2]}.${coord})`;
+      else if (opcode === 0x2f) value = `textureSampleLevel(${texture}, ${sources[0]}.${coord}, ${sources[1]}.x)`;
+      else if (opcode === 0x31) value = `textureSampleBias(${texture}, ${sources[0]}.${coord}, ${sources[1]}.x)`;
+      else if (opcode === 0x33) value = `textureSample(${texture}, ${x2d}.${coord})`;
+      else value = `textureSample(${texture}, ${x2d}.${coord} / ${x2d}.w)`;
       textureSlots.add(textureSlot);
+      textureDimensions.set(textureSlot, dimension);
     } else if (opcode === 0x1a) value = `vec4f(1.0 / ${sources[0]}.x)`;
     else if (opcode === 0x1b) value = `vec4f(inverseSqrt(abs(${sources[0]}.x)))`;
     else if (opcode === 0x1c) value = `vec4f(exp2(${sources[0]}.x))`;
@@ -680,6 +721,7 @@ function compileFragmentProgram(packet) {
     code: lines.join("\n"),
     textured: textureSlots.size > 0,
     textureSlots: [...textureSlots].sort((a, b) => a - b),
+    textureDimensions,
     opcodes,
     constantCount: constantIndex,
   };
@@ -891,12 +933,13 @@ function programKey(packet, vertexBackend) {
     packet.vertexProgramOutputMask,
     fnv1a32(packet.sections[SectionKind.fragmentProgram].bytes),
     packet.fragmentProgramControl,
+    packet.textures.filter((texture) => texture.stage === 0).map((texture) => `${texture.slot}=${texture.dimension}`).join(","),
   ].join(":");
 }
 
 function assembleShader(vertex, fragment, vertexBackend) {
   const declarations = fragment.textureSlots.flatMap((slot) => [
-    `@group(0) @binding(${slot * 2}) var rsxTexture${slot}: texture_2d<f32>;`,
+    `@group(0) @binding(${slot * 2}) var rsxTexture${slot}: ${WGSL_TEXTURE_TYPES[fragment.textureDimensions.get(slot)]};`,
     `@group(0) @binding(${slot * 2 + 1}) var rsxSampler${slot}: sampler;`,
   ]).join("\n");
   const vertexOutputFields = VertexVaryings.map((name, varying) => `@location(${varying}) ${name}: vec4f,`).join("\n");
@@ -1087,24 +1130,34 @@ struct ClearFragment { @location(0) color: vec4f, @builtin(frag_depth) depth: f3
 
 // RPCS3's null texture for referenced-but-disabled samplers: a small
 // zero-filled RGBA8 image with a plain sampler.
-function getNullTexture(prepared) {
-  if (prepared.nullTexture) return prepared.nullTexture;
+function getNullTexture(prepared, dimension = 1) {
+  const cache = prepared.nullTextures ??= new Map();
+  if (cache.has(dimension)) return cache.get(dimension);
   const { device } = prepared;
+  const cube = dimension === 2;
   const texture = device.createTexture({
-    label: "RPCS3 RSX null texture",
-    size: { width: 4, height: 4 },
+    label: `RPCS3 RSX null texture (${TEXTURE_VIEW_DIMENSIONS[dimension]})`,
+    size: { width: 4, height: dimension === 0 ? 1 : 4, depthOrArrayLayers: cube ? 6 : 1 },
+    dimension: dimension === 3 ? "3d" : dimension === 0 ? "1d" : "2d",
     format: "rgba8unorm",
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
   });
-  device.queue.writeTexture({ texture }, new Uint8Array(4 * 4 * 4), { bytesPerRow: 16, rowsPerImage: 4 }, { width: 4, height: 4 });
-  prepared.nullTexture = {
+  const height = dimension === 0 ? 1 : 4;
+  device.queue.writeTexture(
+    { texture },
+    new Uint8Array(4 * height * 4 * (cube ? 6 : 1)),
+    { bytesPerRow: 16, rowsPerImage: height },
+    { width: 4, height, depthOrArrayLayers: cube ? 6 : 1 },
+  );
+  const resource = {
     texture,
-    view: texture.createView(),
+    view: texture.createView({ dimension: TEXTURE_VIEW_DIMENSIONS[dimension] }),
     sampler: device.createSampler({ magFilter: "nearest", minFilter: "nearest" }),
     byteSize: 64,
-    diagnostics: { width: 4, height: 4, nullTexture: true },
+    diagnostics: { width: 4, height, nullTexture: true },
   };
-  return prepared.nullTexture;
+  cache.set(dimension, resource);
+  return resource;
 }
 
 function getClearPipeline(prepared, format, writeMask, depthWrite) {
@@ -1170,7 +1223,7 @@ function getProgram(prepared, packet, vertexBackend) {
         buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: FRAGMENT_STATE_BYTES },
       },
       ...fragment.textureSlots.flatMap((slot) => [
-        { binding: slot * 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+        { binding: slot * 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: TEXTURE_VIEW_DIMENSIONS[fragment.textureDimensions.get(slot)] } },
         { binding: slot * 2 + 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
       ]),
     ],
@@ -1403,22 +1456,22 @@ function decodeBcColor(bytes, offset, forceFourColors) {
   return { colors, indices };
 }
 
-function decodeBcTexture(descriptor, baseFormat, rgba, bytesPerRow) {
+// Decodes one DXT subresource (RPCS3 never swizzles compressed formats) into RGBA8 rows.
+function decodeBcSubresource(bytes, offset, sourcePitch, width, height, baseFormat, rgba, rgbaOffset, bytesPerRow) {
   const blockBytes = baseFormat === 0x86 ? 8 : 16;
-  const blockWidth = Math.max(1, Math.ceil(descriptor.width / 4));
-  const blockHeight = Math.max(1, Math.ceil(descriptor.height / 4));
-  const sourcePitch = descriptor.pitch || blockWidth * blockBytes;
-  if (descriptor.bytes.byteLength < sourcePitch * blockHeight) throw new Error("RPCS3 compressed texture payload is truncated");
+  const blockWidth = Math.max(1, Math.ceil(width / 4));
+  const blockHeight = Math.max(1, Math.ceil(height / 4));
+  if (bytes.byteLength < offset + sourcePitch * (blockHeight - 1) + blockWidth * blockBytes) throw new Error("RPCS3 compressed texture payload is truncated");
   for (let blockY = 0; blockY < blockHeight; blockY += 1) {
     for (let blockX = 0; blockX < blockWidth; blockX += 1) {
-      const block = blockY * sourcePitch + blockX * blockBytes;
+      const block = offset + blockY * sourcePitch + blockX * blockBytes;
       const colorOffset = baseFormat === 0x86 ? block : block + 8;
-      const { colors, indices } = decodeBcColor(descriptor.bytes, colorOffset, baseFormat !== 0x86);
+      const { colors, indices } = decodeBcColor(bytes, colorOffset, baseFormat !== 0x86);
       let alphaBits = 0n;
       let alphaPalette;
       if (baseFormat === 0x88) {
-        const alpha0 = descriptor.bytes[block];
-        const alpha1 = descriptor.bytes[block + 1];
+        const alpha0 = bytes[block];
+        const alpha1 = bytes[block + 1];
         alphaPalette = [alpha0, alpha1];
         const divisor = alpha0 > alpha1 ? 7 : 5;
         const interpolated = alpha0 > alpha1 ? 6 : 4;
@@ -1426,17 +1479,17 @@ function decodeBcTexture(descriptor, baseFormat, rgba, bytesPerRow) {
           alphaPalette.push(Math.floor(((divisor - index) * alpha0 + index * alpha1) / divisor));
         }
         if (alpha0 <= alpha1) alphaPalette.push(0, 255);
-        for (let byte = 0; byte < 6; byte += 1) alphaBits |= BigInt(descriptor.bytes[block + 2 + byte]) << BigInt(byte * 8);
+        for (let byte = 0; byte < 6; byte += 1) alphaBits |= BigInt(bytes[block + 2 + byte]) << BigInt(byte * 8);
       }
       for (let pixel = 0; pixel < 16; pixel += 1) {
         const x = blockX * 4 + (pixel & 3);
         const y = blockY * 4 + (pixel >>> 2);
-        if (x >= descriptor.width || y >= descriptor.height) continue;
+        if (x >= width || y >= height) continue;
         const color = colors[(indices >>> (pixel * 2)) & 3];
-        const destination = y * bytesPerRow + x * 4;
+        const destination = rgbaOffset + y * bytesPerRow + x * 4;
         rgba.set(color, destination);
         if (baseFormat === 0x87) {
-          rgba[destination + 3] = ((descriptor.bytes[block + (pixel >>> 1)] >>> ((pixel & 1) * 4)) & 15) * 17;
+          rgba[destination + 3] = ((bytes[block + (pixel >>> 1)] >>> ((pixel & 1) * 4)) & 15) * 17;
         } else if (baseFormat === 0x88) {
           rgba[destination + 3] = alphaPalette[Number((alphaBits >> BigInt(pixel * 3)) & 7n)];
         }
@@ -1445,42 +1498,184 @@ function decodeBcTexture(descriptor, baseFormat, rgba, bytesPerRow) {
   }
 }
 
-function uploadTexture2D(device, descriptor, withStatistics = false) {
-  const baseFormat = descriptor.format & ~(0x20 | 0x40);
-  const bytesPerTexel = baseFormat === 0x85 ? 4 : baseFormat === 0x8b ? 2 : baseFormat === 0x81 ? 1 : 0;
-  const compressed = baseFormat >= 0x86 && baseFormat <= 0x88;
-  if ((!bytesPerTexel && !compressed) || descriptor.depth !== 1 || descriptor.dimension !== 1) {
-    throw new Error(`current WebGPU texture closure requires B8, G8B8, A8R8G8B8, or DXT 2D data (format=0x${descriptor.format.toString(16)})`);
-  }
-  const bytesPerRow = Math.ceil((descriptor.width * 4) / 256) * 256;
-  const rgba = new Uint8Array(bytesPerRow * descriptor.height);
-  if (compressed) {
-    decodeBcTexture(descriptor, baseFormat, rgba, bytesPerRow);
-  } else {
-    const linear = Boolean(descriptor.format & 0x20);
-    const sourcePitch = linear ? (descriptor.pitch || descriptor.width * bytesPerTexel) : descriptor.width * bytesPerTexel;
-    if (sourcePitch < descriptor.width * bytesPerTexel || descriptor.bytes.byteLength < sourcePitch * descriptor.height) {
-      throw new Error("RPCS3 texture payload is truncated");
+function nextPow2(value) {
+  let result = 1;
+  while (result < value) result *= 2;
+  return result;
+}
+
+// rsx::calculate_z_index: x, y and z bits interleaved while any dimension still has bits.
+function swizzledIndex3D(x, y, z, log2Width, log2Height, log2Depth) {
+  let offset = 0;
+  let shift = 0;
+  do {
+    if (log2Width) { offset |= (x & 1) << shift; shift += 1; x >>>= 1; log2Width -= 1; }
+    if (log2Height) { offset |= (y & 1) << shift; shift += 1; y >>>= 1; log2Height -= 1; }
+    if (log2Depth) { offset |= (z & 1) << shift; shift += 1; z >>>= 1; log2Depth -= 1; }
+  } while (x | y | z);
+  return offset;
+}
+
+// rsx::convert_linear_swizzle_3d: a depth of 1 is the 2D swizzle.
+function deswizzle3D(bytes, width, height, depth, bytesPerElement) {
+  if (depth === 1) return deswizzle2D(bytes, width, height, bytesPerElement);
+  const log2Width = Math.ceil(Math.log2(width));
+  const log2Height = Math.ceil(Math.log2(height));
+  const log2Depth = Math.ceil(Math.log2(depth));
+  const result = new Uint8Array(width * height * depth * bytesPerElement);
+  let destination = 0;
+  for (let z = 0; z < depth; z += 1) {
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const source = swizzledIndex3D(x, y, z, log2Width, log2Height, log2Depth) * bytesPerElement;
+        result.set(bytes.subarray(source, source + bytesPerElement), destination);
+        destination += bytesPerElement;
+      }
     }
-    const sourceBytes = linear
-      ? descriptor.bytes
-      : deswizzle2D(descriptor.bytes, descriptor.width, descriptor.height, bytesPerTexel);
-    for (let y = 0; y < descriptor.height; y += 1) {
-      for (let x = 0; x < descriptor.width; x += 1) {
-        const source = y * sourcePitch + x * bytesPerTexel;
-        const destination = y * bytesPerRow + x * 4;
+  }
+  return result;
+}
+
+// Subresource layout of an RSX texture payload, mirroring rsx::get_subresources_layout_impl:
+// layers (6 cube faces) of mip chains; linear rows use the register pitch and a 1-texel border,
+// swizzled data is tightly packed (or padded to a power of two around a 4-texel border) and each
+// layer starts 128-byte aligned.
+function textureLayout(descriptor, baseFormat) {
+  const compressed = baseFormat >= 0x86 && baseFormat <= 0x88;
+  const blockEdge = compressed ? 4 : 1;
+  const blockBytes = compressed ? (baseFormat === 0x86 ? 8 : 16) : baseFormat === 0x9a ? 8 : baseFormat === 0x85 || baseFormat === 0x9f ? 4 : baseFormat === 0x8b ? 2 : 1;
+  const linear = Boolean(descriptor.format & 0x20);
+  const hasBorder = descriptor.borderType === 0 && !compressed;
+  const border = hasBorder ? (linear ? 1 : 4) : 0;
+  const layers = descriptor.dimension === 2 ? 6 : 1;
+  const height0 = descriptor.dimension === 0 ? 1 : descriptor.height;
+  const depth0 = descriptor.dimension === 3 ? Math.max(1, descriptor.depth) : 1;
+  const mips = Math.max(1, descriptor.mipCount);
+  const subresources = [];
+  let offset = 0;
+  for (let layer = 0; layer < layers; layer += 1) {
+    let width = descriptor.width;
+    let height = height0;
+    let depth = depth0;
+    for (let level = 0; level < mips; level += 1) {
+      const widthInBlock = Math.ceil(width / blockEdge);
+      const heightInBlock = Math.ceil(height / blockEdge);
+      let pitchInBlock;
+      let fullHeightInBlock;
+      if (linear) {
+        pitchInBlock = Math.floor(descriptor.pitch / blockBytes);
+        fullHeightInBlock = heightInBlock + border + border;
+      } else if (!border) {
+        pitchInBlock = widthInBlock;
+        fullHeightInBlock = heightInBlock;
+      } else {
+        pitchInBlock = nextPow2(widthInBlock + border + border);
+        fullHeightInBlock = nextPow2(heightInBlock + border + border);
+      }
+      const sliceBytes = pitchInBlock * blockBytes * fullHeightInBlock * depth;
+      subresources.push({ layer, level, width, height, depth, widthInBlock, heightInBlock, pitchInBlock, fullHeightInBlock, offset, bytes: sliceBytes });
+      offset += sliceBytes;
+      width = Math.max(width >>> 1, 1);
+      height = Math.max(height >>> 1, 1);
+      depth = Math.max(depth >>> 1, 1);
+    }
+    if (!linear) offset = (offset + 127) & ~127;
+  }
+  // rsx::get_texture_size does not pad after the last layer
+  const last = subresources[subresources.length - 1];
+  return { compressed, blockBytes, linear, border, layers, mips, height0, depth0, subresources, totalBytes: last.offset + last.bytes };
+}
+
+// Converts one subresource to RGBA8 rows (bytesPerRow per row, height rows per depth slice).
+function convertSubresource(descriptor, baseFormat, layout, subresource, rgba, bytesPerRow) {
+  const { width, height, depth, widthInBlock, heightInBlock, pitchInBlock, fullHeightInBlock, offset } = subresource;
+  const { blockBytes, linear, border } = layout;
+  if (layout.compressed) {
+    for (let z = 0; z < depth; z += 1) {
+      decodeBcSubresource(descriptor.bytes, offset + z * pitchInBlock * blockBytes * fullHeightInBlock, pitchInBlock * blockBytes, width, height, baseFormat, rgba, z * bytesPerRow * height, bytesPerRow);
+    }
+    return;
+  }
+  if (descriptor.bytes.byteLength < offset + subresource.bytes) throw new Error("RPCS3 texture payload is truncated");
+  // Source texels (bytesPerTexel each) with rowPitch texels per row and rowsPerSlice rows per slice
+  let source;
+  let rowPitch;
+  let rowsPerSlice;
+  if (linear) {
+    source = descriptor.bytes.subarray(offset, offset + subresource.bytes);
+    rowPitch = pitchInBlock;
+    rowsPerSlice = fullHeightInBlock;
+  } else {
+    // copy_unmodified_block_swizzled: deswizzle the (padded) block, then skip the border
+    const paddedWidth = border ? nextPow2(widthInBlock + border + border) : widthInBlock;
+    const paddedHeight = border ? nextPow2(heightInBlock + border + border) : heightInBlock;
+    source = deswizzle3D(descriptor.bytes.subarray(offset, offset + paddedWidth * paddedHeight * depth * blockBytes), paddedWidth, paddedHeight, depth, blockBytes);
+    rowPitch = paddedWidth;
+    rowsPerSlice = paddedHeight;
+  }
+  if (baseFormat === 0x9a || baseFormat === 0x9f) {
+    // W16_Z16_Y16_X16_FLOAT / Y16_X16_FLOAT: big-endian half words copied into R16G16B16A16_SFLOAT /
+    // R16G16_SFLOAT (word order preserved) and read through RPCS3's ARGB component mapping
+    // {A,R,G,B} / {R,G,R,G} (vk::get_component_mapping); WebGPU has no view swizzle, so the
+    // mapping and the guest remap are baked into an rgba16float image (exact for half floats).
+    const words = new Uint16Array(rgba.buffer, rgba.byteOffset, rgba.byteLength >>> 1);
+    const remap = descriptor.remap & 0xffff;
+    const remapControl = descriptor.remap >>> 8;
+    const identity = remap === 0xaae4;
+    for (let z = 0; z < depth; z += 1) {
+      for (let y = 0; y < height; y += 1) {
+        const sourceRow = ((z * rowsPerSlice + y + border) * rowPitch + border) * blockBytes;
+        const destinationRow = ((z * height + y) * bytesPerRow) >>> 1;
+        for (let x = 0; x < width; x += 1) {
+          const o = sourceRow + x * blockBytes;
+          const w0 = (source[o] << 8) | source[o + 1];
+          const w1 = (source[o + 2] << 8) | source[o + 3];
+          let argb;
+          if (baseFormat === 0x9a) {
+            const w2 = (source[o + 4] << 8) | source[o + 5];
+            const w3 = (source[o + 6] << 8) | source[o + 7];
+            argb = [w3, w0, w1, w2];
+          } else {
+            argb = [w0, w1, w0, w1];
+          }
+          let out = argb;
+          if (!identity) {
+            out = [0, 1, 2, 3].map((channel) => {
+              const control = (remapControl >>> (channel * 2)) & 3;
+              if (control === 0) return 0;
+              if (control === 1) return 0x3c00;
+              return argb[(remap >>> (channel * 2)) & 3];
+            });
+          }
+          const destination = destinationRow + x * 4;
+          words[destination] = out[1];
+          words[destination + 1] = out[2];
+          words[destination + 2] = out[3];
+          words[destination + 3] = out[0];
+        }
+      }
+    }
+    return;
+  }
+  for (let z = 0; z < depth; z += 1) {
+    for (let y = 0; y < height; y += 1) {
+      const sourceRow = ((z * rowsPerSlice + y + border) * rowPitch + border) * blockBytes;
+      const destinationRow = (z * height + y) * bytesPerRow;
+      for (let x = 0; x < width; x += 1) {
+        const sourceOffset = sourceRow + x * blockBytes;
+        const destination = destinationRow + x * 4;
         if (baseFormat === 0x85) {
-          rgba[destination] = sourceBytes[source + 1];
-          rgba[destination + 1] = sourceBytes[source + 2];
-          rgba[destination + 2] = sourceBytes[source + 3];
-          rgba[destination + 3] = sourceBytes[source];
+          rgba[destination] = source[sourceOffset + 1];
+          rgba[destination + 1] = source[sourceOffset + 2];
+          rgba[destination + 2] = source[sourceOffset + 3];
+          rgba[destination + 3] = source[sourceOffset];
         } else if (baseFormat === 0x8b) {
-          rgba[destination] = sourceBytes[source + 1];
-          rgba[destination + 1] = sourceBytes[source];
-          rgba[destination + 2] = sourceBytes[source + 1];
-          rgba[destination + 3] = sourceBytes[source];
+          rgba[destination] = source[sourceOffset + 1];
+          rgba[destination + 1] = source[sourceOffset];
+          rgba[destination + 2] = source[sourceOffset + 1];
+          rgba[destination + 3] = source[sourceOffset];
         } else {
-          const value = sourceBytes[source];
+          const value = source[sourceOffset];
           rgba[destination] = value;
           rgba[destination + 1] = value;
           rgba[destination + 2] = value;
@@ -1489,6 +1684,10 @@ function uploadTexture2D(device, descriptor, withStatistics = false) {
       }
     }
   }
+}
+
+function applyRemap(descriptor, rgba, bytesPerRow, width, rows) {
+  if ((descriptor.remap & 0xffff) === 0xaae4) return;
   const remapControl = descriptor.remap >>> 8;
   const component = (argb, channel) => {
     const control = (remapControl >>> (channel * 2)) & 3;
@@ -1496,68 +1695,105 @@ function uploadTexture2D(device, descriptor, withStatistics = false) {
     if (control === 1) return 255;
     return argb[(descriptor.remap >>> (channel * 2)) & 3];
   };
-  if ((descriptor.remap & 0xffff) !== 0xaae4) {
-    for (let y = 0; y < descriptor.height; y += 1) {
-      for (let x = 0; x < descriptor.width; x += 1) {
-        const destination = y * bytesPerRow + x * 4;
-        const argb = [rgba[destination + 3], rgba[destination], rgba[destination + 1], rgba[destination + 2]];
-        const remapped = [0, 1, 2, 3].map((channel) => component(argb, channel));
-        rgba.set([remapped[1], remapped[2], remapped[3], remapped[0]], destination);
-      }
+  for (let y = 0; y < rows; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const destination = y * bytesPerRow + x * 4;
+      const argb = [rgba[destination + 3], rgba[destination], rgba[destination + 1], rgba[destination + 2]];
+      const remapped = [0, 1, 2, 3].map((channel) => component(argb, channel));
+      rgba.set([remapped[1], remapped[2], remapped[3], remapped[0]], destination);
     }
   }
-  // Per-channel statistics are diagnostics for the acceptance specs, not
-  // part of the upload.
-  const channelMin = [255, 255, 255, 255];
-  const channelMax = [0, 0, 0, 0];
-  const channelSum = [0, 0, 0, 0];
-  if (withStatistics) {
-    for (let y = 0; y < descriptor.height; y += 1) {
-      for (let x = 0; x < descriptor.width; x += 1) {
-        const destination = y * bytesPerRow + x * 4;
-        for (let channel = 0; channel < 4; channel += 1) {
-          channelMin[channel] = Math.min(channelMin[channel], rgba[destination + channel]);
-          channelMax[channel] = Math.max(channelMax[channel], rgba[destination + channel]);
-          channelSum[channel] += rgba[destination + channel];
-        }
-      }
-    }
+}
+
+// Uploads an RSX fragment texture (1D, 2D, cube or 3D, every mip level) as RGBA8.
+function uploadTexture(device, descriptor, withStatistics = false) {
+  const baseFormat = descriptor.format & ~(0x20 | 0x40);
+  const halfFloat = baseFormat === 0x9a || baseFormat === 0x9f;
+  const bytesPerTexel = baseFormat === 0x85 ? 4 : baseFormat === 0x8b ? 2 : baseFormat === 0x81 ? 1 : baseFormat === 0x9a ? 8 : baseFormat === 0x9f ? 4 : 0;
+  const compressed = baseFormat >= 0x86 && baseFormat <= 0x88;
+  if (!bytesPerTexel && !compressed) {
+    throw new Error(`current WebGPU texture closure requires B8, G8B8, A8R8G8B8, W16_Z16_Y16_X16_FLOAT, Y16_X16_FLOAT, or DXT data (format=0x${descriptor.format.toString(16)})`);
   }
+  const gpuFormat = halfFloat ? "rgba16float" : "rgba8unorm";
+  const outputBytesPerTexel = halfFloat ? 8 : 4;
+  if (descriptor.dimension > 3) throw new Error(`invalid RSX texture dimension ${descriptor.dimension}`);
+  const layout = textureLayout(descriptor, baseFormat);
+  if (descriptor.dimension === 0 && layout.mips > 1) throw new Error("RSX 1D textures with mipmaps are not yet translated");
+  if (descriptor.bytes.byteLength < layout.totalBytes) throw new Error(`RPCS3 texture payload is truncated (${descriptor.bytes.byteLength} of ${layout.totalBytes} bytes)`);
+  const cube = descriptor.dimension === 2;
+  const viewDimension = TEXTURE_VIEW_DIMENSIONS[descriptor.dimension];
   const texture = device.createTexture({
     label: `RPCS3 RSX texture ${descriptor.stage}:${descriptor.slot}`,
-    size: { width: descriptor.width, height: descriptor.height },
-    format: "rgba8unorm",
+    size: { width: descriptor.width, height: layout.height0, depthOrArrayLayers: cube ? 6 : layout.depth0 },
+    dimension: descriptor.dimension === 3 ? "3d" : descriptor.dimension === 0 ? "1d" : "2d",
+    mipLevelCount: layout.mips,
+    format: gpuFormat,
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
   });
-  device.queue.writeTexture(
-    { texture },
-    rgba,
-    { bytesPerRow, rowsPerImage: descriptor.height },
-    { width: descriptor.width, height: descriptor.height },
-  );
+  let byteSize = 0;
+  let base;
+  for (const subresource of layout.subresources) {
+    const bytesPerRow = Math.ceil((subresource.width * outputBytesPerTexel) / 256) * 256;
+    const rgba = new Uint8Array(bytesPerRow * subresource.height * subresource.depth);
+    convertSubresource(descriptor, baseFormat, layout, subresource, rgba, bytesPerRow);
+    if (!halfFloat) applyRemap(descriptor, rgba, bytesPerRow, subresource.width, subresource.height * subresource.depth);
+    device.queue.writeTexture(
+      { texture, mipLevel: subresource.level, origin: { x: 0, y: 0, z: cube ? subresource.layer : 0 } },
+      rgba,
+      { bytesPerRow, rowsPerImage: subresource.height },
+      { width: subresource.width, height: subresource.height, depthOrArrayLayers: cube ? 1 : subresource.depth },
+    );
+    byteSize += subresource.width * subresource.height * subresource.depth * outputBytesPerTexel;
+    if (subresource.layer === 0 && subresource.level === 0) base = { rgba, bytesPerRow, width: subresource.width, height: subresource.height };
+  }
   const addressMode = (value) => value === 1 ? "repeat" : value === 2 ? "mirror-repeat" : "clamp-to-edge";
   const minFilter = descriptor.filterModes & 0xff;
   const magFilter = (descriptor.filterModes >>> 8) & 0xff;
+  // CELL_GCM_TEXTURE_NEAREST/LINEAR sample the base level only; *_NEAREST_NEAREST/LINEAR_NEAREST
+  // pick a level, *_NEAREST_LINEAR/LINEAR_LINEAR blend two levels.
+  const mipmapped = minFilter >= 3 && minFilter <= 6;
   const sampler = device.createSampler({
     addressModeU: addressMode(descriptor.addressModes & 0xff),
     addressModeV: addressMode((descriptor.addressModes >>> 8) & 0xff),
     addressModeW: addressMode((descriptor.addressModes >>> 16) & 0xff),
     magFilter: magFilter === 1 ? "nearest" : "linear",
     minFilter: minFilter === 1 || minFilter === 3 || minFilter === 5 ? "nearest" : "linear",
+    mipmapFilter: minFilter === 5 || minFilter === 6 ? "linear" : "nearest",
+    lodMaxClamp: mipmapped ? layout.mips - 1 : 0,
   });
+  // Per-channel statistics are diagnostics for the acceptance specs, not
+  // part of the upload.
+  const channelMin = [255, 255, 255, 255];
+  const channelMax = [0, 0, 0, 0];
+  const channelSum = [0, 0, 0, 0];
+  if (withStatistics && !halfFloat) {
+    for (let y = 0; y < base.height; y += 1) {
+      for (let x = 0; x < base.width; x += 1) {
+        const destination = y * base.bytesPerRow + x * 4;
+        for (let channel = 0; channel < 4; channel += 1) {
+          channelMin[channel] = Math.min(channelMin[channel], base.rgba[destination + channel]);
+          channelMax[channel] = Math.max(channelMax[channel], base.rgba[destination + channel]);
+          channelSum[channel] += base.rgba[destination + channel];
+        }
+      }
+    }
+  }
   return {
     texture,
-    view: texture.createView(),
+    view: texture.createView({ dimension: viewDimension }),
     sampler,
-    byteSize: descriptor.width * descriptor.height * 4,
+    byteSize,
     diagnostics: {
       width: descriptor.width,
       height: descriptor.height,
-      ...(withStatistics ? {
-        channelMin,
-        channelMax,
-        channelMean: channelSum.map((sum) => sum / (descriptor.width * descriptor.height)),
-      } : {}),
+      depth: layout.depth0,
+      layers: layout.layers,
+      mipCount: layout.mips,
+      dimension: descriptor.dimension,
+      format: descriptor.format,
+      channelMin,
+      channelMax,
+      channelMean: withStatistics ? channelSum.map((sum) => sum / (base.width * base.height)) : undefined,
     },
   };
 }
@@ -1576,6 +1812,7 @@ function textureCacheKey(descriptor) {
     descriptor.remap,
     descriptor.addressModes,
     descriptor.filterModes,
+    descriptor.borderType,
   ].join(":");
 }
 
@@ -1645,13 +1882,15 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   const pipelineCache = prepared.pipelineCache ??= new Map();
   const bindGroupCache = prepared.bindGroupCache ??= new Map();
   const textureCache = prepared.textureCache ??= new Map();
-  const textureCacheBudget = options.textureCacheBytes ?? 128 * 1024 * 1024;
+  const textureCacheBudget = options.textureCacheBytes ?? 512 * 1024 * 1024;
   const frameTextureKeys = new Set();
   let pipelineCacheHits = 0;
   let pipelineCacheMisses = 0;
   let bindGroupCacheHits = 0;
   let bindGroupCacheMisses = 0;
   let textureCacheHits = 0;
+  let textureEvictions = 0;
+  let missingTexturePayloads = 0;
   let textureCacheMisses = 0;
 
   // One uniform ring for the frame (dynamic offsets per draw) and one vertex
@@ -1784,6 +2023,20 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     }
     uniformBytes.set(fragmentConstants, fragmentBase + 32);
 
+    // The packet builder owns texture residency: it delivers a payload once and evicts through
+    // stage-2 records, so both sides agree on what the cache holds without a return channel.
+    for (const eviction of packet.textureEvictions ?? []) {
+      const cacheKey = textureCacheKey(eviction);
+      const resource = textureCache.get(cacheKey);
+      if (!resource) continue;
+      textureCache.delete(cacheKey);
+      prepared.textureCacheBytes -= resource.byteSize;
+      resource.texture.destroy();
+      for (const key of [...bindGroupCache.keys()]) {
+        if (key.includes(cacheKey)) bindGroupCache.delete(key);
+      }
+      textureEvictions += 1;
+    }
     const textureResources = [];
     if (program.fragment.textured) {
       for (const slot of program.fragment.textureSlots) {
@@ -1791,7 +2044,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
         if (!descriptor) {
           // A referenced sampler that the guest left disabled: RPCS3 binds its
           // zero-filled null image (vk::null_image_view), so samples read 0.
-          textureResources.push({ slot, ...getNullTexture(prepared), cacheKey: "null", cached: true });
+          textureResources.push({ slot, ...getNullTexture(prepared, program.fragment.textureDimensions.get(slot)), cacheKey: "null", cached: true });
           continue;
         }
         const cacheKey = textureCacheKey(descriptor);
@@ -1800,8 +2053,14 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
           textureCache.delete(cacheKey);
           textureCache.set(cacheKey, resource);
           textureCacheHits += 1;
+        } else if (descriptor.bytes.byteLength === 0) {
+          // A reference to a texture the builder believes resident, whose payload never
+          // arrived (its packet was dropped). Bind the null image and count it.
+          missingTexturePayloads += 1;
+          textureResources.push({ slot, ...getNullTexture(prepared, program.fragment.textureDimensions.get(slot)), cacheKey: "null", cached: true });
+          continue;
         } else {
-          resource = uploadTexture2D(device, descriptor, textureDiagnostics);
+          resource = uploadTexture(device, descriptor, textureDiagnostics);
           textureCache.set(cacheKey, resource);
           prepared.textureCacheBytes = (prepared.textureCacheBytes ?? 0) + resource.byteSize;
           textureCacheMisses += 1;
@@ -1950,7 +2209,9 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     frameHash >>>= 0;
   }
   const readbackScannedAt = performance.now();
-  if ((prepared.textureCacheBytes ?? 0) > textureCacheBudget) {
+  // Residency is decided by the packet builder; this is only a guard against a protocol
+  // failure (twice the builder's budget), never the normal eviction path.
+  if ((prepared.textureCacheBytes ?? 0) > textureCacheBudget * 2) {
     for (const [cacheKey, resource] of textureCache) {
       if ((prepared.textureCacheBytes ?? 0) <= textureCacheBudget) break;
       if (frameTextureKeys.has(cacheKey)) continue;
@@ -2029,6 +2290,8 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       size: textureCache.size,
       bytes: prepared.textureCacheBytes ?? 0,
       budget: textureCacheBudget,
+      evictions: textureEvictions,
+      missingPayloads: missingTexturePayloads,
     },
     uniformRingBytes: uniformRing.size,
     vertexRingBytes: vertexRing.size,

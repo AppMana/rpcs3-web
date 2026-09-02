@@ -56,7 +56,7 @@ export function fnv1a32(bytes) {
 }
 
 export function decodeTextureRecords(bytes) {
-  if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) return [];
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) return { textures: [], evictions: [] };
   if (bytes.byteLength < TEXTURE_PACKET_RECORD_SIZE) throw new Error("truncated WebGPU texture section");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const firstDataOffset = u32(view, 40);
@@ -65,16 +65,19 @@ export function decodeTextureRecords(bytes) {
   }
   const count = firstDataOffset / TEXTURE_PACKET_RECORD_SIZE;
   const textures = [];
+  const textureEvictions = [];
   for (let index = 0; index < count; index += 1) {
     const offset = index * TEXTURE_PACKET_RECORD_SIZE;
     const dataOffset = u32(view, offset + 40);
     const dataSize = u32(view, offset + 44);
     const stage = u32(view, offset);
     const slot = u32(view, offset + 4);
-    if (stage > 1 || slot >= (stage === 0 ? 16 : 4) || dataOffset < firstDataOffset || dataOffset + dataSize > bytes.byteLength) {
+    // stage 2: the builder evicted this texture from the renderer's cache (no payload, no slot)
+    const eviction = stage === 2;
+    if (stage > 2 || (!eviction && slot >= (stage === 0 ? 16 : 4)) || (eviction && dataSize !== 0) || (!eviction && (dataOffset < firstDataOffset || dataOffset + dataSize > bytes.byteLength))) {
       throw new Error(`invalid WebGPU texture record ${index}`);
     }
-    textures.push({
+    (eviction ? textureEvictions : textures).push({
       stage,
       slot,
       address: u32(view, offset + 8),
@@ -90,12 +93,13 @@ export function decodeTextureRecords(bytes) {
       contentHash: u32(view, offset + 48),
       remap: u32(view, offset + 52),
       addressModes: u32(view, offset + 56),
+      borderType: (u32(view, offset + 56) >>> 24) & 0xff,
       filterModes: u32(view, offset + 60),
       texelControls: u32(view, offset + 60) >>> 16,
-      bytes: bytes.subarray(dataOffset, dataOffset + dataSize),
+      bytes: eviction ? new Uint8Array(0) : bytes.subarray(dataOffset, dataOffset + dataSize),
     });
   }
-  return textures;
+  return { textures, evictions: textureEvictions };
 }
 
 // Layout of rsx::webgpu::resolved_state_packet (WebGPUCommand.h). Values are
@@ -215,7 +219,9 @@ export function decodeDrawPacket(bytes) {
     subdraw: u32(view, 100),
     sections,
   };
-  packet.textures = decodeTextureRecords(sections[SectionKind.textures].bytes);
+  const textureRecords = decodeTextureRecords(sections[SectionKind.textures].bytes);
+  packet.textures = textureRecords.textures;
+  packet.textureEvictions = textureRecords.evictions;
   packet.resolvedState = decodeResolvedState(sections[SectionKind.resolvedState].bytes);
   return packet;
 }
@@ -246,7 +252,7 @@ export function copyFrontPacket(module) {
 export function discardFrontPacket(module) {
   const kind = module.ccall("rpcs3_webgpu_front_kind", "number", [], []) >>> 0;
   if (!kind) return undefined;
-  if (module.ccall("rpcs3_webgpu_pop_front", "number", [], []) !== 1) {
+  if (module.ccall("rpcs3_webgpu_discard_front", "number", [], []) !== 1) {
     throw new Error("WebGPU packet disappeared before discard");
   }
   return kind;

@@ -13,6 +13,7 @@
 #include "Emu/Memory/vm.h"
 
 #include <array>
+#include <list>
 #include <cstring>
 #include <limits>
 #include <span>
@@ -129,7 +130,8 @@ namespace
 		record.remap = texture.decoded_remap().encoded;
 		record.address_modes = static_cast<u32>(texture.wrap_s()) |
 			(static_cast<u32>(texture.wrap_t()) << 8) |
-			(static_cast<u32>(texture.wrap_r()) << 16);
+			(static_cast<u32>(texture.wrap_r()) << 16) |
+			(static_cast<u32>(texture.border_type()) << 24); // CELL_GCM_TEXTURE_BORDER_TEXTURE (0) carries border texels in the data
 		u32 texel_controls = 0;
 		if constexpr (requires { texture.format_ex(); })
 		{
@@ -207,12 +209,29 @@ namespace
 			lhs.address_modes == rhs.address_modes && lhs.filter_modes == rhs.filter_modes;
 	}
 
-	texture_capture capture_textures(u32 fragment_mask, u32 vertex_mask,
-		const std::vector<rsx::webgpu::texture_packet_record>& frame_cache)
+	// Guest textures are hashed once per frame by default: RPCS3's native texture cache
+	// invalidates on guest writes through page protection, which Wasm32 cannot provide, and
+	// re-hashing every referenced texture for every draw (thousands per frame in
+	// LittleBigPlanet 2's pod) costs more than the draws themselves. Conformance lanes can
+	// request per-draw hashing to observe mid-frame CPU writes.
+	std::atomic<bool> g_texture_hash_per_draw{false};
+
+	// Residency key: every field the renderer keys its texture cache on (rpcs3-webgpu-renderer.mjs
+	// textureCacheKey), i.e. the descriptor without stage, slot and payload placement.
+	u64 texture_residency_key(const rsx::webgpu::texture_packet_record& record)
 	{
+		const u32 fields[] = { record.address, record.format, record.width, record.height, record.depth, record.pitch,
+			record.mip_count, record.dimension, record.content_hash, record.remap, record.address_modes, record.filter_modes };
+		return XXH64(fields, sizeof(fields), 0);
+	}
+
+	texture_capture capture_textures(u32 fragment_mask, u32 vertex_mask,
+		WebGPUGSRender::texture_residency& residency, shared_mutex& residency_mutex,
+		std::unordered_map<u64, u32>& frame_hashes)
+	{
+		std::lock_guard residency_lock(residency_mutex);
 		std::vector<texture_source> sources;
 		bool complete = true;
-
 		for (u32 refs = fragment_mask, slot = 0; refs; refs >>= 1, ++slot)
 		{
 			if (refs & 1)
@@ -227,40 +246,79 @@ namespace
 				collect_texture(sources, complete, rsx::method_registers.vertex_textures[slot], 1, slot);
 			}
 		}
-
 		texture_capture result;
-		usz total_size = sources.size() * sizeof(rsx::webgpu::texture_packet_record);
+		std::vector<rsx::webgpu::texture_packet_record> evictions;
+		std::vector<u64> referenced;
+		usz payload_total = 0;
 		for (auto& source : sources)
 		{
-			if (!source.record.data_size ||
-				!hash_guest_bytes(source.address, source.record.data_size, source.record.content_hash))
+			if (!source.record.data_size)
 			{
 				return {{}, {}, false};
 			}
-
-			const auto is_match = [&](const auto& entry)
+			const u64 hash_key = (static_cast<u64>(source.address) << 32) | source.record.data_size;
+			if (const auto found = g_texture_hash_per_draw ? frame_hashes.end() : frame_hashes.find(hash_key); found != frame_hashes.end())
 			{
-				return same_texture(entry, source.record);
-			};
-			const bool cached = std::any_of(frame_cache.begin(), frame_cache.end(), is_match) ||
-				std::any_of(result.additions.begin(), result.additions.end(), is_match);
-			source.payload_size = cached ? 0 : source.record.data_size;
-			if (!cached)
-			{
-				result.additions.push_back(source.record);
+				source.record.content_hash = found->second;
 			}
-
-			total_size = align_up(total_size, 16);
-			if (total_size > std::numeric_limits<u32>::max() - source.payload_size)
+			else if (!hash_guest_bytes(source.address, source.record.data_size, source.record.content_hash))
 			{
 				return {{}, {}, false};
 			}
-			total_size += source.payload_size;
+			else
+			{
+				frame_hashes[hash_key] = source.record.content_hash;
+			}
+			const u64 key = texture_residency_key(source.record);
+			referenced.push_back(key);
+			if (const auto found = residency.entries.find(key); found != residency.entries.end())
+			{
+				// Resident: reference only, refresh recency
+				residency.lru.splice(residency.lru.begin(), residency.lru, found->second.lru);
+				source.payload_size = 0;
+				continue;
+			}
+			source.payload_size = source.record.data_size;
+			if (payload_total > std::numeric_limits<u32>::max() - source.payload_size - 16)
+			{
+				return {{}, {}, false};
+			}
+			payload_total = align_up(payload_total, 16) + source.payload_size;
+			residency.lru.push_front(key);
+			residency.entries.emplace(key, WebGPUGSRender::texture_residency::entry{ source.record, source.record.data_size, residency.lru.begin() });
+			residency.bytes += source.record.data_size;
+			result.additions.push_back(source.record);
 		}
-
+		// Evict least recently used textures (never one this draw references) until under budget
+		for (auto it = residency.lru.rbegin(); residency.bytes > residency.budget && it != residency.lru.rend();)
+		{
+			const u64 key = *it;
+			if (std::find(referenced.begin(), referenced.end(), key) != referenced.end())
+			{
+				++it;
+				continue;
+			}
+			auto& entry = residency.entries.at(key);
+			rsx::webgpu::texture_packet_record record = entry.record;
+			record.stage = 2; // evict
+			record.slot = 0;
+			record.data_offset = 0;
+			record.data_size = 0;
+			evictions.push_back(record);
+			residency.bytes -= entry.bytes;
+			it = std::list<u64>::reverse_iterator(residency.lru.erase(std::next(it).base()));
+			residency.entries.erase(key);
+		}
 		result.complete = complete;
-		result.bytes.resize(total_size);
-		usz data_offset = sources.size() * sizeof(rsx::webgpu::texture_packet_record);
+		const usz record_count = evictions.size() + sources.size();
+		usz data_offset = record_count * sizeof(rsx::webgpu::texture_packet_record);
+		result.bytes.resize(align_up(data_offset, 16) + payload_total);
+		for (usz index = 0; index < evictions.size(); ++index)
+		{
+			// The host sizes the record table from the first record's data offset
+			evictions[index].data_offset = static_cast<u32>(record_count * sizeof(rsx::webgpu::texture_packet_record));
+			std::memcpy(result.bytes.data() + index * sizeof(rsx::webgpu::texture_packet_record), &evictions[index], sizeof(rsx::webgpu::texture_packet_record));
+		}
 		for (usz index = 0; index < sources.size(); ++index)
 		{
 			auto& source = sources[index];
@@ -274,10 +332,10 @@ namespace
 				result.bytes.clear();
 				return result;
 			}
-			std::memcpy(result.bytes.data() + index * sizeof(source.record), &source.record, sizeof(source.record));
+			std::memcpy(result.bytes.data() + (evictions.size() + index) * sizeof(source.record), &source.record, sizeof(source.record));
 			data_offset += source.payload_size;
 		}
-
+		result.bytes.resize(data_offset);
 		return result;
 	}
 
@@ -367,14 +425,69 @@ namespace
 	}
 }
 
+void rsx_webgpu_set_texture_hash_per_draw(bool enabled)
+{
+	g_texture_hash_per_draw = enabled;
+}
+
+void WebGPUGSRender::forget_texture_keys(const std::vector<u64>& keys)
+{
+	std::lock_guard lock(m_texture_residency_mutex);
+	for (const u64 key : keys)
+	{
+		const auto found = m_texture_residency.entries.find(key);
+		if (found == m_texture_residency.entries.end())
+		{
+			continue;
+		}
+		m_texture_residency.bytes -= found->second.bytes;
+		m_texture_residency.lru.erase(found->second.lru);
+		m_texture_residency.entries.erase(found);
+	}
+}
+
+void WebGPUGSRender::forget_texture(const rsx::webgpu::texture_packet_record& key)
+{
+	forget_texture_keys({texture_residency_key(key)});
+}
+
+void WebGPUGSRender::on_packet_popped(bool delivered)
+{
+	std::vector<u64> keys;
+	{
+		std::lock_guard lock(m_texture_residency_mutex);
+		if (m_queued_packet_textures.empty())
+		{
+			return;
+		}
+		keys = std::move(m_queued_packet_textures.front());
+		m_queued_packet_textures.pop_front();
+	}
+	if (!delivered && !keys.empty())
+	{
+		forget_texture_keys(keys);
+	}
+}
+
+static void rsx_webgpu_packet_pop_hook(bool delivered)
+{
+	if (auto* render = dynamic_cast<WebGPUGSRender*>(g_fxo->try_get<rsx::thread>()))
+	{
+		render->on_packet_popped(delivered);
+	}
+}
+
 u64 WebGPUGSRender::get_cycles()
 {
 	return thread_ctrl::get_cycles(static_cast<named_thread<WebGPUGSRender>&>(*this));
 }
 
+static void rsx_webgpu_packet_pop_hook(bool delivered);
+
 WebGPUGSRender::WebGPUGSRender(utils::serial* ar) noexcept
 	: GSRender(ar)
 {
+	rsx::webgpu::host_command_queue().set_pop_hook(&rsx_webgpu_packet_pop_hook);
 	backend_config.supports_normalized_barycentrics = true;
 	backend_config.supports_hw_instanced_rendering = false;
 	backend_config.supports_multidraw = false;
@@ -509,7 +622,7 @@ bool WebGPUGSRender::emit_draw_packet(u32 subdraw)
 	m_draw_processor.fill_vertex_program_constants_data(vertex_constants.data(), {});
 	const u32 capture_level = rsx::webgpu::packet_capture_level();
 	auto textures = capture_level >= 4
-		? capture_textures(current_fp_metadata.referenced_textures_mask, current_vp_metadata.referenced_textures_mask, m_frame_textures)
+		? capture_textures(current_fp_metadata.referenced_textures_mask, current_vp_metadata.referenced_textures_mask, m_texture_residency, m_texture_residency_mutex, m_frame_texture_hashes)
 		: texture_capture{};
 
 	rsx::webgpu::draw_packet_header header{};
@@ -596,12 +709,25 @@ bool WebGPUGSRender::emit_draw_packet(u32 subdraw)
 	packet_ok = packet.append(rsx::webgpu::section_kind::raster_environment,
 		std::as_bytes(std::span{&raster_environment, 1})) && packet_ok;
 
+	std::vector<u64> payload_keys;
+	payload_keys.reserve(textures.additions.size());
+	for (const auto& record : textures.additions)
+	{
+		payload_keys.push_back(texture_residency_key(record));
+	}
+
 	if (!packet_ok || !rsx::webgpu::host_command_queue().push(packet.finish()))
 	{
+		// The renderer never sees this packet's payloads
+		forget_texture_keys(payload_keys);
 		return false;
 	}
 
-	m_frame_textures.insert(m_frame_textures.end(), textures.additions.begin(), textures.additions.end());
+	{
+		std::lock_guard lock(m_texture_residency_mutex);
+		m_queued_packet_textures.push_back(std::move(payload_keys));
+	}
+
 	return true;
 }
 
@@ -647,9 +773,10 @@ void WebGPUGSRender::emit_control_packet(rsx::webgpu::packet_kind kind, u32 valu
 		packet_ok = packet.append(rsx::webgpu::section_kind::raster_environment,
 			std::as_bytes(std::span{&raster_environment, 1})) && packet_ok;
 	}
-	if (packet_ok)
+	if (packet_ok && rsx::webgpu::host_command_queue().push(packet.finish()))
 	{
-		(void)rsx::webgpu::host_command_queue().push(packet.finish());
+		std::lock_guard lock(m_texture_residency_mutex);
+		m_queued_packet_textures.emplace_back();
 	}
 }
 
@@ -874,7 +1001,7 @@ void WebGPUGSRender::flip(const rsx::display_flip_info_t& info)
 {
 	const u32 flags = info.skip_frame ? rsx::webgpu::packet_skipped : 0u;
 	emit_control_packet(rsx::webgpu::packet_kind::flip, info.buffer, flags);
-	m_frame_textures.clear();
+	m_frame_texture_hashes.clear();
 	if (m_frame)
 	{
 		m_frame->flip(m_context, info.skip_frame);

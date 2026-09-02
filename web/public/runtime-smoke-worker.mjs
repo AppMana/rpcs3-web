@@ -30,6 +30,7 @@ let padState = { digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, 
 let moduleCreateMs = 0;
 let recordInputs = false;
 const inputTrace = [];
+let spuFallbackHistogram = false;
 let diagnostics = false;
 let presentLatestOnly = false;
 let consumedFlips = 0;
@@ -390,6 +391,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     workingSet: workingSet(),
     liveThreadNames: module.ccall("rpcs3_web_live_thread_names", "string", [], []).split("\n").filter(Boolean),
     threads: module.ccall("rpcs3_web_thread_snapshot", "string", [], []),
+    spuFallbackReport: spuFallbackHistogram ? module.ccall("rpcs3_web_spu_aot_fallback_report", "string", ["number"], [48]) : undefined,
     stackReport: stackReport(),
     ppuInstructions: Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], [])),
     ppuAotTable: ppuAotTable
@@ -484,6 +486,14 @@ scope.addEventListener("message", async (event) => {
       scope.postMessage({ type: "runtime-shutdown", ok: false, detail: detail(error) });
     }
     scope.close();
+    return;
+  }
+  if (event.data?.type === "texture-forget") {
+    if (module) {
+      for (const key of event.data.textures ?? []) {
+        module.ccall("rpcs3_webgpu_texture_forget", null, Array(12).fill("number"), key);
+      }
+    }
     return;
   }
   if (event.data?.type === "next-frame") {
@@ -582,6 +592,10 @@ scope.addEventListener("message", async (event) => {
       Number(event.data.traceDelayMs) >>> 0,
     ]);
     module.ccall("rpcs3_web_set_watch_address", null, ["number"], [watchAddress]);
+    if (event.data.spuFallbackHistogram === true) {
+      module.ccall("rpcs3_web_set_spu_fallback_histogram", null, ["number"], [1]);
+      spuFallbackHistogram = true;
+    }
     if (Array.isArray(event.data.spuTraceRange)) {
       module.ccall("rpcs3_web_set_spu_trace_range", null, ["number", "number"], [Number(event.data.spuTraceRange[0]) >>> 0, Number(event.data.spuTraceRange[1]) >>> 0]);
     }

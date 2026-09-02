@@ -78,6 +78,8 @@ extern atomic_t<u64> g_spu_web_ls_boundary_last;
 extern atomic_t<u64> g_spu_web_page_split_dma_count;
 extern atomic_t<u32> g_spu_web_aot_hold;
 extern atomic_t<u32> g_spu_web_aot_ready_mask;
+extern atomic_t<u32> g_spu_web_fallback_histogram;
+extern std::string spu_web_aot_fallback_report(u32 top);
 extern atomic_t<spu_thread*> g_spu_web_aot_context[6];
 extern atomic_t<u32> g_spu_web_aot_step_request[6];
 extern atomic_t<u32> g_spu_web_aot_step_complete[6];
@@ -980,6 +982,18 @@ extern "C"
 		return g_spu_web_aot_fallback_count.load();
 	}
 
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_spu_fallback_histogram(s32 enabled)
+	{
+		g_spu_web_fallback_histogram = enabled != 0;
+	}
+
+	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_spu_aot_fallback_report(u32 top)
+	{
+		static std::string report;
+		report = spu_web_aot_fallback_report(top);
+		return report.c_str();
+	}
+
 	static spu_thread& spu_direct(u32 thread)
 	{
 		return *reinterpret_cast<spu_thread*>(static_cast<uptr>(thread));
@@ -1521,6 +1535,25 @@ extern "C"
 	{
 		g_rpcs3_web_clocks_scale = std::clamp(percent, 10u, 3000u);
 		g_cfg.core.clocks_scale.set(g_rpcs3_web_clocks_scale);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_webgpu_set_texture_hash_per_draw(s32 enabled)
+	{
+		rsx_webgpu_set_texture_hash_per_draw(enabled != 0);
+	}
+
+	// The renderer never received this texture's payload: drop it from the builder's residency
+	EMSCRIPTEN_KEEPALIVE void rpcs3_webgpu_texture_forget(u32 address, u32 format, u32 width, u32 height, u32 depth, u32 pitch,
+		u32 mip_count, u32 dimension, u32 content_hash, u32 remap, u32 address_modes, u32 filter_modes)
+	{
+		if (auto* render = dynamic_cast<WebGPUGSRender*>(g_fxo->try_get<rsx::thread>()))
+		{
+			rsx::webgpu::texture_packet_record key{};
+			key.address = address; key.format = format; key.width = width; key.height = height; key.depth = depth; key.pitch = pitch;
+			key.mip_count = mip_count; key.dimension = dimension; key.content_hash = content_hash; key.remap = remap;
+			key.address_modes = address_modes; key.filter_modes = filter_modes;
+			render->forget_texture(key);
+		}
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_accurate_spu_dma(s32 enabled)

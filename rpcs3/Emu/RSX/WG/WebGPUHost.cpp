@@ -220,7 +220,23 @@ extern "C"
 
 	RPCS3_WEB_EXPORT std::uint32_t rpcs3_webgpu_pop_front()
 	{
-		return rsx::webgpu::host_command_queue().pop_front() ? 1u : 0u;
+		auto& queue = rsx::webgpu::host_command_queue();
+		if (const auto hook = queue.get_pop_hook(); hook && queue.packet_count())
+		{
+			hook(true);
+		}
+		return queue.pop_front() ? 1u : 0u;
+	}
+
+	// Pop without delivering the packet to the renderer (host frame skipping)
+	RPCS3_WEB_EXPORT std::uint32_t rpcs3_webgpu_discard_front()
+	{
+		auto& queue = rsx::webgpu::host_command_queue();
+		if (const auto hook = queue.get_pop_hook(); hook && queue.packet_count())
+		{
+			hook(false);
+		}
+		return queue.pop_front() ? 1u : 0u;
 	}
 
 	RPCS3_WEB_EXPORT std::uint64_t rpcs3_webgpu_queued_bytes()
@@ -256,6 +272,16 @@ extern "C"
 
 	RPCS3_WEB_EXPORT void rpcs3_webgpu_clear()
 	{
+		{
+			auto& queue = rsx::webgpu::host_command_queue();
+			if (const auto hook = queue.get_pop_hook())
+			{
+				for (std::uint32_t remaining = queue.packet_count(); remaining; --remaining)
+				{
+					hook(false);
+				}
+			}
+		}
 		rsx::webgpu::host_command_queue().clear();
 	}
 }

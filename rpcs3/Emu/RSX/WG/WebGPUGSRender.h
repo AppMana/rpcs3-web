@@ -1,5 +1,9 @@
 #pragma once
 
+#include <unordered_map>
+#include <list>
+#include <deque>
+
 #include "Emu/RSX/GSRender.h"
 #include "Emu/RSX/Core/RSXVertexTypes.h"
 #include "WebGPUCommand.h"
@@ -27,6 +31,40 @@ private:
 
 	rsx::vertex_input_layout m_vertex_layout;
 	areau m_scissor{};
-	std::vector<rsx::webgpu::texture_packet_record> m_frame_textures;
+	// Textures the renderer currently holds (payload delivered earlier and not yet evicted).
+	// The builder decides eviction (LRU under a byte budget) and tells the renderer through
+	// stage-2 texture records, so both sides agree on residency without a return channel.
+public:
+	struct texture_residency
+	{
+		struct entry
+		{
+			rsx::webgpu::texture_packet_record record;
+			u32 bytes = 0;
+			std::list<u64>::iterator lru;
+		};
+		std::unordered_map<u64, entry> entries;
+		std::list<u64> lru;
+		u64 bytes = 0;
+		u64 budget = 384ull << 20;
+	};
+	// The renderer reports a referenced texture whose payload it never received (its packet was
+	// dropped or skipped); the builder forgets it so the next reference carries the payload again.
+	void forget_texture(const rsx::webgpu::texture_packet_record& key);
+	void forget_texture_keys(const std::vector<u64>& keys);
+	// Host popped the oldest queued packet; an undelivered one retracts its texture payloads
+	void on_packet_popped(bool delivered);
+
+private:
+	shared_mutex m_texture_residency_mutex;
+	texture_residency m_texture_residency;
+	// Residency keys of the payloads carried by each packet still in the host queue (FIFO)
+	std::deque<std::vector<u64>> m_queued_packet_textures;
+	// Content hashes of guest textures already hashed this frame, keyed by (address << 32 | size).
+	// Cleared on flip; see rpcs3_webgpu_set_texture_hash_per_draw.
+	std::unordered_map<u64, u32> m_frame_texture_hashes;
 	std::uint64_t m_sequence = 0;
 };
+
+// Hash guest textures for every draw instead of once per frame (conformance lanes).
+void rsx_webgpu_set_texture_hash_per_draw(bool enabled);

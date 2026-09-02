@@ -48,7 +48,7 @@ namespace rsx::webgpu
 		std::uint32_t data_size = 0;
 		std::uint32_t content_hash = 0;
 		std::uint32_t remap = 0;
-		std::uint32_t address_modes = 0;
+		std::uint32_t address_modes = 0; // wrap_s | wrap_t << 8 | wrap_r << 16 | border_type << 24
 		std::uint32_t filter_modes = 0;
 	};
 

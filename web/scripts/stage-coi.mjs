@@ -54,7 +54,7 @@ await copyFile(
 );
 
 // Single-module PPU AOT bundles for rpcs3-ppu-aot-table.mjs (one part, absolute block names).
-for (const name of ["web_dispatch_conformance-aot", "gs-gcm-tetris-aot"]) {
+for (const name of ["web_dispatch_conformance-aot", "gs-gcm-tetris-aot", "web_dispatch_conformance-spu-aot"]) {
   const wasm = await WebAssembly.compile(await readFile(path.join(fixtureOutput, `${name}.wasm`)));
   const blocks = WebAssembly.Module.exports(wasm).filter((entry) => entry.kind === "function" && /^__0x[0-9a-f]+$/i.test(entry.name)).length;
   const manifest = { version: 1, parts: [{ url: `${name}.wasm`, module: "fixture", relocatable: false, blocks }] };

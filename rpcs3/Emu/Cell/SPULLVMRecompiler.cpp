@@ -4561,6 +4561,13 @@ public:
 		fmt::throw_exception("Unknown/Illegal instruction (0x%08x)", op);
 	}
 
+	// wasm AOT: the native code signals these conditions by faulting at a special address off the memory
+	// base; the browser has no such alias, so the block calls out instead.
+	[[noreturn]] static void exec_web_fatal(spu_thread*, u32 code)
+	{
+		fmt::throw_exception("SPU compiled block raised fatal signal '%s'", std::string_view(reinterpret_cast<const char*>(&code), 4));
+	}
+
 	void UNK(spu_opcode_t op_unk)
 	{
 		if (m_interp_magn)
@@ -5174,8 +5181,15 @@ public:
 
 				// Illegal update, access violate with special address
 				m_ir->SetInsertPoint(fail);
-				const auto ptr = _ptr(m_memptr, 0xffdead04);
-				m_ir->CreateStore(m_ir->getInt32("TAG\0"_u32), ptr);
+				if (m_wasm_aot)
+				{
+					call("spu_web_fatal", &exec_web_fatal, m_thread, m_ir->getInt32("TAG\0"_u32));
+				}
+				else
+				{
+					const auto ptr = _ptr(m_memptr, 0xffdead04);
+					m_ir->CreateStore(m_ir->getInt32("TAG\0"_u32), ptr);
+				}
 				m_ir->CreateBr(next);
 
 				m_ir->SetInsertPoint(any);
@@ -5240,7 +5254,7 @@ public:
 					break;
 				}
 
-				bool must_use_cpp_functions = !!g_cfg.core.spu_accurate_dma;
+				bool must_use_cpp_functions = !!g_cfg.core.spu_accurate_dma || m_wasm_aot;
 
 				if (u64 cmdh = ci->getZExtValue() & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_RESULT_MASK); g_cfg.core.rsx_fifo_accuracy || g_cfg.video.strict_rendering_mode || /*!g_use_rtm*/ true)
 				{
@@ -5491,8 +5505,22 @@ public:
 				const auto slot = m_ir->CreateLoad(get_type<u32>(), spu_ptr(&spu_thread::mfc_size));
 				const auto off0 = m_ir->CreateAdd(m_ir->CreateMul(slot, m_ir->getInt32(sizeof(spu_mfc_cmd))), m_ir->getInt32(::offset32(&spu_thread::mfc_queue)));
 				const auto ptr0 = _ptr(m_thread, m_ir->CreateZExt(off0, get_type<u64>()));
-				const auto ptr1 = _ptr(m_memptr, 0xffdeadf0);
-				const auto pmfc = m_ir->CreateSelect(m_ir->CreateICmpULT(slot, m_ir->getInt32(16)), ptr0, ptr1);
+				llvm::Value* pmfc = ptr0;
+				if (m_wasm_aot)
+				{
+					const auto slot_ok = llvm::BasicBlock::Create(m_context, "", m_function);
+					const auto slot_bad = llvm::BasicBlock::Create(m_context, "", m_function);
+					m_ir->CreateCondBr(m_ir->CreateICmpULT(slot, m_ir->getInt32(16)), slot_ok, slot_bad, m_md_likely);
+					m_ir->SetInsertPoint(slot_bad);
+					call("spu_web_fatal", &exec_web_fatal, m_thread, m_ir->getInt32("MFCQ"_u32));
+					m_ir->CreateUnreachable();
+					m_ir->SetInsertPoint(slot_ok);
+				}
+				else
+				{
+					const auto ptr1 = _ptr(m_memptr, 0xffdeadf0);
+					pmfc = m_ir->CreateSelect(m_ir->CreateICmpULT(slot, m_ir->getInt32(16)), ptr0, ptr1);
+				}
 				m_ir->CreateStore(ci, _ptr(pmfc, &spu_mfc_cmd::cmd));
 
 				switch (u64 cmd = ci->getZExtValue())
@@ -9556,8 +9584,15 @@ public:
 			m_ir->CreateStore(m_function->getArg(2), spu_ptr(&spu_thread::pc));
 		else
 			update_pc();
-		const auto ptr = _ptr(m_memptr, 0xffdead00);
-		m_ir->CreateStore(m_ir->getInt32("HALT"_u32), ptr);
+		if (m_wasm_aot)
+		{
+			call("spu_web_fatal", &exec_web_fatal, m_thread, m_ir->getInt32("HALT"_u32));
+		}
+		else
+		{
+			const auto ptr = _ptr(m_memptr, 0xffdead00);
+			m_ir->CreateStore(m_ir->getInt32("HALT"_u32), ptr);
+		}
 		m_ir->CreateBr(next);
 		m_ir->SetInsertPoint(next);
 	}

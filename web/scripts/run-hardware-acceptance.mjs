@@ -67,6 +67,7 @@ const runOptions = {
   captureShaders,
   capturePacketFixture: Boolean(packetFixturePath),
   ppuAotBundle: process.env.RPCS3_PPU_AOT_BUNDLE || undefined,
+  spuAotBundle: process.env.RPCS3_SPU_AOT_BUNDLE || undefined,
   tolerateRenderErrors: env.RPCS3_TOLERATE_RENDER_ERRORS !== "0",
   inputTrace,
   clockScale: env.RPCS3_CLOCK_SCALE ? Number(env.RPCS3_CLOCK_SCALE) : undefined,

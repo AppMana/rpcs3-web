@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include <unordered_map>
 #include "Utilities/JIT.h"
 #include "Utilities/date_time.h"
 #include "Emu/Memory/vm.h"
@@ -64,6 +65,50 @@ extern void spu_web_set_escape_context(std::jmp_buf* context) noexcept;
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
 atomic_t<u64> g_spu_web_instruction_count{0};
 atomic_t<u32> g_spu_web_last_pc[6]{};
+
+// Compiled SPU blocks in the browser's wasm function table (the LLVM translator's entry signature).
+// A block verifies its own program against local store at entry and returns through spu_dispatch
+// when it does not match, so the browser needs only (entry address, table index) per program.
+using spu_web_aot_func_t = void (*)(spu_thread*, u8*, u64);
+
+struct spu_web_aot_list
+{
+	u32 count;
+	u32 indices[1]; // count entries
+};
+
+// Per local-store word: immutable candidate lists published by the module thread, read by SPU threads
+static std::array<atomic_t<spu_web_aot_list*>, SPU_LS_SIZE / 4> g_spu_web_aot_lists{};
+atomic_t<u64> g_spu_web_aot_dispatch_count{0};
+atomic_t<u64> g_spu_web_aot_fallback_count{0};
+extern "C" int rpcs3_web_spu_aot_worker_ready();
+
+// (entry address, table index) pairs; several programs may start at one address
+extern void spu_web_aot_register(const u32* pairs, u32 count)
+{
+	std::unordered_map<u32, std::vector<u32>> merged;
+
+	for (u32 i = 0; i < count; i++)
+	{
+		const u32 addr = pairs[i * 2] & 0x3fffc;
+		merged[addr].push_back(pairs[i * 2 + 1]);
+	}
+
+	for (auto& [addr, indices] : merged)
+	{
+		auto& slot = g_spu_web_aot_lists[addr / 4];
+
+		if (const auto old = slot.load())
+		{
+			indices.insert(indices.begin(), old->indices, old->indices + old->count);
+		}
+
+		const auto list = static_cast<spu_web_aot_list*>(std::malloc(sizeof(spu_web_aot_list) + indices.size() * sizeof(u32)));
+		list->count = ::size32(indices);
+		std::copy(indices.begin(), indices.end(), list->indices);
+		slot.store(list); // copy-on-write; the old list stays valid for readers
+	}
+}
 atomic_t<u64> g_spu_web_ls_boundary_count{0};
 atomic_t<u64> g_spu_web_ls_boundary_last{0};
 atomic_t<u64> g_spu_web_page_split_dma_count{0};
@@ -1520,12 +1565,39 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 	u32 web_progress_batch = 0;
 #endif
 
+	const bool aot_ready = rpcs3_web_spu_aot_worker_ready() != 0;
+
 	while (true)
 	{
 		if (spu.state) [[unlikely]]
 		{
 			if (spu.check_state())
 				return true;
+		}
+
+		if (aot_ready)
+		{
+			if (const auto list = g_spu_web_aot_lists[(spu.pc & 0x3fffc) / 4].load())
+			{
+				// A block that ran advances block_counter (its verified entry); one that returned through
+				// spu_dispatch without running leaves it, and the next candidate or the interpreter takes over.
+				const u64 counter = spu.block_counter;
+				bool ran = false;
+
+				for (u32 i = 0; i < list->count && !ran; i++)
+				{
+					reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(list->indices[i]))(&spu, spu._ptr<u8>(0), 0);
+					ran = spu.block_counter != counter;
+				}
+
+				if (ran)
+				{
+					g_spu_web_aot_dispatch_count++;
+					continue;
+				}
+
+				g_spu_web_aot_fallback_count++;
+			}
 		}
 
 		const u32 op = spu._ref<be_t<u32>>(spu.pc);

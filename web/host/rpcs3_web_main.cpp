@@ -86,6 +86,13 @@ extern u32 ppu_web_interpreter_step(ppu_thread& ppu);
 // Set by web/host/rpcs3_web_pre.js once this worker's function table holds the compiled PPU blocks
 EM_JS(int, rpcs3_web_ppu_aot_worker_ready, (), { return self.__rpcs3PpuAotReady ? 1 : 0; });
 
+EM_JS(int, rpcs3_web_spu_aot_worker_ready, (), { return self.__rpcs3SpuAotReady ? 1 : 0; });
+
+extern void spu_web_aot_register(const u32* pairs, u32 count);
+extern atomic_t<u64> g_spu_web_aot_dispatch_count;
+extern atomic_t<u64> g_spu_web_aot_fallback_count;
+[[noreturn]] extern void spu_web_escape_now(spu_thread* spu);
+
 extern void ppu_web_aot_register(const u32* pairs, u32 count);
 extern void* ppu_web_aot_exec_base();
 extern u32 ppu_web_aot_registered(u32 addr);
@@ -951,6 +958,236 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_direct_stdcx(u32 thread, u64 addr, u64 value)
 	{
 		return ppu_stdcx(*reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread)), static_cast<u32>(addr), value);
+	}
+
+	// Direct SPU dispatch: the imports of compiled SPU blocks, mirroring the helpers the native
+	// LLVM recompiler binds (SPULLVMRecompiler.cpp exec_*), running on the owning SPU pthread.
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_aot_register_many(u32 pairs, u32 count)
+	{
+		spu_web_aot_register(reinterpret_cast<const u32*>(static_cast<uptr>(pairs)), count);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_spu_aot_dispatches()
+	{
+		return g_spu_web_aot_dispatch_count.load();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_spu_aot_fallbacks()
+	{
+		return g_spu_web_aot_fallback_count.load();
+	}
+
+	static spu_thread& spu_direct(u32 thread)
+	{
+		return *reinterpret_cast<spu_thread*>(static_cast<uptr>(thread));
+	}
+
+	// spu_escape: unwind to the SPU thread's interpreter loop (never returns)
+	[[noreturn]] EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_direct_escape(u32 thread)
+	{
+		spu_web_escape_now(&spu_direct(thread));
+	}
+
+	// spu_dispatch / spu_dispatcher: the block could not continue (verification or an unresolved
+	// target); pc is already stored, the thread loop re-dispatches
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_direct_dispatch(u32 /*thread*/, u32 /*ls*/, u64 /*arg2*/)
+	{
+	}
+
+	// branch patchpoints: same contract, pc already stored
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_direct_patchpoint(u32 /*thread*/, u32 /*ls*/, u32 /*base_pc*/)
+	{
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_direct_check_state(u32 thread)
+	{
+		return spu_direct(thread).check_state();
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_direct_mfc_cmd(u32 thread)
+	{
+		auto& spu = spu_direct(thread);
+		spu.unsavable = true;
+
+		if (!spu.process_mfc_cmd() || spu.state & cpu_flag::again)
+		{
+			fmt::throw_exception("exec_mfc_cmd(): Should not abort!");
+		}
+
+		static_cast<void>(spu.test_stopped());
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_direct_mfc_cmd_saveable(u32 thread)
+	{
+		auto& spu = spu_direct(thread);
+
+		if (!spu.process_mfc_cmd() || spu.state & cpu_flag::again)
+		{
+			fmt::throw_exception("exec_mfc_cmd(): Should not abort!");
+		}
+
+		static_cast<void>(spu.test_stopped());
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_direct_read_channel(u32 thread, u32 ch)
+	{
+		auto& spu = spu_direct(thread);
+		const s64 result = spu.get_ch_value(ch);
+
+		if (result < 0 || spu.state & cpu_flag::again)
+		{
+			spu_web_escape_now(&spu);
+		}
+
+		static_cast<void>(spu.test_stopped());
+		return static_cast<u32>(result & 0xffffffff);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_direct_read_channel_count(u32 thread, u32 ch)
+	{
+		return spu_direct(thread).get_ch_count(ch);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_direct_read_in_mbox(u32 thread)
+	{
+		return rpcs3_web_spu_direct_read_channel(thread, SPU_RdInMbox);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_direct_read_decrementer(u32 thread)
+	{
+		auto& spu = spu_direct(thread);
+		const u32 res = spu.read_dec().first;
+
+		if (res > 1500 && g_cfg.core.spu_loop_detection)
+		{
+			spu.state += cpu_flag::wait;
+			std::this_thread::yield();
+			static_cast<void>(spu.test_stopped());
+		}
+
+		return res;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_direct_read_events(u32 thread)
+	{
+		return rpcs3_web_spu_direct_read_channel(thread, SPU_RdEventStat);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_direct_get_events(u32 thread, u32 mask)
+	{
+		return spu_direct(thread).get_events(mask).count;
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_direct_write_channel(u32 thread, u32 ch, u32 value)
+	{
+		auto& spu = spu_direct(thread);
+
+		if (!spu.set_ch_value(ch, value) || spu.state & cpu_flag::again)
+		{
+			spu_web_escape_now(&spu);
+		}
+
+		static_cast<void>(spu.test_stopped());
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_direct_list_unstall(u32 thread, u32 tag)
+	{
+		auto& spu = spu_direct(thread);
+
+		for (u32 i = 0; i < spu.mfc_size; i++)
+		{
+			if (spu.mfc_queue[i].tag == (tag | 0x80))
+			{
+				spu.mfc_queue[i].tag &= 0x7f;
+			}
+		}
+
+		spu.do_mfc();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_direct_check_interrupts(u32 thread, u32 addr)
+	{
+		auto& spu = spu_direct(thread);
+		spu.set_interrupt_status(true);
+
+		if (spu.ch_events.load().count)
+		{
+			spu.interrupts_enabled = false;
+			spu.srr0 = addr;
+
+			// Test for BR/BRA instructions (they are equivalent at zero pc)
+			const u32 br = spu._ref<const u32>(0);
+
+			if ((br & 0xfd80007f) == 0x30000000)
+			{
+				return (br >> 5) & 0x3fffc;
+			}
+
+			return 0;
+		}
+
+		return addr;
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_direct_syscall(u32 thread, u32 code)
+	{
+		auto& spu = spu_direct(thread);
+
+		if (!spu.stop_and_signal(code) || spu.state & cpu_flag::again)
+		{
+			spu_web_escape_now(&spu);
+		}
+
+		if (spu.test_stopped())
+		{
+			spu.pc += 4;
+			spu_web_escape_now(&spu);
+		}
+	}
+
+	[[noreturn]] EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_direct_unknown(u32 /*thread*/, u32 op)
+	{
+		fmt::throw_exception("Unknown/Illegal instruction (0x%08x)", op);
+	}
+
+	[[noreturn]] EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_direct_fatal(u32 /*thread*/, u32 code)
+	{
+		fmt::throw_exception("SPU compiled block raised fatal signal '%s'", std::string_view(reinterpret_cast<const char*>(&code), 4));
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_direct_memcpy(u32 dst, u32 src, u32 size)
+	{
+		std::memcpy(reinterpret_cast<void*>(static_cast<uptr>(dst)), reinterpret_cast<const void*>(static_cast<uptr>(src)), size);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_direct_wait_on_channel(u32 thread, u32 channel, u32 is_read)
+	{
+		auto& spu = spu_direct(thread);
+		const auto ch = reinterpret_cast<spu_channel*>(static_cast<uptr>(channel));
+
+		if (is_read)
+		{
+			ch->pop_wait(spu, false);
+		}
+		else
+		{
+			ch->push_wait(spu, 0, false);
+		}
+
+		return ch->get_count();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_direct_wait_inbox(u32 thread, u32 channel)
+	{
+		auto& spu = spu_direct(thread);
+		const auto ch = reinterpret_cast<spu_channel_4_t*>(static_cast<uptr>(channel));
+		ch->pop_wait(spu, false);
+		return ch->get_count();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_spu_direct_get_tb()
+	{
+		return get_timebased_time();
 	}
 
 	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_ppu_aot_timebase()

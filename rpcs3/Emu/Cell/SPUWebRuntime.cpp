@@ -39,6 +39,12 @@ namespace
 	}
 }
 
+// Compiled blocks running on the SPU pthread escape through the same buffer the interpreter uses
+[[noreturn]] void spu_web_escape_now(spu_thread* spu)
+{
+	web_spu_escape(spu);
+}
+
 void spu_web_set_escape_context(std::jmp_buf* context) noexcept
 {
 	s_escape_context = context;

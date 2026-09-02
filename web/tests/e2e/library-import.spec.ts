@@ -31,9 +31,9 @@ test("imports a library file into OPFS through range requests and verifies its S
 
   const files = await page.evaluate(() => (window as typeof window & { __rpcs3Storage: StorageAPI }).__rpcs3Storage.list());
   expect(files).toContainEqual(expect.objectContaining({ path: "games/gs_gcm_cube.elf", size: cube!.size }));
-  expect(files.some((file) => file.path === ".rpcs3-imports/games/gs_gcm_cube.elf.json")).toBe(true);
+  expect(files.some((file) => file.path === ".imports/games/gs_gcm_cube.elf.json")).toBe(true);
 
-  // A second run is satisfied from the verified sidecar without any network transfer.
+  // A second run is satisfied from the verified manifest without any network transfer.
   const again = await page.evaluate(() => (window as typeof window & { __rpcs3Storage: StorageAPI }).__rpcs3Storage.importFromLibrary("gs_gcm_cube.elf", "games"));
   expect(again.alreadyComplete).toBe(true);
   expect(again.sessionBytes).toBe(0);
@@ -73,7 +73,7 @@ test("resumes an aborted import after a reload from the bytes already stored", a
 
   const stored = await page.evaluate(() => (window as typeof window & { __rpcs3Storage: StorageAPI }).__rpcs3Storage.list());
   expect(stored).toContainEqual(expect.objectContaining({ path: "games/gs_gcm_tetris.elf", size: partial }));
-  expect(stored.some((file) => file.path === ".rpcs3-imports/games/gs_gcm_tetris.elf.json")).toBe(true);
+  expect(stored.some((file) => file.path === ".imports/games/gs_gcm_tetris.elf.json")).toBe(true);
 
   await context.unroute("**/library/files/**");
   await page.reload();
@@ -86,15 +86,15 @@ test("resumes an aborted import after a reload from the bytes already stored", a
   expect(resumed.restarted).toBe(false);
 });
 
-test("re-hashes stored bytes locally when the sidecar is missing and restarts on a changed source", async ({ page }) => {
+test("re-hashes stored bytes locally when the manifest is missing and restarts on a changed source", async ({ page }) => {
   await page.goto("/storage.html");
   const index = await page.evaluate(() => (window as typeof window & { __rpcs3Storage: StorageAPI }).__rpcs3Storage.libraryIndex());
   const triangle = index.files.find((file) => file.name === "gs_gcm_basic_triangle.elf")!;
-  // Simulate a crash before the sidecar was written: keep the data, drop the sidecar.
+  // Simulate a crash before the manifest was written: keep the data, drop the manifest.
   const kept = await page.evaluate(async ({ name, size }) => {
     await (window as typeof window & { __rpcs3Storage: StorageAPI }).__rpcs3Storage.importFromLibrary(name, "games", { restart: true });
     const root = await navigator.storage.getDirectory();
-    const imports = await root.getDirectoryHandle(".rpcs3-imports");
+    const imports = await root.getDirectoryHandle(".imports");
     const games = await imports.getDirectoryHandle("games");
     await games.removeEntry(`${name}.json`);
     const truncatedTo = Math.floor(size / 2);
@@ -121,10 +121,10 @@ test("re-hashes stored bytes locally when the sidecar is missing and restarts on
   expect(kept.result.sessionBytes).toBe(triangle.size - kept.truncatedTo);
   expect(kept.result.sha256).toBe(fixtureSha256("gs_gcm_basic_triangle.elf"));
 
-  // A sidecar that names a different source forces a restart from zero.
+  // A manifest that names a different source forces a restart from zero.
   const changed = await page.evaluate(async ({ name }) => {
     const root = await navigator.storage.getDirectory();
-    const imports = await root.getDirectoryHandle(".rpcs3-imports");
+    const imports = await root.getDirectoryHandle(".imports");
     const games = await imports.getDirectoryHandle("games");
     const handle = await games.getFileHandle(`${name}.json`);
     const record = JSON.parse(await (await handle.getFile()).text());

@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 // The browser runtime is intentionally plain ESM so it can be used directly by Safari.
-// @ts-expect-error No declaration file is emitted for public runtime modules.
-import { gameBootPath, normalizeRelativePath, opfsPath } from "../public/rpcs3-storage.mjs";
+import { RPCS3_OPFS_MOUNT, gameBootPath, normalizeRelativePath, opfsPath } from "../public/rpcs3-storage.mjs";
 
 describe("RPCS3 OPFS paths", () => {
   it("normalizes imported directory paths without permitting traversal", () => {
@@ -12,10 +11,12 @@ describe("RPCS3 OPFS paths", () => {
   });
 
   it("selects bootable disc roots and ISOs", () => {
+    expect(RPCS3_OPFS_MOUNT).toBe("/opfs");
     expect(gameBootPath(["games/LBP/PS3_GAME/USRDIR/EBOOT.BIN"]))
       .toBe("/opfs/games/LBP");
     expect(gameBootPath(["games/LittleBigPlanet.iso"]))
       .toBe("/opfs/games/LittleBigPlanet.iso");
+    expect(gameBootPath(["games/README.txt"])).toBeUndefined();
     expect(opfsPath("firmware/PS3UPDAT.PUP")).toBe("/opfs/firmware/PS3UPDAT.PUP");
   });
 });

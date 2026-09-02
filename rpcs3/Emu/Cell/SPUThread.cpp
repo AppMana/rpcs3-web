@@ -1512,6 +1512,38 @@ void spu_thread::cpu_return()
 
 extern thread_local std::string(*g_tls_log_prefix)();
 
+#if defined(RPCS3_WEB_INTERPRETER_ONLY) || defined(RPCS3_PORTABLE_SPU_INTERPRETER)
+// Runs the static interpreter until check_state() asks the thread to leave; escapes longjmp out of here.
+static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_interpreter_rt& table, [[maybe_unused]] u32 index)
+{
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+	u32 web_progress_batch = 0;
+#endif
+
+	while (true)
+	{
+		if (spu.state) [[unlikely]]
+		{
+			if (spu.check_state())
+				return true;
+		}
+
+		const u32 op = spu._ref<be_t<u32>>(spu.pc);
+		if (table.decode(op)(spu, {op}))
+			spu.pc += 4;
+
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+		if (++web_progress_batch == 256)
+		{
+			g_spu_web_instruction_count += web_progress_batch;
+			g_spu_web_last_pc[index % std::size(g_spu_web_last_pc)] = spu.pc;
+			web_progress_batch = 0;
+		}
+#endif
+	}
+}
+#endif
+
 void spu_thread::cpu_task()
 {
 #ifdef __APPLE__
@@ -1625,9 +1657,6 @@ void spu_thread::cpu_task()
 		const auto& table = g_fxo->get<spu_interpreter_rt>();
 
 		allow_interrupts_in_cpu_work = true;
-#if defined(RPCS3_WEB_INTERPRETER_ONLY)
-		u32 web_progress_batch = 0;
-#endif
 		std::jmp_buf escape_context;
 		spu_web_set_escape_context(&escape_context);
 
@@ -1701,6 +1730,9 @@ void spu_thread::cpu_task()
 		}
 #endif
 
+		// The interpreter loop lives in its own function: a function containing setjmp has every call
+		// inside it routed through a JS invoke trampoline under Emscripten's setjmp/longjmp support,
+		// and that used to include the per-instruction dispatch. longjmp still unwinds through it.
 		while (true)
 		{
 			if (setjmp(escape_context))
@@ -1708,24 +1740,10 @@ void spu_thread::cpu_task()
 				continue;
 			}
 
-			if (state) [[unlikely]]
+			if (spu_web_interpreter_loop(*this, table, index))
 			{
-				if (check_state())
-					break;
+				break;
 			}
-
-			const u32 op = _ref<be_t<u32>>(pc);
-			if (table.decode(op)(*this, {op}))
-				pc += 4;
-
-#if defined(RPCS3_WEB_INTERPRETER_ONLY)
-			if (++web_progress_batch == 256)
-			{
-				g_spu_web_instruction_count += web_progress_batch;
-				g_spu_web_last_pc[index % std::size(g_spu_web_last_pc)] = pc;
-				web_progress_batch = 0;
-			}
-#endif
 		}
 		spu_web_set_escape_context(nullptr);
 		allow_interrupts_in_cpu_work = false;

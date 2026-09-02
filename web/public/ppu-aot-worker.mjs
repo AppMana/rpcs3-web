@@ -46,6 +46,7 @@ scope.addEventListener("message", async (event) => {
     let mainMemory;
     module = await createRPCS3({
       locateFile: (name) => new URL(`./core/${name}`, scope.location.href).href,
+      pthreadPoolSize: 40,
       print: () => {},
       printErr: () => {},
       instantiateWasm(imports, receiveInstance) {

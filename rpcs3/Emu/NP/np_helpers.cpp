@@ -1,3 +1,5 @@
+#include "Emu/IdManager.h"
+#include "Emu/NP/np_handler.h"
 #include "Emu/Cell/Modules/sceNp.h"
 #include "stdafx.h"
 #include "util/types.hpp"
@@ -18,6 +20,22 @@ namespace np
 
 		inet_ntop(AF_INET, &ip_addr, ip_str, sizeof(ip_str));
 		return std::string(ip_str);
+	}
+
+	bool is_loopback_destination(u32 addr)
+	{
+		if (reinterpret_cast<const u8*>(&addr)[0] == 127)
+		{
+			return true;
+		}
+
+		if (const auto nph = g_fxo->try_get<named_thread<np_handler>>())
+		{
+			const u32 local = nph->get_local_ip_addr();
+			return local != 0 && local == addr;
+		}
+
+		return false;
 	}
 
 	std::string ether_to_string(const std::array<u8, 6>& ether)

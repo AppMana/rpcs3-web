@@ -18,6 +18,12 @@ bool send_packet_from_p2p_port_ipv4(const std::vector<u8>& data, const sockaddr_
 		{
 			auto& def_port = ::at32(nc.list_p2p_ports, SCE_NP_PORT);
 
+			if (!def_port.has_host_socket())
+			{
+				sys_net.error("Failed to send signaling packet: no host datagram transport");
+				return false;
+			}
+
 			if (np::is_ipv6_supported())
 			{
 				const auto addr6 = np::sockaddr_to_sockaddr6(addr);
@@ -53,6 +59,12 @@ bool send_packet_from_p2p_port_ipv6(const std::vector<u8>& data, const sockaddr_
 		{
 			auto& def_port = ::at32(nc.list_p2p_ports, SCE_NP_PORT);
 			ensure(np::is_ipv6_supported());
+
+			if (!def_port.has_host_socket())
+			{
+				sys_net.error("Failed to send signaling packet: no host datagram transport");
+				return false;
+			}
 
 			if (::sendto(def_port.p2p_socket, reinterpret_cast<const char*>(data.data()), ::size32(data), 0, reinterpret_cast<const sockaddr*>(&addr), sizeof(sockaddr_in6)) == -1)
 			{
@@ -263,6 +275,44 @@ void p2p_thread::create_p2p_port(u16 p2p_port)
 	}
 }
 
+void p2p_thread::queue_loopback(u16 port, const ::sockaddr_in& src, std::vector<u8> data)
+{
+	p2p_loopback_datagram datagram{.port = port};
+	std::memcpy(&datagram.src, &src, sizeof(src));
+	datagram.data = std::move(data);
+
+	std::lock_guard lock(loopback_mutex);
+	loopback_queue.push_back(std::move(datagram));
+}
+
+void p2p_thread::deliver_loopback()
+{
+	std::vector<p2p_loopback_datagram> pending;
+	{
+		std::lock_guard lock(loopback_mutex);
+		pending.swap(loopback_queue);
+	}
+
+	if (pending.empty())
+	{
+		return;
+	}
+
+	{
+		std::scoped_lock lock(mutex_thread_loop, list_p2p_ports_mutex);
+
+		for (auto& datagram : pending)
+		{
+			if (auto it = list_p2p_ports.find(datagram.port); it != list_p2p_ports.end())
+			{
+				it->second.handle_datagram(datagram.data.data(), ::size32(datagram.data), datagram.src);
+			}
+		}
+	}
+
+	wake_threads();
+}
+
 void p2p_thread::operator()()
 {
 	std::vector<::pollfd> p2p_fd(lv2_socket::id_count);
@@ -290,9 +340,22 @@ void p2p_thread::operator()()
 			std::lock_guard lock(list_p2p_ports_mutex);
 			for (const auto& [_, p2p_port] : list_p2p_ports)
 			{
-				set_fd(p2p_port.p2p_socket);
+				if (p2p_port.has_host_socket())
+				{
+					set_fd(p2p_port.p2p_socket);
+				}
 			}
 		}
+
+		if (!num_p2p_sockets)
+		{
+			// Ports without a host transport (browser builds) only receive looped-back local traffic
+			deliver_loopback();
+			thread_ctrl::wait_for(1000);
+			continue;
+		}
+
+		deliver_loopback();
 
 #ifdef _WIN32
 		// WSAPoll seems to consume a lot of CPU time relative to its waiting duration, upping the timeout solves it
@@ -307,6 +370,11 @@ void p2p_thread::operator()()
 
 			auto process_fd = [&](nt_p2p_port& p2p_port)
 			{
+				if (!p2p_port.has_host_socket())
+				{
+					return;
+				}
+
 				if ((p2p_fd[fd_index].revents & POLLIN) == POLLIN || (p2p_fd[fd_index].revents & POLLRDNORM) == POLLRDNORM)
 				{
 					while (p2p_port.recv_data())

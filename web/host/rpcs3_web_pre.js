@@ -6,13 +6,23 @@
 // exported blocks at the same table indices. The layout comes from
 // web/public/rpcs3-ppu-aot-table.mjs, which registers (guest address, index)
 // pairs with RPCS3 once and then hands the same layout to each worker.
+// Reserves [tableBase, tableBase + tableSize) of this instance's function table for a layout.
+// A worker may populate layouts out of order (an SPU thread can run on a worker that never ran a
+// PPU thread), so the gap below a layout is grown with null entries and filled if its own load
+// is populated later.
+function rpcs3ReserveAotTable(table, load) {
+  if (table.length < load.tableBase) table.grow(load.tableBase - table.length);
+  if (table.length === load.tableBase) {
+    table.grow(load.tableSize);
+  } else if (table.length < load.tableBase + load.tableSize) {
+    throw new Error(`function table has ${table.length} entries; the layout expects ${load.tableBase}+${load.tableSize}`);
+  }
+}
+
 Module["rpcs3PopulatePpuAot"] = (load) => {
   const table = wasmExports["__indirect_function_table"];
   if (!(table instanceof WebAssembly.Table)) throw new Error("the runtime did not export its function table");
-  if (table.length !== load.tableBase) {
-    throw new Error(`function table has ${table.length} entries; the layout expects ${load.tableBase}`);
-  }
-  table.grow(load.tableSize);
+  rpcs3ReserveAotTable(table, load);
   const result = { parts: [] };
   for (const part of load.parts) {
     const env = {
@@ -65,10 +75,7 @@ Module["rpcs3PopulatePpuAot"] = (load) => {
 Module["rpcs3PopulateSpuAot"] = (load) => {
   const table = wasmExports["__indirect_function_table"];
   if (!(table instanceof WebAssembly.Table)) throw new Error("the runtime did not export its function table");
-  if (table.length !== load.tableBase) {
-    throw new Error(`function table has ${table.length} entries; the layout expects ${load.tableBase}`);
-  }
-  table.grow(load.tableSize);
+  rpcs3ReserveAotTable(table, load);
   let placed = 0;
   for (const part of load.parts) {
     const env = {
@@ -129,26 +136,39 @@ if (typeof self !== "undefined" && typeof self.addEventListener === "function") 
     } catch (_) {}
   });
   const handlers = {
-    rpcs3PpuAot: { populate: "rpcs3PopulatePpuAot", base: "__rpcs3PpuAotBase", count: (result) => result.parts.length },
-    rpcs3SpuAot: { populate: "rpcs3PopulateSpuAot", base: "__rpcs3SpuAotBase", count: (result) => result },
+    rpcs3PpuAot: { populate: "rpcs3PopulatePpuAot", base: "__rpcs3PpuAotBase", pending: "__rpcs3PpuAotPending" },
+    rpcs3SpuAot: { populate: "rpcs3PopulateSpuAot", base: "__rpcs3SpuAotBase", pending: "__rpcs3SpuAotPending" },
+  };
+  // Instantiating a title's compiled blocks costs JS-heap memory per worker (V8 keeps a function
+  // reference per table entry per instance), so a worker keeps the delivered layout and populates
+  // its table only when a PPU or SPU thread first runs on it (rpcs3_web_*_aot_worker_ready).
+  Module["rpcs3EnsureAot"] = (key) => {
+    const handler = handlers[key];
+    const load = self[handler.pending];
+    if (!load) return self[handler.base] !== undefined;
+    self[handler.pending] = undefined;
+    if (self[handler.base] === load.tableBase) return true;
+    try {
+      Module[handler.populate](load);
+      self[handler.base] = load.tableBase;
+      return true;
+    } catch (error) {
+      const message = String(error && error.message ? error.message : error);
+      self.postMessage({ [`${key}Error`]: message });
+      return false;
+    }
   };
   self.addEventListener("message", (event) => {
     for (const key of Object.keys(handlers)) {
       const load = event.data && event.data[key];
       if (!load) continue;
       const handler = handlers[key];
-      try {
-        if (self[handler.base] === load.tableBase) {
-          self.postMessage({ [`${key}Ready`]: 0 });
-          continue;
-        }
-        const result = Module[handler.populate](load);
-        self[handler.base] = load.tableBase;
-        self.postMessage({ [`${key}Ready`]: handler.count(result) });
-      } catch (error) {
-        const message = String(error && error.message ? error.message : error);
-        self.postMessage({ [`${key}Error`]: message });
+      if (self[handler.base] === load.tableBase) {
+        self.postMessage({ [`${key}Ready`]: 0 });
+        continue;
       }
+      self[handler.pending] = load;
+      self.postMessage({ [`${key}Ready`]: 1 });
     }
   });
 }

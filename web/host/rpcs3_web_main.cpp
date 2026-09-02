@@ -84,9 +84,9 @@ extern atomic_t<u32> g_spu_web_aot_step_complete[6];
 extern atomic_t<u32> g_spu_web_aot_step_result[6];
 extern u32 ppu_web_interpreter_step(ppu_thread& ppu);
 // Set by web/host/rpcs3_web_pre.js once this worker's function table holds the compiled PPU blocks
-EM_JS(int, rpcs3_web_ppu_aot_worker_ready, (), { return self.__rpcs3PpuAotReady ? 1 : 0; });
+EM_JS(int, rpcs3_web_ppu_aot_worker_ready, (), { if (!self.__rpcs3PpuAotReady && Module["rpcs3EnsureAot"]) Module["rpcs3EnsureAot"]("rpcs3PpuAot"); return self.__rpcs3PpuAotReady ? 1 : 0; });
 
-EM_JS(int, rpcs3_web_spu_aot_worker_ready, (), { return self.__rpcs3SpuAotReady ? 1 : 0; });
+EM_JS(int, rpcs3_web_spu_aot_worker_ready, (), { if (!self.__rpcs3SpuAotReady && Module["rpcs3EnsureAot"]) Module["rpcs3EnsureAot"]("rpcs3SpuAot"); return self.__rpcs3SpuAotReady ? 1 : 0; });
 
 extern u32 g_rpcs3_web_clocks_scale;
 extern void spu_web_aot_register(const u32* pairs, u32 count);

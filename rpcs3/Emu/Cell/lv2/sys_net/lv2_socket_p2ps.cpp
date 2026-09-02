@@ -530,6 +530,27 @@ void lv2_socket_p2ps::send_u2s_packet(std::vector<u8> data, const ::sockaddr_in*
 	inet_ntop(AF_INET, &dst->sin_addr, ip_str, sizeof(ip_str));
 	sys_net.trace("[P2PS] Sending U2S packet on socket %d(id:%d): data(%d, seq %d, require_ack %d) to %s:%d", native_socket, lv2_id, data.size(), seq, require_ack, ip_str, std::bit_cast<u16, be_t<u16>>(dst->sin_port));
 
+#ifdef __EMSCRIPTEN__
+	if (native_socket == -1)
+	{
+		// No host datagram transport (see lv2_socket_p2p::sendto): loop local traffic back, drop the rest
+		if (np::is_loopback_destination(dst->sin_addr.s_addr))
+		{
+			::sockaddr_in src{};
+			src.sin_family = AF_INET;
+			src.sin_port = std::bit_cast<u16, be_t<u16>>(port);
+			src.sin_addr.s_addr = dst->sin_addr.s_addr;
+			g_fxo->get<p2p_context>().queue_loopback(port, src, data);
+		}
+		else
+		{
+			sys_net.error("[P2PS] Attempting to send a u2s packet failed: no host datagram transport");
+			return;
+		}
+	}
+	else
+#endif
+
 	while (np::sendto_possibly_ipv6(native_socket, reinterpret_cast<char*>(data.data()), ::size32(data), dst, 0) == -1)
 	{
 		const sys_net_error err = get_last_error(false);
@@ -680,10 +701,6 @@ s32 lv2_socket_p2ps::bind(const sys_net_sockaddr& addr)
 		sys_net.warning("[P2PS] Attempting to bind a socket to a port != %d", +SCE_NP_PORT);
 	}
 
-#ifdef __EMSCRIPTEN__
-	return -SYS_NET_EOPNOTSUPP;
-#endif
-
 	socket_type real_socket{};
 
 	auto& nc = g_fxo->get<p2p_context>();
@@ -784,10 +801,6 @@ std::optional<s32> lv2_socket_p2ps::connect(const sys_net_sockaddr& addr)
 	{
 		dst_port = SCE_NP_PORT;
 	}
-
-#ifdef __EMSCRIPTEN__
-	return -SYS_NET_EOPNOTSUPP;
-#endif
 
 	auto& nc = g_fxo->get<p2p_context>();
 	std::lock_guard list_lock(nc.list_p2p_ports_mutex);

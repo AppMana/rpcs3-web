@@ -1,9 +1,10 @@
 // Delivers an AOT table layout to every Emscripten pthread worker, present and
 // future, and waits for the idle ones to acknowledge. WebAssembly tables are
 // per instance, so each worker instantiates the same modules at the same
-// indices (web/host/rpcs3_web_pre.js) before it runs a thread. A worker busy
-// running a thread reads its queue only once idle, so the message waits there
-// and is applied before any later "run".
+// indices (web/host/rpcs3_web_pre.js); it does so lazily, when a PPU or SPU
+// thread first runs on it, so service threads do not pay the per-instance
+// JS-heap cost. A worker busy running a thread reads its queue only once idle,
+// so the message waits there and is applied before any later "run".
 export function broadcastAotLoad({ module, key, load, readyTimeoutMs = 60_000 }) {
   const PThread = module.PThread;
   const populated = new WeakSet();

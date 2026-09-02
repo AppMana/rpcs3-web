@@ -50,13 +50,31 @@ nt_p2p_port::nt_p2p_port(u16 port)
 #else
 	if (p2p_socket == -1)
 #endif
+	{
+#ifdef __EMSCRIPTEN__
+		// Browsers offer no datagram transport (WASMFS has no sockets). Keep the port's
+		// guest-side state (vports, queues) so sys_net binding behaves as on hardware;
+		// datagrams have no route, as on a console without a link (see network_context.cpp).
+		sys_net.notice("P2P port %d bound without a host datagram transport (%s)", port, get_last_error(true));
+		return;
+#else
 		fmt::throw_exception("Failed to create DGRAM socket for P2P socket: %s!", get_last_error(true));
+#endif
+	}
 
 	np::set_socket_non_blocking(p2p_socket);
 
 	u32 optval = 131072; // value obtained from DECR for a SOCK_DGRAM_P2P socket(should maybe be bigger for actual socket?)
 	if (setsockopt(p2p_socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&optval), sizeof(optval)) != 0)
+	{
+#ifdef __EMSCRIPTEN__
+		// The browser socket layer has no host receive buffer to size; the guest-visible P2P
+		// semantics (port binding, vports, offline delivery) do not depend on it.
+		sys_net.notice("P2P socket: host ignores SO_RCVBUF (%s)", get_last_error(true));
+#else
 		fmt::throw_exception("Error setsockopt SO_RCVBUF on P2P socket: %s", get_last_error(true));
+#endif
+	}
 
 	int ret_bind = 0;
 	const u16 be_port = std::bit_cast<u16, be_t<u16>>(port);
@@ -67,7 +85,13 @@ nt_p2p_port::nt_p2p_port(u16 port)
 		// Some OS(Windows, maybe more) will only support IPv6 adressing by default and we need IPv4 over IPv6
 		optval = 0;
 		if (setsockopt(p2p_socket, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&optval), sizeof(optval)) != 0)
+		{
+#ifdef __EMSCRIPTEN__
+			sys_net.notice("P2P socket: host ignores IPV6_V6ONLY (%s)", get_last_error(true));
+#else
 			fmt::throw_exception("Error setsockopt IPV6_V6ONLY on P2P socket: %s", get_last_error(true));
+#endif
+		}
 
 		::sockaddr_in6 p2p_ipv6_addr{.sin6_family = AF_INET6, .sin6_port = be_port};
 		ret_bind = ::bind(p2p_socket, reinterpret_cast<sockaddr*>(&p2p_ipv6_addr), sizeof(p2p_ipv6_addr));
@@ -95,7 +119,10 @@ nt_p2p_port::nt_p2p_port(u16 port)
 
 nt_p2p_port::~nt_p2p_port()
 {
-	np::close_socket(p2p_socket);
+	if (has_host_socket())
+	{
+		np::close_socket(p2p_socket);
+	}
 }
 
 void nt_p2p_port::dump_packet(p2ps_encapsulated_tcp* tcph)
@@ -164,13 +191,19 @@ bool nt_p2p_port::recv_data()
 		return false;
 	}
 
-	if (recv_res < static_cast<s32>(sizeof(u16)))
+	return handle_datagram(p2p_recv_data.data(), recv_res, native_addr);
+}
+
+// Routes one datagram received on this port (from the host socket or the loopback queue) to its vport
+bool nt_p2p_port::handle_datagram(const u8* data, s32 size, ::sockaddr_storage native_addr)
+{
+	if (size < static_cast<s32>(sizeof(u16)))
 	{
 		sys_net.error("Received badly formed packet on P2P port(no vport)!");
 		return true;
 	}
 
-	u16 dst_vport = reinterpret_cast<le_t<u16>&>(p2p_recv_data[0]);
+	u16 dst_vport = *reinterpret_cast<const le_t<u16>*>(data);
 
 	if (np::is_ipv6_supported())
 	{
@@ -182,15 +215,15 @@ bool nt_p2p_port::recv_data()
 
 	if (dst_vport == 0)
 	{
-		if (recv_res < VPORT_0_HEADER_SIZE)
+		if (size < VPORT_0_HEADER_SIZE)
 		{
 			sys_net.error("Bad vport 0 packet(no subset)!");
 			return true;
 		}
 
-		const u8 subset      = p2p_recv_data[2];
-		const auto data_size = recv_res - VPORT_0_HEADER_SIZE;
-		std::vector<u8> vport_0_data(p2p_recv_data.data() + VPORT_0_HEADER_SIZE, p2p_recv_data.data() + VPORT_0_HEADER_SIZE + data_size);
+		const u8 subset      = data[2];
+		const auto data_size = size - VPORT_0_HEADER_SIZE;
+		std::vector<u8> vport_0_data(data + VPORT_0_HEADER_SIZE, data + VPORT_0_HEADER_SIZE + data_size);
 
 		switch (subset)
 		{
@@ -224,15 +257,15 @@ bool nt_p2p_port::recv_data()
 		}
 	}
 
-	if (recv_res < VPORT_P2P_HEADER_SIZE)
+	if (size < VPORT_P2P_HEADER_SIZE)
 	{
 		return true;
 	}
 
-	const u16 src_vport = *reinterpret_cast<le_t<u16>*>(p2p_recv_data.data() + sizeof(u16));
-	const u16 vport_flags = *reinterpret_cast<le_t<u16>*>(p2p_recv_data.data() + sizeof(u16) + sizeof(u16));
-	std::vector<u8> p2p_data(recv_res - VPORT_P2P_HEADER_SIZE);
-	memcpy(p2p_data.data(), p2p_recv_data.data() + VPORT_P2P_HEADER_SIZE, p2p_data.size());
+	const u16 src_vport = *reinterpret_cast<const le_t<u16>*>(data + sizeof(u16));
+	const u16 vport_flags = *reinterpret_cast<const le_t<u16>*>(data + sizeof(u16) + sizeof(u16));
+	std::vector<u8> p2p_data(size - VPORT_P2P_HEADER_SIZE);
+	memcpy(p2p_data.data(), data + VPORT_P2P_HEADER_SIZE, p2p_data.size());
 
 	if (vport_flags & P2P_FLAG_P2P)
 	{

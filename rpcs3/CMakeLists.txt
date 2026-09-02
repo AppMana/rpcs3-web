@@ -73,10 +73,12 @@ if(RPCS3_WEB)
 		# Measured stack high-water marks on the homebrew fixtures are under
 		# 16 KiB per RPCS3 thread; 1 MiB keeps a wide margin without the 8 MiB
 		# per thread the implicit default committed. The pool is sized by the
-		# host (Module.pthreadPoolSize) so Mobile Safari can start fewer
-		# workers; Emscripten grows it on demand if RPCS3 needs more.
+		# host (Module.pthreadPoolSize); Emscripten grows it on demand, but only
+		# while the module thread can run its event loop, so the preallocation
+		# must cover the threads RPCS3 creates inside the synchronous boot call
+		# (about 30 for homebrew, including the lv2 and module service threads).
 		"-sDEFAULT_PTHREAD_STACK_SIZE=1048576"
-		"-sPTHREAD_POOL_SIZE=(Module['pthreadPoolSize']||12)"
+		"-sPTHREAD_POOL_SIZE=(Module['pthreadPoolSize']||40)"
 		"-sALLOW_TABLE_GROWTH=1"
 		"-Wl,--export=__stack_pointer"
 		"SHELL:--pre-js ${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_pre.js"

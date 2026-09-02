@@ -317,12 +317,11 @@ namespace stx
 				func();
 			}
 
-			// Launch threads. Browser builds keep the globally registered service
-			// objects in their retained state: eagerly starting every desktop
-			// camera/network/audio/debug service consumes dozens of Web Workers
-			// before the PPU and RSX threads can run. Web host adapters activate
-			// services explicitly when a browser capability is actually requested.
-#ifndef RPCS3_WEB
+			// Launch threads. Browser builds launch the same set as native builds:
+			// lv2 services such as the timer thread (periodic sys_timer events
+			// that drive game input polling), cell audio, USB and NP handlers are
+			// guest-visible semantics, so retaining them changes game behaviour.
+			// The worker budget is managed by the pthread pool policy instead.
 			for (auto it = m_info; it != info_before; it--)
 			{
 				if (auto op = (*std::prev(it))->thread_op)
@@ -330,7 +329,6 @@ namespace stx
 					op(*std::prev(m_order, m_info - it + 1), thread_state{});
 				}
 			}
-#endif
 
 			g_tls_serialize_name = {};
 		}

@@ -388,6 +388,8 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     padScheduleApplied: module.ccall("rpcs3_web_pad_schedule_applied", "number", [], []) >>> 0,
     captureMs,
     workingSet: workingSet(),
+    liveThreadNames: module.ccall("rpcs3_web_live_thread_names", "string", [], []).split("\n").filter(Boolean),
+    threads: module.ccall("rpcs3_web_thread_snapshot", "string", [], []),
     stackReport: stackReport(),
     ppuInstructions: Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], [])),
     ppuAotTable: ppuAotTable
@@ -539,7 +541,9 @@ scope.addEventListener("message", async (event) => {
       locateFile: resolveCoreFile,
       // Emscripten workers started up front; RPCS3's homebrew boot uses 7-8
       // threads and the pool grows on demand beyond this.
-      pthreadPoolSize: Math.max(2, Math.min(64, Number(event.data.pthreadPoolSize) || 12)),
+      // The pool must cover the boot thread set: a thread created while the module thread is inside the
+      // synchronous boot call cannot get a new worker (worker loads need this thread's event loop).
+      pthreadPoolSize: Math.max(2, Math.min(64, Number(event.data.pthreadPoolSize) || 40)),
       print: recordLog,
       printErr: recordLog,
       ...(mainWasm ? {

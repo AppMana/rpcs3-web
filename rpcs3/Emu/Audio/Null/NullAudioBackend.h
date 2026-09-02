@@ -10,11 +10,7 @@ public:
 
 	std::string_view GetName() const override { return "Null"sv; }
 
-	bool Open(std::string_view /* dev_id */, AudioFreq /* freq */, AudioSampleSize /* sample_size */, AudioChannelCnt /* ch_cnt */, audio_channel_layout /*layout*/) override
-	{
-		Close();
-		return true;
-	}
+	bool Open(std::string_view dev_id, AudioFreq freq, AudioSampleSize sample_size, AudioChannelCnt ch_cnt, audio_channel_layout layout) override;
 	void Close() override { m_playing = false; }
 
 	f64 GetCallbackFrameLen() override { return 0.01; };

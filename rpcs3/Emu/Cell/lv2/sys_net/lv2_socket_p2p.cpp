@@ -118,10 +118,6 @@ s32 lv2_socket_p2p::bind(const sys_net_sockaddr& addr)
 		sys_net.warning("[P2P] Attempting to bind a socket to a port != %d", +SCE_NP_PORT);
 	}
 
-#ifdef __EMSCRIPTEN__
-	return -SYS_NET_EOPNOTSUPP;
-#endif
-
 	socket_type real_socket{};
 
 	auto& nc = g_fxo->get<p2p_context>();
@@ -302,6 +298,26 @@ std::optional<s32> lv2_socket_p2p::sendto(s32 flags, const std::vector<u8>& buf,
 	{
 		native_flags |= MSG_WAITALL;
 	}
+
+#ifdef __EMSCRIPTEN__
+	if (native_socket == -1)
+	{
+		// Bound to a P2P port without a host datagram transport. Traffic to the console's own
+		// address loops back through the P2P thread as the host kernel would; anything else has
+		// no route, as on a console without a link.
+		if (np::is_loopback_destination(native_addr.sin_addr.s_addr))
+		{
+			::sockaddr_in src{};
+			src.sin_family = AF_INET;
+			src.sin_port = std::bit_cast<u16, be_t<u16>>(port);
+			src.sin_addr.s_addr = native_addr.sin_addr.s_addr;
+			g_fxo->get<p2p_context>().queue_loopback(p2p_port, src, std::move(p2p_data));
+			return {::size32(buf)};
+		}
+
+		return {-SYS_NET_ENETUNREACH};
+	}
+#endif
 
 	auto native_result = np::sendto_possibly_ipv6(native_socket, reinterpret_cast<const char*>(p2p_data.data()), ::size32(p2p_data), &native_addr, native_flags);
 

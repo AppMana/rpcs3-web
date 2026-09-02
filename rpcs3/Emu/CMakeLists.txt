@@ -184,6 +184,7 @@ target_sources(rpcs3_emu PRIVATE
     Audio/audio_utils.cpp
     Audio/AudioDumper.cpp
     Audio/AudioBackend.cpp
+    Audio/Null/NullAudioBackend.cpp
 )
 
 if(NOT RPCS3_WEB)

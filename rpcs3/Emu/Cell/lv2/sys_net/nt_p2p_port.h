@@ -46,6 +46,16 @@ struct nt_p2p_port
 {
 	// Real socket where P2P packets are received/sent
 	socket_type p2p_socket = 0;
+
+	// False when the host could not provide a datagram socket (browser builds)
+	bool has_host_socket() const
+	{
+#ifdef _WIN32
+		return p2p_socket != INVALID_SOCKET;
+#else
+		return p2p_socket != -1;
+#endif
+	}
 	u16 port               = 0;
 
 	shared_mutex bound_p2p_vports_mutex;
@@ -78,4 +88,5 @@ struct nt_p2p_port
 	bool handle_connected(s32 sock_id, p2ps_encapsulated_tcp* tcp_header, u8* data, ::sockaddr_storage* op_addr);
 	bool handle_listening(s32 sock_id, p2ps_encapsulated_tcp* tcp_header, u8* data, ::sockaddr_storage* op_addr);
 	bool recv_data();
+	bool handle_datagram(const u8* data, s32 size, ::sockaddr_storage native_addr);
 };

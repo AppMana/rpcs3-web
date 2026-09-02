@@ -7,6 +7,8 @@
 namespace np
 {
 	std::string ip_to_string(u32 addr);
+	// True for destinations the host loops back to this console: 127.0.0.0/8 and the console's own address (network byte order)
+	bool is_loopback_destination(u32 addr);
 	std::string ether_to_string(const std::array<u8, 6>& ether);
 	bool validate_communication_id(const SceNpCommunicationId& com_id);
 	std::string communication_id_to_string(const SceNpCommunicationId& communicationId);

@@ -1,8 +1,14 @@
-import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+// Native oracle for the PPU/SPU dispatch conformance fixture: runs the
+// native RPCS3 build headlessly in each decoder mode through the kit's
+// native-oracle runner and requires identical RPCS3-DISPATCH/1 protocol lines.
+//
+//   node scripts/run-dispatch-conformance.mjs [--include-spu-llvm]
+//   RPCS3_NATIVE  RPCS3_DISPATCH_FIXTURE  RPCS3_DISPATCH_STATE
+import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { compareOracleRuns, runNativeOracle } from "@appmana-public/web-emulator-harness/native-oracle";
 
 const scriptRoot = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptRoot, "../..");
@@ -23,50 +29,29 @@ if (process.argv.includes("--include-spu-llvm")) {
 mkdirSync(configHome, { recursive: true });
 mkdirSync(dirname(tty), { recursive: true });
 
-function delay(milliseconds) {
-  return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
-}
-
-function protocolLines(text) {
-  return text.split(/\r?\n/).filter((line) => line.startsWith("RPCS3-DISPATCH/1 "));
-}
-
-async function runMode(mode) {
+const results = [];
+for (const mode of modes) {
   const config = join(stateRoot, `${mode.name}.yml`);
   writeFileSync(config, `Core:\n  PPU Decoder: ${mode.ppu}\n  SPU Decoder: ${mode.spu}\nVideo:\n  Renderer: Null\nAudio:\n  Renderer: Null\nMiscellaneous:\n  Exit RPCS3 when process finishes: true\n`);
   writeFileSync(tty, "");
-  const output = [];
-  const child = spawn(executable, ["--headless", "--allow-any-location", "--config", config, fixture], {
+  const run = await runNativeOracle({
+    name: mode.name,
+    command: executable,
+    args: ["--headless", "--allow-any-location", "--config", config, fixture],
     cwd: repoRoot,
-    env: { ...process.env, XDG_CONFIG_HOME: configHome, XDG_CACHE_HOME: cacheHome },
-    stdio: ["ignore", "pipe", "pipe"],
+    env: { XDG_CONFIG_HOME: configHome, XDG_CACHE_HOME: cacheHome },
+    outputFiles: { tty },
+    protocolLinePrefix: "RPCS3-DISPATCH/1 ",
+    timeoutMs: 30_000,
   });
-  child.stdout.on("data", (chunk) => output.push(chunk));
-  child.stderr.on("data", (chunk) => output.push(chunk));
-  const deadline = Date.now() + 30_000;
-  let lines = [];
-  while (Date.now() < deadline) {
-    await delay(20);
-    try {
-      lines = protocolLines(readFileSync(tty, "utf8"));
-    } catch {}
-    if (lines.some((line) => / (PASS|FAIL) /.test(line))) break;
-    if (child.exitCode !== null) break;
-  }
-  if (child.exitCode === null) child.kill("SIGTERM");
-  const terminal = lines.at(-1) ?? "";
+  const terminal = run.terminal ?? "";
   if (!terminal.startsWith("RPCS3-DISPATCH/1 PASS ")) {
-    throw new Error(`${mode.name} did not pass: ${terminal || Buffer.concat(output).toString("utf8").slice(-2000)}`);
+    throw new Error(`${mode.name} did not pass: ${terminal || (run.stdout + run.stderr).slice(-2000)}`);
   }
-  return { mode: mode.name, lines, verdict: terminal.split(" ").at(-1) };
+  results.push({ mode: mode.name, lines: run.lines, verdict: terminal.split(" ").at(-1) });
 }
-
-const results = [];
-for (const mode of modes) results.push(await runMode(mode));
-const oracle = results[0].lines;
-for (const result of results.slice(1)) {
-  if (JSON.stringify(result.lines) !== JSON.stringify(oracle)) {
-    throw new Error(`${result.mode} output differs from ${results[0].mode}`);
-  }
+const comparison = compareOracleRuns(results.map((result) => ({ name: result.mode, lines: result.lines })));
+if (!comparison.ok) {
+  throw new Error(`${comparison.divergent.map((run) => run.name).join(", ")} output differs from ${comparison.reference}`);
 }
 process.stdout.write(`${JSON.stringify({ ok: true, fixture, results }, null, 2)}\n`);

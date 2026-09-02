@@ -1,6 +1,6 @@
 // Drives a same-origin library import into the iPad's OPFS from the hosted
-// origin (default https://rpcs3.appmana.com) over the WebKit Inspector
-// Protocol: navigates Safari to storage.html, calls
+// origin (default https://rpcs3.appmana.com) over the kit's WebKit Inspector
+// client: navigates Safari to storage.html, calls
 // window.__rpcs3Storage.importFromLibrary(name, destination), polls the
 // progress snapshot, and saves a report with the storage estimates before and
 // after, the measured rate, the resume point, and the SHA-256 verdict.
@@ -16,6 +16,7 @@
 // inspector client may be attached to a Safari page at a time.
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { WebKitConnection, delay, findPage, openPage, waitForExpression } from "@appmana-public/web-emulator-harness/webkit-inspector";
 
 const positional = [];
 const flags = { chunkMiB: undefined, restart: false, verify: false, interruptAfter: undefined };
@@ -31,7 +32,7 @@ const origin = new URL(positional[0] || process.env.RPCS3_DEVICE_ORIGIN || "http
 const outputDirectory = path.resolve(positional[1] || "device-library-evidence");
 const fileName = positional[2] || "PS3UPDAT.PUP";
 const destination = positional[3] || (/\.pup$/i.test(fileName) ? "firmware" : "games");
-const discoveryURL = process.env.WIP_DISCOVERY_URL || "http://127.0.0.1:9221/json";
+const discoveryURL = process.env.WIP_DISCOVERY_URL;
 const timeoutMs = Number(process.env.WIP_TIMEOUT_MS || 180_000);
 const pollMs = Number(process.env.RPCS3_LIBRARY_POLL_MS || 1000);
 // The import runs in the page's worker independently of the inspector, so a
@@ -39,7 +40,7 @@ const pollMs = Number(process.env.RPCS3_LIBRARY_POLL_MS || 1000);
 // than abandoning a transfer that is still running.
 const pollTimeoutMs = Number(process.env.RPCS3_LIBRARY_POLL_TIMEOUT_MS || 30_000);
 const maxReconnects = Number(process.env.RPCS3_LIBRARY_MAX_RECONNECTS || 20);
-const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const log = (line) => process.stderr.write(`${line}\n`);
 const formatBytes = (value) => {
   const units = ["B", "KiB", "MiB", "GiB"];
   let unit = 0;
@@ -48,127 +49,21 @@ const formatBytes = (value) => {
   return `${bytes.toFixed(unit ? 2 : 0)} ${units[unit]}`;
 };
 
-async function readJson(url) {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`${url} returned ${response.status}`);
-  return response.json();
-}
-
-async function discover() {
-  const devices = await readJson(discoveryURL);
-  if (devices.length !== 1) throw new Error(`Expected one attached device, found ${devices.length}`);
-  const device = devices[0];
-  return { device, pages: await readJson(`http://${device.url}/json`) };
-}
-
-class WebKitConnection {
-  constructor(url) {
-    this.socket = new WebSocket(url);
-    this.targetId = undefined;
-    this.innerId = 0;
-    this.outerId = 0;
-    this.pending = new Map();
-  }
-
-  async open() {
-    this.socket.addEventListener("message", (event) => this.onMessage(event));
-    await new Promise((resolve, reject) => {
-      this.socket.addEventListener("open", resolve, { once: true });
-      this.socket.addEventListener("error", reject, { once: true });
-    });
-    const deadline = Date.now() + 15_000;
-    while (!this.targetId && Date.now() < deadline) await delay(25);
-    if (!this.targetId) throw new Error("WebKit did not announce a page target");
-    return this;
-  }
-
-  onMessage(event) {
-    const message = JSON.parse(event.data);
-    if (message.method === "Target.targetCreated") {
-      const info = message.params.targetInfo;
-      if (!this.targetId && info.type === "page" && !info.isProvisional) this.targetId = info.targetId;
-    }
-    if (message.method === "Target.didCommitProvisionalTarget" && message.params.oldTargetId === this.targetId) {
-      this.targetId = message.params.newTargetId;
-    }
-    if (message.method !== "Target.dispatchMessageFromTarget") return;
-    const inner = JSON.parse(message.params.message);
-    const pending = this.pending.get(inner.id);
-    if (!pending) return;
-    this.pending.delete(inner.id);
-    clearTimeout(pending.timer);
-    if (inner.error) pending.reject(new Error(inner.error.message));
-    else pending.resolve(inner.result);
-  }
-
-  command(method, params = {}, commandTimeoutMs = timeoutMs) {
-    const innerId = ++this.innerId;
-    this.socket.send(JSON.stringify({
-      id: ++this.outerId,
-      method: "Target.sendMessageToTarget",
-      params: { targetId: this.targetId, message: JSON.stringify({ id: innerId, method, params }) },
-    }));
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(innerId);
-        reject(new Error(`${method} timed out`));
-      }, commandTimeoutMs);
-      this.pending.set(innerId, { resolve, reject, timer });
-    });
-  }
-
-  async evaluate(expression, awaitPromise = false, commandTimeoutMs = timeoutMs) {
-    const evaluation = await this.command("Runtime.evaluate", {
-      expression,
-      returnByValue: !awaitPromise,
-      doNotPauseOnExceptionsAndMuteConsole: true,
-    }, commandTimeoutMs);
-    if (evaluation.wasThrown) throw new Error(evaluation.result.description || "Evaluation failed");
-    let result = evaluation.result;
-    if (awaitPromise && result.objectId) {
-      const awaited = await this.command("Runtime.awaitPromise", { promiseObjectId: result.objectId, returnByValue: true });
-      if (awaited.wasThrown) throw new Error(awaited.result.description || "Promise rejected");
-      result = awaited.result;
-    }
-    return result.value;
-  }
-
-  close() {
-    this.socket.close();
-  }
-}
-
-async function findPage(predicate, description) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const found = await discover();
-    const page = found.pages.find(predicate);
-    if (page) return { device: found.device, page };
-    await delay(250);
-  }
-  throw new Error(`No inspectable Safari page matched ${description}`);
-}
-
 async function attachTo(url) {
-  const navigated = await findPage((page) => page.url === url, url);
-  const connection = await new WebKitConnection(navigated.page.webSocketDebuggerUrl).open();
+  const navigated = await findPage((page) => page.url === url, { discoveryURL, timeoutMs });
+  const connection = await new WebKitConnection(navigated.page.webSocketDebuggerUrl, { timeoutMs: pollTimeoutMs, log }).open();
   return { connection, device: navigated.device };
 }
 
 async function navigateTo(url) {
-  const initial = await findPage((page) => page.title !== "ServiceWorker" && !page.url.startsWith("safari-web-extension:"), "any page");
-  const bootstrap = await new WebKitConnection(initial.page.webSocketDebuggerUrl).open();
-  await bootstrap.evaluate(`location.assign(${JSON.stringify(url)})`);
-  bootstrap.close();
-  const { connection, device: navigatedDevice } = await attachTo(url);
-  const navigated = { device: navigatedDevice };
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await connection.evaluate("Boolean(window.__rpcs3Storage && window.__rpcs3Storage.importFromLibrary)")) return { connection, device: navigated.device };
-    await delay(250);
+  const { connection, device } = await openPage(url, { discoveryURL, timeoutMs, commandTimeoutMs: pollTimeoutMs, log });
+  try {
+    await waitForExpression(connection, "Boolean(window.__rpcs3Storage && window.__rpcs3Storage.importFromLibrary)", { timeoutMs, what: "window.__rpcs3Storage" });
+  } catch (error) {
+    connection.close();
+    throw new Error(`storage.html did not expose __rpcs3Storage: ${error.message}`);
   }
-  connection.close();
-  throw new Error("storage.html did not expose __rpcs3Storage");
+  return { connection, device };
 }
 
 const options = {
@@ -201,7 +96,7 @@ async function drive(session, { interruptAfterMs, restart }) {
   for (;;) {
     let snapshot;
     try {
-      snapshot = JSON.parse(await connection.evaluate("JSON.stringify({ run: window.__rpcs3LibraryRun, progress: window.__rpcs3Storage.importProgress() })", false, pollTimeoutMs));
+      snapshot = JSON.parse(await connection.evaluate("JSON.stringify({ run: window.__rpcs3LibraryRun, progress: window.__rpcs3Storage.importProgress() })"));
     } catch (error) {
       if (++reconnects > maxReconnects) throw error;
       process.stderr.write(`poll failed (${error.message}); reconnecting to the page (${reconnects}/${maxReconnects})\n`);

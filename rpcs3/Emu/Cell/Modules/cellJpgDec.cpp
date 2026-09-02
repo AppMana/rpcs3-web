@@ -314,6 +314,7 @@ error_code cellJpgDecDecodeData(u32 mainHandle, u32 subHandle, vm::ptr<u8> data,
 		return CELL_JPGDEC_ERROR_ARG;
 	}
 
+	vm::note_write(data.addr(), static_cast<u32>(std::max<usz>(image_size, static_cast<usz>(height) * bytesPerLine)));
 	dataOutInfo->status = CELL_JPGDEC_DEC_STATUS_FINISH;
 
 	if (dataCtrlParam->outputBytesPerLine)

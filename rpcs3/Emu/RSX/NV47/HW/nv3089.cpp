@@ -250,6 +250,17 @@ namespace rsx
 				return { false, src_info, dst_info };
 			}
 
+#ifdef RPCS3_WEB
+			// The web VM translates unmapped pages to null host pointers instead of faulting:
+			// refuse the transfer the way the access-violation handler would (FIFO recovery)
+			if (!vm::check_addr(dst_address + out_offset, vm::page_writable, out_pitch * (clip_h - 1) + out_bpp * clip_w) ||
+				!vm::check_addr(src_address + in_offset, vm::page_readable, in_pitch * (in_h - 1) + src_line_length))
+			{
+				rsx_log.error("NV3089_IMAGE_IN: Unmapped transfer range (src=0x%x+0x%x, dst=0x%x+0x%x, out_pitch=%u, clip=%ux%u)", src_address, in_offset, dst_address, out_offset, out_pitch, clip_w, clip_h);
+				RSX(ctx)->recover_fifo();
+				return { false, src_info, dst_info };
+			}
+#endif
 			u8* pixels_src = vm::_ptr<u8>(src_address + in_offset);
 			u8* pixels_dst = vm::_ptr<u8>(dst_address + out_offset);
 
@@ -330,6 +341,9 @@ namespace rsx
 			bool src_is_modified,
 			bool interpolate)
 		{
+			// Page write versions of the destination rows (the range the texture cache's dst_range covers)
+			struct note_write_t { u32 addr; u32 size; ~note_write_t() { vm::note_write(addr, size); } }
+			note_write_{ dst.rsx_address, dst.pitch * (dst.clip_height - 1) + (dst.bpp * dst.clip_width) };
 			std::vector<u8> temp2;
 
 			if (!need_convert) [[ likely ]]

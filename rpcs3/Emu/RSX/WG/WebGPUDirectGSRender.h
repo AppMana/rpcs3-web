@@ -50,6 +50,19 @@ public:
 		u32 address = 0;
 		u32 pitch = 0;
 		u32 rsx_format = 0;
+		// Copies a draw samples: sub-rectangles / 3D slice stacks (texture_cache _3d_gather) and the
+		// scratch copy of a target sampled while bound (cyclic reference)
+		struct region
+		{
+			WGPUTexture texture = nullptr;
+			WGPUTextureView view = nullptr;
+			u32 width = 0;
+			u32 height = 0;
+			u32 depth = 0;
+			u32 row = 0;
+		};
+		std::unordered_map<std::string, region> regions;
+		region scratch;
 	};
 
 	struct gpu_program
@@ -69,6 +82,7 @@ public:
 		WGPUTextureView view = nullptr;
 		u32 bytes = 0;
 		u64 last_use = 0;
+		u64 version = 0; // vm::web_page_version_sum of the guest pages at upload
 	};
 
 	struct ring_buffer
@@ -76,6 +90,8 @@ public:
 		WGPUBuffer buffer = nullptr;
 		u64 size = 0;
 		u64 offset = 0;
+		u64 flushed = 0;                 // staged bytes below this offset already reached the buffer
+		std::vector<std::byte> staging;  // this frame's contents, written to the buffer at submit
 	};
 
 	struct targets
@@ -111,6 +127,8 @@ private:
 	void end_pass();
 	void submit();
 	u64 ring_allocate(ring_buffer& ring, u64 bytes, WGPUBufferUsage usage, const char* label);
+	void ring_write(ring_buffer& ring, u64 offset, const void* data, usz size);
+	void flush_ring(ring_buffer& ring);
 
 	// Programs, pipelines, samplers, textures
 	gpu_program& get_program(const std::string& key, const std::array<u8, 16>& dimensions, u32 color_target_count, u32 alpha_func, const std::string& swizzles);
@@ -132,6 +150,9 @@ private:
 	// Resolves a fragment texture: a surface of the store (whole match), else an upload
 	sampled_texture resolve_texture(const rsx::fragment_texture& texture, u32 slot);
 	gpu_texture* upload_texture(const rsx::fragment_texture& texture, const rsx::webgpu::texture_packet_record& record, u32 address, u32 size);
+	// texture_cache::upload_texture surface path (check_framebuffer_resource): a texture over a row of a colour surface
+	bool alias_surface_texture(const rsx::webgpu::texture_packet_record& record, u32 address, u32 gcm_format, sampled_texture& result);
+	void release_surface_copies(gpu_surface& surface);
 
 	WGPUInstance m_instance = nullptr;
 	WGPUDevice m_device = nullptr;
@@ -163,11 +184,14 @@ private:
 	ring_buffer m_stream_ring;
 	ring_buffer m_index_ring;
 	u64 m_frame_serial = 0;
+	std::vector<std::byte> m_draw_persistent, m_draw_transient, m_draw_vertex_state, m_draw_fragment_state;
 
 	std::unordered_map<std::string, gpu_program> m_programs;
 	std::unordered_map<std::string, WGPURenderPipeline> m_pipelines;
 	std::unordered_map<u64, WGPUSampler> m_samplers;
 	std::unordered_map<u64, gpu_texture> m_textures;
+	std::vector<std::byte> m_guest_staging;   // contiguous copy of a texture's guest bytes (16-byte aligned inside)
+	std::vector<std::byte> m_decode_staging;  // decoded subresource rows for wgpuQueueWriteTexture
 	u64 m_texture_bytes = 0;
 	std::array<WGPUTextureView, 4> m_null_views{};
 	WGPUSampler m_null_sampler = nullptr;
@@ -188,6 +212,7 @@ public:
 		u64 programs = 0;
 		u64 pipelines = 0;
 		u64 texture_uploads = 0;
+		u64 texture_invalidations = 0;
 		u64 texture_hits = 0;
 		u64 surface_hits = 0;
 		u64 surface_ops = 0;

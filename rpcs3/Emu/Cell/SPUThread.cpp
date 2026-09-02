@@ -2417,6 +2417,9 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 
 	const bool is_get = (args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GET_CMD;
 
+	// Page write versions: a PUT changes its destination pages by the time this returns
+	struct note_put_t { u32 eal; u32 size; bool skip; ~note_put_t() { if (!skip) vm::note_write(eal, size); } } note_put{ args.eal, args.size, is_get };
+
 	u32 eal = args.eal;
 	u32 lsa = args.lsa & 0x3ffff;
 
@@ -3802,6 +3805,7 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 
 bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 {
+	struct note_store_t { u32 addr; ~note_store_t() { vm::note_write(addr, 128); } } note_store{ args.eal & -128 };
 	perf_meter<"PUTLLC-"_u64> perf0;
 	perf_meter<"PUTLLC+"_u64> perf1 = perf0;
 
@@ -3976,6 +3980,7 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 
 void do_cell_atomic_128_store(u32 addr, const void* to_write)
 {
+	struct note_store_t { u32 addr; ~note_store_t() { vm::note_write(addr, 128); } } note_store{ addr };
 	perf_meter<"STORE128"_u64> perf0;
 
 	const auto cpu = get_current_cpu_thread();

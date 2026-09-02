@@ -61,6 +61,7 @@ const runOptions = {
   render: env.RPCS3_RENDERER !== "null",
   renderer: env.RPCS3_RENDERER === "null" ? "null" : "webgpu",
   directRenderer: env.RPCS3_DIRECT_RENDERER === "1",
+  captureEvery: env.RPCS3_CAPTURE_EVERY ? Number(env.RPCS3_CAPTURE_EVERY) : undefined,
   width,
   height,
   readback,
@@ -366,6 +367,11 @@ try {
     && (untilDraw ? frameList.some((frame) => (frame.drawPacketCount ?? 0) > 0) : frameList.length >= frames);
   const { packetFixture, ...resultWithoutFixture } = result;
   const rgbaBase64 = result.gpu?.rgbaBase64;
+  for (const image of result.gpu?.frameImages ?? []) {
+    const data = String(image.png).replace(/^data:image\/png;base64,/, "");
+    await writeFile(outputPath.replace(/\.json$/, "") + `.frame${image.frame}.png`, Buffer.from(data, "base64"));
+  }
+  if (result.gpu?.frameImages) result.gpu = { ...result.gpu, frameImages: result.gpu.frameImages.map((image) => ({ frame: image.frame, presented: image.presented })) };
   const surfaceDumps = result.gpu?.surfaceDumps;
   if (resultWithoutFixture.gpu) resultWithoutFixture.gpu = { ...resultWithoutFixture.gpu, rgbaBase64: undefined, surfaceDumps: undefined };
   const percentile = (values, fraction) => {

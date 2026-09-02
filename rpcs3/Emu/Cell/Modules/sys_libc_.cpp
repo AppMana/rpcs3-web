@@ -119,6 +119,7 @@ vm::ptr<void> _sys_memset(vm::ptr<void> dst, s32 value, u32 size)
 	sysPrxForUser.trace("_sys_memset(dst=*0x%x, value=%d, size=0x%x)", dst, value, size);
 
 	std::memset(dst.get_ptr(), value, size);
+	vm::note_write(dst.addr(), size);
 
 	return dst;
 }
@@ -128,6 +129,7 @@ vm::ptr<void> _sys_memcpy(vm::ptr<void> dst, vm::cptr<void> src, u32 size)
 	sysPrxForUser.trace("_sys_memcpy(dst=*0x%x, src=*0x%x, size=0x%x)", dst, src, size);
 
 	std::memcpy(dst.get_ptr(), src.get_ptr(), size);
+	vm::note_write(dst.addr(), size);
 
 	return dst;
 }
@@ -182,6 +184,7 @@ vm::ptr<void> _sys_memmove(vm::ptr<void> dst, vm::cptr<void> src, u32 size)
 	sysPrxForUser.trace("_sys_memmove(dst=*0x%x, src=*0x%x, size=%d)", dst, src, size);
 
 	std::memmove(dst.get_ptr(), src.get_ptr(), size);
+	vm::note_write(dst.addr(), size);
 
 	return dst;
 }

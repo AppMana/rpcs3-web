@@ -258,12 +258,20 @@ extern "C"
 
 void rsx::webgpu::command_queue::note_flip()
 {
-	m_frame_counter.fetch_add(1, std::memory_order_acq_rel);
+	const std::uint32_t flips = m_frame_counter.fetch_add(1, std::memory_order_acq_rel) + 1;
 #ifdef __EMSCRIPTEN__
 	__builtin_wasm_memory_atomic_notify(reinterpret_cast<int*>(&m_frame_counter), 0x7fffffff);
 #else
 	m_frame_counter.notify_all();
 #endif
+
+	// Same observers as a queued flip packet: the pad schedule advances per presented frame
+	std::function<void(std::uint32_t)> callback;
+	{
+		std::lock_guard lock(m_callback_mutex);
+		callback = m_flip_callback;
+	}
+	if (callback) callback(flips);
 }
 
 extern "C"

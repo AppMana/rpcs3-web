@@ -8,6 +8,7 @@ vm::ptr<void> sys_libc_memcpy(vm::ptr<void> dst, vm::cptr<void> src, u32 size)
 	sys_libc.trace("memcpy(dst=*0x%x, src=*0x%x, size=0x%x)", dst, src, size);
 
 	::memcpy(dst.get_ptr(), src.get_ptr(), size);
+	vm::note_write(dst.addr(), size);
 	return dst;
 }
 vm::ptr<void> sys_libc_memset(vm::ptr<void> dst, s32 value, u32 size)
@@ -15,6 +16,7 @@ vm::ptr<void> sys_libc_memset(vm::ptr<void> dst, s32 value, u32 size)
 	sys_libc.trace("memset(dst=*0x%x, value=0x%x, size=0x%x)", dst, value, size);
 
 	::memset(dst.get_ptr(), value, size);
+	vm::note_write(dst.addr(), size);
 	return dst;
 }
 

@@ -83,7 +83,16 @@ namespace rsx
 					return;
 				}
 
+#ifdef RPCS3_WEB
+				if (!vm::check_addr(dst_address, vm::page_writable, data_length))
+				{
+					rsx_log.error("NV308A_COLOR: Unmapped destination (dst=0x%x/%u)", dst_address, data_length);
+					RSX(ctx)->recover_fifo();
+					return;
+				}
+#endif
 				const auto dst = vm::_ptr<u8>(dst_address);
+				struct note_write_t { u32 addr; u32 size; ~note_write_t() { vm::note_write(addr, size); } } note_write_{ dst_address, data_length };
 				const auto src = reinterpret_cast<const u8*>(fifo_span.data());
 
 				rsx::reservation_lock<true> rsx_lock(dst_address, data_length);
@@ -115,7 +124,16 @@ namespace rsx
 				const auto data_length = count * 2;
 
 				const auto dst_address = get_address(dst_offset + (x * 2) + (y * out_pitch), dst_dma, data_length);
+#ifdef RPCS3_WEB
+				if (!vm::check_addr(dst_address, vm::page_writable, data_length))
+				{
+					rsx_log.error("NV308A_COLOR: Unmapped destination (dst=0x%x/%u)", dst_address, data_length);
+					RSX(ctx)->recover_fifo();
+					return;
+				}
+#endif
 				const auto dst = vm::_ptr<u16>(dst_address);
+				struct note_write_t { u32 addr; u32 size; ~note_write_t() { vm::note_write(addr, size); } } note_write_{ dst_address, data_length };
 				const auto src = utils::bless<const be_t<u32>>(fifo_span.data());
 
 				if (!dst_address)

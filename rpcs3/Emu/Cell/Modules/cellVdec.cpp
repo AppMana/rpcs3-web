@@ -1805,6 +1805,14 @@ error_code cellVdecGetPictureExt(ppu_thread& ppu, u32 handle, vm::cptr<CellVdecP
 
 		const u8* in_data[4] = { frame->data[0], frame->data[1], frame->data[2], alpha_plane.get() };
 		const int in_line[4] = { frame->linesize[0], frame->linesize[1], frame->linesize[2], w * 1 };
+#ifdef RPCS3_WEB
+		// The web VM cannot fault on an unmapped output buffer; a frame-sized write must stay inside mapped memory
+		if (!vm::check_addr(outBuff.addr(), vm::page_writable, w * h * 4)) [[unlikely]]
+		{
+			cellVdec.error("cellVdecGetPicture: output buffer 0x%x (%ux%u) is not writable guest memory; frame dropped", outBuff.addr(), w, h);
+			return CELL_OK;
+		}
+#endif
 		u8* out_data[4] = { outBuff.get_ptr() };
 		int out_line[4] = { w * 4 }; // RGBA32 or ARGB32
 
@@ -1825,6 +1833,7 @@ error_code cellVdecGetPictureExt(ppu_thread& ppu, u32 handle, vm::cptr<CellVdecP
 		}
 
 		sws_scale(vdec->sws, in_data, in_line, 0, h, out_data, out_line);
+		vm::note_write(outBuff.addr(), w * h * 4);
 	}
 
 	return CELL_OK;

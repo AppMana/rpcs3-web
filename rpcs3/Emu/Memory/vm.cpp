@@ -71,6 +71,43 @@ namespace vm
 
 	std::array<u8*, 0x100000> g_web_pages{};
 	std::array<u32, 0x100000> g_web_reverse_pages{};
+	// Write version per guest page (web_note_write / web_page_version_sum)
+	static std::array<std::atomic<u32>, 0x100000> g_web_page_versions{};
+
+	void web_note_write(u32 addr, u32 size) noexcept
+	{
+		if (!size) return;
+		const u32 first = addr >> 12;
+		const u32 last = static_cast<u32>((static_cast<u64>(addr) + size - 1) >> 12);
+		for (u32 page = first; page <= last && page < 0x100000; page++)
+		{
+			g_web_page_versions[page].fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+
+	alignas(4096) u8 g_web_sink_page[0x100000]{};
+
+	void web_note_unmapped(u32 addr) noexcept
+	{
+		static atomic_t<u32> reported{0};
+		if (reported++ < 32)
+		{
+			vm_log.error("Guest access to unmapped memory (sink page): addr=0x%x thread=%s", addr, thread_ctrl::get_name());
+		}
+	}
+
+	u64 web_page_version_sum(u32 addr, u32 size) noexcept
+	{
+		if (!size) return 0;
+		const u32 first = addr >> 12;
+		const u32 last = static_cast<u32>((static_cast<u64>(addr) + size - 1) >> 12);
+		u64 sum = 0;
+		for (u32 page = first; page <= last && page < 0x100000; page++)
+		{
+			sum += g_web_page_versions[page].load(std::memory_order_relaxed);
+		}
+		return sum;
+	}
 	static atomic_t<u32> g_web_mapped_pages{0};
 
 	u32 web_mapped_pages() noexcept
@@ -95,6 +132,7 @@ namespace vm
 				g_web_mapped_pages++;
 			}
 			g_web_pages[guest_page] = host_page;
+			g_web_page_versions[guest_page].fetch_add(1, std::memory_order_relaxed);
 
 			// Shared guest aliases can point at the same backing. Keep the first
 			// address as the canonical reverse translation.
@@ -120,6 +158,7 @@ namespace vm
 			}
 
 			g_web_mapped_pages--;
+			g_web_page_versions[guest_page].fetch_add(1, std::memory_order_relaxed);
 			const u32 host_page_index = reinterpret_cast<uptr>(host_page) >> 12;
 
 			if (g_web_reverse_pages[host_page_index] == guest_page + 1)
@@ -180,6 +219,7 @@ namespace vm
 			if (is_write)
 			{
 				std::memcpy(guest, bytes + offset, chunk);
+				g_web_page_versions[current >> 12].fetch_add(1, std::memory_order_relaxed);
 			}
 			else
 			{
@@ -2319,6 +2359,7 @@ namespace vm
 					case 16: atomic_storage<u128>::release(*static_cast<u128*>(dst), *static_cast<u128*>(src)); break;
 					}
 
+					note_write(addr, size);
 					return true;
 				}
 			}
@@ -2331,6 +2372,7 @@ namespace vm
 #endif
 
 			std::memcpy(dst, src, size);
+			if (is_write) note_write(addr, size);
 			return true;
 		}
 

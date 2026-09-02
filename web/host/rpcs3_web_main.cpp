@@ -136,10 +136,17 @@ namespace
 {
 	using web_v128 = u8 __attribute__((vector_size(16)));
 
+	// PPU AOT memory accesses: an access inside one mapped page is a direct (unaligned) wasm
+	// load or store; only page-crossing accesses take the per-page copy loop
 	template <typename T>
 	T read_guest_raw(u32 addr) noexcept
 	{
 		T value{};
+		if ((addr & 0xfff) + sizeof(T) <= 0x1000) [[likely]]
+		{
+			std::memcpy(&value, vm::web_ptr(addr), sizeof(T));
+			return value;
+		}
 		vm::web_copy_range(addr, &value, sizeof(value), false);
 		return value;
 	}
@@ -147,6 +154,12 @@ namespace
 	template <typename T>
 	void write_guest_raw(u32 addr, T value) noexcept
 	{
+		if ((addr & 0xfff) + sizeof(T) <= 0x1000) [[likely]]
+		{
+			std::memcpy(vm::web_ptr(addr), &value, sizeof(T));
+			vm::web_note_write(addr, sizeof(T));
+			return;
+		}
 		vm::web_copy_range(addr, &value, sizeof(value), true);
 	}
 
@@ -599,8 +612,8 @@ extern "C"
 		if (auto* render = dynamic_cast<WebGPUDirectGSRender*>(g_fxo->try_get<rsx::thread>()))
 		{
 			const auto& s = render->m_stats;
-			buffer = fmt::format("{\"draws\":%llu,\"drawsSkipped\":%llu,\"clears\":%llu,\"programs\":%llu,\"pipelines\":%llu,\"textureUploads\":%llu,\"textureHits\":%llu,\"surfaceHits\":%llu,\"surfaceOps\":%llu,\"translationFailures\":%llu,\"unsupported\":%llu}",
-				s.draws, s.draws_skipped, s.clears, s.programs, s.pipelines, s.texture_uploads, s.texture_hits, s.surface_hits, s.surface_ops, s.translation_failures, s.unsupported);
+			buffer = fmt::format("{\"draws\":%llu,\"drawsSkipped\":%llu,\"clears\":%llu,\"programs\":%llu,\"pipelines\":%llu,\"textureUploads\":%llu,\"textureInvalidations\":%llu,\"textureHits\":%llu,\"surfaceHits\":%llu,\"surfaceOps\":%llu,\"translationFailures\":%llu,\"unsupported\":%llu}",
+				s.draws, s.draws_skipped, s.clears, s.programs, s.pipelines, s.texture_uploads, s.texture_invalidations, s.texture_hits, s.surface_hits, s.surface_ops, s.translation_failures, s.unsupported);
 		}
 		return buffer.c_str();
 	}

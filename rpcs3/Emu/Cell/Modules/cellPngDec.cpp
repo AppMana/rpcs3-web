@@ -785,6 +785,7 @@ error_code pngDecodeData(ppu_thread& ppu, PHandle handle, PStream stream, vm::pt
 	// Get the number of iTXt, tEXt and zTXt chunks
 	const s32 text_chunks = png_get_text(stream->png_ptr, stream->info_ptr, nullptr, nullptr);
 
+	vm::note_write(data.addr(), stream->out_param.outputHeight * bytes_per_line);
 	// Set the chunk information and the previously obtained number of text chunks
 	data_out_info->numText = static_cast<u32>(text_chunks);
 	data_out_info->chunkInformation = pngDecGetChunkInformation(stream.get_ptr(), true);

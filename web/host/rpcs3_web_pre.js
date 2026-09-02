@@ -242,7 +242,11 @@ if (typeof self !== "undefined" && typeof self.addEventListener === "function") 
       self.__rpcs3GpuCanvas = canvas;
       Module["preinitializedWebGPUDevice"] = device;
       // WGSL translation for the direct backend (rpcs3-webgpu-renderer.mjs translateRsxProgram)
-      self.__rpcs3Translator = await import(new URL("../rpcs3-webgpu-renderer.mjs", import.meta.url).href);
+      // The renderer module sits at the site root; the core may be staged under core/ or core/profile/
+      const coreUrl = new URL(import.meta.url);
+      const coreIndex = coreUrl.pathname.indexOf("/core/");
+      const translatorUrl = coreIndex >= 0 ? new URL(coreUrl.pathname.slice(0, coreIndex) + "/rpcs3-webgpu-renderer.mjs", coreUrl) : new URL("../rpcs3-webgpu-renderer.mjs", coreUrl);
+      self.__rpcs3Translator = await import(translatorUrl.href);
       if (!Module["specialHTMLTargets"]) throw new Error("specialHTMLTargets is not exported to the worker");
       Module["specialHTMLTargets"]["#rpcs3-canvas"] = canvas;
       const info = adapter.info || {};

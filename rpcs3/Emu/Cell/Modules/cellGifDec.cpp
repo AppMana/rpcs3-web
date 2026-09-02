@@ -578,6 +578,7 @@ error_code cellGifDecDecodeData(vm::ptr<GifDecoder> mainHandle, vm::cptr<GifStre
 		return CELL_GIFDEC_ERROR_ARG;
 	}
 
+	vm::note_write(data.addr(), static_cast<u32>(std::max<usz>(image_size, static_cast<usz>(height) * bytesPerLine)));
 	dataOutInfo->status = CELL_GIFDEC_DEC_STATUS_FINISH;
 	dataOutInfo->recordType = CELL_GIFDEC_RECORD_TYPE_IMAGE_DESC;
 

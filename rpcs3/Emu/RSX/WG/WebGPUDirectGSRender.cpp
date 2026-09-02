@@ -283,24 +283,6 @@ struct BlitOut { @builtin(position) position: vec4f, @location(0) uv: vec2f };
 		return true;
 	}
 
-	u64 hash_guest_range(u32 address, usz size)
-	{
-		XXH64_state_t* state = XXH64_createState();
-		XXH64_reset(state, 0);
-		usz hashed = 0;
-		while (hashed < size)
-		{
-			const u32 current = address + static_cast<u32>(hashed);
-			const usz chunk = std::min<usz>(size - hashed, 0x1000 - (current & 0xfff));
-			const void* source = vm::base(current);
-			if (!source) break;
-			XXH64_update(state, source, chunk);
-			hashed += chunk;
-		}
-		const u64 result = XXH64_digest(state);
-		XXH64_freeState(state);
-		return result;
-	}
 }
 
 // The hosting worker's JS keeps the presentation canvas (rpcs3_web_pre.js rpcs3PrepareGpu).
@@ -455,6 +437,7 @@ void WebGPUDirectGSRender::on_exit()
 	m_surface_ops.ops.clear();
 	for (auto& [id, surface] : m_surfaces)
 	{
+		release_surface_copies(surface);
 		if (surface.view) wgpuTextureViewRelease(surface.view);
 		if (surface.texture) wgpuTextureRelease(surface.texture);
 	}
@@ -526,6 +509,9 @@ void WebGPUDirectGSRender::end_pass()
 void WebGPUDirectGSRender::submit()
 {
 	end_pass();
+	flush_ring(m_uniform_ring);
+	flush_ring(m_stream_ring);
+	flush_ring(m_index_ring);
 	if (m_encoder)
 	{
 		WGPUCommandBuffer commands = wgpuCommandEncoderFinish(m_encoder, nullptr);
@@ -558,14 +544,37 @@ u64 WebGPUDirectGSRender::ring_allocate(ring_buffer& ring, u64 bytes, WGPUBuffer
 		descriptor.usage = usage | WGPUBufferUsage_CopyDst;
 		descriptor.size = size;
 		WGPUBuffer buffer = wgpuDeviceCreateBuffer(m_device, &descriptor);
-		if (ring.buffer) m_retired_buffers.push_back(ring.buffer);
+		if (ring.buffer)
+		{
+			// The bytes staged for the previous buffer reach it before this frame's commands
+			flush_ring(ring);
+			m_retired_buffers.push_back(ring.buffer);
+		}
 		ring.buffer = buffer;
 		ring.size = size;
 		ring.offset = 0;
+		ring.staging.resize(size);
 	}
 	const u64 offset = ring.offset;
 	ring.offset += needed;
 	return offset;
+}
+
+void WebGPUDirectGSRender::ring_write(ring_buffer& ring, u64 offset, const void* data, usz size)
+{
+	std::memcpy(ring.staging.data() + offset, data, size);
+}
+
+// One queue write per ring and frame instead of one per draw and section: every emdawnwebgpu
+// call crosses into JS, and the profile showed the per-draw writes above the draw work itself
+void WebGPUDirectGSRender::flush_ring(ring_buffer& ring)
+{
+	if (ring.buffer && ring.offset > ring.flushed)
+	{
+		const u64 end = std::min<u64>(utils::align(ring.offset, 4), ring.size);
+		wgpuQueueWriteBuffer(m_queue, ring.buffer, ring.flushed, ring.staging.data() + ring.flushed, end - ring.flushed);
+	}
+	ring.flushed = 0;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -686,7 +695,7 @@ void WebGPUDirectGSRender::copy_surface(gpu_surface& source, gpu_surface& target
 		rect[0] = static_cast<f32>(sx1) / source.width; rect[1] = static_cast<f32>(sy1) / source.height;
 		rect[2] = static_cast<f32>(sx2) / source.width; rect[3] = static_cast<f32>(sy2) / source.height;
 	}
-	wgpuQueueWriteBuffer(m_queue, m_uniform_ring.buffer, rect_offset, rect, sizeof(rect));
+	ring_write(m_uniform_ring, rect_offset, rect, sizeof(rect));
 
 	WGPURenderPipeline pipeline = get_blit_pipeline(target.format, depth);
 	WGPURenderPassColorAttachment color{};
@@ -798,6 +807,7 @@ void WebGPUDirectGSRender::apply_surface_ops()
 			if (auto surface = surface_by_id(op.id))
 			{
 				end_pass();
+				release_surface_copies(*surface);
 				m_retired_views.push_back(surface->view);
 				m_retired_textures.push_back(surface->texture);
 				m_surfaces.erase(op.id);
@@ -1269,18 +1279,27 @@ WebGPUDirectGSRender::gpu_texture* WebGPUDirectGSRender::upload_texture(const rs
 		return nullptr;
 	}
 
-	// Content keyed like the packet renderer: descriptor plus a hash of the guest bytes
-	const u64 content = hash_guest_range(address, size);
-	XXH64_state_t* state = XXH64_createState();
-	XXH64_reset(state, content);
-	XXH64_update(state, &record, sizeof(record) - 8);
-	const u64 key = XXH64_digest(state);
-	XXH64_freeState(state);
+	// Keyed by placement (descriptor, address, size). The upload stays valid while the write
+	// versions of its guest pages are unchanged (vm::web_page_version_sum): every guest write
+	// path bumps them, which is what RPCS3's texture cache gets from page protection.
+	struct placement_key { rsx::webgpu::texture_packet_record record; u32 address; u32 size; } placement{ record, address, size };
+	std::memset(reinterpret_cast<u8*>(&placement.record) + sizeof(record) - 8, 0, 8);
+	const u64 key = XXH64(&placement, sizeof(placement), 0);
+	const u64 version = vm::web_page_version_sum(address, size);
 	if (const auto found = m_textures.find(key); found != m_textures.end())
 	{
-		found->second.last_use = m_frame_serial;
-		m_stats.texture_hits++;
-		return &found->second;
+		if (found->second.version == version)
+		{
+			found->second.last_use = m_frame_serial;
+			m_stats.texture_hits++;
+			return &found->second;
+		}
+		// The guest wrote these pages since the upload: decode again
+		m_retired_views.push_back(found->second.view);
+		m_retired_textures.push_back(found->second.texture);
+		m_texture_bytes -= found->second.bytes;
+		m_textures.erase(found);
+		m_stats.texture_invalidations++;
 	}
 
 	const bool cube = record.dimension == 2;
@@ -1307,9 +1326,11 @@ WebGPUDirectGSRender::gpu_texture* WebGPUDirectGSRender::upload_texture(const rs
 	caps.supports_dxt = true;
 	caps.alignment = 256;
 
-	// Guest bytes staged contiguously (8-byte aligned for the decoder's span casts)
-	std::vector<u64> guest((size + 7) / 8 + 1);
-	if (!copy_guest_range(reinterpret_cast<std::byte*>(guest.data()), address, size))
+	// Guest bytes staged contiguously, 16-byte aligned: the decoder casts spans to the block type
+	// (DXT3/5 blocks are 16 bytes) and requires natural alignment of pointer and size
+	m_guest_staging.resize(utils::align<usz>(size, 16) + 16);
+	std::byte* guest_bytes = reinterpret_cast<std::byte*>(utils::align(reinterpret_cast<uptr>(m_guest_staging.data()), 16));
+	if (!copy_guest_range(guest_bytes, address, size))
 	{
 		wgpuTextureRelease(result.texture);
 		return nullptr;
@@ -1324,16 +1345,16 @@ WebGPUDirectGSRender::gpu_texture* WebGPUDirectGSRender::upload_texture(const rs
 	default: break;
 	}
 	// The sparse web page table cannot hand out flat guest spans: layouts over the staged copy
-	const auto layouts = rsx::get_subresources_layout(reinterpret_cast<const std::byte*>(guest.data()), gcm_format,
+	const auto layouts = rsx::get_subresources_layout(guest_bytes, gcm_format,
 		static_cast<u16>(record.width), layout_height, layout_depth, layout_layers, static_cast<u16>(mip_count), record.pitch, swizzled, !texture.border_type());
-	std::vector<u64> staging;
 	for (const auto& layout : layouts)
 	{
 		if (layout.level >= descriptor.mipLevelCount) continue;
 		const u32 row_pitch = utils::align(layout.width_in_block * block_bytes, 256u);
 		const usz bytes = static_cast<usz>(row_pitch) * layout.height_in_block * std::max<u16>(layout.depth, 1);
-		staging.assign((bytes + 7) / 8 + 1, 0);
-		std::span<std::byte> staging_span(reinterpret_cast<std::byte*>(staging.data()), bytes);
+		m_decode_staging.resize(utils::align<usz>(bytes, 16) + 16);
+		std::byte* staging_bytes = reinterpret_cast<std::byte*>(utils::align(reinterpret_cast<uptr>(m_decode_staging.data()), 16));
+		std::span<std::byte> staging_span(staging_bytes, bytes);
 		rsx::io_buffer buffer(staging_span);
 		rsx::upload_texture_subresource(buffer, layout, gcm_format, swizzled, caps);
 		WGPUTexelCopyTextureInfo destination{ result.texture, layout.level, { 0, 0, layout.layer }, WGPUTextureAspect_All };
@@ -1342,7 +1363,7 @@ WebGPUDirectGSRender::gpu_texture* WebGPUDirectGSRender::upload_texture(const rs
 		const u32 mip_height = std::max<u32>(record.height >> layout.level, 1);
 		WGPUExtent3D extent{ std::min<u32>(mip_width, layout.width_in_block * block_texels), std::min<u32>(mip_height, layout.height_in_block * block_texels),
 			record.dimension == 3 ? std::max<u32>(layout.depth, 1) : 1u };
-		wgpuQueueWriteTexture(m_queue, &destination, staging.data(), bytes, &data_layout, &extent);
+		wgpuQueueWriteTexture(m_queue, &destination, staging_bytes, bytes, &data_layout, &extent);
 		result.bytes += static_cast<u32>(bytes);
 	}
 
@@ -1355,6 +1376,7 @@ WebGPUDirectGSRender::gpu_texture* WebGPUDirectGSRender::upload_texture(const rs
 	view_descriptor.aspect = WGPUTextureAspect_All;
 	result.view = wgpuTextureCreateView(result.texture, &view_descriptor);
 	result.last_use = m_frame_serial;
+	result.version = version;
 	m_texture_bytes += result.bytes;
 	m_stats.texture_uploads++;
 
@@ -1396,33 +1418,12 @@ WebGPUDirectGSRender::sampled_texture WebGPUDirectGSRender::resolve_texture(cons
 	result.dimension = static_cast<u8>(record.dimension & 3);
 	const u32 gcm_format = record.format & ~(CELL_GCM_TEXTURE_LN | CELL_GCM_TEXTURE_UN);
 
-	// A texture that is exactly a render target of the store (surface_store::get_surface_at with
-	// texture_cache_helpers::check_framebuffer_resource in rsx::surface_metrics::samples)
-	if (result.dimension == 1)
+	// Render targets of the store as textures: whole surfaces, row-aligned sub-rectangles and 3D
+	// slice stacks (the texture cache's surface path), before any guest-memory upload
+	if ((result.dimension == 1 || result.dimension == 3) && alias_surface_texture(record, address, gcm_format, result))
 	{
-		if (auto surface = m_rtts.get_surface_at(address); surface && !surface->is_depth_surface())
-		{
-			if (auto image = surface_by_id(surface->id))
-			{
-				const u32 sample_width = image->surface_width * image->samples_x;
-				const u32 sample_height = image->surface_height * image->samples_y;
-				const bool pitch_ok = record.height == 1 || record.pitch == image->pitch;
-				const bool format_ok = (gcm_format == CELL_GCM_TEXTURE_A8R8G8B8 && image->format == WGPUTextureFormat_BGRA8Unorm) ||
-					(gcm_format == CELL_GCM_TEXTURE_B8 && image->format == WGPUTextureFormat_R8Unorm) ||
-					(gcm_format == CELL_GCM_TEXTURE_G8B8 && image->format == WGPUTextureFormat_RG8Unorm) ||
-					(gcm_format == CELL_GCM_TEXTURE_W16_Z16_Y16_X16_FLOAT && image->format == WGPUTextureFormat_RGBA16Float) ||
-					(gcm_format == CELL_GCM_TEXTURE_W32_Z32_Y32_X32_FLOAT && image->format == WGPUTextureFormat_RGBA32Float) ||
-					(gcm_format == CELL_GCM_TEXTURE_X32_FLOAT && image->format == WGPUTextureFormat_R32Float);
-				if (pitch_ok && format_ok && record.width == sample_width && record.height == sample_height)
-				{
-					result.view = image->view;
-					result.sampler = get_sampler(record.address_modes, record.filter_modes, 1);
-					result.swizzle = compose_swizzle(surface_native_map(image->rsx_format), record.remap);
-					m_stats.surface_hits++;
-					return result;
-				}
-			}
-		}
+		m_stats.surface_hits++;
+		return result;
 	}
 
 	if (auto uploaded = upload_texture(texture, record, address, size))
@@ -1437,6 +1438,146 @@ WebGPUDirectGSRender::sampled_texture WebGPUDirectGSRender::resolve_texture(cons
 	result.view = null_texture_view(result.dimension);
 	result.sampler = null_sampler();
 	return result;
+}
+
+void WebGPUDirectGSRender::release_surface_copies(gpu_surface& surface)
+{
+	for (auto& [key, region] : surface.regions)
+	{
+		m_retired_views.push_back(region.view);
+		m_retired_textures.push_back(region.texture);
+	}
+	surface.regions.clear();
+	if (surface.scratch.texture)
+	{
+		m_retired_views.push_back(surface.scratch.view);
+		m_retired_textures.push_back(surface.scratch.texture);
+		surface.scratch = {};
+	}
+}
+
+bool WebGPUDirectGSRender::alias_surface_texture(const rsx::webgpu::texture_packet_record& record, u32 address, u32 gcm_format, sampled_texture& result)
+{
+	// vk::get_compatible_sampler_format of the texture must be the surface's image format
+	const WGPUTextureFormat expected = texture_format(gcm_format);
+	if (expected == WGPUTextureFormat_Undefined) return false;
+	const u32 depth = record.dimension == 3 ? std::max<u32>(record.depth, 1) : 1;
+
+	gpu_surface* hit = nullptr;
+	u32 hit_id = 0;
+	u32 row_offset = 0;
+	m_rtts.for_each_overlapping(rsx::address_range32::start_length(address, 1), [&](rsx::webgpu::render_target* surface)
+	{
+		if (hit || surface->is_depth_surface()) return;
+		auto image = surface_by_id(surface->id);
+		if (!image || image->format != expected || !image->pitch) return;
+		// texture_cache_helpers::check_framebuffer_resource compares in rsx::surface_metrics::samples
+		const u32 sample_width = image->surface_width * image->samples_x;
+		const u32 sample_height = image->surface_height * image->samples_y;
+		const u64 span = static_cast<u64>(image->pitch) * sample_height;
+		if (address < image->address || address >= image->address + span) return;
+		const u32 offset = address - image->address;
+		if (offset % image->pitch != 0) return;
+		// rsx::pitch_compatible: a single-row texture matches any pitch, otherwise pitches must agree
+		if (record.pitch && record.height != 1 && record.pitch != image->pitch) return;
+		const u32 row = offset / image->pitch;
+		if (record.width > sample_width || row + record.height * depth > sample_height) return;
+		hit = image;
+		hit_id = surface->id;
+		row_offset = row;
+	});
+	if (!hit) return false;
+
+	result.sampler = get_sampler(record.address_modes, record.filter_modes, 1);
+	result.swizzle = compose_swizzle(surface_native_map(hit->rsx_format), record.remap);
+	const bool whole = row_offset == 0 && depth == 1 && record.width == hit->surface_width * hit->samples_x && record.height == hit->surface_height * hit->samples_y;
+
+	// A target of this very draw cannot be bound as a texture of the same pass: sample a scratch copy
+	bool cyclic = false;
+	for (const auto& bound : m_rtts.m_bound_render_targets)
+	{
+		if (bound.second && bound.second->id == hit_id) cyclic = true;
+	}
+	if (whole && !cyclic)
+	{
+		result.view = hit->view;
+		return true;
+	}
+
+	end_pass();
+	if (whole)
+	{
+		if (!hit->scratch.texture)
+		{
+			WGPUTextureDescriptor descriptor{};
+			descriptor.label = sv("RPCS3 RSX surface scratch");
+			descriptor.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+			descriptor.dimension = WGPUTextureDimension_2D;
+			descriptor.size = { hit->width, hit->height, 1 };
+			descriptor.format = hit->format;
+			descriptor.mipLevelCount = 1;
+			descriptor.sampleCount = 1;
+			hit->scratch.texture = wgpuDeviceCreateTexture(m_device, &descriptor);
+			hit->scratch.view = wgpuTextureCreateView(hit->scratch.texture, nullptr);
+			hit->scratch.width = hit->width;
+			hit->scratch.height = hit->height;
+		}
+		WGPUTexelCopyTextureInfo src{ hit->texture, 0, { 0, 0, 0 }, WGPUTextureAspect_All };
+		WGPUTexelCopyTextureInfo dst{ hit->scratch.texture, 0, { 0, 0, 0 }, WGPUTextureAspect_All };
+		WGPUExtent3D extent{ hit->width, hit->height, 1 };
+		wgpuCommandEncoderCopyTextureToTexture(encoder(), &src, &dst, &extent);
+		result.view = hit->scratch.view;
+		return true;
+	}
+
+	// Rows and sizes are guest samples; the copy is taken in image pixels scaled like the surface
+	const f32 scale_x = static_cast<f32>(hit->width) / hit->surface_width;
+	const f32 scale_y = static_cast<f32>(hit->height) / hit->surface_height;
+	const u32 region_width = std::max<u32>(1, static_cast<u32>(std::lround((static_cast<f32>(record.width) / hit->samples_x) * scale_x)));
+	const u32 region_height = std::max<u32>(1, static_cast<u32>(std::lround((static_cast<f32>(record.height) / hit->samples_y) * scale_y)));
+	const u32 region_row = static_cast<u32>(std::lround((static_cast<f32>(row_offset) / hit->samples_y) * scale_y));
+	const std::string key = fmt::format("%u:%ux%ux%u", row_offset, record.width, record.height, depth);
+	auto& region = hit->regions[key];
+	if (region.texture && (region.width != region_width || region.height != region_height || region.depth != depth))
+	{
+		m_retired_views.push_back(region.view);
+		m_retired_textures.push_back(region.texture);
+		region = {};
+	}
+	if (!region.texture)
+	{
+		WGPUTextureDescriptor descriptor{};
+		descriptor.label = sv("RPCS3 RSX surface region");
+		descriptor.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+		descriptor.dimension = depth > 1 ? WGPUTextureDimension_3D : WGPUTextureDimension_2D;
+		descriptor.size = { region_width, region_height, depth };
+		descriptor.format = hit->format;
+		descriptor.mipLevelCount = 1;
+		descriptor.sampleCount = 1;
+		region.texture = wgpuDeviceCreateTexture(m_device, &descriptor);
+		WGPUTextureViewDescriptor view_descriptor{};
+		view_descriptor.format = hit->format;
+		view_descriptor.dimension = depth > 1 ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2D;
+		view_descriptor.mipLevelCount = 1;
+		view_descriptor.arrayLayerCount = 1;
+		view_descriptor.aspect = WGPUTextureAspect_All;
+		region.view = wgpuTextureCreateView(region.texture, &view_descriptor);
+		region.width = region_width;
+		region.height = region_height;
+		region.depth = depth;
+	}
+	region.row = region_row;
+	for (u32 slice = 0; slice < depth; slice++)
+	{
+		const u32 source_row = region_row + slice * region_height;
+		if (source_row + region_height > hit->height || region_width > hit->width) break;
+		WGPUTexelCopyTextureInfo src{ hit->texture, 0, { 0, source_row, 0 }, WGPUTextureAspect_All };
+		WGPUTexelCopyTextureInfo dst{ region.texture, 0, { 0, 0, slice }, WGPUTextureAspect_All };
+		WGPUExtent3D extent{ region_width, region_height, 1 };
+		wgpuCommandEncoderCopyTextureToTexture(encoder(), &src, &dst, &extent);
+	}
+	result.view = region.view;
+	return true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1507,8 +1648,10 @@ void WebGPUDirectGSRender::end()
 	const u32 alpha_func = state.alpha_test_enabled ? (state.alpha_func & 7) : 0xff;
 	const u32 target_count = static_cast<u32>(targets.colors.size());
 
-	const u64 vp_hash = XXH64(current_vertex_program.data.data(), current_vertex_program.data.size() * sizeof(u32), 0);
-	const u64 fp_hash = XXH64(current_fragment_program.get_data(), current_fragment_program.ucode_length, 0);
+	// RPCS3's ucode hashes: the fragment hash skips the inline constants, which the draw
+	// supplies through the fragment uniform (fragment_program_utils::get_fragment_program_ucode_hash)
+	const u64 vp_hash = program_hash_util::vertex_program_utils::get_vertex_program_ucode_hash(current_vertex_program);
+	const u64 fp_hash = program_hash_util::fragment_program_utils::get_fragment_program_ucode_hash(current_fragment_program);
 	const std::string program_key = fmt::format("%llx:%u:%x:%x:%llx:%x:%s:%u:%x", vp_hash, current_vertex_program.entry, current_vertex_program.ctrl,
 		rsx::method_registers.vertex_attrib_output_mask(), fp_hash, rsx::method_registers.shader_control(),
 		fmt::format("%s|%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d", swizzles, dimensions[0], dimensions[1], dimensions[2], dimensions[3], dimensions[4], dimensions[5], dimensions[6], dimensions[7],
@@ -1566,12 +1709,15 @@ void WebGPUDirectGSRender::end()
 
 		// Vertex streams and uniforms (the same RPCS3 draw-processor data the packet backend ships)
 		const auto requirements = calculate_memory_requirements(m_vertex_layout, upload.first_vertex, upload.allocated_vertex_count);
-		std::vector<std::byte> persistent(requirements.first);
-		std::vector<std::byte> transient(requirements.second);
+		auto& persistent = m_draw_persistent;
+		auto& transient = m_draw_transient;
+		persistent.resize(requirements.first);
+		transient.resize(requirements.second);
 		m_draw_processor.write_vertex_data_to_memory(m_vertex_layout, upload.first_vertex, upload.allocated_vertex_count,
 			persistent.empty() ? nullptr : persistent.data(), transient.empty() ? nullptr : transient.data());
 
-		std::vector<std::byte> vertex_state(vertex_state_bytes);
+		auto& vertex_state = m_draw_vertex_state;
+		vertex_state.assign(vertex_state_bytes, std::byte{});
 		m_draw_processor.fill_scale_offset_data(vertex_state.data(), false);
 		m_draw_processor.fill_user_clip_data(vertex_state.data() + 64);
 		*reinterpret_cast<u32*>(vertex_state.data() + 68) = rsx::method_registers.transform_branch_bits();
@@ -1584,7 +1730,8 @@ void WebGPUDirectGSRender::end()
 		layout_words[1] = upload.vertex_index_offset;
 		m_draw_processor.fill_vertex_layout_state(m_vertex_layout, current_vp_metadata, upload.first_vertex, upload.allocated_vertex_count, reinterpret_cast<s32*>(layout_words + 4), 0, 0);
 
-		std::vector<std::byte> fragment_state(fragment_state_bytes);
+		auto& fragment_state = m_draw_fragment_state;
+		fragment_state.assign(fragment_state_bytes, std::byte{});
 		m_draw_processor.fill_fragment_state_buffer(fragment_state.data(), current_fragment_program);
 		if (program.constant_count)
 		{
@@ -1595,17 +1742,17 @@ void WebGPUDirectGSRender::end()
 		}
 
 		const u64 uniform_offset = ring_allocate(m_uniform_ring, vertex_state_stride + fragment_state_stride, WGPUBufferUsage_Uniform, "RPCS3 RSX uniforms");
-		wgpuQueueWriteBuffer(m_queue, m_uniform_ring.buffer, uniform_offset, vertex_state.data(), vertex_state.size());
-		wgpuQueueWriteBuffer(m_queue, m_uniform_ring.buffer, uniform_offset + vertex_state_stride, fragment_state.data(), fragment_state.size());
+		ring_write(m_uniform_ring, uniform_offset, vertex_state.data(), vertex_state.size());
+		ring_write(m_uniform_ring, uniform_offset + vertex_state_stride, fragment_state.data(), fragment_state.size());
 		const u64 persistent_offset = ring_allocate(m_stream_ring, std::max<usz>(persistent.size(), 16), WGPUBufferUsage_Storage, "RPCS3 RSX vertex streams");
-		if (!persistent.empty()) wgpuQueueWriteBuffer(m_queue, m_stream_ring.buffer, persistent_offset, persistent.data(), utils::align(persistent.size(), 4));
+		if (!persistent.empty()) ring_write(m_stream_ring, persistent_offset, persistent.data(), persistent.size());
 		const u64 transient_offset = ring_allocate(m_stream_ring, std::max<usz>(transient.size(), 16), WGPUBufferUsage_Storage, "RPCS3 RSX vertex streams");
-		if (!transient.empty()) wgpuQueueWriteBuffer(m_queue, m_stream_ring.buffer, transient_offset, transient.data(), utils::align(transient.size(), 4));
+		if (!transient.empty()) ring_write(m_stream_ring, transient_offset, transient.data(), transient.size());
 		u64 index_offset = 0;
 		if (upload.indexed)
 		{
 			index_offset = ring_allocate(m_index_ring, upload.indices.size(), WGPUBufferUsage_Index, "RPCS3 RSX indices");
-			wgpuQueueWriteBuffer(m_queue, m_index_ring.buffer, index_offset, upload.indices.data(), utils::align(upload.indices.size(), 4));
+			ring_write(m_index_ring, index_offset, upload.indices.data(), upload.indices.size());
 		}
 
 		// Bind group of this draw
@@ -1808,7 +1955,7 @@ void WebGPUDirectGSRender::clear_surface(u32 mask)
 	const u64 offset = ring_allocate(m_uniform_ring, 32, WGPUBufferUsage_Uniform, "RPCS3 RSX uniforms");
 	const f32 values[8] = { state.clear_color[0], state.clear_color[1], state.clear_color[2], state.clear_color[3],
 		(state.clear_mask & RSX_GCM_CLEAR_DEPTH_BIT) ? state.clear_depth : 1.f, 0.f, 0.f, 0.f };
-	wgpuQueueWriteBuffer(m_queue, m_uniform_ring.buffer, offset, values, sizeof(values));
+	ring_write(m_uniform_ring, offset, values, sizeof(values));
 	WGPURenderPipeline pipeline = get_clear_pipeline(targets, write_mask, depth_write);
 	WGPUBindGroupEntry entry{};
 	entry.binding = 0;
@@ -1867,7 +2014,7 @@ void WebGPUDirectGSRender::flip(const rsx::display_flip_info_t& info)
 				// Present: the display buffer blitted into the canvas texture, nearest filtered
 				const u64 rect_offset = ring_allocate(m_uniform_ring, 16, WGPUBufferUsage_Uniform, "RPCS3 RSX uniforms");
 				const f32 rect[4] = { 0.f, 0.f, 1.f, 1.f };
-				wgpuQueueWriteBuffer(m_queue, m_uniform_ring.buffer, rect_offset, rect, sizeof(rect));
+				ring_write(m_uniform_ring, rect_offset, rect, sizeof(rect));
 				WGPURenderPipeline pipeline = get_blit_pipeline(WGPUTextureFormat_BGRA8Unorm, false);
 				std::array<WGPUBindGroupEntry, 3> entries{};
 				entries[0].binding = 0; entries[0].textureView = display->view;

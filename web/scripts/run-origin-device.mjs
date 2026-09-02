@@ -161,11 +161,11 @@ try {
   const startedAt = Date.now();
   const result = await connection.evaluate(`(async () => {
     const result = await window.__rpcs3Runtime.run(${JSON.stringify(`fixtures/${fixtureName}`)}, {
-      frames: ${frameCount}, render: true, width: 320, height: 180, readback: false, presentLatestOnly: false, directRenderer: ${direct},
+      frames: ${frameCount}, render: true, width: 320, height: 180, readback: false, presentLatestOnly: false, directRenderer: ${direct}, keepRuntime: ${direct},
     });
     // Capture one final frame with readback for image evidence.
     const capture = await window.__rpcs3Runtime.run(${JSON.stringify(`fixtures/${fixtureName}`)}, {
-      frames: ${direct ? 3 : 1}, render: true, width: 320, height: 180, captureRgba: true, directRenderer: ${direct},
+      frames: ${direct ? 3 : 1}, render: true, width: 320, height: 180, captureRgba: true, directRenderer: ${direct}, keepRuntime: ${direct},
     });
     const frames = result.frames ?? [];
     const percentile = (values, fraction) => { const sorted = [...values].sort((a, b) => a - b); return sorted[Math.min(sorted.length - 1, Math.floor(fraction * sorted.length))]; };
@@ -188,7 +188,8 @@ try {
       captureMs: { p50: percentile(steady.map((f) => f.captureMs), 0.5), p95: percentile(steady.map((f) => f.captureMs), 0.95) },
       gpuTimings: frames.at(-1)?.gpu?.timings,
       workingSet: frames.at(-1)?.workingSet,
-      shutdown: result.shutdown && { stoppedCleanly: result.shutdown.stoppedCleanly, stopMs: result.shutdown.stopMs, liveThreadNames: result.shutdown.liveThreadNames, stackReport: result.shutdown.stackReport, workingSet: result.shutdown.workingSet },
+      captureModuleCreateMs: capture.moduleCreateMs,
+      shutdown: result.shutdown && { kept: result.shutdown.kept, stoppedCleanly: result.shutdown.stoppedCleanly, stopMs: result.shutdown.stopMs, liveThreadNames: result.shutdown.liveThreadNames, stackReport: result.shutdown.stackReport, workingSet: result.shutdown.workingSet },
       capture: { frameHash: capture.gpu?.frameHash, changedPixels: capture.gpu?.changedPixels, width: capture.gpu?.width, height: capture.gpu?.height, rgbaBase64: capture.gpu?.rgbaBase64 },
     };
   })()`, true);

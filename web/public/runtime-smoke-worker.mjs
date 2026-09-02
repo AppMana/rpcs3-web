@@ -6,6 +6,8 @@ import { createSpuDispatcher } from "./rpcs3-spu-dispatcher.mjs";
 
 const scope = self;
 let module;
+let persistentMainInstance;
+let persistentMainMemory;
 let logs = [];
 let initialized = 0;
 let bootResult = -1;
@@ -489,10 +491,12 @@ scope.addEventListener("message", async (event) => {
       const shutdownStackReport = stackReport();
       const shutdownWorkingSet = workingSet();
       const liveThreadNames = module ? module.ccall("rpcs3_web_live_thread_names", "string", [], []).split("\n").filter(Boolean) : [];
-      module?.PThread?.terminateAllThreads();
+      const keepRuntime = event.data.keepRuntime === true && stoppedCleanly;
+      if (!keepRuntime) module?.PThread?.terminateAllThreads();
       scope.postMessage({
         type: "runtime-shutdown",
         ok: true,
+        kept: keepRuntime,
         stoppedCleanly,
         stopMs: performance.now() - stopStartedAt,
         stackReport: shutdownStackReport,
@@ -502,7 +506,7 @@ scope.addEventListener("message", async (event) => {
     } catch (error) {
       scope.postMessage({ type: "runtime-shutdown", ok: false, detail: detail(error) });
     }
-    scope.close();
+    if (!(event.data.keepRuntime === true)) scope.close();
     return;
   }
   if (event.data?.type === "texture-forget") {
@@ -552,10 +556,21 @@ scope.addEventListener("message", async (event) => {
       if (event.data.wasmUrl && name.endsWith(".wasm")) return event.data.wasmUrl;
       try { return new URL(name, coreUrl).href; } catch { return name; }
     };
-    const { default: createRPCS3 } = await import(coreUrl);
-    let mainInstance;
-    let mainMemory;
-    const [mainWasm, aotWasm, spuAotWasm] = await Promise.all([
+    // Persistent runtime: a second boot reuses the module, its shared memory, the pthread pool and
+    // the GPU worker (Safari does not release a 512 MiB shared memory promptly enough to allocate
+    // another one for the next run)
+    const reuse = Boolean(module) && event.data.reuse === true;
+    if (reuse) {
+      recordLog("persistent runtime: booting again in the existing module");
+      consumedFlips = module.ccall("rpcs3_webgpu_frame_counter", "number", [], []) >>> 0;
+      frameSequence = 0;
+      carriedSurfaceOps = [];
+      module.ccall("rpcs3_webgpu_clear", null, [], []);
+    }
+    const { default: createRPCS3 } = reuse ? { default: undefined } : await import(coreUrl);
+    let mainInstance = reuse ? persistentMainInstance : undefined;
+    let mainMemory = reuse ? persistentMainMemory : undefined;
+    const [mainWasm, aotWasm, spuAotWasm] = reuse ? [] : await Promise.all([
       event.data.ppuAot === true || event.data.spuAot === true || typeof event.data.ppuAotBundle === "string" || typeof event.data.spuAotBundle === "string"
         ? WebAssembly.compileStreaming(fetch(resolveCoreFile("rpcs3-web.wasm"))) : undefined,
       event.data.ppuAot === true
@@ -564,7 +579,7 @@ scope.addEventListener("message", async (event) => {
         ? WebAssembly.compileStreaming(fetch("./fixtures/web_dispatch_conformance-spu-aot.wasm")) : undefined,
     ]);
     const moduleCreateStartedAt = performance.now();
-    module = await createRPCS3({
+    if (!reuse) module = await createRPCS3({
       locateFile: resolveCoreFile,
       // Emscripten workers started up front; RPCS3's homebrew boot uses 7-8
       // threads and the pool grows on demand beyond this.
@@ -583,6 +598,8 @@ scope.addEventListener("message", async (event) => {
       } : {}),
     });
     moduleCreateMs = performance.now() - moduleCreateStartedAt;
+    persistentMainInstance = mainInstance;
+    persistentMainMemory = mainMemory;
     frameCounterAddress = module.ccall("rpcs3_webgpu_frame_counter_address", "number", [], []) >>> 0;
     atomicNotifyReentry = module.ccall("rpcs3_web_atomic_notify_reentry_probe", "number", [], []);
     let path = event.data.path;
@@ -601,8 +618,10 @@ scope.addEventListener("message", async (event) => {
       module.ccall("rpcs3_web_set_direct_renderer", null, ["number"], [1]);
       const flagAddress = module.ccall("rpcs3_web_rsx_spawn_flag_address", "number", [], []) >>> 0;
       module.rpcs3OnPresent = (data) => scope.postMessage({ type: "runtime-present", frame: data.frame, bitmap: data.rpcs3Present }, [data.rpcs3Present]);
-      directGpu = await module.rpcs3PrepareGpu(event.data.gpuCanvas, flagAddress);
-      recordLog(`direct WebGPU device ready on a pool worker: ${JSON.stringify(directGpu)}`);
+      if (!module.__rpcs3GpuWorker) {
+        directGpu = await module.rpcs3PrepareGpu(event.data.gpuCanvas, flagAddress);
+        recordLog(`direct WebGPU device ready on a pool worker: ${JSON.stringify(directGpu)}`);
+      }
     }
     initialized = module.ccall("rpcs3_web_init", "number", [], []);
     sparseVmProbe = module.ccall("rpcs3_web_sparse_vm_probe", "number", [], []);
@@ -633,7 +652,7 @@ scope.addEventListener("message", async (event) => {
         Number(entry.leftX ?? 128) >>> 0, Number(entry.leftY ?? 128) >>> 0, Number(entry.rightX ?? 128) >>> 0, Number(entry.rightY ?? 128) >>> 0,
       ]);
     }
-    if (typeof event.data.ppuAotBundle === "string") {
+    if (typeof event.data.ppuAotBundle === "string" && !reuse) {
       // Title bundle: compiled blocks placed in every worker's function table before boot, run by the PPU pthreads.
       const { loadPpuAotBundle } = await import("./rpcs3-ppu-aot-table.mjs");
       ppuAotTable = await loadPpuAotBundle({
@@ -644,7 +663,7 @@ scope.addEventListener("message", async (event) => {
         log: (line) => { recordLog(line); console.log(line); },
       });
     }
-    if (typeof event.data.spuAotBundle === "string") {
+    if (typeof event.data.spuAotBundle === "string" && !reuse) {
       const { loadSpuAotBundle } = await import("./rpcs3-spu-aot-table.mjs");
       spuAotTable = await loadSpuAotBundle({
         module,

@@ -96,7 +96,10 @@ if(RPCS3_WEB)
 	# import/export names that the PPU/SPU AOT side modules link against
 	# (env.memory, rpcs3_web_* exports). The profile variant additionally keeps
 	# the function name section for CPU profiles and traces.
-	target_link_options(rpcs3_web_runtime PRIVATE "-sASSERTIONS=1")
+	# STACK_OVERFLOW_CHECK=1 keeps the stack cookies but drops the address-zero probe: a host-side
+	# store of a wall-clock seconds value lands at wasm address 0 during LBP2 (harmless: static
+	# data starts at GLOBAL_BASE), and the probe aborts the runtime at the next thread exit.
+	target_link_options(rpcs3_web_runtime PRIVATE "-sASSERTIONS=1" "-sSTACK_OVERFLOW_CHECK=1")
 	if(RPCS3_WEB_PROFILE)
 		target_link_options(rpcs3_web_runtime PRIVATE
 			"-g1"
@@ -160,6 +163,7 @@ if(RPCS3_WEB)
 		"-sMAXIMUM_MEMORY=536870912"
 		"-sNO_EXIT_RUNTIME=1"
 		"-sASSERTIONS=1"
+		"-sSTACK_OVERFLOW_CHECK=1"
 		"-sWASM_BIGINT=1")
     return()
 endif()

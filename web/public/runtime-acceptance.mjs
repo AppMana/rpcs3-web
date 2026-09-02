@@ -20,6 +20,7 @@ function compactFrame(frame, keepDetail) {
 
 let active;
 let activeWorker;
+let persistentWorker;
 // Keep the device/context alive after run() resolves. A WebGPU canvas is a
 // presentation surface, not a retained bitmap; allowing the last device
 // reference to be collected can clear the compositor surface even though the
@@ -39,7 +40,9 @@ function setPad(state = {}) {
 // browser and where they write evidence.
 function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
   if (active) return active;
-  activeWorker?.terminate();
+  // A kept runtime (options.keepRuntime) is reused instead of terminated: Safari does not release a
+  // finished run's 512 MiB shared memory in time to allocate the next one.
+  if (activeWorker && activeWorker !== persistentWorker) activeWorker.terminate();
   active = new Promise((resolve, reject) => {
     const dispatchCompletion = options.completion === "dispatch";
     const bootPath = typeof target === "string" && target.startsWith("/") ? target : undefined;
@@ -73,13 +76,18 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
     // frame back as an ImageBitmap; the DOM canvas only displays it.
     const direct = options.directRenderer === true;
     const preparedGpu = options.render && !direct ? prepareWebGPU(canvas) : undefined;
-    const directCanvas = direct ? new OffscreenCanvas(canvas.width, canvas.height) : undefined;
+    const reuse = options.keepRuntime === true && Boolean(persistentWorker);
+    const directCanvas = direct && !reuse ? new OffscreenCanvas(canvas.width, canvas.height) : undefined;
     const directView = direct ? canvas.getContext("bitmaprenderer") : undefined;
     const directScratch = direct ? document.createElement("canvas") : undefined;
     let presentedFrames = 0;
     let presentedHash = 0;
+    const frameImages = [];
+    const captureEvery = Number.isInteger(options.captureEvery) && options.captureEvery > 0 ? options.captureEvery : 0;
     if (directScratch) { directScratch.width = canvas.width; directScratch.height = canvas.height; }
-    const worker = new Worker("./runtime-smoke-worker.mjs", { type: "module" });
+    const worker = reuse ? persistentWorker : new Worker("./runtime-smoke-worker.mjs", { type: "module" });
+    persistentWorker = undefined;
+    if (reuse && worker.__rpcs3Handler) worker.removeEventListener("message", worker.__rpcs3Handler);
     activeWorker = worker;
     const events = [];
     const frames = [];
@@ -89,7 +97,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       reject(new Error(`real RPCS3 runtime timed out; events=${JSON.stringify(events.slice(-40))}`));
     }, timeoutMs);
     let frameRequestedAt = performance.now();
-    worker.addEventListener("message", async (event) => {
+    worker.addEventListener("message", worker.__rpcs3Handler = async (event) => {
       if (event.data?.type === "runtime-present") {
         const bitmap = event.data.bitmap;
         presentedFrames += 1;
@@ -194,6 +202,10 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
           if (direct) {
             gpu = { direct: true, presented: presentedFrames, frameHash: presentedHash, device: event.data.directGpu, stats: event.data.directStats, width: directScratch.width, height: directScratch.height };
             const finalFrameExpected = frames.length + 1 >= requestedFrames;
+            if (captureEvery && presentedFrames > 0 && (frames.length + 1) % captureEvery === 0) {
+              frameImages.push({ frame: frames.length + 1, presented: presentedFrames, png: directScratch.toDataURL("image/png") });
+            }
+            if (frameImages.length && finalFrameExpected) gpu.frameImages = frameImages;
             if (presentedFrames > 0 && (finalFrameExpected || options.captureRgba)) {
               const pixels = directScratch.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, directScratch.width, directScratch.height).data;
               let hash = 0x811c9dc5;
@@ -238,6 +250,10 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
             // after RPCS3's threads have exited.
             const { type: _type, ...shutdown } = shutdownEvent.data;
             result.shutdown = shutdown;
+            if (shutdown.kept) {
+              worker.removeEventListener("message", worker.__rpcs3Handler);
+              persistentWorker = worker;
+            }
             resolve(result);
           };
           worker.addEventListener("message", onShutdown);
@@ -246,7 +262,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
           if (typeof window.__rpcs3BeforeShutdown === "function") {
             try { await window.__rpcs3BeforeShutdown(); } catch (_) {}
           }
-          worker.postMessage({ type: "shutdown" });
+          worker.postMessage({ type: "shutdown", keepRuntime: options.keepRuntime === true });
         } catch (error) {
           clearTimeout(timeout);
           worker.terminate();
@@ -257,12 +273,13 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
     worker.addEventListener("error", (event) => {
       clearTimeout(timeout);
       worker.terminate();
-      reject(new Error(`real RPCS3 runtime worker failed: ${event.message || ""} ${event.filename || ""}:${event.lineno || 0} ${String(event.error ?? "")}`.trim()));
+      reject(new Error(`real RPCS3 runtime worker failed: ${event.message || ""} ${event.filename || ""}:${event.lineno || 0} ${String(event.error ?? "")}; events=${JSON.stringify(events.slice(-40))}`.trim()));
     }, { once: true });
     worker.postMessage({
       type: "boot",
       directRenderer: direct,
       gpuCanvas: directCanvas,
+      reuse,
       fixture,
       path: bootPath,
       returnPackets: Boolean(options.render),

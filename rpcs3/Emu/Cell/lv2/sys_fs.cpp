@@ -567,6 +567,7 @@ u64 lv2_file::op_read(const fs::file& file, vm::ptr<void> buf, u64 size, u64 opt
 		}
 	}
 
+	vm::note_write(buf.addr(), static_cast<u32>(result));
 	return result;
 #else
 	if (u64 region = buf.addr() >> 28, region_end = (buf.addr() + size) >> 28;

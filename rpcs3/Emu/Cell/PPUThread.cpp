@@ -3899,6 +3899,7 @@ template <typename T>
 static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 {
 	perf_meter<"STCX"_u32> perf0;
+	struct note_store_t { u32 addr; ~note_store_t() { vm::note_write(addr, sizeof(T)); } } note_store{ addr };
 
 	if (addr % sizeof(T))
 	{

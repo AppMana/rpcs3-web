@@ -123,7 +123,16 @@ namespace rsx
 
 			auto res = ::rsx::reservation_lock<true>(write_address, write_length, read_address, read_length);
 
+#ifdef RPCS3_WEB
+			if (!vm::check_addr(write_address, vm::page_writable, write_length) || !vm::check_addr(read_address, vm::page_readable, read_length))
+			{
+				rsx_log.error("NV0039_BUFFER_NOTIFY: Unmapped transfer range (src=0x%x/%u, dst=0x%x/%u)", read_address, read_length, write_address, write_length);
+				RSX(ctx)->recover_fifo();
+				return;
+			}
+#endif
 			u8* dst = vm::_ptr<u8>(write_address);
+			struct note_write_t { u32 addr; u32 size; ~note_write_t() { vm::note_write(addr, size); } } note_write_{ write_address, write_length };
 			const u8* src = vm::_ptr<u8>(read_address);
 
 			rsx::simple_array<utils::address_range64> flush_mm_ranges =

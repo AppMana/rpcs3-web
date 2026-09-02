@@ -48,6 +48,12 @@ namespace vm
 	bool web_is_contiguous(u32 addr, u32 size) noexcept;
 	bool web_copy_range(u32 addr, void* buffer, u32 size, bool is_write) noexcept;
 
+	// Guest page write versions. The web build has no page protection, so every guest write
+	// path bumps the version of the pages it touches; consumers that cache guest contents
+	// (the RSX texture cache) compare the versions of their pages instead of trapping writes.
+	void web_note_write(u32 addr, u32 size) noexcept;
+	u64 web_page_version_sum(u32 addr, u32 size) noexcept;
+
 	inline u8* web_base(u32 addr) noexcept
 	{
 		if (u8* page = g_web_pages[addr >> 12])
@@ -56,6 +62,22 @@ namespace vm
 		}
 
 		return nullptr;
+	}
+
+	// Host pointer for guest accesses. An unmapped guest page aliases a sink page: native RPCS3
+	// faults on such an access and recovers, wasm cannot, so the access lands in scratch memory
+	// instead of at wasm address 0 (Emscripten's heap sentinel). The first accesses are logged.
+	extern u8 g_web_sink_page[0x100000];
+	void web_note_unmapped(u32 addr) noexcept;
+	inline u8* web_ptr(u32 addr) noexcept
+	{
+		if (u8* page = g_web_pages[addr >> 12]) [[likely]]
+		{
+			return page + (addr & 0xfff);
+		}
+
+		web_note_unmapped(addr);
+		return g_web_sink_page + (addr & 0xfff);
 	}
 #endif
 
@@ -299,7 +321,7 @@ namespace vm
 	inline void* base(T addr)
 	{
 #ifdef RPCS3_WEB
-		return web_base(static_cast<u32>(vm::cast(addr)));
+		return web_ptr(static_cast<u32>(vm::cast(addr)));
 #else
 		return g_base_addr + static_cast<u32>(vm::cast(addr));
 #endif
@@ -308,7 +330,7 @@ namespace vm
 	inline const u8& read8(u32 addr)
 	{
 #ifdef RPCS3_WEB
-		return *web_base(addr);
+		return *web_ptr(addr);
 #else
 		return g_base_addr[addr];
 #endif
@@ -321,7 +343,8 @@ namespace vm
 #endif
 	{
 #ifdef RPCS3_WEB
-		*web_base(addr) = value;
+		*web_ptr(addr) = value;
+		web_note_write(addr, 1);
 #else
 		g_base_addr[addr] = value;
 #endif
@@ -358,7 +381,7 @@ namespace vm
 		inline to_be_t<T>* get_super_ptr(u32 addr)
 		{
 #ifdef RPCS3_WEB
-			return reinterpret_cast<to_be_t<T>*>(web_base(addr));
+			return reinterpret_cast<to_be_t<T>*>(web_ptr(addr));
 #else
 			return reinterpret_cast<to_be_t<T>*>(g_sudo_addr + addr);
 #endif
@@ -382,6 +405,9 @@ namespace vm
 			if constexpr (!std::is_void_v<T>)
 			{
 				*_ptr<dest_t>(addr) = value;
+#ifdef RPCS3_WEB
+				web_note_write(addr, sizeof(dest_t));
+#endif
 			}
 
 #ifdef RPCS3_HAS_MEMORY_BREAKPOINTS
@@ -423,6 +449,16 @@ namespace vm
 	}
 
 	void close();
+
+	// Records a guest write for the page write versions (no-op outside the web build)
+	inline void note_write(u32 addr, u32 size) noexcept
+	{
+#ifdef RPCS3_WEB
+		web_note_write(addr, size);
+#else
+		(void)addr; (void)size;
+#endif
+	}
 
 	void load(utils::serial& ar);
 	void save(utils::serial& ar);

@@ -1,5 +1,20 @@
 const scope = self;
 
+function dylinkTableSize(module) {
+  const sections = WebAssembly.Module.customSections(module, "dylink.0");
+  if (!sections.length) return 0;
+  const bytes = new Uint8Array(sections[0]);
+  const leb = (offset) => { let result = 0, shift = 0; for (;;) { const byte = bytes[offset++]; result |= (byte & 0x7f) << shift; if (!(byte & 0x80)) return [result >>> 0, offset]; shift += 7; } };
+  let offset = 0;
+  while (offset < bytes.length) {
+    const type = bytes[offset++];
+    let size; [size, offset] = leb(offset);
+    if (type === 1) { let cursor = offset; [, cursor] = leb(cursor); [, cursor] = leb(cursor); return leb(cursor)[0]; }
+    offset += size;
+  }
+  return 0;
+}
+
 function detail(error) {
   return error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ""}` : String(error);
 }
@@ -80,6 +95,8 @@ scope.addEventListener("message", async (event) => {
       ),
       __memory_base: new WebAssembly.Global({ value: "i32", mutable: false }, memoryBase),
       __table_base: new WebAssembly.Global({ value: "i32", mutable: false }, 0),
+      // Modules built for the table dispatch path place their blocks in an imported table by element segment.
+      __indirect_function_table: new WebAssembly.Table({ initial: dylinkTableSize(aotWasm), element: "anyfunc" }),
       __check: () => {},
       __get_tb: () => 0n,
       __trap: () => { throw new WebAssembly.RuntimeError("translated PPU trap"); },
@@ -116,7 +133,8 @@ scope.addEventListener("message", async (event) => {
       const fn = aotInstance.exports[`__0x${pc.toString(16)}`];
       if (typeof fn !== "function") return { pc: `0x${pc.toString(16)}`, missing: true };
       fn(
-        0,
+        // Exec base: RPCS3's page directory, so indirect branches to unregistered blocks store cia and return
+        mainExports.rpcs3_web_ppu_aot_exec_base() >>> 0,
         targetContext,
         0n,
         0,

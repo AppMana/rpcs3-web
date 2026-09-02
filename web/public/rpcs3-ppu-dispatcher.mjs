@@ -12,6 +12,21 @@ function taskYield() {
   });
 }
 
+function dylinkTableSize(module) {
+  const sections = WebAssembly.Module.customSections(module, "dylink.0");
+  if (!sections.length) return 0;
+  const bytes = new Uint8Array(sections[0]);
+  const leb = (offset) => { let result = 0, shift = 0; for (;;) { const byte = bytes[offset++]; result |= (byte & 0x7f) << shift; if (!(byte & 0x80)) return [result >>> 0, offset]; shift += 7; } };
+  let offset = 0;
+  while (offset < bytes.length) {
+    const type = bytes[offset++];
+    let size; [size, offset] = leb(offset);
+    if (type === 1) { let cursor = offset; [, cursor] = leb(cursor); [, cursor] = leb(cursor); return leb(cursor)[0]; }
+    offset += size;
+  }
+  return 0;
+}
+
 export function createPpuDispatcher({ module, mainExports, mainMemory, aotModule, entryReadyAddress }) {
   if (!(aotModule instanceof WebAssembly.Module)) throw new TypeError("aotModule must be a WebAssembly.Module");
   if (!(mainMemory instanceof WebAssembly.Memory)) throw new TypeError("mainMemory must be RPCS3's WebAssembly.Memory");
@@ -51,6 +66,9 @@ export function createPpuDispatcher({ module, mainExports, mainMemory, aotModule
     ),
     __memory_base: new WebAssembly.Global({ value: "i32", mutable: false }, memoryBase),
     __table_base: new WebAssembly.Global({ value: "i32", mutable: false }, 0),
+    // Modules built for the table dispatch path place their blocks in an imported table by element
+    // segment; this harness gives them a private one sized from dylink.0.
+    __indirect_function_table: new WebAssembly.Table({ initial: dylinkTableSize(aotModule), element: "anyfunc" }),
     __check: (thread, pc) => mainExports.rpcs3_web_ppu_aot_check(thread >>> 0, Number(pc) >>> 0),
     __get_tb: () => mainExports.rpcs3_web_ppu_aot_timebase(),
     __lwarx: (thread, address) => {
@@ -121,7 +139,7 @@ export function createPpuDispatcher({ module, mainExports, mainMemory, aotModule
       activeContext = context;
       try {
         fn(
-          0,
+          mainExports.rpcs3_web_ppu_aot_exec_base() >>> 0,
           context,
           0n,
           0,

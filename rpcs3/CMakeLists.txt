@@ -77,11 +77,14 @@ if(RPCS3_WEB)
 		# workers; Emscripten grows it on demand if RPCS3 needs more.
 		"-sDEFAULT_PTHREAD_STACK_SIZE=1048576"
 		"-sPTHREAD_POOL_SIZE=(Module['pthreadPoolSize']||12)"
+		"-sALLOW_TABLE_GROWTH=1"
+		"SHELL:--pre-js ${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_pre.js"
 		"-sNO_EXIT_RUNTIME=1"
 		"-sFORCE_FILESYSTEM=1"
 		"-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8','PThread']"
 		"-sEXPORTED_FUNCTIONS=['_main','_malloc','_free']"
 		"-sWASM_BIGINT=1")
+	set_property(TARGET rpcs3_web_runtime APPEND PROPERTY LINK_DEPENDS ${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_pre.js)
 	# ASSERTIONS stays on in both variants: it only adds a stack cookie and JS
 	# glue checks, and it is what keeps Emscripten from minifying the wasm
 	# import/export names that the PPU/SPU AOT side modules link against

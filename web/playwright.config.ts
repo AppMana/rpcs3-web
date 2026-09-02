@@ -6,6 +6,7 @@ export default defineConfig({
   // config runs both correctness tests (software adapters allowed) and strict
   // hardware gates (software adapters rejected).
   testIgnore: [
+    "ppu-aot-table-gpu.spec.ts",
     "frame-oracle.spec.ts",
     "gpu.spec.ts",
     "playable-tetris.spec.ts",

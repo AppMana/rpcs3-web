@@ -43,6 +43,14 @@ PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_mo
 		m_use_avx = false;
 		m_use_avx512 = false;
 		m_use_avx512_icl = false;
+
+		for (const auto& func : m_info.get_funcs())
+		{
+			if (func.size && !std::count(m_info.excluded_funcs.begin(), m_info.excluded_funcs.end(), func.addr))
+			{
+				m_wasm_part_blocks.emplace(func.addr);
+			}
+		}
 	}
 
 	// Initialize transform passes
@@ -614,6 +622,13 @@ void PPUTranslator::CallFunction(u64 target, Value* indirect)
 				break;
 			}
 
+			if (!indirect && m_wasm_aot && !m_wasm_part_blocks.count(target_last))
+			{
+				// The block lives in another module part: resolve it through the guest-address table at run time
+				WasmCallThroughTable(m_ir->getInt32(target_last), seg0);
+				return;
+			}
+
 			if (!indirect)
 			{
 				callee = m_module->getOrInsertFunction(fmt::format("__0x%x", target_last - base), type);
@@ -631,15 +646,15 @@ void PPUTranslator::CallFunction(u64 target, Value* indirect)
 		}
 	}
 
+	if (indirect && m_wasm_aot)
+	{
+		WasmCallThroughTable(indirect, seg0);
+		return;
+	}
+
 	if (indirect)
 	{
 		m_ir->CreateStore(Trunc(indirect, GetType<u32>()), m_ir->CreateStructGEP(m_thread_type, m_thread, static_cast<uint>(&m_cia - m_locals)));
-
-		if (m_wasm_aot)
-		{
-			m_ir->CreateRetVoid();
-			return;
-		}
 
 		// Try to optimize
 		if (auto inst = dyn_cast_or_null<Instruction>(indirect))
@@ -665,8 +680,42 @@ void PPUTranslator::CallFunction(u64 target, Value* indirect)
 
 	m_ir->SetInsertPoint(block);
 	const auto c = m_ir->CreateCall(callee, {m_exec, m_thread, seg0, m_base, GetGpr(0), GetGpr(1), GetGpr(2)});
-	c->setTailCallKind(llvm::CallInst::TCK_Tail);
+	c->setTailCallKind(m_wasm_aot ? llvm::CallInst::TCK_MustTail : llvm::CallInst::TCK_Tail);
 	c->setCallingConv(m_wasm_aot ? CallingConv::C : CallingConv::GHC);
+	m_ir->CreateRetVoid();
+}
+
+void PPUTranslator::WasmCallThroughTable(Value* target, Value* seg0)
+{
+	// Exec base (arg 0) is the directory of 64 KiB guest pages; a page's first member is the u32 wasm table index per guest word.
+	// Unregistered blocks store cia and return, and the owning PPU thread continues in the interpreter.
+	const auto type = m_function->getFunctionType();
+	const auto addr = Trunc(target, GetType<u32>());
+	const auto r0 = GetGpr(0);
+	const auto r1 = GetGpr(1);
+	const auto r2 = GetGpr(2);
+
+	const auto have_page = BasicBlock::Create(m_context, "", m_function);
+	const auto call = BasicBlock::Create(m_context, "", m_function);
+	const auto fallback = BasicBlock::Create(m_context, "", m_function);
+
+	const auto dir_slot = m_ir->CreateGEP(GetType<u32>(), m_exec, m_ir->CreateLShr(addr, 16));
+	const auto page = m_ir->CreateLoad(GetType<u32>(), dir_slot);
+	m_ir->CreateCondBr(m_ir->CreateIsNull(page), fallback, have_page, m_md_unlikely);
+
+	m_ir->SetInsertPoint(have_page);
+	const auto leaf_slot = m_ir->CreateGEP(GetType<u32>(), m_ir->CreateIntToPtr(page, GetType<u8*>()), m_ir->CreateLShr(m_ir->CreateAnd(addr, 0xffff), 2));
+	const auto index = m_ir->CreateLoad(GetType<u32>(), leaf_slot);
+	m_ir->CreateCondBr(m_ir->CreateIsNull(index), fallback, call, m_md_unlikely);
+
+	m_ir->SetInsertPoint(call);
+	const auto c = m_ir->CreateCall(FunctionCallee(type, m_ir->CreateIntToPtr(index, GetType<u8*>())), {m_exec, m_thread, seg0, m_base, r0, r1, r2});
+	c->setTailCallKind(llvm::CallInst::TCK_MustTail);
+	c->setCallingConv(CallingConv::C);
+	m_ir->CreateRetVoid();
+
+	m_ir->SetInsertPoint(fallback);
+	m_ir->CreateStore(addr, m_ir->CreateStructGEP(m_thread_type, m_thread, static_cast<uint>(&m_cia - m_locals)));
 	m_ir->CreateRetVoid();
 }
 
@@ -895,9 +944,11 @@ Value* PPUTranslator::ReadMemory(Value* addr, Type* type, bool is_be, u32 align)
 		Value* value;
 		if (size == 128)
 		{
-			const auto storage = m_ir->CreateAlloca(GetType<u8[16]>());
-			Call(GetType<void>(), "rpcs3_web_vm_read128_raw", guest_addr, storage);
-			value = m_ir->CreateLoad(GetType<u8[16]>(), storage);
+			// Two raw 64-bit reads assemble the same little-endian i128 as a 16-byte load, and need no stack
+			const auto i128 = m_ir->getIntNTy(128);
+			const auto lo = Call(GetType<u64>(), "rpcs3_web_vm_read64_raw", guest_addr);
+			const auto hi = Call(GetType<u64>(), "rpcs3_web_vm_read64_raw", m_ir->CreateAdd(guest_addr, m_ir->getInt32(8)));
+			value = m_ir->CreateOr(m_ir->CreateZExt(lo, i128), m_ir->CreateShl(m_ir->CreateZExt(hi, i128), 64));
 		}
 		else
 		{
@@ -991,9 +1042,10 @@ void PPUTranslator::WriteMemory(Value* addr, Value* value, bool is_be, u32 align
 		const auto guest_addr = Trunc(addr, GetType<u32>());
 		if (size == 128)
 		{
-			const auto storage = m_ir->CreateAlloca(GetType<u8[16]>());
-			m_ir->CreateStore(bitcast(value, GetType<u8[16]>()), storage);
-			Call(GetType<void>(), "rpcs3_web_vm_write128_raw", guest_addr, storage);
+			const auto i128 = m_ir->getIntNTy(128);
+			const auto bits = bitcast(value, i128);
+			Call(GetType<void>(), "rpcs3_web_vm_write64_raw", guest_addr, m_ir->CreateTrunc(bits, GetType<u64>()));
+			Call(GetType<void>(), "rpcs3_web_vm_write64_raw", m_ir->CreateAdd(guest_addr, m_ir->getInt32(8)), m_ir->CreateTrunc(m_ir->CreateLShr(bits, 64), GetType<u64>()));
 		}
 		else
 		{
@@ -2388,6 +2440,14 @@ void PPUTranslator::SC(ppu_opcode_t op)
 
 		if (index < 1024)
 		{
+			if (m_wasm_aot)
+			{
+				// The native link table binds every syscall name to ppu_execute_syscall; one import does the same
+				Call(GetType<void>(), "__syscall", m_thread, m_ir->getInt64(index));
+				m_ir->CreateRetVoid();
+				return;
+			}
+
 			Call(GetType<void>(), fmt::format("%s", ppu_syscall_code(index)), m_thread);
 			//Call(GetType<void>(), "__escape", m_thread)->setTailCall();
 			m_ir->CreateRetVoid();
@@ -3767,6 +3827,12 @@ void PPUTranslator::STVLX(ppu_opcode_t op)
 	const auto addr = op.ra ? m_ir->CreateAdd(GetGpr(op.ra), GetGpr(op.rb)) : GetGpr(op.rb);
 	const auto data = pshufb(get_vr<u8[16]>(op.vs), build<u8[16]>(127, 126, 125, 124, 123, 122, 121, 120, 119, 118, 117, 116, 115, 114, 113, 112) + vsplat<u8[16]>(trunc<u8>(value<u64>(addr) & 0xf)));
 	const auto mask = bitcast<bool[16]>(splat<u16>(0xffff) << trunc<u16>(value<u64>(addr) & 0xf));
+	if (m_wasm_aot)
+	{
+		WasmMaskedStore16(m_ir->CreateAnd(addr, ~0xfull), data.eval(m_ir), mask.eval(m_ir));
+		return;
+	}
+
 	m_ir->CreateMaskedStore(data.eval(m_ir), GetMemory(m_ir->CreateAnd(addr, ~0xfull)), llvm::Align(16), mask.eval(m_ir));
 }
 
@@ -3795,6 +3861,12 @@ void PPUTranslator::STVRX(ppu_opcode_t op)
 	const auto addr = op.ra ? m_ir->CreateAdd(GetGpr(op.ra), GetGpr(op.rb)) : GetGpr(op.rb);
 	const auto data = pshufb(get_vr<u8[16]>(op.vs), build<u8[16]>(255, 254, 253, 252, 251, 250, 249, 248, 247, 246, 245, 244, 243, 242, 241, 240) + vsplat<u8[16]>(trunc<u8>(value<u64>(addr) & 0xf)));
 	const auto mask = bitcast<bool[16]>(trunc<u16>(splat<u64>(0xffff) << (value<u64>(addr) & 0xf) >> 16));
+	if (m_wasm_aot)
+	{
+		WasmMaskedStore16(m_ir->CreateAnd(addr, ~0xfull), data.eval(m_ir), mask.eval(m_ir));
+		return;
+	}
+
 	m_ir->CreateMaskedStore(data.eval(m_ir), GetMemory(m_ir->CreateAnd(addr, ~0xfull)), llvm::Align(16), mask.eval(m_ir));
 }
 
@@ -3974,9 +4046,35 @@ void PPUTranslator::DCBZ(ppu_opcode_t op)
 	{
 		Call(GetType<void>(), "__dcbz", addr);
 	}
+	else if (m_wasm_aot)
+	{
+		// The cache line is zeroed through the checked accessors, 16 aligned 64-bit stores
+		const auto guest_addr = Trunc(addr, GetType<u32>());
+		for (u32 offset = 0; offset < 128; offset += 8)
+		{
+			Call(GetType<void>(), "rpcs3_web_vm_write64_raw", m_ir->CreateAdd(guest_addr, m_ir->getInt32(offset)), m_ir->getInt64(0));
+		}
+	}
 	else
 	{
 		Call(GetType<void>(), "llvm.memset.p0.i32", GetMemory(addr), m_ir->getInt8(0), m_ir->getInt32(128), m_ir->getFalse());
+	}
+}
+
+void PPUTranslator::WasmMaskedStore16(Value* aligned_addr, Value* data, Value* mask)
+{
+	// Byte-lane masked store without a host pointer: only the selected bytes are written
+	const auto guest_addr = Trunc(aligned_addr, GetType<u32>());
+
+	for (u32 lane = 0; lane < 16; lane++)
+	{
+		const auto store = BasicBlock::Create(m_context, "", m_function);
+		const auto next = BasicBlock::Create(m_context, "", m_function);
+		m_ir->CreateCondBr(m_ir->CreateExtractElement(mask, lane), store, next);
+		m_ir->SetInsertPoint(store);
+		Call(GetType<void>(), "rpcs3_web_vm_write8_raw", m_ir->CreateAdd(guest_addr, m_ir->getInt32(lane)), m_ir->CreateExtractElement(data, lane));
+		m_ir->CreateBr(next);
+		m_ir->SetInsertPoint(next);
 	}
 }
 

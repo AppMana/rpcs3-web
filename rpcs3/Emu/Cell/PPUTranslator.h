@@ -7,6 +7,7 @@
 #include "PPUAnalyser.h"
 
 #include "util/types.hpp"
+#include <unordered_set>
 
 template <typename T>
 struct ppu_module;
@@ -75,6 +76,9 @@ class PPUTranslator final : public cpu_translator
 	llvm::Value* nan_vec4;
 	bool m_may_be_mmio = false;
 	bool m_wasm_aot = false;
+
+	// Block entry addresses translated into this module part (wasm AOT): calls to any other address go through the guest-address table
+	std::unordered_set<u32> m_wasm_part_blocks;
 
 #define DEF_VALUE(loc, glb, pos)\
 	llvm::Value*& loc = m_locals[pos];\
@@ -155,6 +159,12 @@ public:
 
 	// Emit function call
 	void CallFunction(u64 target, llvm::Value* indirect = nullptr);
+
+	// wasm AOT: tail-call the compiled block registered for a guest address, or store cia and return when none is
+	void WasmCallThroughTable(llvm::Value* target, llvm::Value* seg0);
+
+	// wasm AOT: byte-masked 16-byte store through the checked accessors (stvlx/stvrx)
+	void WasmMaskedStore16(llvm::Value* aligned_addr, llvm::Value* data, llvm::Value* mask);
 
 	// Emit state check mid-block
 	void TestAborted();

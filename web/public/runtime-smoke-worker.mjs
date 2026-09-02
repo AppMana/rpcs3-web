@@ -23,6 +23,7 @@ let progressIntervalMs = 250;
 let progressTimer;
 let dispatchLines = [];
 let ppuDispatcher;
+let ppuAotTable = null;
 let spuDispatcher;
 let padState = { digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 };
 let moduleCreateMs = 0;
@@ -96,6 +97,9 @@ async function captureDispatch(expectedVerdict = "", timeoutMs = 30_000) {
     atomicNotifyReentry,
     sparseVmProbe,
     ppuAot: ppuDispatcher?.snapshot() ?? null,
+    ppuAotTable: ppuAotTable
+      ? { ...ppuAotTable, dispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])) }
+      : null,
     spuAot: spuDispatcher?.snapshot() ?? null,
     spuAotAbi: Array.from({ length: 7 }, (_, field) =>
       module.ccall("rpcs3_web_spu_aot_abi", "number", ["number"], [field]) >>> 0),
@@ -204,6 +208,9 @@ function progress(includeThreads = false) {
     workingSet: workingSet(),
     stackReport: includeThreads ? stackReport() : undefined,
     ppuInstructions: Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], [])),
+    ppuAotTable: ppuAotTable
+      ? { ...ppuAotTable, dispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])) }
+      : null,
     ppuLastPc: module.ccall("rpcs3_web_ppu_last_pc", "number", [], []) >>> 0,
     ppuLastFunction: module.ccall("rpcs3_web_ppu_last_function", "string", [], []),
     ppuAotEntryReady: module.ccall("rpcs3_web_ppu_aot_entry_ready", "number", [], []),
@@ -376,6 +383,9 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     workingSet: workingSet(),
     stackReport: stackReport(),
     ppuInstructions: Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], [])),
+    ppuAotTable: ppuAotTable
+      ? { ...ppuAotTable, dispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])) }
+      : null,
     ppuLastPc: module.ccall("rpcs3_web_ppu_last_pc", "number", [], []) >>> 0,
     ppuLastFunction: module.ccall("rpcs3_web_ppu_last_function", "string", [], []),
     spuInstructions: Number(module.ccall("rpcs3_web_spu_instruction_count", "bigint", [], [])),
@@ -507,7 +517,7 @@ scope.addEventListener("message", async (event) => {
     let mainInstance;
     let mainMemory;
     const [mainWasm, aotWasm, spuAotWasm] = await Promise.all([
-      event.data.ppuAot === true || event.data.spuAot === true
+      event.data.ppuAot === true || event.data.spuAot === true || typeof event.data.ppuAotBundle === "string"
         ? WebAssembly.compileStreaming(fetch(resolveCoreFile("rpcs3-web.wasm"))) : undefined,
       event.data.ppuAot === true
         ? WebAssembly.compileStreaming(fetch("./fixtures/web_dispatch_conformance-aot.wasm")) : undefined,
@@ -565,6 +575,17 @@ scope.addEventListener("message", async (event) => {
         Number(entry.frame) >>> 0, Number(entry.digital1 ?? 0) >>> 0, Number(entry.digital2 ?? 0) >>> 0,
         Number(entry.leftX ?? 128) >>> 0, Number(entry.leftY ?? 128) >>> 0, Number(entry.rightX ?? 128) >>> 0, Number(entry.rightY ?? 128) >>> 0,
       ]);
+    }
+    if (typeof event.data.ppuAotBundle === "string") {
+      // Title bundle: compiled blocks placed in every worker's function table before boot, run by the PPU pthreads.
+      const { loadPpuAotBundle } = await import("./rpcs3-ppu-aot-table.mjs");
+      ppuAotTable = await loadPpuAotBundle({
+        module,
+        mainInstance,
+        mainMemory,
+        manifestUrl: new URL(event.data.ppuAotBundle, scope.location.href).href,
+        log: (line) => { recordLog(line); console.log(line); },
+      });
     }
     if (aotWasm) module.ccall("rpcs3_web_set_ppu_aot_handoff", null, ["number"], [1]);
     if (spuAotWasm) module.ccall("rpcs3_web_set_spu_aot_handoff", null, ["number"], [1]);

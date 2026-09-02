@@ -1,12 +1,22 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { accessSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, tmpdir, availableParallelism } from "node:os";
 import { basename, join, resolve } from "node:path";
+import { promisify } from "node:util";
 
-const [inputArg, outputArg, ...options] = process.argv.slice(2);
-if (!inputArg || !outputArg) {
-  throw new Error("usage: compile-ppu-ir-to-wasm.mjs INPUT.ll OUTPUT.wasm [--pic] [--export=NAME | --export-all]");
+// One or more IR parts lower to one wasm module: every part is lowered to an
+// object in parallel and a single wasm-ld link resolves the __0x blocks across
+// parts as direct calls. A per-part module would import the shared function
+// table separately, and V8 keeps a table-sized dispatch table per importing
+// instance, which is what made a 114-instance bundle exhaust a worker's heap.
+const args = process.argv.slice(2);
+const inputArgs = args.filter((argument) => argument.endsWith(".ll"));
+const outputArg = args.find((argument) => argument.endsWith(".wasm"));
+const options = args.filter((argument) => argument.startsWith("--"));
+if (!inputArgs.length || !outputArg) {
+  throw new Error("usage: compile-ppu-ir-to-wasm.mjs INPUT.ll [MORE.ll ...] OUTPUT.wasm [--pic] [--export=NAME | --export-all] [--jobs=N]");
 }
+const execFileAsync = promisify(execFile);
 
 function findTool(environmentName, name) {
   const explicit = process.env[environmentName];
@@ -56,10 +66,14 @@ function findRuntimeArchives() {
   return [];
 }
 
-const input = resolve(inputArg);
+const inputs = inputArgs.map((argument) => resolve(argument));
 const output = resolve(outputArg);
+const jobsOption = options.find((option) => option.startsWith("--jobs="));
+const jobs = Math.max(1, Number(jobsOption?.slice("--jobs=".length)) || Math.min(8, availableParallelism()));
 const exports = options.filter((option) => option.startsWith("--export="));
-const exportAll = options.includes("--export-all") || exports.length === 0;
+// Shared (PIC) modules export their visible symbols by default: the per-part block tables. Named
+// block exports are only for the JS dispatcher fixtures (--export-all).
+const exportAll = options.includes("--export-all") || (!options.includes("--pic") && exports.length === 0);
 const pic = options.includes("--pic");
 const llvmAs = findTool("RPCS3_LLVM_AS", "llvm-as");
 const llc = findTool("RPCS3_LLC", "llc");
@@ -67,20 +81,33 @@ const wasmLd = findTool("RPCS3_WASM_LD", "wasm-ld");
 const runtimeArchives = findRuntimeArchives();
 const scratch = mkdtempSync(join(tmpdir(), "rpcs3-ppu-aot-"));
 
-try {
-  const bitcode = join(scratch, `${basename(input)}.bc`);
-  const object = join(scratch, `${basename(input)}.o`);
-  execFileSync(llvmAs, [input, "-o", bitcode], { stdio: "inherit" });
-  execFileSync(llc, [
+async function lower(input, index) {
+  const bitcode = join(scratch, `${index}-${basename(input)}.bc`);
+  const object = join(scratch, `${index}-${basename(input)}.o`);
+  await execFileAsync(llvmAs, [input, "-o", bitcode], { maxBuffer: 1 << 24 });
+  await execFileAsync(llc, [
     "-mtriple=wasm32-unknown-unknown",
-    "-mattr=+atomics,+bulk-memory,+mutable-globals,+sign-ext,+simd128",
+    "-mattr=+atomics,+bulk-memory,+mutable-globals,+sign-ext,+simd128,+tail-call",
     pic ? "-relocation-model=pic" : undefined,
     "-O2",
     "-filetype=obj",
     bitcode,
     "-o",
     object,
-  ].filter(Boolean), { stdio: "inherit" });
+  ].filter(Boolean), { maxBuffer: 1 << 24 });
+  rmSync(bitcode, { force: true });
+  return object;
+}
+
+try {
+  const objects = new Array(inputs.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(jobs, inputs.length) }, async () => {
+    while (next < inputs.length) {
+      const index = next++;
+      objects[index] = await lower(inputs[index], index);
+    }
+  }));
 
   const linkOptions = [
     pic ? "--shared" : "--no-entry",
@@ -92,7 +119,7 @@ try {
     "--allow-undefined",
     exportAll ? "--export-all" : undefined,
     ...exports,
-    object,
+    ...objects,
     ...runtimeArchives,
     "-o",
     output,
@@ -102,7 +129,7 @@ try {
   const bytes = readFileSync(output);
   const module = new WebAssembly.Module(bytes);
   process.stdout.write(`${JSON.stringify({
-    input,
+    inputs,
     output,
     pic,
     bytes: bytes.byteLength,

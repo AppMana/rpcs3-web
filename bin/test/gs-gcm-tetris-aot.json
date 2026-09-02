@@ -1,15 +1,18 @@
 {
   "schema": 1,
-  "source": "web_dispatch_conformance.self",
-  "sourceSha256": "b768009030c44e1a9cd41462d1504b1cc3d147acbdc8d5dd9f81d578aa73bfdc",
-  "fragmentCount": 2,
+  "source": "gs_gcm_tetris.elf",
+  "sourceSha256": "2a564792c578b73afaf394f9cfea5b470b468dd20c15b83185cf8bbe348e8e99",
+  "fragmentCount": 5,
   "fragmentBytes": [
-    10341569,
-    1354003
+    11971934,
+    10051537,
+    11172041,
+    10089565,
+    4156727
   ],
-  "linkedIrBytes": 11693028,
-  "wasmBytes": 1676914,
-  "wasmSha256": "4dade4b9236ab088f39ecb61bdfee1d05ffc5088690af1d13bf55eb698a0975f",
+  "linkedIrBytes": 47429948,
+  "wasmBytes": 6345859,
+  "wasmSha256": "b9b060b192992a1c8c595f693668208b30b00b28d9628fa24168856ce67ef651",
   "imports": [
     {
       "module": "env",
@@ -38,22 +41,7 @@
     },
     {
       "module": "env",
-      "name": "rpcs3_web_vm_write64_raw",
-      "kind": "function"
-    },
-    {
-      "module": "env",
-      "name": "__check",
-      "kind": "function"
-    },
-    {
-      "module": "env",
-      "name": "rpcs3_web_vm_read64_raw",
-      "kind": "function"
-    },
-    {
-      "module": "env",
-      "name": "rpcs3_web_vm_read8_raw",
+      "name": "rpcs3_web_vm_write32_raw",
       "kind": "function"
     },
     {
@@ -63,7 +51,12 @@
     },
     {
       "module": "env",
-      "name": "rpcs3_web_vm_write32_raw",
+      "name": "__check",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "rpcs3_web_vm_read8_raw",
       "kind": "function"
     },
     {
@@ -73,17 +66,7 @@
     },
     {
       "module": "env",
-      "name": "__syscall",
-      "kind": "function"
-    },
-    {
-      "module": "env",
-      "name": "__lwarx",
-      "kind": "function"
-    },
-    {
-      "module": "env",
-      "name": "__stwcx",
+      "name": "rpcs3_web_vm_write64_raw",
       "kind": "function"
     },
     {
@@ -98,12 +81,22 @@
     },
     {
       "module": "env",
+      "name": "rpcs3_web_vm_read64_raw",
+      "kind": "function"
+    },
+    {
+      "module": "env",
+      "name": "__syscall",
+      "kind": "function"
+    },
+    {
+      "module": "env",
       "name": "__get_tb",
       "kind": "function"
     }
   ],
-  "exportCount": 6658,
-  "guestBlockExportCount": 6640,
+  "exportCount": 24555,
+  "guestBlockExportCount": 24530,
   "runtimeExports": [
     {
       "name": "__wasm_call_ctors",
@@ -126,15 +119,7 @@
       "kind": "function"
     },
     {
-      "name": "__lshrti3",
-      "kind": "function"
-    },
-    {
-      "name": "__ashlti3",
-      "kind": "function"
-    },
-    {
-      "name": "__multi3",
+      "name": "__ppu_block_index_v8_kusa_AUzHt606E8hmQvFaqVU9Rh_00001t_znver3_obj",
       "kind": "function"
     },
     {
@@ -142,19 +127,55 @@
       "kind": "function"
     },
     {
-      "name": "__ppu_block_index_v8_kusa_7kjzcVSWofiGYjKj3ed0g6_00001t_znver3_obj",
+      "name": "__ppu_block_index_v8_kusa_R98NGNCZjfy2vxxPd7H1Rb_00001t_znver3_obj",
       "kind": "function"
     },
     {
-      "name": "__ppu_block_index_v8_kusa_KuU8JU94xdEnQ2R3sXCtbt_0004YN_znver3_obj",
+      "name": "__ashlti3",
       "kind": "function"
     },
     {
-      "name": "__ppu_blocks_v8_kusa_7kjzcVSWofiGYjKj3ed0g6_00001t_znver3_obj",
+      "name": "__ppu_block_index_v8_kusa_RpYct1C6z8vQF6pLkJ9Y7N_00001t_znver3_obj",
+      "kind": "function"
+    },
+    {
+      "name": "__lshrti3",
+      "kind": "function"
+    },
+    {
+      "name": "__trap",
+      "kind": "function"
+    },
+    {
+      "name": "__ashrti3",
+      "kind": "function"
+    },
+    {
+      "name": "__ppu_block_index_v8_kusa_Va2FCWJeygqFyYEUv5Avoj_00001t_znver3_obj",
+      "kind": "function"
+    },
+    {
+      "name": "__ppu_block_index_v8_kusa_hQzon8m8EfXCtfWoNQsx2j_0004YN_znver3_obj",
+      "kind": "function"
+    },
+    {
+      "name": "__ppu_blocks_v8_kusa_AUzHt606E8hmQvFaqVU9Rh_00001t_znver3_obj",
       "kind": "global"
     },
     {
-      "name": "__ppu_blocks_v8_kusa_KuU8JU94xdEnQ2R3sXCtbt_0004YN_znver3_obj",
+      "name": "__ppu_blocks_v8_kusa_R98NGNCZjfy2vxxPd7H1Rb_00001t_znver3_obj",
+      "kind": "global"
+    },
+    {
+      "name": "__ppu_blocks_v8_kusa_RpYct1C6z8vQF6pLkJ9Y7N_00001t_znver3_obj",
+      "kind": "global"
+    },
+    {
+      "name": "__ppu_blocks_v8_kusa_Va2FCWJeygqFyYEUv5Avoj_00001t_znver3_obj",
+      "kind": "global"
+    },
+    {
+      "name": "__ppu_blocks_v8_kusa_hQzon8m8EfXCtfWoNQsx2j_0004YN_znver3_obj",
       "kind": "global"
     },
     {

@@ -83,6 +83,18 @@ extern atomic_t<u32> g_spu_web_aot_step_request[6];
 extern atomic_t<u32> g_spu_web_aot_step_complete[6];
 extern atomic_t<u32> g_spu_web_aot_step_result[6];
 extern u32 ppu_web_interpreter_step(ppu_thread& ppu);
+// Set by web/host/rpcs3_web_pre.js once this worker's function table holds the compiled PPU blocks
+EM_JS(int, rpcs3_web_ppu_aot_worker_ready, (), { return self.__rpcs3PpuAotReady ? 1 : 0; });
+
+extern void ppu_web_aot_register(const u32* pairs, u32 count);
+extern void* ppu_web_aot_exec_base();
+extern u32 ppu_web_aot_registered(u32 addr);
+extern atomic_t<u64> g_ppu_web_aot_dispatch_count;
+extern u32 ppu_lwarx(ppu_thread& ppu, u32 addr);
+extern u64 ppu_ldarx(ppu_thread& ppu, u32 addr);
+extern bool ppu_stwcx(ppu_thread& ppu, u32 addr, u32 reg_value);
+extern bool ppu_stdcx(ppu_thread& ppu, u32 addr, u64 reg_value);
+extern void ppu_execute_syscall(ppu_thread& ppu, u64 code);
 extern atomic_t<u32> g_ppu_web_aot_hold_entry;
 extern atomic_t<u32> g_ppu_web_aot_entry_ready;
 extern atomic_t<u32> g_ppu_web_aot_step_request;
@@ -866,6 +878,79 @@ extern "C"
 		if (!expected || !s_aot_slice_active) return 1;
 		expected->cia = pc;
 		return is_stopped(expected->state);
+	}
+
+	// Direct dispatch: compiled blocks registered in the wasm function table run on the owning PPU pthread.
+	// These are the imports the compiled modules bind to; they mirror the native link table entries.
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_aot_register_many(u32 pairs, u32 count)
+	{
+		ppu_web_aot_register(reinterpret_cast<const u32*>(static_cast<uptr>(pairs)), count);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_exec_base()
+	{
+		return static_cast<u32>(reinterpret_cast<uptr>(ppu_web_aot_exec_base()));
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_registered(u32 addr)
+	{
+		return ppu_web_aot_registered(addr);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_ppu_aot_dispatches()
+	{
+		return g_ppu_web_aot_dispatch_count.load();
+	}
+
+	// __check: ppu_check
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_direct_check(u32 thread, u64 addr)
+	{
+		auto& ppu = *reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread));
+		ppu.cia = ::narrow<u32>(addr);
+		static_cast<void>(ppu.test_stopped());
+	}
+
+	// __error: ppu_error sets cia and falls back to the interpreter, which the thread loop does on return
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_direct_error(u32 thread, u64 addr, u32 /*op*/)
+	{
+		auto& ppu = *reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread));
+		ppu.cia = ::narrow<u32>(addr);
+	}
+
+	// __syscall: ppu_execute_syscall (cia already stored by the compiled block)
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_direct_syscall(u32 thread, u64 code)
+	{
+		ppu_execute_syscall(*reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread)), code);
+	}
+
+	// __lv1call has no native binding; the interpreter executes the SC instruction at the stored cia
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_direct_lv1call(u32 /*thread*/, u64 /*code*/)
+	{
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_ppu_direct_get_tb()
+	{
+		return get_timebased_time();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_direct_lwarx(u32 thread, u64 addr)
+	{
+		return ppu_lwarx(*reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread)), static_cast<u32>(addr));
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_ppu_direct_ldarx(u32 thread, u64 addr)
+	{
+		return ppu_ldarx(*reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread)), static_cast<u32>(addr));
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_direct_stwcx(u32 thread, u64 addr, u32 value)
+	{
+		return ppu_stwcx(*reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread)), static_cast<u32>(addr), value);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_direct_stdcx(u32 thread, u64 addr, u64 value)
+	{
+		return ppu_stdcx(*reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread)), static_cast<u32>(addr), value);
 	}
 
 	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_ppu_aot_timebase()

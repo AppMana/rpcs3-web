@@ -147,3 +147,6 @@ CMakeUserPresets.json
 
 # claude
 CLAUDE.md
+
+# Title-specific PPU AOT bundles built from commercial code
+web/public/local-aot/

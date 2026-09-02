@@ -162,6 +162,7 @@ extern const ppu_decoder<ppu_iname> g_ppu_iname{};
 // batched in the interpreter loop so acceptance diagnostics do not put an
 // atomic operation on every guest instruction.
 atomic_t<u64> g_ppu_web_instruction_count{0};
+extern "C" int rpcs3_web_ppu_aot_worker_ready();
 atomic_t<u32> g_ppu_web_last_pc{0};
 atomic_t<u32> g_ppu_web_trace_pc{0};
 atomic_t<u32> g_ppu_web_trace_hits{0};
@@ -525,6 +526,9 @@ namespace
 {
 	struct ppu_web_dispatch_page
 	{
+		// Wasm function table index of the compiled block that starts at each guest word (0 = none).
+		// First member: compiled blocks resolve cross-module targets by reading it at offset 0 of the page.
+		std::atomic<u32> aot[0x10000 / sizeof(u32)]{};
 		std::atomic<ppu_intrp_func_t> hooks[0x10000 / sizeof(u32)]{};
 		std::atomic<u64> decoded[0x10000 / sizeof(u32)]{};
 	};
@@ -583,8 +587,63 @@ static inline void ppu_write(u32 addr, ppu_intrp_func_t function)
 	{
 		const u32 index = (addr & 0xffff) / sizeof(u32);
 		page->decoded[index].store(0, std::memory_order_release);
+		if (function)
+		{
+			// An explicit hook takes the address away from compiled code
+			page->aot[index].store(0, std::memory_order_release);
+		}
 		page->hooks[index].store(function, std::memory_order_release);
 	}
+}
+
+// Compiled PPU blocks in the browser's wasm function table (same 7-argument signature as the LLVM translator's functions)
+using ppu_web_aot_func_t = void (*)(void* exec, ppu_thread* thread, u64 seg0, void* base, u64 r0, u64 r1, u64 r2);
+
+atomic_t<u64> g_ppu_web_aot_dispatch_count{0};
+
+static inline u32 ppu_web_aot_lookup(u32 addr)
+{
+	const auto page = ppu_web_dispatch_page_for(addr, false);
+	if (!page)
+	{
+		return 0;
+	}
+
+	const u32 index = (addr & 0xffff) / sizeof(u32);
+	if (page->hooks[index].load(std::memory_order_acquire))
+	{
+		return 0;
+	}
+
+	return page->aot[index].load(std::memory_order_acquire);
+}
+
+// (guest address, table index) pairs; hooked addresses stay with the hook
+extern void ppu_web_aot_register(const u32* pairs, u32 count)
+{
+	for (u32 i = 0; i < count; i++)
+	{
+		const u32 addr = pairs[i * 2];
+		const u32 table_index = pairs[i * 2 + 1];
+		const auto page = ppu_web_dispatch_page_for(addr, true);
+		const u32 index = (addr & 0xffff) / sizeof(u32);
+		if (page->hooks[index].load(std::memory_order_acquire))
+		{
+			continue;
+		}
+
+		page->aot[index].store(table_index, std::memory_order_release);
+	}
+}
+
+extern void* ppu_web_aot_exec_base()
+{
+	return s_ppu_web_dispatch_pages.data();
+}
+
+extern u32 ppu_web_aot_registered(u32 addr)
+{
+	return ppu_web_aot_lookup(addr);
 }
 #else
 static inline ppu_intrp_func_t ppu_read(u32 addr)
@@ -2952,6 +3011,8 @@ void ppu_thread::exec_task()
 #ifdef RPCS3_WEB
 	u32 web_progress_batch = 0;
 	bool web_reported_zero_pc = false;
+	// Compiled blocks are only callable once this worker's function table holds them (see rpcs3_web_pre.js)
+	const bool web_aot_ready = rpcs3_web_ppu_aot_worker_ready() != 0;
 	g_ppu_web_last_pc = cia;
 #endif
 
@@ -3010,6 +3071,13 @@ void ppu_thread::exec_task()
 					read32(gpr[24] + 0x48), read32(gpr[24] + 0x5c), read32(gpr[24] + 0x60), read32(gpr[24] + 0x64),
 					read32(gpr[25] + 0x18), read32(gpr[25] + 0x38));
 			}
+		}
+		if (const u32 aot_index = web_aot_ready ? ppu_web_aot_lookup(web_instruction_pc) : 0)
+		{
+			// Run the compiled block on this thread; it tail-calls through the table and returns with cia set at a boundary
+			g_ppu_web_aot_dispatch_count++;
+			reinterpret_cast<ppu_web_aot_func_t>(static_cast<uptr>(aot_index))(ppu_web_aot_exec_base(), this, 0, nullptr, gpr[0], gpr[1], gpr[2]);
+			continue;
 		}
 		const u32 opcode = *op;
 		const auto fn = ppu_read(cia, opcode);
@@ -6286,6 +6354,13 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 			f->setCallingConv(wasm_aot ? CallingConv::C : CallingConv::GHC);
 			f->addParamAttr(1, llvm::Attribute::NoAlias);
 			f->addFnAttr(Attribute::NoUnwind);
+
+			if (wasm_aot)
+			{
+				// Blocks reach the browser through the module's block table, not as named exports
+				// (V8 allows 100,000 exports per module; a title has hundreds of thousands of blocks)
+				f->setVisibility(GlobalValue::HiddenVisibility);
+			}
 		}
 	}
 
@@ -6411,6 +6486,65 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 
 	if (wasm_aot)
 	{
+		// Block table: { u32 count, [count x u32 guest_addr] } plus i32 __ppu_block_index_*(i32 i) returning
+		// block i's function table index. Materializing the address in code needs no data relocation, so a
+		// title with hundreds of thousands of blocks links without one giant relocation function.
+		{
+			std::vector<std::pair<u32, Function*>> blocks;
+
+			for (const auto& func : module_part.get_funcs())
+			{
+				if (!func.size || std::count(module_part.excluded_funcs.begin(), module_part.excluded_funcs.end(), func.addr))
+				{
+					continue;
+				}
+
+				if (const auto f = _module->getFunction(fmt::format("__0x%x", func.addr - reloc)); f && !f->isDeclaration())
+				{
+					blocks.emplace_back(static_cast<u32>(func.addr - reloc), f);
+				}
+			}
+
+			std::string suffix = obj_name;
+			for (auto& c : suffix)
+			{
+				if (!std::isalnum(static_cast<u8>(c)))
+				{
+					c = '_';
+				}
+			}
+
+			std::vector<Constant*> addrs;
+			for (const auto& [addr, f] : blocks)
+			{
+				addrs.emplace_back(ConstantInt::get(translator.get_type<u32>(), addr));
+			}
+
+			const auto array_type = ArrayType::get(translator.get_type<u32>(), addrs.size());
+			const auto table_type = StructType::get(jit.get_context(), {translator.get_type<u32>(), array_type});
+			const auto init = ConstantStruct::get(table_type, {ConstantInt::get(translator.get_type<u32>(), addrs.size()), ConstantArray::get(array_type, addrs)});
+			const auto table = new GlobalVariable(*_module, table_type, true, GlobalValue::ExternalLinkage, init, "__ppu_blocks_" + suffix);
+			table->setAlignment(llvm::Align(4));
+
+			const auto index_type = FunctionType::get(translator.get_type<u32>(), {translator.get_type<u32>()}, false);
+			const auto index_fn = cast<Function>(_module->getOrInsertFunction("__ppu_block_index_" + suffix, index_type).getCallee());
+			index_fn->setCallingConv(CallingConv::C);
+			IRBuilder<> irb(BasicBlock::Create(jit.get_context(), "entry", index_fn));
+			const auto exit = BasicBlock::Create(jit.get_context(), "none", index_fn);
+			const auto sw = irb.CreateSwitch(index_fn->getArg(0), exit, ::size32(blocks));
+
+			for (u32 i = 0; i < blocks.size(); i++)
+			{
+				const auto bb = BasicBlock::Create(jit.get_context(), "", index_fn);
+				sw->addCase(irb.getInt32(i), bb);
+				irb.SetInsertPoint(bb);
+				irb.CreateRet(irb.CreatePtrToInt(blocks[i].second, translator.get_type<u32>()));
+			}
+
+			irb.SetInsertPoint(exit);
+			irb.CreateRet(ConstantInt::get(translator.get_type<u32>(), 0));
+		}
+
 		std::string result;
 		raw_string_ostream out(result);
 		out << *_module;

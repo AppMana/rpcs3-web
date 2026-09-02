@@ -385,6 +385,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
   scope.postMessage({
     type,
     directGpu,
+    directStats: directGpu ? JSON.parse(module.ccall("rpcs3_web_direct_stats", "string", [], [])) : undefined,
     carriedSurfaceOps: packets.length ? carriedSurfaceOps.splice(0) : undefined,
     ok: initialized === 1 && bootResult === 0 && flipPacketCount === 1,
     initialized,

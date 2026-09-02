@@ -86,7 +86,7 @@ if(RPCS3_WEB)
 		"SHELL:--pre-js ${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_pre.js"
 		"-sNO_EXIT_RUNTIME=1"
 		"-sFORCE_FILESYSTEM=1"
-		"-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8','PThread','specialHTMLTargets']"
+		"-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8','HEAPU32','PThread','specialHTMLTargets','stringToNewUTF8','UTF8ToString']"
 		"--use-port=emdawnwebgpu"
 		"-sEXPORTED_FUNCTIONS=['_main','_malloc','_free']"
 		"-sWASM_BIGINT=1")

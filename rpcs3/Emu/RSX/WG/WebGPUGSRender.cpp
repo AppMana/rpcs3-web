@@ -3,6 +3,7 @@
 #include "WebGPUGSRender.h"
 
 #include "WebGPUHost.h"
+#include "WebGPUDrawCommon.h"
 #include "Emu/RSX/Common/BufferUtils.h"
 #include "Emu/RSX/Common/TextureUtils.h"
 #include "Emu/RSX/Common/surface_store.h"
@@ -74,19 +75,7 @@ namespace
 		return offsets;
 	}
 
-	struct vertex_upload
-	{
-		u32 first_vertex = 0;
-		u32 allocated_vertex_count = 0;
-		u32 draw_count = 0;
-		u32 vertex_index_base = 0;
-		u32 vertex_index_offset = 0;
-		rsx::index_array_type index_type = rsx::index_array_type::u16;
-		bool indexed = false;
-		bool primitive_expanded = false;
-		bool index_restart_sentinel = false;
-		byte_vector indices;
-	};
+	using vertex_upload = rsx::webgpu::draw_vertex_upload;
 
 	struct texture_source
 	{
@@ -424,6 +413,37 @@ namespace
 
 		return result;
 	}
+}
+
+bool rsx::webgpu::native_primitive(rsx::primitive_type primitive)
+{
+	return webgpu_native_primitive(primitive);
+}
+
+rsx::webgpu::draw_vertex_upload rsx::webgpu::prepare_draw_vertex_upload(const rsx::vertex_input_layout& layout,
+	const std::variant<rsx::draw_array_command, rsx::draw_indexed_array_command, rsx::draw_inlined_array>& command)
+{
+	return prepare_vertex_upload(layout, command);
+}
+
+std::vector<u32> rsx::webgpu::fragment_inline_constant_offsets(const void* ucode, u32 ucode_length)
+{
+	return fragment_constant_offsets(ucode, ucode_length);
+}
+
+bool rsx::webgpu::describe_fragment_texture(const rsx::fragment_texture& texture, u32 slot, rsx::webgpu::texture_packet_record& record, u32& address, u32& size)
+{
+	std::vector<texture_source> sources;
+	bool complete = true;
+	collect_texture(sources, complete, texture, 0, slot);
+	if (sources.empty())
+	{
+		return false;
+	}
+	record = sources[0].record;
+	address = sources[0].address;
+	size = complete ? record.data_size : 0;
+	return true;
 }
 
 void rsx_webgpu_set_texture_hash_per_draw(bool enabled)
@@ -952,6 +972,11 @@ void WebGPUGSRender::emit_control_packet(rsx::webgpu::packet_kind kind, u32 valu
 // VKGSRender::decode_rsx_state and VKGSRender::clear_surface use, so the
 // packet never re-derives guest register semantics.
 void WebGPUGSRender::fill_resolved_state(rsx::webgpu::resolved_state_packet& state, u32 clear_mask) const
+{
+	rsx::webgpu::fill_resolved_state(state, clear_mask, m_framebuffer_layout);
+}
+
+void rsx::webgpu::fill_resolved_state(rsx::webgpu::resolved_state_packet& state, u32 clear_mask, const rsx::framebuffer_layout& m_framebuffer_layout)
 {
 	const auto& regs = rsx::method_registers;
 	const auto surface_color = regs.surface_color();

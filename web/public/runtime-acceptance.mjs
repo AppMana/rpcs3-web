@@ -93,14 +93,8 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       if (event.data?.type === "runtime-present") {
         const bitmap = event.data.bitmap;
         presentedFrames += 1;
-        if (directScratch) {
-          const scratch = directScratch.getContext("2d", { willReadFrequently: true });
-          scratch.drawImage(bitmap, 0, 0);
-          const pixels = scratch.getImageData(0, 0, directScratch.width, directScratch.height).data;
-          let hash = 0x811c9dc5;
-          for (let i = 0; i < pixels.length; i += 1) { hash ^= pixels[i]; hash = Math.imul(hash, 0x01000193) >>> 0; }
-          presentedHash = hash >>> 0;
-        }
+        // Keep a copy for the end-of-run hash and image; hashing every present would cost more than the frame
+        directScratch?.getContext("2d", { willReadFrequently: true }).drawImage(bitmap, 0, 0);
         directView?.transferFromImageBitmap(bitmap);
         return;
       }
@@ -198,10 +192,15 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
             }
           }
           if (direct) {
-            gpu = { direct: true, presented: presentedFrames, frameHash: presentedHash, device: event.data.directGpu, width: directScratch.width, height: directScratch.height };
-            if (options.captureRgba && presentedFrames > 0) {
+            gpu = { direct: true, presented: presentedFrames, frameHash: presentedHash, device: event.data.directGpu, stats: event.data.directStats, width: directScratch.width, height: directScratch.height };
+            const finalFrameExpected = frames.length + 1 >= requestedFrames;
+            if (presentedFrames > 0 && (finalFrameExpected || options.captureRgba)) {
               const pixels = directScratch.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, directScratch.width, directScratch.height).data;
-              gpu.rgbaBase64 = base64Of(pixels);
+              let hash = 0x811c9dc5;
+              for (let i = 0; i < pixels.length; i += 1) { hash ^= pixels[i]; hash = Math.imul(hash, 0x01000193) >>> 0; }
+              presentedHash = hash >>> 0;
+              gpu.frameHash = presentedHash;
+              if (options.captureRgba) gpu.rgbaBase64 = base64Of(pixels);
             }
           }
           const frame = {

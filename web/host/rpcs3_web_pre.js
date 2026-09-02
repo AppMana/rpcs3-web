@@ -231,16 +231,22 @@ if (typeof self !== "undefined" && typeof self.addEventListener === "function") 
       if (!("gpu" in navigator)) throw new Error("navigator.gpu is unavailable in this worker");
       const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
       if (!adapter) throw new Error("requestAdapter returned null in the worker");
-      const device = await adapter.requestDevice();
+      // Features the backend uses when the adapter has them (BC textures for DXT, filterable
+      // float for the float render targets, depth clip control for RSX depth clamp)
+      const wanted = ["texture-compression-bc", "float32-filterable", "depth-clip-control", "shader-f16"];
+      const requiredFeatures = wanted.filter((feature) => adapter.features.has(feature));
+      const device = await adapter.requestDevice({ requiredFeatures });
       device.addEventListener("uncapturederror", (error) => {
         self.postMessage({ rpcs3WorkerError: `WebGPU uncaptured error: ${String(error.error && error.error.message || error.error)}` });
       });
       self.__rpcs3GpuCanvas = canvas;
       Module["preinitializedWebGPUDevice"] = device;
+      // WGSL translation for the direct backend (rpcs3-webgpu-renderer.mjs translateRsxProgram)
+      self.__rpcs3Translator = await import(new URL("../rpcs3-webgpu-renderer.mjs", import.meta.url).href);
       if (!Module["specialHTMLTargets"]) throw new Error("specialHTMLTargets is not exported to the worker");
       Module["specialHTMLTargets"]["#rpcs3-canvas"] = canvas;
       const info = adapter.info || {};
-      self.postMessage({ rpcs3GpuReady: { vendor: info.vendor, architecture: info.architecture, description: info.description, width: canvas.width, height: canvas.height } });
+      self.postMessage({ rpcs3GpuReady: { vendor: info.vendor, architecture: info.architecture, description: info.description, width: canvas.width, height: canvas.height, features: requiredFeatures } });
     })().catch((error) => self.postMessage({ rpcs3GpuError: String(error && error.stack ? error.stack : error) }));
   });
   self.addEventListener("message", (event) => {

@@ -591,6 +591,19 @@ extern "C"
 	{
 		s_direct_renderer = enabled != 0;
 	}
+	// Direct backend counters as JSON (draws, programs, pipelines, uploads, surface ops, unsupported)
+	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_direct_stats()
+	{
+		static std::string buffer;
+		buffer = "{}";
+		if (auto* render = dynamic_cast<WebGPUDirectGSRender*>(g_fxo->try_get<rsx::thread>()))
+		{
+			const auto& s = render->m_stats;
+			buffer = fmt::format("{\"draws\":%llu,\"drawsSkipped\":%llu,\"clears\":%llu,\"programs\":%llu,\"pipelines\":%llu,\"textureUploads\":%llu,\"textureHits\":%llu,\"surfaceHits\":%llu,\"surfaceOps\":%llu,\"translationFailures\":%llu,\"unsupported\":%llu}",
+				s.draws, s.draws_skipped, s.clears, s.programs, s.pipelines, s.texture_uploads, s.texture_hits, s.surface_hits, s.surface_ops, s.translation_failures, s.unsupported);
+		}
+		return buffer.c_str();
+	}
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_rsx_spawn_flag_address()
 	{
 		return static_cast<u32>(reinterpret_cast<uptr>(&g_rpcs3_web_rsx_spawn_pending));

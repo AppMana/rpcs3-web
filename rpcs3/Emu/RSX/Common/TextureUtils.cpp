@@ -907,6 +907,11 @@ namespace rsx
 			false);
 	}
 
+	std::vector<rsx::subresource_layout> get_subresources_layout(const std::byte* pixels, u32 gcm_format, u16 width, u16 height, u16 depth, u8 layers, u16 mipmaps, u32 pitch, bool swizzled, bool border)
+	{
+		return get_subresources_layout_impl(pixels, gcm_format, width, height, depth, layers, mipmaps, pitch, swizzled, border);
+	}
+
 	texture_memory_info upload_texture_subresource(rsx::io_buffer& dst_buffer, const rsx::subresource_layout& src_layout, int format, bool is_swizzled, texture_uploader_capabilities& caps)
 	{
 		u16 w = src_layout.width_in_block;

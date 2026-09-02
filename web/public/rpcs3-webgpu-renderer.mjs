@@ -941,6 +941,35 @@ fn rsxReadLocation(location: u32, vertexIndex: u32) -> vec4f {
 // Translated programs are keyed by microcode content and the control words
 // that change the generated WGSL, so a frame that reuses a program never
 // re-translates it or rebuilds its shader module and bind group layout.
+// Translation entry point for the direct backend (RSX worker): the same compilers over the
+// program bytes RPCS3 hands over, without a packet.
+export function translateRsxProgram(input) {
+  const packet = {
+    kind: PacketKind.draw,
+    flags: 0,
+    sections: {
+      [SectionKind.vertexProgram]: { bytes: input.vertexProgram },
+      [SectionKind.fragmentProgram]: { bytes: input.fragmentProgram },
+    },
+    vertexProgramEntry: input.vertexProgramEntry,
+    vertexProgramControl: input.vertexProgramControl,
+    vertexProgramOutputMask: input.vertexProgramOutputMask,
+    fragmentProgramControl: input.fragmentProgramControl,
+    textures: input.textures ?? [],
+  };
+  const vertex = compileVertexProgram(packet);
+  const fragment = compileFragmentProgram(packet);
+  const swizzles = new Map(Object.entries(input.textureSwizzles ?? {}).map(([slot, swizzle]) => [Number(slot), swizzle]));
+  const code = assembleShader(vertex, fragment, "webgpu-wgsl", input.colorTargetCount ?? 1, input.alphaFunc, swizzles);
+  return {
+    code,
+    textureSlots: [...fragment.textureSlots],
+    textureDimensions: Object.fromEntries(fragment.textureDimensions),
+    constantCount: fragment.constantCount,
+    inputs: vertex.inputs,
+  };
+}
+
 function programKey(packet, vertexBackend, textureSwizzles = new Map()) {
   return [
     vertexBackend,

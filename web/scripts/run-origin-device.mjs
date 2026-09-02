@@ -126,6 +126,15 @@ async function findPage(predicate) {
 const runtimeUrl = new URL(`runtime.html?device=${Date.now()}`, origin).href;
 const initial = await findPage((page) => page.title !== "ServiceWorker" && !page.url.startsWith("safari-web-extension:"));
 let connection = await new WebKitConnection(initial.page.webSocketDebuggerUrl).open();
+if (process.env.RPCS3_DEVICE_HARD_RESET === "1") {
+  // Safari keeps a previous run's 512 MiB shared memory until its page is gone; park the tab on
+  // about:blank first so the next module creation can allocate it again.
+  await connection.evaluate(`location.assign("about:blank")`);
+  connection.close();
+  await delay(4000);
+  const blank = await findPage((page) => page.url === "about:blank");
+  connection = await new WebKitConnection(blank.page.webSocketDebuggerUrl).open();
+}
 await connection.evaluate(`location.assign(${JSON.stringify(runtimeUrl)})`);
 connection.close();
 const navigated = await findPage((page) => page.url === runtimeUrl);
@@ -156,7 +165,7 @@ try {
     });
     // Capture one final frame with readback for image evidence.
     const capture = await window.__rpcs3Runtime.run(${JSON.stringify(`fixtures/${fixtureName}`)}, {
-      frames: 1, render: true, width: 320, height: 180, captureRgba: true, directRenderer: ${direct},
+      frames: ${direct ? 3 : 1}, render: true, width: 320, height: 180, captureRgba: true, directRenderer: ${direct},
     });
     const frames = result.frames ?? [];
     const percentile = (values, fraction) => { const sorted = [...values].sort((a, b) => a - b); return sorted[Math.min(sorted.length - 1, Math.floor(fraction * sorted.length))]; };
@@ -185,8 +194,9 @@ try {
   })()`, true);
   const rgba = Buffer.from(result.capture?.rgbaBase64 ?? "", "base64");
   delete result.capture?.rgbaBase64;
+  const adapterName = String(result.adapter ?? result.directDevice?.vendor ?? "").toLowerCase();
   const passed = Boolean(result.ok) && result.bootResult === 0 && result.droppedPackets === 0
-    && String(result.adapter ?? "").toLowerCase().includes("apple")
+    && adapterName.includes("apple") && (!direct || (result.presented ?? 0) > 0)
     && result.shutdown?.stoppedCleanly === true && (result.shutdown?.liveThreadNames ?? []).length === 0;
   const evidence = {
     capturedAt: new Date().toISOString(),

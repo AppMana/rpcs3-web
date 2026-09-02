@@ -60,6 +60,7 @@ const runOptions = {
   timeoutMs,
   render: env.RPCS3_RENDERER !== "null",
   renderer: env.RPCS3_RENDERER === "null" ? "null" : "webgpu",
+  directRenderer: env.RPCS3_DIRECT_RENDERER === "1",
   width,
   height,
   readback,

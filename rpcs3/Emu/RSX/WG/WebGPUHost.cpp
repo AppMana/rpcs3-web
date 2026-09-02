@@ -254,6 +254,20 @@ extern "C"
 		return rsx::webgpu::host_command_queue().dropped_packets();
 	}
 
+}
+
+void rsx::webgpu::command_queue::note_flip()
+{
+	m_frame_counter.fetch_add(1, std::memory_order_acq_rel);
+#ifdef __EMSCRIPTEN__
+	__builtin_wasm_memory_atomic_notify(reinterpret_cast<int*>(&m_frame_counter), 0x7fffffff);
+#else
+	m_frame_counter.notify_all();
+#endif
+}
+
+extern "C"
+{
 	RPCS3_WEB_EXPORT std::uint32_t rpcs3_webgpu_frame_counter()
 	{
 		return rsx::webgpu::host_command_queue().frame_counter();

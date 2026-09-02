@@ -126,6 +126,69 @@ Module["rpcs3PopulateSpuAot"] = (load) => {
   return placed;
 };
 
+
+// Direct WebGPU backend support (module main thread side). The pool worker that will host the
+// RSX thread creates the GPU device and receives the presentation OffscreenCanvas before the
+// thread starts, and the worker allocator hands that worker to the RSX thread when RPCS3 spawns
+// it (Utilities/Thread.cpp sets the flag at rpcs3_web_rsx_spawn_flag_address).
+Module["rpcs3PrepareGpu"] = (canvas, flagAddress) => new Promise((resolve, reject) => {
+  const PThread = Module["PThread"];
+  const worker = PThread.unusedWorkers[PThread.unusedWorkers.length - 1];
+  if (!worker) { reject(new Error("no idle pthread worker to host the GPU device")); return; }
+  const deadline = setTimeout(() => reject(new Error("GPU worker did not answer")), 60_000);
+  let sentCanvas = false;
+  const onMessage = (event) => {
+    const data = event.data;
+    if (!data) return;
+    if (data.rpcs3GpuPong && !sentCanvas) {
+      sentCanvas = true;
+      worker.postMessage({ rpcs3PrepareGpu: { canvas } }, [canvas]);
+    } else if (data.rpcs3GpuReady) {
+      clearTimeout(deadline);
+      Module["__rpcs3GpuWorker"] = worker;
+      Module["__rpcs3RsxSpawnFlag"] = flagAddress >>> 0;
+      resolve(data.rpcs3GpuReady);
+    } else if (data.rpcs3GpuError) {
+      clearTimeout(deadline);
+      reject(new Error(data.rpcs3GpuError));
+    } else if (data.rpcs3Present && Module["rpcs3OnPresent"]) {
+      Module["rpcs3OnPresent"](data);
+    }
+  };
+  worker.addEventListener("message", onMessage);
+  // A worker still loading its wasm drops unknown messages: ping until its hook answers
+  let attempts = 0;
+  const ping = setInterval(() => {
+    if (sentCanvas || ++attempts > 60) { clearInterval(ping); return; }
+    worker.postMessage({ rpcs3GpuPing: 1 });
+  }, 250);
+  worker.postMessage({ rpcs3GpuPing: 1 });
+  if (!PThread.__rpcs3GpuPinned) {
+    PThread.__rpcs3GpuPinned = true;
+    const originalGetNewWorker = PThread.getNewWorker.bind(PThread);
+    PThread.getNewWorker = () => {
+      const gpuWorker = Module["__rpcs3GpuWorker"];
+      const flag = Module["__rpcs3RsxSpawnFlag"];
+      if (gpuWorker && flag) {
+        const words = new Uint32Array(Module["HEAPU8"].buffer);
+        const wantsRsx = Atomics.load(words, flag >>> 2) !== 0;
+        const index = PThread.unusedWorkers.indexOf(gpuWorker);
+        if (wantsRsx && index >= 0) {
+          Atomics.store(words, flag >>> 2, 0);
+          PThread.unusedWorkers.splice(index, 1);
+          return gpuWorker;
+        }
+        if (!wantsRsx && index >= 0 && PThread.unusedWorkers.length > 1) {
+          // Keep the GPU worker for the RSX thread
+          PThread.unusedWorkers.splice(index, 1);
+          PThread.unusedWorkers.unshift(gpuWorker);
+        }
+      }
+      return originalGetNewWorker();
+    };
+  }
+});
+
 if (typeof self !== "undefined" && typeof self.addEventListener === "function") {
   // An uncaught error in a pthread worker only reaches the parent as a message string; forward the
   // stack (wasm function names in the profile build) so the module worker can log it.
@@ -158,6 +221,28 @@ if (typeof self !== "undefined" && typeof self.addEventListener === "function") 
       return false;
     }
   };
+  self.addEventListener("message", (event) => {
+    const data = event.data;
+    if (!data) return;
+    if (data.rpcs3GpuPing) { self.postMessage({ rpcs3GpuPong: 1 }); return; }
+    if (!data.rpcs3PrepareGpu) return;
+    (async () => {
+      const canvas = data.rpcs3PrepareGpu.canvas;
+      if (!("gpu" in navigator)) throw new Error("navigator.gpu is unavailable in this worker");
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+      if (!adapter) throw new Error("requestAdapter returned null in the worker");
+      const device = await adapter.requestDevice();
+      device.addEventListener("uncapturederror", (error) => {
+        self.postMessage({ rpcs3WorkerError: `WebGPU uncaptured error: ${String(error.error && error.error.message || error.error)}` });
+      });
+      self.__rpcs3GpuCanvas = canvas;
+      Module["preinitializedWebGPUDevice"] = device;
+      if (!Module["specialHTMLTargets"]) throw new Error("specialHTMLTargets is not exported to the worker");
+      Module["specialHTMLTargets"]["#rpcs3-canvas"] = canvas;
+      const info = adapter.info || {};
+      self.postMessage({ rpcs3GpuReady: { vendor: info.vendor, architecture: info.architecture, description: info.description, width: canvas.width, height: canvas.height } });
+    })().catch((error) => self.postMessage({ rpcs3GpuError: String(error && error.stack ? error.stack : error) }));
+  });
   self.addEventListener("message", (event) => {
     for (const key of Object.keys(handlers)) {
       const load = event.data && event.data[key];

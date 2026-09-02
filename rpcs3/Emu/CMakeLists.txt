@@ -639,7 +639,10 @@ if(RPCS3_WEB)
         RSX/WG/WebGPUHost.cpp
         RSX/WG/WebGPUGSRender.cpp
         RSX/WG/WebGPURenderTargets.cpp
+        RSX/WG/WebGPUDirectGSRender.cpp
     )
+    # webgpu.h from Dawn's Emscripten bindings (compile: include path; the link step adds the port library)
+    target_compile_options(rpcs3_emu PRIVATE "--use-port=emdawnwebgpu")
 endif()
 
 if(NOT ANDROID AND NOT APPLE AND NOT RPCS3_WEB)

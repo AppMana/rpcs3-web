@@ -59,6 +59,8 @@ if(RPCS3_WEB)
 	set_target_properties(rpcs3_web_runtime PROPERTIES
 		OUTPUT_NAME "rpcs3-web"
 		SUFFIX ".mjs")
+	# webgpu.h for the host's backend selection (emdawnwebgpu port include path)
+	target_compile_options(rpcs3_web_runtime PRIVATE "--use-port=emdawnwebgpu")
 	target_link_options(rpcs3_web_runtime PRIVATE
 		-pthread
 		"-Wl,--error-limit=0"
@@ -84,7 +86,8 @@ if(RPCS3_WEB)
 		"SHELL:--pre-js ${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_pre.js"
 		"-sNO_EXIT_RUNTIME=1"
 		"-sFORCE_FILESYSTEM=1"
-		"-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8','PThread']"
+		"-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8','PThread','specialHTMLTargets']"
+		"--use-port=emdawnwebgpu"
 		"-sEXPORTED_FUNCTIONS=['_main','_malloc','_free']"
 		"-sWASM_BIGINT=1")
 	set_property(TARGET rpcs3_web_runtime APPEND PROPERTY LINK_DEPENDS ${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_pre.js)

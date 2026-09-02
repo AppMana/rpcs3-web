@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>RPCS3 web: worker WebGPU probe</title>
+<style>body{font-family:system-ui;margin:16px}canvas{border:1px solid #888}pre{white-space:pre-wrap}</style>
+<h1>Worker WebGPU probe</h1>
+<canvas id="c" width="480" height="270"></canvas>
+<pre id="out">running…</pre>
+<script type="module">
+const out = document.getElementById("out");
+const result = { userAgent: navigator.userAgent, mainNavigatorGpu: "gpu" in navigator, crossOriginIsolated, offscreenCanvas: typeof OffscreenCanvas === "function", jspi: { suspending: typeof WebAssembly.Suspending === "function", promising: typeof WebAssembly.promising === "function" } };
+window.__probeResult = undefined;
+try {
+  const canvas = document.getElementById("c");
+  result.transferControlToOffscreen = typeof canvas.transferControlToOffscreen === "function";
+  const offscreen = canvas.transferControlToOffscreen();
+  const worker = new Worker(new URL("./probe-worker-webgpu.worker.mjs", import.meta.url), { type: "module" });
+  worker.onerror = (event) => { result.workerError = event.message; result.ok = false; window.__probeResult = result; out.textContent = JSON.stringify(result, null, 2); };
+  worker.onmessage = ({ data }) => { Object.assign(result, { worker: data, ok: data.ok }); window.__probeResult = result; out.textContent = JSON.stringify(result, null, 2); };
+  worker.postMessage({ canvas: offscreen, frames: 120 }, [offscreen]);
+} catch (error) {
+  result.ok = false; result.error = String(error && error.stack ? error.stack : error);
+  window.__probeResult = result; out.textContent = JSON.stringify(result, null, 2);
+}
+</script>

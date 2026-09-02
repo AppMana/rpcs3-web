@@ -16,6 +16,8 @@ const origin = new URL(process.argv[2] || process.env.RPCS3_DEVICE_ORIGIN || "ht
 const outputDirectory = path.resolve(process.argv[3] || "device-origin-evidence");
 const fixtureName = process.argv[4] || "gs_gcm_tetris.elf";
 const frameCount = Math.max(1, Math.min(60, Number(process.argv[5] || 60)));
+// RPCS3_DIRECT_RENDERER=1: the RSX thread renders through emdawnwebgpu and presents ImageBitmaps
+const direct = process.env.RPCS3_DIRECT_RENDERER === "1";
 const discoveryURL = process.env.WIP_DISCOVERY_URL || "http://127.0.0.1:9221/json";
 const timeoutMs = Number(process.env.WIP_TIMEOUT_MS || 180_000);
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -150,11 +152,11 @@ try {
   const startedAt = Date.now();
   const result = await connection.evaluate(`(async () => {
     const result = await window.__rpcs3Runtime.run(${JSON.stringify(`fixtures/${fixtureName}`)}, {
-      frames: ${frameCount}, render: true, width: 320, height: 180, readback: false, presentLatestOnly: false,
+      frames: ${frameCount}, render: true, width: 320, height: 180, readback: false, presentLatestOnly: false, directRenderer: ${direct},
     });
     // Capture one final frame with readback for image evidence.
     const capture = await window.__rpcs3Runtime.run(${JSON.stringify(`fixtures/${fixtureName}`)}, {
-      frames: 1, render: true, width: 320, height: 180, captureRgba: true,
+      frames: 1, render: true, width: 320, height: 180, captureRgba: true, directRenderer: ${direct},
     });
     const frames = result.frames ?? [];
     const percentile = (values, fraction) => { const sorted = [...values].sort((a, b) => a - b); return sorted[Math.min(sorted.length - 1, Math.floor(fraction * sorted.length))]; };
@@ -167,6 +169,9 @@ try {
       frames: frames.length,
       adapter: frames.at(-1)?.gpu?.adapter,
       draws: frames.at(-1)?.gpu?.draws,
+      presented: frames.at(-1)?.gpu?.presented,
+      presentedHash: capture.gpu?.frameHash,
+      directDevice: frames.at(-1)?.gpu?.device,
       vertices: frames.at(-1)?.gpu?.vertices,
       droppedPackets: frames.reduce((sum, frame) => sum + frame.droppedPackets, 0),
       waitForPacketsMs: { p50: percentile(steady.map((f) => f.hostTimings.waitForPacketsMs), 0.5), p95: percentile(steady.map((f) => f.hostTimings.waitForPacketsMs), 0.95) },
@@ -198,7 +203,7 @@ try {
   await writeFile(path.join(outputDirectory, "report.json"), `${JSON.stringify(evidence, null, 2)}\n`);
   if (rgba.length === (result.capture?.width ?? 0) * (result.capture?.height ?? 0) * 4) {
     const frame = new PNG({ width: result.capture.width, height: result.capture.height });
-    frame.data.set(rgba);
+    if (rgba) frame.data.set(rgba);
     await writeFile(path.join(outputDirectory, "frame.png"), PNG.sync.write(frame));
   }
   process.stdout.write(`${JSON.stringify({ ...evidence, result: { ...evidence.result, shutdown: evidence.result.shutdown && { ...evidence.result.shutdown, stackReport: undefined } } }, null, 2)}\n`);

@@ -2760,6 +2760,8 @@ const bool s_terminate_handler_set = []() -> bool
 thread_local DECLARE(thread_ctrl::g_tls_this_thread) = nullptr;
 
 #ifdef RPCS3_WEB
+volatile u32 g_rpcs3_web_rsx_spawn_pending = 0;
+
 namespace
 {
 	// Browser thread telemetry. Emscripten pthreads are Web Workers with fixed
@@ -2951,6 +2953,14 @@ void thread_base::start()
 	ensure(pthread_create(&thread_id, &attrs, entry_point, this) == 0);
 #else
 	pthread_t thread_id{};
+#ifdef RPCS3_WEB
+	// The direct WebGPU backend needs the RSX thread on the pool worker that holds the GPU
+	// device; the module's JS reads this flag when it picks a worker for the next thread.
+	if (const auto name = m_tname.load(); name && *name == "rsx::thread")
+	{
+		g_rpcs3_web_rsx_spawn_pending = 1;
+	}
+#endif
 	ensure(pthread_create(&thread_id, nullptr, entry_point, this) == 0);
 #ifdef RPCS3_WEB
 	if (const auto name = m_tname.load())

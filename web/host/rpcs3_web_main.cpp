@@ -9,6 +9,9 @@
 #include "Emu/RSX/GSFrameBase.h"
 #include "Emu/RSX/Null/NullGSRender.h"
 #include "Emu/RSX/WG/WebGPUGSRender.h"
+#include "Emu/RSX/WG/WebGPUDirectGSRender.h"
+
+extern volatile u32 g_rpcs3_web_rsx_spawn_pending;
 #include "Emu/RSX/WG/WebGPUHost.h"
 #include "Emu/Memory/vm.h"
 #include "Emu/Memory/vm_locking.h"
@@ -149,6 +152,7 @@ namespace
 
 	std::atomic<bool> s_initialized{false};
 	std::atomic<bool> s_null_renderer{false};
+	std::atomic<bool> s_direct_renderer{false};
 	std::mutex s_host_task_mutex;
 	std::deque<std::function<void()>> s_host_tasks;
 
@@ -459,6 +463,10 @@ namespace
 			{
 				g_fxo->init<rsx::thread, named_thread<NullGSRender>>(ar);
 			}
+			else if (s_direct_renderer)
+			{
+				g_fxo->init<rsx::thread, named_thread<WebGPUDirectGSRender>>(ar);
+			}
 			else
 			{
 				g_fxo->init<rsx::thread, named_thread<WebGPUGSRender>>(ar);
@@ -578,6 +586,15 @@ extern "C"
 		return s_firmware_result;
 	}
 
+	// Direct backend: the RSX thread calls WebGPU itself (emdawnwebgpu) instead of shipping packets
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_direct_renderer(s32 enabled)
+	{
+		s_direct_renderer = enabled != 0;
+	}
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_rsx_spawn_flag_address()
+	{
+		return static_cast<u32>(reinterpret_cast<uptr>(&g_rpcs3_web_rsx_spawn_pending));
+	}
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_null_renderer(s32 enabled)
 	{
 		if (!s_initialized)

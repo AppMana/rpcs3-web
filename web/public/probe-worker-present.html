@@ -1,0 +1,34 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>RPCS3 web: worker presentation probe</title>
+<style>body{font-family:system-ui;margin:16px}canvas{border:1px solid #888}pre{white-space:pre-wrap}</style>
+<h1>Worker presentation probe (transferToImageBitmap, no event loop turns in the worker)</h1>
+<canvas id="view" width="480" height="270"></canvas>
+<pre id="out">running…</pre>
+<script type="module">
+const out = document.getElementById("out");
+const view = document.getElementById("view").getContext("bitmaprenderer");
+const result = { userAgent: navigator.userAgent, pageBitmapsShown: 0, firstBitmapAt: undefined, lastBitmapAt: undefined };
+window.__probeResult = undefined;
+try {
+  const offscreen = new OffscreenCanvas(480, 270);
+  const worker = new Worker(new URL("./probe-worker-present.worker.mjs", import.meta.url), { type: "module" });
+  worker.onerror = (event) => { result.workerError = event.message; result.ok = false; window.__probeResult = result; out.textContent = JSON.stringify(result, null, 2); };
+  worker.onmessage = ({ data }) => {
+    if (data.bitmap) {
+      view.transferFromImageBitmap(data.bitmap);
+      result.pageBitmapsShown += 1;
+      result.firstBitmapAt ??= performance.now();
+      result.lastBitmapAt = performance.now();
+      return;
+    }
+    Object.assign(result, { worker: data.result, ok: data.result.ok && result.pageBitmapsShown > 0 });
+    // Give the page a moment to paint the last bitmaps before reporting
+    setTimeout(() => { window.__probeResult = result; out.textContent = JSON.stringify(result, null, 2); }, 200);
+  };
+  worker.postMessage({ canvas: offscreen, frames: 300 }, [offscreen]);
+} catch (error) {
+  result.ok = false; result.error = String(error && error.stack ? error.stack : error);
+  window.__probeResult = result; out.textContent = JSON.stringify(result, null, 2);
+}
+</script>

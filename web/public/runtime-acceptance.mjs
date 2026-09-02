@@ -69,7 +69,16 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
     // reads back WebGPU correctly from a transferred OffscreenCanvas, but does
     // not composite that one-shot worker surface into screenshots. Main-thread
     // ownership proves both the hardware render and the displayed frame.
-    const preparedGpu = options.render ? prepareWebGPU(canvas) : undefined;
+    // Direct backend: the runtime's RSX worker renders into an OffscreenCanvas and hands each
+    // frame back as an ImageBitmap; the DOM canvas only displays it.
+    const direct = options.directRenderer === true;
+    const preparedGpu = options.render && !direct ? prepareWebGPU(canvas) : undefined;
+    const directCanvas = direct ? new OffscreenCanvas(canvas.width, canvas.height) : undefined;
+    const directView = direct ? canvas.getContext("bitmaprenderer") : undefined;
+    const directScratch = direct ? document.createElement("canvas") : undefined;
+    let presentedFrames = 0;
+    let presentedHash = 0;
+    if (directScratch) { directScratch.width = canvas.width; directScratch.height = canvas.height; }
     const worker = new Worker("./runtime-smoke-worker.mjs", { type: "module" });
     activeWorker = worker;
     const events = [];
@@ -81,6 +90,20 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
     }, timeoutMs);
     let frameRequestedAt = performance.now();
     worker.addEventListener("message", async (event) => {
+      if (event.data?.type === "runtime-present") {
+        const bitmap = event.data.bitmap;
+        presentedFrames += 1;
+        if (directScratch) {
+          const scratch = directScratch.getContext("2d", { willReadFrequently: true });
+          scratch.drawImage(bitmap, 0, 0);
+          const pixels = scratch.getImageData(0, 0, directScratch.width, directScratch.height).data;
+          let hash = 0x811c9dc5;
+          for (let i = 0; i < pixels.length; i += 1) { hash ^= pixels[i]; hash = Math.imul(hash, 0x01000193) >>> 0; }
+          presentedHash = hash >>> 0;
+        }
+        directView?.transferFromImageBitmap(bitmap);
+        return;
+      }
       const { packetBuffers = [], ...eventWithoutPackets } = event.data ?? {};
       if (events.length < 4_000) events.push(compactFrame(eventWithoutPackets, requestedFrames <= 60 || events.length < 8));
       if (event.data?.type === "runtime-result" || event.data?.type === "runtime-frame") {
@@ -174,6 +197,13 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
               };
             }
           }
+          if (direct) {
+            gpu = { direct: true, presented: presentedFrames, frameHash: presentedHash, device: event.data.directGpu, width: directScratch.width, height: directScratch.height };
+            if (options.captureRgba && presentedFrames > 0) {
+              const pixels = directScratch.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, directScratch.width, directScratch.height).data;
+              gpu.rgbaBase64 = base64Of(pixels);
+            }
+          }
           const frame = {
             ...eventWithoutPackets,
             gpu,
@@ -232,6 +262,8 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
     }, { once: true });
     worker.postMessage({
       type: "boot",
+      directRenderer: direct,
+      gpuCanvas: directCanvas,
       fixture,
       path: bootPath,
       returnPackets: Boolean(options.render),
@@ -271,7 +303,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       // rendering is separately gated by options.render. Only an explicit
       // renderer: "null" selects NullGSRender (dispatch-only fixtures).
       renderer: options.renderer ?? "webgpu",
-    });
+    }, directCanvas ? [directCanvas] : []);
   }).finally(() => { active = undefined; });
   return active;
 }

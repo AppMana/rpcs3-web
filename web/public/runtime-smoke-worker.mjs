@@ -36,6 +36,7 @@ let spuFallbackHistogram = false;
 let diagnostics = false;
 let presentLatestOnly = false;
 let consumedFlips = 0;
+let directGpu;
 let presentedSkips = 0;
 let frameCounterAddress = 0;
 
@@ -322,6 +323,17 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
   // omit overlays, while draining past a flip would blend independent frames.
   for (;;) {
   while (bootResult === 0 && flipPacketCount === 0 && status !== 0 && performance.now() < packetDeadline) {
+    if (directGpu) {
+      // Direct backend: frames are presented by the RSX thread itself; a frame is complete when
+      // the host frame counter advanced (no packets to drain)
+      const pending = pendingFlips();
+      if (pending > 0) {
+        consumedFlips += pending;
+        presentedSkips += pending - 1;
+        flipPacketCount = 1;
+        break;
+      }
+    }
     if (discardPackets) {
       let kind;
       while ((kind = discardFrontPacket(module, carriedSurfaceOps))) {
@@ -372,6 +384,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     })))) : undefined;
   scope.postMessage({
     type,
+    directGpu,
     carriedSurfaceOps: packets.length ? carriedSurfaceOps.splice(0) : undefined,
     ok: initialized === 1 && bootResult === 0 && flipPacketCount === 1,
     initialized,
@@ -582,6 +595,14 @@ scope.addEventListener("message", async (event) => {
     }
     module.ccall("rpcs3_web_set_null_renderer", null, ["number"], [event.data.renderer === "null" ? 1 : 0]);
     bootStartedAt = performance.now();
+    if (event.data.directRenderer) {
+      // Direct WebGPU backend: the RSX thread's pool worker owns the device and the presentation canvas
+      module.ccall("rpcs3_web_set_direct_renderer", null, ["number"], [1]);
+      const flagAddress = module.ccall("rpcs3_web_rsx_spawn_flag_address", "number", [], []) >>> 0;
+      module.rpcs3OnPresent = (data) => scope.postMessage({ type: "runtime-present", frame: data.frame, bitmap: data.rpcs3Present }, [data.rpcs3Present]);
+      directGpu = await module.rpcs3PrepareGpu(event.data.gpuCanvas, flagAddress);
+      recordLog(`direct WebGPU device ready on a pool worker: ${JSON.stringify(directGpu)}`);
+    }
     initialized = module.ccall("rpcs3_web_init", "number", [], []);
     sparseVmProbe = module.ccall("rpcs3_web_sparse_vm_probe", "number", [], []);
     module.ccall("rpcs3_webgpu_set_capture_level", null, ["number"], [Number(event.data.packetCaptureLevel ?? 4)]);

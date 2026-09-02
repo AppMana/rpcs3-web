@@ -20,6 +20,8 @@ namespace rsx::webgpu
 		explicit command_queue(std::size_t byte_limit = 64 * 1024 * 1024);
 
 		[[nodiscard]] bool push(std::vector<std::byte> packet);
+		// A flip presented outside the packet stream (direct backend): advances the frame counter
+		void note_flip();
 		[[nodiscard]] std::uint32_t front_size() const;
 		[[nodiscard]] std::uint32_t front_kind() const;
 		[[nodiscard]] std::uint32_t copy_front(std::span<std::byte> destination) const;

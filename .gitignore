@@ -117,6 +117,15 @@ CMakeLists.txt.user
 
 # Experimental browser frontend and generated probe artifacts
 /web/node_modules/
+/web/.yarn/*
+!/web/.yarn/patches
+!/web/.yarn/plugins
+!/web/.yarn/releases
+!/web/.yarn/sdks
+!/web/.yarn/versions
+/web/.pnp.*
+/web/public/vendor/
+/web/.chrome-profile/
 /web/dist/
 /web/playwright-report/
 /web/test-results/

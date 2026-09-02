@@ -25,21 +25,22 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@v4
+      - run: corepack enable
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache: yarn
+          cache-dependency-path: web/yarn.lock
       - uses: mymindstorm/setup-emsdk@v14
         with:
           version: 6.0.8
           actions-cache-folder: emsdk-cache
-      - run: npm ci
-      - run: npm run build:core
-      - run: npm test
-      - run: npm run build
-      - run: npx playwright install --with-deps chromium
-      - run: npm run test:e2e
+      - run: yarn install --immutable
+      - run: yarn build:core
+      - run: yarn test
+      - run: yarn build
+      - run: yarn playwright install --with-deps chromium
+      - run: yarn test:e2e
       - uses: actions/upload-pages-artifact@v3
         if: github.event_name != 'pull_request'
         with:

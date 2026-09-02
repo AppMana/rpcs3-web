@@ -10,7 +10,7 @@
 const bindings = Object.freeze({
   spu_escape: "rpcs3_web_spu_direct_escape",
   spu_dispatch: "rpcs3_web_spu_direct_dispatch",
-  spu_dispatcher: "rpcs3_web_spu_direct_dispatch",
+  spu_dispatcher: "rpcs3_web_spu_direct_dispatcher_address",
   spu_exec_check_state: "rpcs3_web_spu_direct_check_state",
   spu_exec_mfc_cmd: "rpcs3_web_spu_direct_mfc_cmd",
   spu_exec_mfc_cmd_saveable: "rpcs3_web_spu_direct_mfc_cmd_saveable",
@@ -151,12 +151,25 @@ export async function loadSpuAotBundle({ module, mainInstance, mainMemory, manif
       pairs.push(Number.parseInt(programPattern.exec(names[position])[1], 16) >>> 0, exportBase + position);
     }
   }
+  // Diagnosis aid: `manifest.json#range=lo-hi` registers only programs [lo, hi) in placement order.
+  const range = /#range=(\d+)-(\d+)/.exec(manifestUrl);
+  if (range) {
+    const lo = Number(range[1]);
+    const hi = Number(range[2]);
+    const kept = [];
+    for (let entry = 0; entry < pairs.length / 2; entry += 1) {
+      if (entry >= lo && entry < hi) kept.push(pairs[entry * 2], pairs[entry * 2 + 1]);
+    }
+    log(`SPU AOT bundle: registering programs ${lo}-${hi} of ${pairs.length / 2}`);
+    pairs.length = 0;
+    pairs.push(...kept);
+  }
   const load = { tableBase, tableSize: cursor - tableBase, parts, bindings: boundNames };
   log(`SPU AOT bundle: layout ${pairs.length / 2} programs in ${parts.length} parts at table ${tableBase}+${load.tableSize}`);
 
   const populateStartedAt = performance.now();
   const placed = module.rpcs3PopulateSpuAot(load);
-  if (placed !== pairs.length / 2) throw new Error(`placed ${placed} programs, expected ${pairs.length / 2}`);
+  if (!range && placed !== pairs.length / 2) throw new Error(`placed ${placed} programs, expected ${pairs.length / 2}`);
   const pairBytes = module._malloc(pairs.length * 4) >>> 0;
   new Uint32Array(mainMemory.buffer, pairBytes, pairs.length).set(pairs);
   module.ccall("rpcs3_web_spu_aot_register_many", null, ["number", "number"], [pairBytes, pairs.length / 2]);

@@ -88,7 +88,10 @@ EM_JS(int, rpcs3_web_ppu_aot_worker_ready, (), { return self.__rpcs3PpuAotReady 
 
 EM_JS(int, rpcs3_web_spu_aot_worker_ready, (), { return self.__rpcs3SpuAotReady ? 1 : 0; });
 
+extern u32 g_rpcs3_web_clocks_scale;
 extern void spu_web_aot_register(const u32* pairs, u32 count);
+extern u32 g_spu_web_trace_lo;
+extern u32 g_spu_web_trace_hi;
 extern atomic_t<u64> g_spu_web_aot_dispatch_count;
 extern atomic_t<u64> g_spu_web_aot_fallback_count;
 [[noreturn]] extern void spu_web_escape_now(spu_thread* spu);
@@ -994,6 +997,13 @@ extern "C"
 	{
 	}
 
+	// spu_dispatcher is declared as a pointer-returning function by the translator (the address of the
+	// native ubertrampoline); nothing on the table path calls through it
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_direct_dispatcher_address()
+	{
+		return 0;
+	}
+
 	// branch patchpoints: same contract, pc already stored
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_direct_patchpoint(u32 /*thread*/, u32 /*ls*/, u32 /*base_pc*/)
 	{
@@ -1500,9 +1510,17 @@ extern "C"
 		return vm::web_ppu_lock_state(index);
 	}
 
+	// Diagnosis: log SPU channel traffic for pcs in [lo, hi)
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_spu_trace_range(u32 lo, u32 hi)
+	{
+		g_spu_web_trace_lo = lo;
+		g_spu_web_trace_hi = hi;
+	}
+
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_clock_scale(u32 percent)
 	{
-		g_cfg.core.clocks_scale.set(std::clamp(percent, 10u, 3000u));
+		g_rpcs3_web_clocks_scale = std::clamp(percent, 10u, 3000u);
+		g_cfg.core.clocks_scale.set(g_rpcs3_web_clocks_scale);
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_accurate_spu_dma(s32 enabled)

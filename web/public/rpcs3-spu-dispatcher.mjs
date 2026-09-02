@@ -42,10 +42,16 @@ export function createSpuDispatcher({ module, mainExports, mainMemory, aotModule
   };
 
   for (const [moduleIndex, aotModule] of aotModules.entries()) {
+    // Modules from the current translator import a stack pointer (and a table when they place blocks
+    // by element segment); this harness runs one block at a time on the module worker.
+    const stackBytes = 64 * 1024;
+    const stackBase = module._malloc(stackBytes + 16);
     const env = {
       memory: mainMemory,
       __memory_base: new WebAssembly.Global({ value: "i32", mutable: false }, memoryBase + moduleIndex * 64 * 1024),
       __table_base: new WebAssembly.Global({ value: "i32", mutable: false }, 0),
+      __stack_pointer: new WebAssembly.Global({ value: "i32", mutable: true }, (stackBase + stackBytes) & ~15),
+      __indirect_function_table: new WebAssembly.Table({ initial: 0, element: "anyfunc" }),
       spu_dispatch: () => stop(boundary.dispatch),
       spu_escape: () => stop(boundary.escape),
     };
@@ -56,6 +62,12 @@ export function createSpuDispatcher({ module, mainExports, mainMemory, aotModule
       if (imported.kind !== "function" || imported.name in env) continue;
       if (/^__spu-0x[0-9a-f]+-.+-(?:pp|chunkpp)-/i.test(imported.name)) {
         env[imported.name] = () => stop(boundary.patchpoint);
+      } else if (imported.name === "spu_exec_check_state") {
+        // The parked thread is between steps; the harness runs blocks only while it is not stopping
+        env[imported.name] = () => 0;
+      } else if (/^(spu_|wait_|get_timebased_time$|PUTLLC)/.test(imported.name)) {
+        // Channel, MFC and timer helpers need the owning thread: stop the block, the interpreter steps
+        env[imported.name] = () => stop(boundary.escape);
       } else {
         throw new Error(`unsupported SPU AOT function import env.${imported.name}`);
       }

@@ -78,6 +78,7 @@ if(RPCS3_WEB)
 		"-sDEFAULT_PTHREAD_STACK_SIZE=1048576"
 		"-sPTHREAD_POOL_SIZE=(Module['pthreadPoolSize']||12)"
 		"-sALLOW_TABLE_GROWTH=1"
+		"-Wl,--export=__stack_pointer"
 		"SHELL:--pre-js ${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_pre.js"
 		"-sNO_EXIT_RUNTIME=1"
 		"-sFORCE_FILESYSTEM=1"

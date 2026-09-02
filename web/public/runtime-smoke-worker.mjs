@@ -578,6 +578,9 @@ scope.addEventListener("message", async (event) => {
       Number(event.data.traceDelayMs) >>> 0,
     ]);
     module.ccall("rpcs3_web_set_watch_address", null, ["number"], [watchAddress]);
+    if (Array.isArray(event.data.spuTraceRange)) {
+      module.ccall("rpcs3_web_set_spu_trace_range", null, ["number", "number"], [Number(event.data.spuTraceRange[0]) >>> 0, Number(event.data.spuTraceRange[1]) >>> 0]);
+    }
     // Input trace replay: applied on the RSX thread at the recorded flips.
     module.ccall("rpcs3_web_pad_schedule_clear", null, [], []);
     for (const entry of [...(Array.isArray(event.data.inputTrace) ? event.data.inputTrace : [])].sort((a, b) => a.frame - b.frame)) {

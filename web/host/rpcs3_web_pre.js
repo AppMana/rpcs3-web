@@ -25,7 +25,12 @@ Module["rpcs3PopulatePpuAot"] = (load) => {
       if (imported.module !== "env") throw new Error(`unsupported import ${imported.module}.${imported.name}`);
       if (imported.name in env) continue;
       if (imported.kind === "global" && imported.name === "__stack_pointer") {
-        // One pool slot per worker instance (claimed atomically; no malloc before thread init).
+        // Share this worker's own stack pointer: a longjmp out of compiled code unwinds without epilogues,
+        // and Emscripten's invoke wrappers restore only the main module's stack pointer.
+        if (wasmExports["__stack_pointer"] instanceof WebAssembly.Global) {
+          env.__stack_pointer = wasmExports["__stack_pointer"];
+          continue;
+        }
         const pool = part.stackPool;
         if (!pool) throw new Error("part imports __stack_pointer but the layout reserved no stack pool");
         const slot = Atomics.add(new Int32Array(wasmMemory.buffer, pool.base, 1), 0, 1);
@@ -76,6 +81,10 @@ Module["rpcs3PopulateSpuAot"] = (load) => {
       if (imported.module !== "env") throw new Error(`unsupported import ${imported.module}.${imported.name}`);
       if (imported.name in env) continue;
       if (imported.kind === "global" && imported.name === "__stack_pointer") {
+        if (wasmExports["__stack_pointer"] instanceof WebAssembly.Global) {
+          env.__stack_pointer = wasmExports["__stack_pointer"];
+          continue;
+        }
         const pool = part.stackPool;
         if (!pool) throw new Error("part imports __stack_pointer but the layout reserved no stack pool");
         const slot = Atomics.add(new Int32Array(wasmMemory.buffer, pool.base, 1), 0, 1);
@@ -111,6 +120,14 @@ Module["rpcs3PopulateSpuAot"] = (load) => {
 };
 
 if (typeof self !== "undefined" && typeof self.addEventListener === "function") {
+  // An uncaught error in a pthread worker only reaches the parent as a message string; forward the
+  // stack (wasm function names in the profile build) so the module worker can log it.
+  self.addEventListener("error", (event) => {
+    try {
+      const stack = event && event.error && event.error.stack ? String(event.error.stack) : String(event && event.message);
+      self.postMessage({ rpcs3WorkerError: stack.slice(0, 4000) });
+    } catch (_) {}
+  });
   const handlers = {
     rpcs3PpuAot: { populate: "rpcs3PopulatePpuAot", base: "__rpcs3PpuAotBase", count: (result) => result.parts.length },
     rpcs3SpuAot: { populate: "rpcs3PopulateSpuAot", base: "__rpcs3SpuAotBase", count: (result) => result },

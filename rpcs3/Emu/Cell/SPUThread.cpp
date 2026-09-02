@@ -144,6 +144,10 @@ static bool spu_web_dma_is_contiguous(u32 ea, u32 size)
 }
 #endif
 
+// Diagnosis: channel traffic is logged for pcs in [lo, hi) (rpcs3_web_set_spu_trace_range)
+u32 g_spu_web_trace_lo = 0;
+u32 g_spu_web_trace_hi = 0;
+
 const u32 spu_frest_exponent_lut[256] =
 {
 	0x7F800000, 0x7E000000, 0x7D800000, 0x7D000000, 0x7C800000, 0x7C000000, 0x7B800000, 0x7B000000, 0x7A800000, 0x7A000000, 0x79800000, 0x79000000, 0x78800000, 0x78000000, 0x77800000, 0x77000000,
@@ -1567,6 +1571,9 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 
 	const bool aot_ready = rpcs3_web_spu_aot_worker_ready() != 0;
 
+	// Re-entered after an escape longjmp as well, so restore the interpreter's setting here
+	spu.allow_interrupts_in_cpu_work = true;
+
 	while (true)
 	{
 		if (spu.state) [[unlikely]]
@@ -1579,16 +1586,22 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 		{
 			if (const auto list = g_spu_web_aot_lists[(spu.pc & 0x3fffc) / 4].load())
 			{
-				// A block that ran advances block_counter (its verified entry); one that returned through
-				// spu_dispatch without running leaves it, and the next candidate or the interpreter takes over.
-				const u64 counter = spu.block_counter;
+				// A program whose local-store verification fails increments block_failure and returns
+				// through spu_dispatch; any other return means it ran, whatever it did to pc.
+				const u64 failures = spu.block_failure;
 				bool ran = false;
+
+				// Compiled code takes interrupts at its own spu_check_interrupts sites, as the native
+				// recompiled path does; cpu_work must not redirect pc underneath it
+				spu.allow_interrupts_in_cpu_work = false;
 
 				for (u32 i = 0; i < list->count && !ran; i++)
 				{
 					reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(list->indices[i]))(&spu, spu._ptr<u8>(0), 0);
-					ran = spu.block_counter != counter;
+					ran = spu.block_failure == failures + i;
 				}
+
+				spu.allow_interrupts_in_cpu_work = true;
 
 				if (ran)
 				{
@@ -2319,6 +2332,14 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 			fragment.eal += offset;
 			fragment.lsa += offset;
 			fragment.size = std::min<u32>(args.size - offset, 0x1000 - (fragment.eal & 0xfff));
+
+			if (!spu_web_dma_is_contiguous(fragment.eal, fragment.size))
+			{
+				// A single-page fragment that is still not contiguous is an unmapped guest page: the
+				// desktop build faults here, so stop with the command instead of recursing
+				fmt::throw_exception("SPU DMA to unmapped guest memory: cmd=0x%x eal=0x%x lsa=0x%x size=0x%x tag=%u pc=0x%x", args.cmd, args.eal, args.lsa, args.size, args.tag, _this ? _this->pc : 0);
+			}
+
 			do_dma_transfer(_this, fragment, ls);
 			offset += fragment.size;
 		}
@@ -5656,6 +5677,18 @@ void spu_thread::set_interrupt_status(bool enable)
 
 u32 spu_thread::get_ch_count(u32 ch)
 {
+	if (g_spu_web_trace_lo <= pc && pc < g_spu_web_trace_hi)
+	{
+		const u32 r = get_ch_count_impl(ch);
+		spu_log.warning("web-trace[%u] pc=0x%05x rchcnt(%u) -> %u", index, pc, ch, r);
+		return r;
+	}
+
+	return get_ch_count_impl(ch);
+}
+
+u32 spu_thread::get_ch_count_impl(u32 ch)
+{
 	if (ch < 128) spu_log.trace("get_ch_count(ch=%s)", spu_ch_name[ch]);
 
 	switch (ch)
@@ -5702,6 +5735,18 @@ u32 spu_thread::get_ch_count(u32 ch)
 }
 
 s64 spu_thread::get_ch_value(u32 ch)
+{
+	if (g_spu_web_trace_lo <= pc && pc < g_spu_web_trace_hi)
+	{
+		const s64 r = get_ch_value_impl(ch);
+		spu_log.warning("web-trace[%u] pc=0x%05x rdch(%u) -> 0x%llx st=0x%x", index, pc, ch, r, +state);
+		return r;
+	}
+
+	return get_ch_value_impl(ch);
+}
+
+s64 spu_thread::get_ch_value_impl(u32 ch)
 {
 	if (ch < 128) spu_log.trace("get_ch_value(ch=%s)", spu_ch_name[ch]);
 
@@ -6324,6 +6369,18 @@ s64 spu_thread::get_ch_value(u32 ch)
 }
 
 bool spu_thread::set_ch_value(u32 ch, u32 value)
+{
+	if (g_spu_web_trace_lo <= pc && pc < g_spu_web_trace_hi)
+	{
+		const bool r = set_ch_value_impl(ch, value);
+		spu_log.warning("web-trace[%u] pc=0x%05x wrch(%u, 0x%x) -> %d st=0x%x", index, pc, ch, value, r, +state);
+		return r;
+	}
+
+	return set_ch_value_impl(ch, value);
+}
+
+bool spu_thread::set_ch_value_impl(u32 ch, u32 value)
 {
 	if (ch < 128) spu_log.trace("set_ch_value(ch=%s, value=0x%x)", spu_ch_name[ch], value);
 

@@ -231,6 +231,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       ppuAot: options.ppuAot === true,
       ppuAotBundle: typeof options.ppuAotBundle === "string" ? options.ppuAotBundle : undefined,
       spuAotBundle: typeof options.spuAotBundle === "string" ? options.spuAotBundle : undefined,
+      spuTraceRange: Array.isArray(options.spuTraceRange) ? options.spuTraceRange : undefined,
       spuAot: options.spuAot === true,
       clockScale: options.clockScale,
       accurateSpuDma: options.accurateSpuDma,

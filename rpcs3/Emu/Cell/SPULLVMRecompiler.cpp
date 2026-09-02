@@ -4739,7 +4739,7 @@ public:
 		}
 		case MFC_RdTagStat:
 		{
-			res.value = get_rdch(op, ::offset32(&spu_thread::ch_tag_stat), false);
+			res.value = get_rdch(op, spu_offset(&spu_thread::ch_tag_stat), false);
 			break;
 		}
 		case MFC_RdTagMask:
@@ -4751,30 +4751,31 @@ public:
 		{
 			update_pc();
 			ensure_gpr_stores();
-			res.value = get_rdch(op, ::offset32(&spu_thread::ch_snr1), true);
+			res.value = get_rdch(op, spu_offset(&spu_thread::ch_snr1), true);
 			break;
 		}
 		case SPU_RdSigNotify2:
 		{
 			update_pc();
 			ensure_gpr_stores();
-			res.value = get_rdch(op, ::offset32(&spu_thread::ch_snr2), true);
+			res.value = get_rdch(op, spu_offset(&spu_thread::ch_snr2), true);
 			break;
 		}
 		case MFC_RdAtomicStat:
 		{
-			res.value = get_rdch(op, ::offset32(&spu_thread::ch_atomic_stat), false);
+			res.value = get_rdch(op, spu_offset(&spu_thread::ch_atomic_stat), false);
 			break;
 		}
 		case MFC_RdListStallStat:
 		{
-			res.value = get_rdch(op, ::offset32(&spu_thread::ch_stall_stat), false);
+			res.value = get_rdch(op, spu_offset(&spu_thread::ch_stall_stat), false);
 			break;
 		}
 		case SPU_RdDec:
 		{
 #if defined(ARCH_X64) || defined(ARCH_ARM64)
-			if (utils::get_tsc_freq() && !(g_cfg.core.spu_loop_detection) && (g_cfg.core.clocks_scale == 100))
+			// The inlined decrementer reads the host cycle counter and a host global; the browser has neither
+			if (!m_wasm_aot && utils::get_tsc_freq() && !(g_cfg.core.spu_loop_detection) && (g_cfg.core.clocks_scale == 100))
 			{
 				const auto timebase_offs = m_ir->CreateLoad(get_type<u64>(), m_ir->CreateIntToPtr(m_ir->getInt64(reinterpret_cast<u64>(&g_timebase_offs)), get_type<u64*>()));
 				const auto timestamp = m_ir->CreateLoad(get_type<u64>(), spu_ptr(&spu_thread::ch_dec_start_timestamp));
@@ -4931,22 +4932,22 @@ public:
 			{
 			case SPU_WrOutMbox:
 			{
-				res.value = wait_rchcnt(::offset32(&spu_thread::ch_out_mbox), true);
+				res.value = wait_rchcnt(spu_offset(&spu_thread::ch_out_mbox), true);
 				break;
 			}
 			case SPU_WrOutIntrMbox:
 			{
-				res.value = wait_rchcnt(::offset32(&spu_thread::ch_out_intr_mbox), true);
+				res.value = wait_rchcnt(spu_offset(&spu_thread::ch_out_intr_mbox), true);
 				break;
 			}
 			case SPU_RdSigNotify1:
 			{
-				res.value = wait_rchcnt(::offset32(&spu_thread::ch_snr1));
+				res.value = wait_rchcnt(spu_offset(&spu_thread::ch_snr1));
 				break;
 			}
 			case SPU_RdSigNotify2:
 			{
-				res.value = wait_rchcnt(::offset32(&spu_thread::ch_snr2));
+				res.value = wait_rchcnt(spu_offset(&spu_thread::ch_snr2));
 				break;
 			}
 			case SPU_RdInMbox:
@@ -4973,37 +4974,37 @@ public:
 		{
 		case SPU_WrOutMbox:
 		{
-			res.value = get_rchcnt(::offset32(&spu_thread::ch_out_mbox), true);
+			res.value = get_rchcnt(spu_offset(&spu_thread::ch_out_mbox), true);
 			break;
 		}
 		case SPU_WrOutIntrMbox:
 		{
-			res.value = get_rchcnt(::offset32(&spu_thread::ch_out_intr_mbox), true);
+			res.value = get_rchcnt(spu_offset(&spu_thread::ch_out_intr_mbox), true);
 			break;
 		}
 		case MFC_RdTagStat:
 		{
-			res.value = get_rchcnt(::offset32(&spu_thread::ch_tag_stat));
+			res.value = get_rchcnt(spu_offset(&spu_thread::ch_tag_stat));
 			break;
 		}
 		case MFC_RdListStallStat:
 		{
-			res.value = get_rchcnt(::offset32(&spu_thread::ch_stall_stat));
+			res.value = get_rchcnt(spu_offset(&spu_thread::ch_stall_stat));
 			break;
 		}
 		case SPU_RdSigNotify1:
 		{
-			res.value = get_rchcnt(::offset32(&spu_thread::ch_snr1));
+			res.value = get_rchcnt(spu_offset(&spu_thread::ch_snr1));
 			break;
 		}
 		case SPU_RdSigNotify2:
 		{
-			res.value = get_rchcnt(::offset32(&spu_thread::ch_snr2));
+			res.value = get_rchcnt(spu_offset(&spu_thread::ch_snr2));
 			break;
 		}
 		case MFC_RdAtomicStat:
 		{
-			res.value = get_rchcnt(::offset32(&spu_thread::ch_atomic_stat));
+			res.value = get_rchcnt(spu_offset(&spu_thread::ch_atomic_stat));
 			break;
 		}
 		case MFC_WrTagUpdate:
@@ -5503,7 +5504,7 @@ public:
 
 				// Get MFC slot, redirect to invalid memory address
 				const auto slot = m_ir->CreateLoad(get_type<u32>(), spu_ptr(&spu_thread::mfc_size));
-				const auto off0 = m_ir->CreateAdd(m_ir->CreateMul(slot, m_ir->getInt32(sizeof(spu_mfc_cmd))), m_ir->getInt32(::offset32(&spu_thread::mfc_queue)));
+				const auto off0 = m_ir->CreateAdd(m_ir->CreateMul(slot, m_ir->getInt32(sizeof(spu_mfc_cmd))), m_ir->getInt32(spu_offset(&spu_thread::mfc_queue)));
 				const auto ptr0 = _ptr(m_thread, m_ir->CreateZExt(off0, get_type<u64>()));
 				llvm::Value* pmfc = ptr0;
 				if (m_wasm_aot)
@@ -5618,7 +5619,8 @@ public:
 			call("spu_get_events", &exec_get_events, m_thread, m_ir->getInt32(SPU_EVENT_TM));
 
 #if defined(ARCH_X64) || defined(ARCH_ARM64)
-			if (utils::get_tsc_freq() && !(g_cfg.core.spu_loop_detection) && (g_cfg.core.clocks_scale == 100))
+			// The inlined decrementer reads the host cycle counter and a host global; the browser has neither
+			if (!m_wasm_aot && utils::get_tsc_freq() && !(g_cfg.core.spu_loop_detection) && (g_cfg.core.clocks_scale == 100))
 			{
 				const auto timebase_offs = m_ir->CreateLoad(get_type<u64>(), m_ir->CreateIntToPtr(m_ir->getInt64(reinterpret_cast<u64>(&g_timebase_offs)), get_type<u64*>()));
 				const auto tsc = m_ir->CreateCall(get_intrinsic(llvm::Intrinsic::readcyclecounter));
@@ -6573,7 +6575,8 @@ public:
 		const auto b = get_vr<u8[16]>(op.rb);
 
 #if defined(ARCH_X64)
-		if (!m_use_ssse3)
+		// The generic path below is exact on wasm: x86_pshufb lowers to i8x16.swizzle there
+		if (!m_use_ssse3 && !m_wasm_aot)
 		{
 			value_t<u8[16]> r;
 			r.value = call<u8[16]>("spu_rotqby", &exec_rotqby, a.value, eval(extract(b, 12)).value);
@@ -6852,7 +6855,8 @@ public:
 #ifdef ARCH_ARM64
 		set_vr(op.rt, ctlz(get_vr(op.ra)));
 #else
-		if (m_use_avx512)
+		// The float trick below needs the host FPU in round-towards-zero; wasm rounds to nearest
+		if (m_use_avx512 || m_wasm_aot)
 		{
 			set_vr(op.rt, ctlz(get_vr(op.ra)));
 			return;
@@ -9402,16 +9406,24 @@ public:
 		}
 	}
 
+	// The native local store is mapped several times so an address that left the 256 KiB range after
+	// adding an immediate wraps through the mirror; the browser has one unmirrored block, so the SPU's
+	// modulo-LS addressing is applied here for wasm output.
+	llvm::Value* ls_addr(value_t<u64> addr)
+	{
+		return m_wasm_aot ? m_ir->CreateAnd(addr.value, 0x3fff0) : addr.value;
+	}
+
 	void make_store_ls(value_t<u64> addr, value_t<u8[16]> data)
 	{
 		const auto bswapped = byteswap(data);
-		spu_mem_attr(m_ir->CreateStore(bswapped.eval(m_ir), _ptr(m_lsptr, addr.value)));
+		spu_mem_attr(m_ir->CreateStore(bswapped.eval(m_ir), _ptr(m_lsptr, ls_addr(addr))));
 	}
 
 	auto make_load_ls(value_t<u64> addr)
 	{
 		value_t<u8[16]> data;
-		data.value = spu_mem_attr(m_ir->CreateLoad(get_type<u8[16]>(), _ptr(m_lsptr, addr.value)));
+		data.value = spu_mem_attr(m_ir->CreateLoad(get_type<u8[16]>(), _ptr(m_lsptr, ls_addr(addr))));
 		return byteswap(data);
 	}
 
@@ -9754,7 +9766,7 @@ public:
 		if (ret && g_cfg.core.spu_block_size >= spu_block_size_type::mega)
 		{
 			// Compare address stored in stack mirror with addr
-			const auto stack0 = eval(zext<u64>(sp) + ::offset32(&spu_thread::stack_mirror));
+			const auto stack0 = eval(zext<u64>(sp) + spu_offset(&spu_thread::stack_mirror));
 			const auto stack1 = eval(stack0 + 8);
 			const auto _ret = m_ir->CreateLoad(get_type<u64>(), _ptr(m_thread, stack0.value));
 			const auto link = m_ir->CreateLoad(get_type<u64>(), _ptr(m_thread, stack1.value));
@@ -10448,7 +10460,7 @@ public:
 		{
 			// Store the return function chunk address at the stack mirror
 			const auto pfunc = add_function(m_pos + 4);
-			const auto stack0 = eval(zext<u64>(extract(get_reg_fixed(1), 3) & 0x3fff0) + ::offset32(&spu_thread::stack_mirror));
+			const auto stack0 = eval(zext<u64>(extract(get_reg_fixed(1), 3) & 0x3fff0) + spu_offset(&spu_thread::stack_mirror));
 			const auto stack1 = eval(stack0 + 8);
 			const auto rel_ptr = m_ir->CreateSub(m_ir->CreatePtrToInt(pfunc->chunk, get_type<u64>()), m_ir->CreatePtrToInt(get_segment_base(), get_type<u64>()));
 			const auto ptr_plus_op = m_ir->CreateOr(m_ir->CreateShl(rel_ptr, 32), m_ir->getInt64(m_next_op));

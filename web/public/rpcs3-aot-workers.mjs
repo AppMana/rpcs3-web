@@ -15,6 +15,11 @@ export function broadcastAotLoad({ module, key, load, readyTimeoutMs = 60_000 })
   const send = (worker) => {
     if (populated.has(worker)) return;
     populated.add(worker);
+    // Uncaught errors forwarded by the worker hook (stays registered for the worker's lifetime)
+    worker.addEventListener("message", (event) => {
+      const data = event.data;
+      if (data && typeof data.rpcs3WorkerError === "string") console.log(`[rpcs3 worker error] ${data.rpcs3WorkerError}`);
+    });
     const promise = new Promise((resolve) => {
       worker.addEventListener("message", function listener(event) {
         const data = event.data;

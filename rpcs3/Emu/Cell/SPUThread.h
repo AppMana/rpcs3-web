@@ -876,6 +876,9 @@ public:
 	u32 get_ch_count(u32 ch);
 	s64 get_ch_value(u32 ch);
 	bool set_ch_value(u32 ch, u32 value);
+	u32 get_ch_count_impl(u32 ch);
+	s64 get_ch_value_impl(u32 ch);
+	bool set_ch_value_impl(u32 ch, u32 value);
 	bool stop_and_signal(u32 code);
 	void halt();
 

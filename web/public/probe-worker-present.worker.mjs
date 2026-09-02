@@ -13,7 +13,9 @@ struct U { t: f32 };
 self.onmessage = async ({ data }) => {
   const result = { startedAt: Date.now() };
   try {
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    // Ask for the adapter with no options first: headless Chrome answers a
+    // powerPreference request with null even when a hardware adapter exists.
+    const adapter = await navigator.gpu.requestAdapter() ?? await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     const device = await adapter.requestDevice();
     const canvas = data.canvas;
     const context = canvas.getContext("webgpu");

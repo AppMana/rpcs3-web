@@ -224,10 +224,12 @@ async function probeWebGpu(canvas?: OffscreenCanvas) {
     };
   }
 
-  let adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  // Ask for the adapter with no options first: headless Chrome answers a
+  // powerPreference request with null even when a hardware adapter exists.
+  let adapter = await navigator.gpu.requestAdapter();
   if (!adapter) {
     await new Promise<void>((resolve) => setTimeout(resolve, 100));
-    adapter = await navigator.gpu.requestAdapter();
+    adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
   }
   if (!adapter) {
     const guest = await probeGuestWithoutGpu("requestAdapter returned null");

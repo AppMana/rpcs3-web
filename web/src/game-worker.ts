@@ -288,7 +288,9 @@ class GuestRenderer {
 
 async function start(canvas: OffscreenCanvas): Promise<void> {
   if (!("gpu" in navigator)) throw new Error("WebGPU is unavailable in this worker");
-  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  // Ask for the adapter with no options first: headless Chrome answers a
+  // powerPreference request with null even when a hardware adapter exists.
+  const adapter = await navigator.gpu.requestAdapter() ?? await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
   if (!adapter) throw new Error("WebGPU requestAdapter returned null");
   const device = await adapter.requestDevice();
   const context = canvas.getContext("webgpu");

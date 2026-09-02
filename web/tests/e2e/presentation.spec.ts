@@ -11,7 +11,8 @@ test("presents a WebGPU swapchain texture to the browser compositor", async ({ p
     canvas.height = 64;
     canvas.style.display = "block";
     document.body.prepend(canvas);
-    const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
+    // No power preference: headless Chrome answers that request with null even with hardware present.
+    const adapter = await navigator.gpu?.requestAdapter();
     if (!adapter) return { ok: false, detail: "no adapter" };
     const device = await adapter.requestDevice();
     const context = canvas.getContext("webgpu");

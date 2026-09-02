@@ -229,7 +229,9 @@ if (typeof self !== "undefined" && typeof self.addEventListener === "function") 
     (async () => {
       const canvas = data.rpcs3PrepareGpu.canvas;
       if (!("gpu" in navigator)) throw new Error("navigator.gpu is unavailable in this worker");
-      const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+      // Ask for the adapter with no options first: headless Chrome answers a
+      // powerPreference request with null even when a hardware adapter exists.
+      const adapter = await navigator.gpu.requestAdapter() ?? await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
       if (!adapter) throw new Error("requestAdapter returned null in the worker");
       // Features the backend uses when the adapter has them (BC textures for DXT, filterable
       // float for the float render targets, depth clip control for RSX depth clamp)

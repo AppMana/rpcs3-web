@@ -19,7 +19,9 @@ self.onmessage = async ({ data }) => {
     result.jspi = { suspending: typeof WebAssembly.Suspending === "function", promising: typeof WebAssembly.promising === "function" };
     result.offscreenCanvasReceived = data.canvas instanceof OffscreenCanvas;
     if (!result.workerNavigatorGpu) throw new Error("navigator.gpu is unavailable in the worker");
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    // Ask for the adapter with no options first: headless Chrome answers a
+    // powerPreference request with null even when a hardware adapter exists.
+    const adapter = await navigator.gpu.requestAdapter() ?? await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) throw new Error("requestAdapter returned null in the worker");
     const info = adapter.info ?? {};
     result.adapter = { vendor: info.vendor, architecture: info.architecture, device: info.device, description: info.description,

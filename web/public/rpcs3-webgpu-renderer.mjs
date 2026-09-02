@@ -2005,11 +2005,10 @@ export async function prepareWebGPU(canvas, options = {}) {
     throw new Error("an HTMLCanvasElement or OffscreenCanvas is required for WebGPU presentation");
   }
   if (!("gpu" in navigator)) throw new Error("WebGPU is unavailable in this execution context");
-  let adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-  // Some Dawn/Vulkan combinations expose the discrete device while ignoring
-  // the preference hint in dedicated workers. Match RPCS3 Web's capability
-  // probe and retry without a hint before declaring WebGPU unavailable.
-  if (!adapter) adapter = await navigator.gpu.requestAdapter();
+  // Ask for the adapter with no options first: headless Chrome answers a
+  // powerPreference request with null even when a hardware adapter exists.
+  let adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
   if (!adapter) throw new Error("WebGPU requestAdapter returned null");
   const device = await adapter.requestDevice();
   const presentation = options.presentation !== false;

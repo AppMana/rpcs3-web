@@ -1,4 +1,4 @@
-import { ClearMask, PacketFlag, PacketKind, SectionKind, fnv1a32 } from "./rpcs3-webgpu-packet.mjs";
+import { ClearMask, PacketFlag, PacketKind, SectionKind, fnv1a32, SurfaceOpKind } from "./rpcs3-webgpu-packet.mjs";
 
 let activePresentation;
 
@@ -25,6 +25,8 @@ export function releaseWebGPU(prepared) {
   prepared.textureCache?.forEach((resource) => resource.texture.destroy());
   prepared.textureCache = undefined;
   prepared.textureCacheBytes = 0;
+  prepared.surfaceTable?.forEach((surface) => { surface.texture.destroy(); surface.scratch?.destroy(); surface.regions?.forEach((region) => region.texture.destroy()); });
+  prepared.surfaceTable = undefined;
   prepared.bindGroupCache = undefined;
   prepared.pipelineCache = undefined;
   prepared.programCache = undefined;
@@ -354,6 +356,11 @@ function compileVertexProgram(packet) {
     "  dot(rsxVertexState.environment[3], rsxPosition),",
     ");",
     "transformedPosition.y = -transformedPosition.y;",
+    // RPCS3's Vulkan backend sets the viewport depth range to the RSX clip min/max registers
+    // (VKGSRender::set_viewport, VK_EXT_depth_range_unrestricted): z_window = min + z_ndc * (max - min).
+    // WebGPU viewports cannot express an inverted range, so the same transform is applied to clip z.
+    "let rsxDepthRange = vec2f(rsxVertexState.environment[4].w, rsxVertexState.environment[5].x);",
+    "transformedPosition.z = transformedPosition.z * (rsxDepthRange.y - rsxDepthRange.x) + rsxDepthRange.x * transformedPosition.w;",
     "result.position = transformedPosition;",
     ...VertexVaryings.map((name, index) => `result.${name} = destination[${VertexVaryingDestinations[index]}];`),
   );
@@ -497,7 +504,12 @@ function applyVertexEnvironment(packet, position) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const columns = Array.from({ length: 4 }, (_, column) =>
     Array.from({ length: 4 }, (_, row) => view.getFloat32(column * 16 + row * 4, true)));
-  return columns.map((column) => position.reduce((sum, component, index) => sum + component * column[index], 0));
+  const transformed = columns.map((column) => position.reduce((sum, component, index) => sum + component * column[index], 0));
+  // Viewport depth range from the RSX clip min/max registers (floats 19 and 20), as the WGSL epilogue applies it.
+  const clipMin = view.getFloat32(76, true);
+  const clipMax = view.getFloat32(80, true);
+  transformed[2] = transformed[2] * (clipMax - clipMin) + clipMin * transformed[3];
+  return transformed;
 }
 
 function fragmentWord(view, offset) {
@@ -664,6 +676,9 @@ function compileFragmentProgram(packet) {
       else if (opcode === 0x31) value = `textureSampleBias(${texture}, ${sources[0]}.${coord}, ${sources[1]}.x)`;
       else if (opcode === 0x33) value = `textureSample(${texture}, ${x2d}.${coord})`;
       else value = `textureSample(${texture}, ${x2d}.${coord} / ${x2d}.w)`;
+      // Render targets sampled as textures go through the surface's native component map
+      // composed with the guest remap (vk::apply_swizzle_remap); uploads bake the remap.
+      value = `rsxTexel${textureSlot}(${value})`;
       textureSlots.add(textureSlot);
       textureDimensions.set(textureSlot, dimension);
     } else if (opcode === 0x1a) value = `vec4f(1.0 / ${sources[0]}.x)`;
@@ -791,10 +806,12 @@ function translateDraw(packet, program, vertexDiagnostics = false, vertexBackend
   let input;
   let oracleOutput;
   if (needsCpuVertices) {
-    if (primitiveRestart) throw new Error("the CPU vertex oracle cannot expand a primitive-restart index stream");
+    if (primitiveRestart && vertexBackend === "cpu-oracle") throw new Error("the CPU vertex oracle cannot expand a primitive-restart index stream");
     const descriptors = readVertexDescriptors(packet);
     const { vertexBaseIndex, vertexIndexOffset } = vertexIndexing(packet);
-    const vertexOrder = drawVertexOrder(packet);
+    // Diagnostics only need the transformed vertices, so restart markers are dropped.
+    const restartSentinel = packet.indexType === 0 ? 0xffffffff : 0xffff;
+    const vertexOrder = drawVertexOrder(packet).filter((vertex) => !(primitiveRestart && vertex === restartSentinel));
     input = new Float32Array(vertexOrder.length * VertexOutputStrideFloats);
     oracleOutput = new Float32Array(vertexOrder.length * VertexOutputStrideFloats);
     for (let outputVertex = 0; outputVertex < vertexOrder.length; outputVertex += 1) {
@@ -924,7 +941,7 @@ fn rsxReadLocation(location: u32, vertexIndex: u32) -> vec4f {
 // Translated programs are keyed by microcode content and the control words
 // that change the generated WGSL, so a frame that reuses a program never
 // re-translates it or rebuilds its shader module and bind group layout.
-function programKey(packet, vertexBackend) {
+function programKey(packet, vertexBackend, textureSwizzles = new Map()) {
   return [
     vertexBackend,
     fnv1a32(packet.sections[SectionKind.vertexProgram].bytes),
@@ -933,14 +950,17 @@ function programKey(packet, vertexBackend) {
     packet.vertexProgramOutputMask,
     fnv1a32(packet.sections[SectionKind.fragmentProgram].bytes),
     packet.fragmentProgramControl,
-    packet.textures.filter((texture) => texture.stage === 0).map((texture) => `${texture.slot}=${texture.dimension}`).join(","),
+    packet.textures.filter((texture) => texture.stage === 0).map((texture) => `${texture.slot}=${texture.dimension}${textureSwizzles.has(texture.slot) ? `/${textureSwizzles.get(texture.slot)}` : ""}`).join(","),
+    (SURFACE_TARGET_INDICES[packet.colorTarget] ?? []).length,
+    packet.resolvedState.alphaTestEnabled ? `a${packet.resolvedState.alphaFunc & 7}` : "a-",
   ].join(":");
 }
 
-function assembleShader(vertex, fragment, vertexBackend) {
+function assembleShader(vertex, fragment, vertexBackend, colorTargetCount = 1, alphaFunc = undefined, textureSwizzles = new Map()) {
   const declarations = fragment.textureSlots.flatMap((slot) => [
     `@group(0) @binding(${slot * 2}) var rsxTexture${slot}: ${WGSL_TEXTURE_TYPES[fragment.textureDimensions.get(slot)]};`,
     `@group(0) @binding(${slot * 2 + 1}) var rsxSampler${slot}: sampler;`,
+    textureSwizzleCode(slot, textureSwizzles.get(slot)),
   ]).join("\n");
   const vertexOutputFields = VertexVaryings.map((name, varying) => `@location(${varying}) ${name}: vec4f,`).join("\n");
   const fragmentDeclarations = `
@@ -1004,10 +1024,41 @@ function assembleShader(vertex, fragment, vertexBackend) {
       ${vertexOutputFields}
     };
     ${vertexStage}
-    @fragment fn fragment_main(input: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(0) vec4f {
-      ${fragment.code}
-    }
+    ${fragmentSignature(fragment, colorTargetCount, alphaFunc)}
   `;
+}
+
+// RSX alpha test (RSXROPEpilogue.glsl): the fragment is discarded unless color 0's alpha
+// passes alpha_func against alpha_ref (fragment environment word 3). Function codes are the
+// low bits of CELL_GCM_NEVER..ALWAYS.
+const ALPHA_COMPARISONS = ["false", "a < r", "a == r", "a <= r", "a > r", "a != r", "a >= r", "true"];
+function alphaTestCode(value, alphaFunc) {
+  if (alphaFunc === undefined) return "";
+  return `{ let a = ${value}.w; let r = rsxFragmentState.environment[0].w; if (!(${ALPHA_COMPARISONS[alphaFunc]})) { discard; } }`;
+}
+
+// RSX writes color targets 1..3 from r2, r3, r4 (32-bit exports) or h4, h6, h8 (16-bit
+// exports), as FragmentProgramDecompiler's ocol1..3; a single target keeps the plain return.
+function fragmentSignature(fragment, colorTargetCount, alphaFunc) {
+  const match = /return (r16|r32)\[0\];\s*$/.exec(fragment.code);
+  if (!match) throw new Error("RSX fragment program has no color return");
+  const file = match[1];
+  const body = fragment.code.slice(0, match.index);
+  const alphaTest = alphaTestCode(`${file}[0]`, alphaFunc);
+  if (colorTargetCount <= 1) {
+    return `@fragment fn fragment_main(input: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(0) vec4f {
+      ${body}${alphaTest}
+      return ${file}[0];
+    }`;
+  }
+  const registers = file === "r32" ? [0, 2, 3, 4] : [0, 4, 6, 8];
+  const fields = Array.from({ length: colorTargetCount }, (_, i) => `@location(${i}) color${i}: vec4f,`).join(" ");
+  const values = Array.from({ length: colorTargetCount }, (_, i) => `${file}[${registers[i]}]`).join(", ");
+  return `struct FragmentOut { ${fields} };
+    @fragment fn fragment_main(input: VertexOut, @builtin(front_facing) frontFacing: bool) -> FragmentOut {
+      ${body}${alphaTest}
+      return FragmentOut(${values});
+    }`;
 }
 
 // Differential check of the WGSL vertex fetch: a compute pass runs
@@ -1119,11 +1170,11 @@ struct ClearOut { @builtin(position) position: vec4f };
   out.position = vec4f(x, y, 0.0, 1.0);
   return out;
 }
-struct ClearFragment { @location(0) color: vec4f, @builtin(frag_depth) depth: f32 };
+struct ClearFragment { CLEAR_OUTPUTS CLEAR_DEPTH_FIELD };
 @fragment fn fragment_main() -> ClearFragment {
   var out: ClearFragment;
-  out.color = rsxClear.color;
-  out.depth = rsxClear.depth;
+  CLEAR_ASSIGNMENTS
+  CLEAR_DEPTH_ASSIGN
   return out;
 }
 `;
@@ -1160,23 +1211,38 @@ function getNullTexture(prepared, dimension = 1) {
   return resource;
 }
 
-function getClearPipeline(prepared, format, writeMask, depthWrite) {
+// A clear covers every bound color target and the depth target of its framebuffer.
+function getClearPipeline(prepared, targets, writeMask, depthWrite) {
   const cache = prepared.clearPipelineCache ??= new Map();
-  const key = `${format}|${writeMask}|${depthWrite}`;
+  const key = `${targets.formatKey}|${writeMask}|${depthWrite}`;
   let pipeline = cache.get(key);
   if (pipeline) return pipeline;
   const { device } = prepared;
-  prepared.clearModule ??= device.createShaderModule({ label: "RPCS3 RSX clear", code: CLEAR_WGSL });
+  const count = Math.max(1, targets.colors.length);
+  const modules = prepared.clearModules ??= new Map();
+  const hasDepth = Boolean(targets.depth);
+  const moduleKey = `${count}:${hasDepth ? "depth" : "color"}`;
+  let module = modules.get(moduleKey);
+  if (!module) {
+    // A fragment stage may only export depth when the pipeline has a depth attachment
+    const code = CLEAR_WGSL
+      .replace("CLEAR_OUTPUTS", Array.from({ length: count }, (_, i) => `@location(${i}) color${i}: vec4f,`).join(" "))
+      .replace("CLEAR_ASSIGNMENTS", Array.from({ length: count }, (_, i) => `out.color${i} = rsxClear.color;`).join("\n  "))
+      .replace("CLEAR_DEPTH_FIELD", hasDepth ? "@builtin(frag_depth) depth: f32" : "")
+      .replace("CLEAR_DEPTH_ASSIGN", hasDepth ? "out.depth = rsxClear.depth;" : "");
+    module = device.createShaderModule({ label: `RPCS3 RSX clear (${moduleKey})`, code });
+    modules.set(moduleKey, module);
+  }
   prepared.clearBindGroupLayout ??= device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 32 } },
   ] });
   pipeline = device.createRenderPipeline({
     label: `RPCS3 RSX clear ${key}`,
     layout: device.createPipelineLayout({ bindGroupLayouts: [prepared.clearBindGroupLayout] }),
-    vertex: { module: prepared.clearModule, entryPoint: "vertex_main", buffers: [] },
-    fragment: { module: prepared.clearModule, entryPoint: "fragment_main", targets: [{ format, writeMask }] },
+    vertex: { module, entryPoint: "vertex_main", buffers: [] },
+    fragment: { module, entryPoint: "fragment_main", targets: targets.colors.map((surface) => ({ format: surface.format, writeMask })) },
     primitive: { topology: "triangle-list", cullMode: "none" },
-    depthStencil: { format: "depth24plus", depthWriteEnabled: depthWrite, depthCompare: "always" },
+    depthStencil: targets.depth ? { format: targets.depth.format, depthWriteEnabled: depthWrite, depthCompare: "always" } : undefined,
   });
   cache.set(key, pipeline);
   return pipeline;
@@ -1184,7 +1250,8 @@ function getClearPipeline(prepared, format, writeMask, depthWrite) {
 
 function getClearBindGroup(prepared, uniformRing) {
   if (prepared.clearBindGroup?.generation === uniformRing.generation) return prepared.clearBindGroup.group;
-  getClearPipeline(prepared, prepared.format, 0, false);
+  // Warm the clear shader for the common single-target framebuffer
+  getClearPipeline(prepared, { formatKey: `${prepared.format}|depth24plus`, colors: [{ format: prepared.format }], depth: { format: "depth24plus" } }, 0, false);
   const group = prepared.device.createBindGroup({
     layout: prepared.clearBindGroupLayout,
     entries: [{ binding: 0, resource: { buffer: uniformRing.buffer, offset: 0, size: 32 } }],
@@ -1193,9 +1260,10 @@ function getClearBindGroup(prepared, uniformRing) {
   return group;
 }
 
-function getProgram(prepared, packet, vertexBackend) {
+function getProgram(prepared, packet, vertexBackend, aliasCandidates) {
   const cache = prepared.programCache ??= new Map();
-  const key = programKey(packet, vertexBackend);
+  const textureSwizzles = surfaceTextureSwizzles(aliasCandidates, packet);
+  const key = programKey(packet, vertexBackend, textureSwizzles);
   let program = cache.get(key);
   if (program) {
     cache.delete(key);
@@ -1204,7 +1272,8 @@ function getProgram(prepared, packet, vertexBackend) {
   }
   const vertex = compileVertexProgram(packet);
   const fragment = compileFragmentProgram(packet);
-  const shaderCode = assembleShader(vertex, fragment, vertexBackend);
+  const shaderCode = assembleShader(vertex, fragment, vertexBackend, (SURFACE_TARGET_INDICES[packet.colorTarget] ?? []).length,
+    packet.resolvedState.alphaTestEnabled ? packet.resolvedState.alphaFunc & 7 : undefined, textureSwizzles);
   const { device } = prepared;
   const module = device.createShaderModule({ label: `RPCS3 translated RSX program ${key}`, code: shaderCode });
   const bindGroupLayout = device.createBindGroupLayout({
@@ -1261,6 +1330,510 @@ function ensureRing(prepared, name, usage, bytes) {
     ring.generation += 1;
   }
   return ring;
+}
+
+// RSX surface formats (rsx::surface_color_format, rsx::surface_depth_format2) as WebGPU
+// formats, following the Vulkan backend's choices (VKFormats.cpp).
+function surfaceColorFormat(rsxFormat) {
+  switch (rsxFormat) {
+    case 4: case 5: case 8: return "bgra8unorm";   // X8R8G8B8_*, A8R8G8B8
+    case 14: case 15: case 16: return "rgba8unorm"; // X8B8G8R8_*, A8B8G8R8
+    case 9: return "r8unorm";                       // B8
+    case 10: return "rg8unorm";                     // G8B8
+    case 11: return "rgba16float";                  // F_W16Z16Y16X16
+    case 12: return "rgba32float";                  // F_W32Z32Y32X32
+    case 13: return "r32float";                     // F_X32
+    default: throw new Error(`RSX surface color format ${rsxFormat} is not yet translated`);
+  }
+}
+
+function surfaceDepthFormat(rsxFormat) {
+  switch (rsxFormat) {
+    case 1: return "depth16unorm";   // Z16
+    case 2: return "depth24plus";    // Z24S8 (stencil not yet translated)
+    case 3: return "depth32float";   // Z16 float
+    case 4: return "depth32float";   // Z24S8 float
+    default: throw new Error(`RSX surface depth format ${rsxFormat} is not yet translated`);
+  }
+}
+
+// GPU format an RSX texture format expects when it samples a render target directly
+// (VK get_compatible_sampler_format); anything else needs RPCS3's format conversion.
+function textureSurfaceFormat(baseFormat) {
+  switch (baseFormat) {
+    case 0x85: return "bgra8unorm";
+    case 0x81: return "r8unorm";
+    case 0x8b: return "rg8unorm";
+    case 0x9a: return "rgba16float";
+    case 0x9b: return "rgba32float";
+    case 0x9c: return "r32float";
+    default: return undefined;
+  }
+}
+
+// Guest surfaces (render targets) live on the GPU, keyed by kind, address and format, and
+// persist across frames like their guest memory; they are the texture cache's surface store.
+// guestWidth/guestHeight are the RSX surface dimensions (texture lookups match on them);
+// width/height are the backing size under the resolution scale (RPCS3's resolution_scale).
+// Host image formats of rsx::webgpu::host_surface_format (WebGPURenderTargets.h). R5G6B5
+// and A1R5G5B5 render as BGRA8, the way the Vulkan backend falls back without the packed formats.
+const HOST_SURFACE_FORMATS = Object.freeze({
+  1: "bgra8unorm", 2: "rgba8unorm", 3: "r8unorm", 4: "rg8unorm", 5: "rgba16float", 6: "rgba32float", 7: "r32float",
+  8: "bgra8unorm", 9: "bgra8unorm", 0x101: "depth16unorm", 0x102: "depth24plus",
+});
+
+// RPCS3's surface store (rsx::surface_store, WebGPURenderTargets.h traits) owns every surface
+// decision; the renderer only keeps the images it names by id. Structural ops keep the table
+// current at the point of the packet stream they arrive in; erase/copy ops are encoded in
+// packet order by the pass loop. Returns false for an op the pass loop must encode.
+function applyStructuralSurfaceOp(prepared, op, retired, stats) {
+  const table = prepared.surfaceTable ??= new Map();
+  switch (op.kind) {
+    case SurfaceOpKind.create: {
+      if (table.has(op.id)) {
+        // A restarted runtime numbers its surfaces from 1 again: the old image is retired
+        retired.push(table.get(op.id));
+        table.delete(op.id);
+        stats.replaced = (stats.replaced ?? 0) + 1;
+      }
+      const kind = op.isDepth ? "depth" : "color";
+      const format = HOST_SURFACE_FORMATS[op.hostFormat];
+      if (!format) throw new Error(`RSX surface host format 0x${op.hostFormat.toString(16)} is not translated`);
+      const texture = prepared.device.createTexture({
+        label: `RPCS3 RSX ${kind} surface #${op.id} ${format}`,
+        size: { width: op.imageWidth, height: op.imageHeight },
+        format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
+      });
+      table.set(op.id, {
+        id: op.id, key: `${kind}:${op.id}`, diagKey: `${kind}:#${op.id}:${format}`, kind, format, hostFormat: op.hostFormat,
+        width: op.imageWidth, height: op.imageHeight, texture, view: texture.createView(),
+        regions: new Map(), scratch: undefined, scratchView: undefined,
+        address: 0, pitch: 0, surfaceWidth: op.imageWidth, surfaceHeight: op.imageHeight, samplesX: 1, samplesY: 1, rsxFormat: 0,
+      });
+      stats.creates += 1;
+      return true;
+    }
+    case SurfaceOpKind.describe: {
+      const surface = table.get(op.id);
+      if (!surface) { stats.missing += 1; (stats.missingByKind ??= {})[`describe:${op.id}`] = ((stats.missingByKind ??= {})[`describe:${op.id}`] ?? 0) + 1; return true; }
+      Object.assign(surface, {
+        address: op.address, pitch: op.pitch, surfaceWidth: op.surfaceWidth, surfaceHeight: op.surfaceHeight,
+        samplesX: op.samplesX, samplesY: op.samplesY, rsxFormat: op.rsxFormat,
+        diagKey: `${surface.kind}:${op.address.toString(16)}:${surface.format}#${op.id}`,
+      });
+      return true;
+    }
+    default:
+      // destroy, erase, copy and load are ordered with the GPU work (a destroy after a copy
+      // that reads the surface must not run before it)
+      return false;
+  }
+}
+
+// Metadata snapshot of the surfaces a draw can alias textures onto, taken at the draw's
+// position in the packet stream (a later describe must not change an earlier draw's lookup).
+function surfaceAliasCandidates(prepared) {
+  return [...(prepared.surfaceTable?.values() ?? [])].map((surface) => ({
+    live: surface, kind: surface.kind, format: surface.format, address: surface.address, pitch: surface.pitch,
+    surfaceWidth: surface.surfaceWidth, surfaceHeight: surface.surfaceHeight, samplesX: surface.samplesX, samplesY: surface.samplesY,
+    rsxFormat: surface.rsxFormat, width: surface.width, height: surface.height,
+  }));
+}
+
+const RECT_BLIT_WGSL = `
+struct BlitRect { source: vec4f };
+@group(0) @binding(0) var blitTexture: texture_2d<f32>;
+@group(0) @binding(1) var blitSampler: sampler;
+@group(0) @binding(2) var<uniform> blitRect: BlitRect;
+struct BlitOut { @builtin(position) position: vec4f, @location(0) uv: vec2f };
+@vertex fn vertex_main(@builtin(vertex_index) index: u32) -> BlitOut {
+  var out: BlitOut;
+  let x = f32(i32(index & 1u) * 4 - 1);
+  let y = f32(i32(index >> 1u) * 4 - 1);
+  out.position = vec4f(x, y, 0.0, 1.0);
+  out.uv = vec2f((x + 1.0) * 0.5, (1.0 - y) * 0.5);
+  return out;
+}
+@fragment fn fragment_main(input: BlitOut) -> @location(0) vec4f {
+  return textureSample(blitTexture, blitSampler, mix(blitRect.source.xy, blitRect.source.zw, input.uv));
+}
+`;
+
+const DEPTH_BLIT_WGSL = `
+struct BlitRect { source: vec4f };
+@group(0) @binding(0) var blitDepth: texture_depth_2d;
+@group(0) @binding(2) var<uniform> blitRect: BlitRect;
+struct BlitOut { @builtin(position) position: vec4f, @location(0) uv: vec2f };
+@vertex fn vertex_main(@builtin(vertex_index) index: u32) -> BlitOut {
+  var out: BlitOut;
+  let x = f32(i32(index & 1u) * 4 - 1);
+  let y = f32(i32(index >> 1u) * 4 - 1);
+  out.position = vec4f(x, y, 0.0, 1.0);
+  out.uv = vec2f((x + 1.0) * 0.5, (1.0 - y) * 0.5);
+  return out;
+}
+@fragment fn fragment_main(input: BlitOut) -> @builtin(frag_depth) f32 {
+  let texel = vec2i(floor(mix(blitRect.source.xy, blitRect.source.zw, input.uv)));
+  return textureLoad(blitDepth, texel, 0);
+}
+`;
+
+// vk::blitter::scale_image with nearest filtering: source rect of one surface into the
+// destination rect of another. Color surfaces sample normalized coordinates; depth surfaces
+// load the nearest texel and export it as fragment depth.
+function getRectBlitPipeline(prepared, format, depth) {
+  const cache = prepared.rectBlitPipelines ??= new Map();
+  const key = `${depth ? "depth" : "color"}:${format}`;
+  let pipeline = cache.get(key);
+  if (pipeline) return pipeline;
+  const { device } = prepared;
+  if (depth) {
+    prepared.depthBlitModule ??= device.createShaderModule({ label: "RPCS3 RSX surface depth blit", code: DEPTH_BLIT_WGSL });
+    prepared.depthBlitBindGroupLayout ??= device.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth", viewDimension: "2d" } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform", minBindingSize: 16 } },
+    ] });
+    pipeline = device.createRenderPipeline({
+      label: `RPCS3 RSX surface depth blit ${format}`,
+      layout: device.createPipelineLayout({ bindGroupLayouts: [prepared.depthBlitBindGroupLayout] }),
+      vertex: { module: prepared.depthBlitModule, entryPoint: "vertex_main", buffers: [] },
+      fragment: { module: prepared.depthBlitModule, entryPoint: "fragment_main", targets: [] },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+      depthStencil: { format, depthWriteEnabled: true, depthCompare: "always" },
+    });
+  } else {
+    prepared.rectBlitModule ??= device.createShaderModule({ label: "RPCS3 RSX surface blit", code: RECT_BLIT_WGSL });
+    prepared.rectBlitBindGroupLayout ??= device.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform", minBindingSize: 16 } },
+    ] });
+    prepared.blitSampler ??= device.createSampler({ magFilter: "nearest", minFilter: "nearest" });
+    pipeline = device.createRenderPipeline({
+      label: `RPCS3 RSX surface blit ${format}`,
+      layout: device.createPipelineLayout({ bindGroupLayouts: [prepared.rectBlitBindGroupLayout] }),
+      vertex: { module: prepared.rectBlitModule, entryPoint: "vertex_main", buffers: [] },
+      fragment: { module: prepared.rectBlitModule, entryPoint: "fragment_main", targets: [{ format }] },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+    });
+  }
+  cache.set(key, pipeline);
+  return pipeline;
+}
+
+// Encodes an erase or copy op at its position in the frame (between render passes).
+function encodeSurfaceOp(prepared, encoder, op, stats) {
+  const table = prepared.surfaceTable ?? new Map();
+  const { device } = prepared;
+  if (op.kind === SurfaceOpKind.destroy) {
+    const surface = table.get(op.id);
+    if (surface) { table.delete(op.id); stats.retired.push(surface); }
+    stats.destroys += 1;
+    return;
+  }
+  if (op.kind === SurfaceOpKind.erase) {
+    const surface = table.get(op.id);
+    if (!surface) { stats.missing += 1; (stats.missingByKind ??= {})[`erase:${op.id}`] = ((stats.missingByKind ??= {})[`erase:${op.id}`] ?? 0) + 1; return; }
+    // vk::render_target::clear_memory: color (0, 0, 0, 1), depth 1.0 (stencil 255)
+    const pass = surface.kind === "color"
+      ? encoder.beginRenderPass({ colorAttachments: [{ view: surface.view, loadOp: "clear", clearValue: { r: 0, g: 0, b: 0, a: 1 }, storeOp: "store" }] })
+      : encoder.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: surface.view, depthLoadOp: "clear", depthClearValue: 1, depthStoreOp: "store" } });
+    pass.end();
+    stats.erases += 1;
+    return;
+  }
+  if (op.kind === SurfaceOpKind.copyScaled) {
+    const source = table.get(op.srcId);
+    const target = table.get(op.id);
+    if (!source || !target) { stats.missing += 1; (stats.missingByKind ??= {})[`copy:${op.srcId}->${op.id}`] = ((stats.missingByKind ??= {})[`copy:${op.srcId}->${op.id}`] ?? 0) + 1; return; }
+    if (op.rsxFormat === 1 || source.format !== target.format || source === target) {
+      // Typeless (format-cast) transfers are not translated yet
+      stats.unsupported += 1;
+      return;
+    }
+    const clip = (v, max) => Math.max(0, Math.min(max, v));
+    const sx1 = clip(op.srcX1, source.width), sy1 = clip(op.srcY1, source.height);
+    const sx2 = clip(op.srcX2, source.width), sy2 = clip(op.srcY2, source.height);
+    const dx1 = clip(op.dstX1, target.width), dy1 = clip(op.dstY1, target.height);
+    const dx2 = clip(op.dstX2, target.width), dy2 = clip(op.dstY2, target.height);
+    const sw = sx2 - sx1, sh = sy2 - sy1, dw = dx2 - dx1, dh = dy2 - dy1;
+    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) { stats.empty += 1; return; }
+    if (sw === dw && sh === dh) {
+      encoder.copyTextureToTexture(
+        { texture: source.texture, origin: { x: sx1, y: sy1 } },
+        { texture: target.texture, origin: { x: dx1, y: dy1 } },
+        { width: dw, height: dh },
+      );
+      stats.copies += 1;
+      return;
+    }
+    const depth = target.kind === "depth";
+    const rect = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(rect, 0, new Float32Array(depth
+      ? [sx1, sy1, sx2, sy2]
+      : [sx1 / source.width, sy1 / source.height, sx2 / source.width, sy2 / source.height]));
+    (prepared.frameScratchBuffers ??= []).push(rect);
+    const pass = depth
+      ? encoder.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: target.view, depthLoadOp: "load", depthStoreOp: "store" } })
+      : encoder.beginRenderPass({ colorAttachments: [{ view: target.view, loadOp: "load", storeOp: "store" }] });
+    pass.setPipeline(getRectBlitPipeline(prepared, target.format, depth));
+    pass.setViewport(dx1, dy1, dw, dh, 0, 1);
+    pass.setScissorRect(dx1, dy1, dw, dh);
+    pass.setBindGroup(0, device.createBindGroup({
+      layout: depth ? prepared.depthBlitBindGroupLayout : prepared.rectBlitBindGroupLayout,
+      entries: depth
+        ? [{ binding: 0, resource: source.view }, { binding: 2, resource: { buffer: rect } }]
+        : [{ binding: 0, resource: source.view }, { binding: 1, resource: prepared.blitSampler }, { binding: 2, resource: { buffer: rect } }],
+    }));
+    pass.draw(3);
+    pass.end();
+    stats.scaledCopies += 1;
+    return;
+  }
+  if (op.kind === SurfaceOpKind.loadMemory) {
+    // read_color_buffers / read_depth_buffer: guest memory upload into a surface (not translated)
+    stats.unsupported += 1;
+    return;
+  }
+  throw new Error(`unknown RSX surface op ${op.kind}`);
+}
+
+// A texture that reads part of a surface: a row-aligned sub-rectangle (2D) or a stack of
+// slices (3D volumes rendered into a tall 2D surface, as RPCS3's _3d_gather deferred
+// request). The region is refreshed from the surface before every draw that samples it.
+// A texture that reads part of a surface: a row-aligned sub-rectangle (2D) or a stack of
+// slices (3D volumes rendered into a tall 2D surface, as RPCS3's _3d_gather deferred
+// request). Rows and sizes are in guest samples (rsx::surface_metrics::samples); the copy is
+// taken in image pixels, scaled like the surface's image. Refreshed before every draw that samples it.
+function getSurfaceRegion(prepared, candidate, rowOffset, width, height, depth) {
+  const surface = candidate.live;
+  const key = `${rowOffset}:${width}x${height}x${depth}`;
+  let region = surface.regions.get(key);
+  const scaleX = candidate.width / candidate.surfaceWidth;
+  const scaleY = candidate.height / candidate.surfaceHeight;
+  const scaledWidth = Math.max(1, Math.round((width / candidate.samplesX) * scaleX));
+  const scaledHeight = Math.max(1, Math.round((height / candidate.samplesY) * scaleY));
+  const scaledRow = Math.round((rowOffset / candidate.samplesY) * scaleY);
+  if (region && (region.scaledWidth !== scaledWidth || region.scaledHeight !== scaledHeight || region.texture.format !== surface.format)) {
+    region.texture.destroy();
+    surface.regions.delete(key);
+    region = undefined;
+  }
+  if (!region) {
+    const texture = prepared.device.createTexture({
+      label: `RPCS3 RSX surface region ${surface.key} ${key}`,
+      size: { width: scaledWidth, height: scaledHeight, depthOrArrayLayers: depth },
+      dimension: depth > 1 ? "3d" : "2d",
+      format: surface.format,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    region = { key, surface, rowOffset, width, height, depth, scaledWidth, scaledHeight, scaledRow, texture, view: texture.createView({ dimension: depth > 1 ? "3d" : "2d" }) };
+    surface.regions.set(key, region);
+  }
+  region.scaledRow = scaledRow;
+  return region;
+}
+
+// Scratch copy of a surface a draw samples while rendering to it (RPCS3 inserts a texture
+// barrier there; WebGPU cannot bind an attachment of the current pass).
+function getSurfaceScratch(prepared, surface) {
+  if (!surface.scratch) {
+    surface.scratch = prepared.device.createTexture({
+      label: `RPCS3 RSX surface scratch ${surface.key}`,
+      size: { width: surface.width, height: surface.height },
+      format: surface.format,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    surface.scratchView = surface.scratch.createView();
+  }
+  return surface;
+}
+
+const SURFACE_TARGET_INDICES = { 0: [], 1: [0], 2: [1], 0x13: [0, 1], 0x17: [0, 1, 2], 0x1f: [0, 1, 2, 3] };
+
+// Image size of an operation's attachments (the surfaces carry RPCS3's resolution scale)
+function targetExtent(targets) {
+  const reference = targets.colors[0] ?? targets.depth;
+  return { width: reference?.width ?? 1, height: reference?.height ?? 1 };
+}
+
+// Attachments of a draw or clear: the color targets selected by surface_target and the depth
+// target, all sized like RPCS3's framebuffer layout for that operation.
+// Attachments of a draw or clear: the surfaces RPCS3's surface store bound for it, by id.
+function operationTargets(prepared, packet) {
+  const fb = packet.framebuffer;
+  if (!fb) throw new Error("RSX packet has no framebuffer section");
+  const indices = SURFACE_TARGET_INDICES[packet.colorTarget];
+  if (!indices) throw new Error(`invalid RSX surface target 0x${packet.colorTarget.toString(16)}`);
+  const table = prepared.surfaceTable ?? new Map();
+  const colors = [];
+  let missing = 0;
+  // A target RPCS3's layout leaves unwritten (color_write_enabled false) or unaddressed has
+  // no attachment, as in the native backends
+  for (const index of indices) {
+    if (fb.colorAddresses[index] === 0 || !((fb.colorWriteMask >>> index) & 1)) continue;
+    const surface = table.get(fb.colorSurfaceIds[index]);
+    if (surface) colors.push(surface); else missing += 1;
+  }
+  let depth;
+  if (fb.zetaAddress) {
+    depth = table.get(fb.zetaSurfaceId);
+    if (!depth) missing += 1;
+  }
+  return {
+    colors,
+    depth,
+    missing,
+    // Attachment identity (pass boundaries) and attachment formats (pipeline compatibility)
+    key: [...colors.map((surface) => surface.key), depth?.key ?? "-"].join("|"),
+    formatKey: [...colors.map((surface) => surface.format), depth?.format ?? "-"].join("|"),
+  };
+}
+
+// A texture lookup that hits a render target exactly (rsx::surface_store::get_surface_at with
+// texture_cache_helpers::check_framebuffer_resource): same base address, a 2D single-level
+// image of the surface's size, a format the surface can be sampled as, identity remap.
+// (texture_cache::upload_texture surface path with check_framebuffer_resource): a 2D or 3D
+// texture whose start lies on a row of a color surface with the same pitch and a format the
+// surface can be sampled as; 3D volumes take depth slices of height rows each. Returns the
+// surface plus the row offset; the caller binds the surface directly when it matches whole.
+// Component map a colour surface is sampled through, in RSX ARGB order, from
+// VKGSRender's get_compatible_surface_format: X8*_Z* forces alpha to 0, X8*_O* to 1,
+// B8 broadcasts red with alpha 1, G8B8 reads {R,G,R,G}, F_X32 broadcasts red.
+function surfaceNativeMap(rsxFormat) {
+  switch (rsxFormat) {
+    case 4: case 14: return ["0", "r", "g", "b"];
+    case 5: case 15: return ["1", "r", "g", "b"];
+    case 9: return ["1", "r", "r", "r"];
+    case 10: return ["g", "r", "g", "r"];
+    case 13: return ["r", "r", "r", "r"];
+    default: return ["a", "r", "g", "b"];
+  }
+}
+
+// vk::apply_swizzle_remap(native map, texture remap): the guest remap selects, per
+// ARGB channel, a native component, zero or one; returned in RGBA order as a
+// 4-character swizzle over the sampled vec4 ("rgba" = identity).
+function surfaceTextureSwizzle(surface, descriptor) {
+  const native = surfaceNativeMap(surface.rsxFormat);
+  const remap = descriptor.remap & 0xffff;
+  const control = descriptor.remap >>> 8;
+  const argb = [0, 1, 2, 3].map((channel) => {
+    const mode = (control >>> (channel * 2)) & 3;
+    if (mode === 0) return "0";
+    if (mode === 1) return "1";
+    return native[(remap >>> (channel * 2)) & 3];
+  });
+  return `${argb[1]}${argb[2]}${argb[3]}${argb[0]}`;
+}
+
+function textureSwizzleCode(slot, swizzle = "rgba") {
+  const component = (token) => token === "0" ? "0.0" : token === "1" ? "1.0" : `s.${token}`;
+  const body = swizzle === "rgba" ? "s" : `vec4f(${[...swizzle].map(component).join(", ")})`;
+  return `fn rsxTexel${slot}(s: vec4f) -> vec4f { return ${body}; }`;
+}
+
+// Per-slot swizzles of the textures this draw samples from render targets.
+function surfaceTextureSwizzles(candidates, packet) {
+  const swizzles = new Map();
+  for (const descriptor of packet.textures) {
+    if (descriptor.stage !== 0) continue;
+    const hit = findSurfaceForTexture(candidates, descriptor);
+    if (hit && hit.swizzle !== "rgba") swizzles.set(descriptor.slot, hit.swizzle);
+  }
+  return swizzles;
+}
+
+function findSurfaceForTexture(candidates, descriptor) {
+  if (!candidates) return undefined;
+  if (descriptor.dimension !== 1 && descriptor.dimension !== 3) return undefined;
+  const expected = textureSurfaceFormat(descriptor.format & ~0x60);
+  if (!expected) return undefined;
+  const depth = descriptor.dimension === 3 ? Math.max(1, descriptor.depth) : 1;
+  for (const candidate of candidates) {
+    if (candidate.kind !== "color" || candidate.format !== expected || !candidate.pitch) continue;
+    // texture_cache_helpers::check_framebuffer_resource compares in rsx::surface_metrics::samples
+    const sampleWidth = candidate.surfaceWidth * candidate.samplesX;
+    const sampleHeight = candidate.surfaceHeight * candidate.samplesY;
+    const span = candidate.pitch * sampleHeight;
+    if (descriptor.address < candidate.address || descriptor.address >= candidate.address + span) continue;
+    const offset = descriptor.address - candidate.address;
+    if (offset % candidate.pitch !== 0) continue;
+    // rsx::pitch_compatible: a single-row texture matches any pitch, otherwise pitches must agree.
+    if (descriptor.pitch && descriptor.height !== 1 && descriptor.pitch !== candidate.pitch) continue;
+    const rowOffset = offset / candidate.pitch;
+    if (descriptor.width > sampleWidth || rowOffset + descriptor.height * depth > sampleHeight) continue;
+    const whole = rowOffset === 0 && depth === 1 && descriptor.width === sampleWidth && descriptor.height === sampleHeight;
+    return { surface: candidate.live, candidate, rowOffset, depth, whole, swizzle: surfaceTextureSwizzle(candidate, descriptor) };
+  }
+  return undefined;
+}
+
+function findColorSurfaceAt(prepared, address) {
+  if (!prepared.surfaceTable) return undefined;
+  for (const surface of prepared.surfaceTable.values()) {
+    if (surface.kind === "color" && surface.address === address) return surface;
+  }
+  return undefined;
+}
+
+function createRsxSampler(device, descriptor, mipCount) {
+  const addressMode = (value) => value === 1 ? "repeat" : value === 2 ? "mirror-repeat" : "clamp-to-edge";
+  const minFilter = descriptor.filterModes & 0xff;
+  const magFilter = (descriptor.filterModes >>> 8) & 0xff;
+  // CELL_GCM_TEXTURE_NEAREST/LINEAR sample the base level only; *_NEAREST_NEAREST/LINEAR_NEAREST
+  // pick a level, *_NEAREST_LINEAR/LINEAR_LINEAR blend two levels.
+  const mipmapped = minFilter >= 3 && minFilter <= 6;
+  return device.createSampler({
+    addressModeU: addressMode(descriptor.addressModes & 0xff),
+    addressModeV: addressMode((descriptor.addressModes >>> 8) & 0xff),
+    addressModeW: addressMode((descriptor.addressModes >>> 16) & 0xff),
+    magFilter: magFilter === 1 ? "nearest" : "linear",
+    minFilter: minFilter === 1 || minFilter === 3 || minFilter === 5 ? "nearest" : "linear",
+    mipmapFilter: minFilter === 5 || minFilter === 6 ? "linear" : "nearest",
+    lodMaxClamp: mipmapped ? mipCount - 1 : 0,
+  });
+}
+
+const BLIT_WGSL = `
+@group(0) @binding(0) var blitTexture: texture_2d<f32>;
+@group(0) @binding(1) var blitSampler: sampler;
+struct BlitOut { @builtin(position) position: vec4f, @location(0) uv: vec2f };
+@vertex fn vertex_main(@builtin(vertex_index) index: u32) -> BlitOut {
+  var out: BlitOut;
+  let x = f32(i32(index & 1u) * 4 - 1);
+  let y = f32(i32(index >> 1u) * 4 - 1);
+  out.position = vec4f(x, y, 0.0, 1.0);
+  out.uv = vec2f((x + 1.0) * 0.5, (1.0 - y) * 0.5);
+  return out;
+}
+@fragment fn fragment_main(input: BlitOut) -> @location(0) vec4f {
+  return textureSample(blitTexture, blitSampler, input.uv);
+}
+`;
+
+// Presents a surface into the frame target (the display scan-out); an exact copy at equal size.
+function getBlitPipeline(prepared, format) {
+  const cache = prepared.blitPipelines ??= new Map();
+  let pipeline = cache.get(format);
+  if (pipeline) return pipeline;
+  const { device } = prepared;
+  prepared.blitModule ??= device.createShaderModule({ label: "RPCS3 RSX present", code: BLIT_WGSL });
+  prepared.blitBindGroupLayout ??= device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+    { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+  ] });
+  prepared.blitSampler ??= device.createSampler({ magFilter: "nearest", minFilter: "nearest" });
+  pipeline = device.createRenderPipeline({
+    label: `RPCS3 RSX present ${format}`,
+    layout: device.createPipelineLayout({ bindGroupLayouts: [prepared.blitBindGroupLayout] }),
+    vertex: { module: prepared.blitModule, entryPoint: "vertex_main", buffers: [] },
+    fragment: { module: prepared.blitModule, entryPoint: "fragment_main", targets: [{ format }] },
+    primitive: { topology: "triangle-list", cullMode: "none" },
+  });
+  cache.set(format, pipeline);
+  return pipeline;
 }
 
 // The frame is rendered into an owned color/depth pair that persists across
@@ -1339,12 +1912,15 @@ function renderTargetState(packet) {
   // wins, and WebGPU has no logic op, so such draws are rejected explicitly.
   if (state.logicOpEnabled) throw new Error(`RSX logic operation 0x${state.logicOperation.toString(16)} is not supported by WebGPU`);
   const blendEnabled = Boolean(state.blendEnabledMask & 1);
-  const mask = state.colorWriteMask[0];
-  let writeMask = 0;
-  if (mask & 1) writeMask |= GPUColorWrite.RED;
-  if (mask & 2) writeMask |= GPUColorWrite.GREEN;
-  if (mask & 4) writeMask |= GPUColorWrite.BLUE;
-  if (mask & 8) writeMask |= GPUColorWrite.ALPHA;
+  const writeMasks = [0, 1, 2, 3].map((index) => {
+    const mask = state.colorWriteMask[index];
+    let writeMask = 0;
+    if (mask & 1) writeMask |= GPUColorWrite.RED;
+    if (mask & 2) writeMask |= GPUColorWrite.GREEN;
+    if (mask & 4) writeMask |= GPUColorWrite.BLUE;
+    if (mask & 8) writeMask |= GPUColorWrite.ALPHA;
+    return writeMask;
+  });
   const blend = blendEnabled ? {
     color: { srcFactor: factor(state.blendSfactorRgb), dstFactor: factor(state.blendDfactorRgb), operation: operation(state.blendEquationRgb) },
     alpha: { srcFactor: factor(state.blendSfactorA), dstFactor: factor(state.blendDfactorA), operation: operation(state.blendEquationA) },
@@ -1353,7 +1929,9 @@ function renderTargetState(packet) {
   return {
     blend,
     blendEnabled,
-    writeMask,
+    blendEnabledMask: state.blendEnabledMask,
+    writeMask: writeMasks[0],
+    writeMasks,
     blendConstant: { r, g, b, a },
   };
 }
@@ -1385,10 +1963,11 @@ function scissorState(packet, canvas) {
     width: view.getUint32(8, true),
     height: view.getUint32(12, true),
   };
-  const x = Math.min(canvas.width, Math.floor(raw.x * canvas.width / packet.width));
-  const y = Math.min(canvas.height, Math.floor(raw.y * canvas.height / packet.height));
-  const x2 = Math.min(canvas.width, Math.floor((raw.x + raw.width) * canvas.width / packet.width));
-  const y2 = Math.min(canvas.height, Math.floor((raw.y + raw.height) * canvas.height / packet.height));
+  // RPCS3's get_scissor already applies its resolution scale; clip to the attachment
+  const x = Math.min(canvas.width, raw.x);
+  const y = Math.min(canvas.height, raw.y);
+  const x2 = Math.min(canvas.width, raw.x + raw.width);
+  const y2 = Math.min(canvas.height, raw.y + raw.height);
   return { ...raw, scaled: { x, y, width: Math.max(0, x2 - x), height: Math.max(0, y2 - y) } };
 }
 
@@ -1784,6 +2363,7 @@ function uploadTexture(device, descriptor, withStatistics = false) {
     sampler,
     byteSize,
     diagnostics: {
+      address: descriptor.address,
       width: descriptor.width,
       height: descriptor.height,
       depth: layout.depth0,
@@ -1820,6 +2400,7 @@ function drawDiagnostics(draw) {
   if (!draw.oracleOutput) return { vertexOracle: false };
   const result = {
     vertexOracle: true,
+    attribute0Bounds: { min: [Infinity, Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity, -Infinity] },
     clipBounds: { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] },
     varyingBounds: Object.fromEntries(VertexVaryings.map((name) => [name, {
       min: [Infinity, Infinity, Infinity, Infinity],
@@ -1827,6 +2408,11 @@ function drawDiagnostics(draw) {
     }])),
   };
   for (let offset = 0; offset < draw.oracleOutput.length; offset += VertexOutputStrideFloats) {
+    for (let component = 0; component < 4; component += 1) {
+      const value = draw.input[offset + component];
+      result.attribute0Bounds.min[component] = Math.min(result.attribute0Bounds.min[component], value);
+      result.attribute0Bounds.max[component] = Math.max(result.attribute0Bounds.max[component], value);
+    }
     const w = draw.oracleOutput[offset + 3];
     for (let component = 0; component < 3; component += 1) {
       const value = draw.oracleOutput[offset + component] / w;
@@ -1847,6 +2433,8 @@ function drawDiagnostics(draw) {
 
 export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   const renderStartedAt = performance.now();
+  // Validation failures invalidate the whole command buffer; report them instead of a silent black frame
+  prepared.device.pushErrorScope("validation");
   stopWebGPUPresentation();
   const { canvas, adapter, device, context, format } = prepared;
   // Clears and draws execute in packet order against a render target that
@@ -1856,11 +2444,44 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   const operations = packets.filter((packet) => packet.kind === PacketKind.draw || packet.kind === PacketKind.clear);
   const drawPackets = operations.filter((packet) => packet.kind === PacketKind.draw);
   const clearPackets = operations.filter((packet) => packet.kind === PacketKind.clear);
-  const clears = clearPackets.map((packet) => ({
+  // Draws and clears address guest surfaces at their own size; the canvas only sees the
+  // presented display buffer.
+  // Resolution scale (RPCS3's resolution_scale): surfaces render at guest size times this
+  // factor and are scaled only on presentation. Without an explicit option the canvas size
+  // over the frame's size is used, which keeps the fragment cost at the canvas resolution.
+  // RPCS3's surface store effects arrive with each packet (the ones a discarded packet carried
+  // come first). Structural ops update the id table at their position in the stream; erase and
+  // copy ops are encoded in order by the pass loop, before the operation they precede.
+  const retiredSurfaces = [];
+  const surfaceOpStats = { creates: 0, destroys: 0, erases: 0, copies: 0, scaledCopies: 0, empty: 0, missing: 0, unsupported: 0, retired: retiredSurfaces };
+  const gpuOpsBefore = [];
+  const aliasCandidatesByDraw = [];
+  const operationTargetList = [];
+  let gpuOpQueue = [];
+  const applyOps = (ops) => {
+    for (const op of ops) {
+      if (!applyStructuralSurfaceOp(prepared, op, retiredSurfaces, surfaceOpStats)) gpuOpQueue.push(op);
+    }
+  };
+  applyOps(options.carriedSurfaceOps ?? []);
+  for (const packet of packets) {
+    applyOps(packet.surfaceOps ?? []);
+    if (packet.kind === PacketKind.draw || packet.kind === PacketKind.clear) {
+      gpuOpsBefore.push(gpuOpQueue);
+      gpuOpQueue = [];
+      operationTargetList.push(operationTargets(prepared, packet));
+      if (packet.kind === PacketKind.draw) aliasCandidatesByDraw.push(surfaceAliasCandidates(prepared));
+    }
+  }
+  const trailingGpuOps = gpuOpQueue;
+  const clearTargets = operationTargetList.filter((_, index) => operations[index].kind === PacketKind.clear);
+  const drawTargets = operationTargetList.filter((_, index) => operations[index].kind === PacketKind.draw);
+  const missingTargets = operationTargetList.reduce((sum, targets) => sum + targets.missing, 0);
+  const clears = clearPackets.map((packet, index) => ({
     ...clearValue(packet),
     scissor: packet.sections[SectionKind.rasterEnvironment].bytes.byteLength === 16
-      ? scissorState(packet, canvas)
-      : { scaled: { x: 0, y: 0, width: canvas.width, height: canvas.height } },
+      ? scissorState(packet, targetExtent(clearTargets[index]))
+      : { scaled: { x: 0, y: 0, ...targetExtent(clearTargets[index]) } },
   }));
   // Reference clear values for the readback statistics (changed vs clear pixels).
   const clear = clears[0] ?? prepared.lastClear ?? { r: 0, g: 0, b: 0, a: 0, bytes: [0, 0, 0, 0], mask: 0, depth: 1, stencil: 0 };
@@ -1871,12 +2492,12 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   }
   const vertexDiagnostics = options.vertexDiagnostics === true;
   const textureDiagnostics = vertexDiagnostics || options.textureDiagnostics === true;
-  const programs = drawPackets.map((packet) => getProgram(prepared, packet, vertexBackend));
+  const programs = drawPackets.map((packet, index) => getProgram(prepared, packet, vertexBackend, aliasCandidatesByDraw[index]));
   const translated = drawPackets.map((packet, index) => translateDraw(packet, programs[index], vertexDiagnostics, vertexBackend));
   const depthStates = drawPackets.map(depthState);
   const targetStates = drawPackets.map(renderTargetState);
   const rasterStates = drawPackets.map(rasterState);
-  const scissorStates = drawPackets.map((packet) => scissorState(packet, canvas));
+  const scissorStates = drawPackets.map((packet, index) => scissorState(packet, targetExtent(drawTargets[index])));
   const translatedAt = performance.now();
 
   const pipelineCache = prepared.pipelineCache ??= new Map();
@@ -1891,6 +2512,8 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   let textureCacheHits = 0;
   let textureEvictions = 0;
   let missingTexturePayloads = 0;
+  let surfaceTextureHits = 0;
+  let surfaceCyclicCopies = 0;
   let textureCacheMisses = 0;
 
   // One uniform ring for the frame (dynamic offsets per draw) and one vertex
@@ -1911,7 +2534,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     if (op.mask & ClearMask.blue) writeMask |= GPUColorWrite.BLUE;
     if (op.mask & ClearMask.alpha) writeMask |= GPUColorWrite.ALPHA;
     const depthWrite = Boolean(op.mask & ClearMask.depth);
-    return { pipeline: getClearPipeline(prepared, format, writeMask, depthWrite), offset: clearBase + index * UNIFORM_ALIGNMENT, scissor: op.scissor.scaled, writeMask, depthWrite };
+    return { pipeline: getClearPipeline(prepared, clearTargets[index], writeMask, depthWrite), offset: clearBase + index * UNIFORM_ALIGNMENT, scissor: op.scissor.scaled, writeMask, depthWrite };
   });
   const clearBindGroup = clears.length ? getClearBindGroup(prepared, uniformRing) : undefined;
   const vertexBytes = translated.reduce((sum, draw) => sum + (draw.gpuInput ? alignTo(draw.gpuInput.byteLength, UNIFORM_ALIGNMENT) : 0), 0);
@@ -1932,6 +2555,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
   const resources = translated.map((draw, index) => {
     const packet = drawPackets[index];
     const { program } = draw;
+    const targets = drawTargets[index];
     const target = targetStates[index];
     const depth = depthStates[index];
     const raster = rasterStates[index];
@@ -1940,7 +2564,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       ? [blend.color.srcFactor, blend.color.dstFactor, blend.color.operation, blend.alpha.srcFactor, blend.alpha.dstFactor, blend.alpha.operation].join(",")
       : "none";
     const stripIndexFormat = vertexBackend === "webgpu-wgsl" && draw.indexed && draw.topology.endsWith("-strip") ? draw.indexFormat : undefined;
-    const pipelineKey = [program.key, format, draw.topology, stripIndexFormat ?? "-", raster.frontFace, raster.cullMode, depth.writeEnabled, depth.comparison, target.writeMask, blendKey].join("|");
+    const pipelineKey = [program.key, targets.formatKey, draw.topology, stripIndexFormat ?? "-", raster.frontFace, raster.cullMode, depth.writeEnabled, depth.comparison, target.writeMask, blendKey].join("|");
     let pipeline = pipelineCache.get(pipelineKey);
     if (pipeline) {
       pipelineCacheHits += 1;
@@ -1964,10 +2588,10 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
         fragment: {
           module: program.module,
           entryPoint: "fragment_main",
-          targets: [{ format, blend, writeMask: target.writeMask }],
+          targets: targets.colors.map((surface, i) => ({ format: surface.format, blend: (target.blendEnabledMask & (1 << i)) ? blend : undefined, writeMask: target.writeMasks[i] })),
         },
         primitive: { topology: draw.topology, frontFace: raster.frontFace, cullMode: raster.cullMode, stripIndexFormat },
-        depthStencil: { format: "depth24plus", depthWriteEnabled: depth.writeEnabled, depthCompare: depth.comparison },
+        depthStencil: targets.depth ? { format: targets.depth.format, depthWriteEnabled: depth.writeEnabled, depthCompare: depth.comparison } : undefined,
       });
       pipelineCache.set(pipelineKey, pipeline);
       if (pipelineCache.size > PIPELINE_CACHE_LIMIT) pipelineCache.delete(pipelineCache.keys().next().value);
@@ -2038,6 +2662,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       textureEvictions += 1;
     }
     const textureResources = [];
+    const cyclicCopies = [];
     if (program.fragment.textured) {
       for (const slot of program.fragment.textureSlots) {
         const descriptor = packet.textures.find((texture) => texture.stage === 0 && texture.slot === slot);
@@ -2045,6 +2670,27 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
           // A referenced sampler that the guest left disabled: RPCS3 binds its
           // zero-filled null image (vk::null_image_view), so samples read 0.
           textureResources.push({ slot, ...getNullTexture(prepared, program.fragment.textureDimensions.get(slot)), cacheKey: "null", cached: true });
+          continue;
+        }
+        const hit = findSurfaceForTexture(aliasCandidatesByDraw[index], descriptor);
+        if (hit) {
+          // Sampling a render target. A whole match binds the surface; a target of this very
+          // draw, a sub-rectangle or a slice stack is copied right before the draw (pass loop).
+          const { surface, rowOffset, depth, whole } = hit;
+          const cyclic = drawTargets[index].colors.includes(surface);
+          const sampler = createRsxSampler(device, descriptor, 1);
+          if (whole && !cyclic) {
+            textureResources.push({ slot, texture: surface.texture, view: surface.view, sampler, cacheKey: `surface:${surface.key}`, cached: true, diagnostics: { surface: surface.key } });
+          } else if (whole) {
+            getSurfaceScratch(prepared, surface);
+            cyclicCopies.push({ surface, region: undefined });
+            textureResources.push({ slot, texture: surface.scratch, view: surface.scratchView, sampler, cacheKey: `surface-scratch:${surface.key}`, cached: true, diagnostics: { surface: surface.key, cyclic: true } });
+          } else {
+            const region = getSurfaceRegion(prepared, hit.candidate, rowOffset, descriptor.width, descriptor.height, depth);
+            cyclicCopies.push({ surface, region });
+            textureResources.push({ slot, texture: region.texture, view: region.view, sampler, cacheKey: `surface-region:${surface.key}:${region.key}`, cached: true, diagnostics: { surface: surface.key, region: region.key, cyclic } });
+          }
+          surfaceTextureHits += 1;
           continue;
         }
         const cacheKey = textureCacheKey(descriptor);
@@ -2099,24 +2745,48 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       if (bindGroupCache.size > BIND_GROUP_CACHE_LIMIT) bindGroupCache.delete(bindGroupCache.keys().next().value);
     }
     const dynamicOffsets = vertexBackend === "webgpu-wgsl" ? [uniformBase, fragmentBase] : [fragmentBase];
-    return { pipeline, vertexOffset, vertexSize, indexOffset, indexSize, bindGroup, dynamicOffsets, textureResources, shaderCode: program.shaderCode };
+    return { pipeline, vertexOffset, vertexSize, indexOffset, indexSize, bindGroup, dynamicOffsets, textureResources, cyclicCopies, shaderCode: program.shaderCode };
   });
   device.queue.writeBuffer(uniformRing.buffer, 0, uniformBytes);
   const frameTarget = ensureFrameTarget(prepared, canvas.width, canvas.height, format);
   const resourcesReadyAt = performance.now();
 
   const encoder = device.createCommandEncoder({ label: "RPCS3 RSX packet frame" });
-  const pass = encoder.beginRenderPass({ colorAttachments: [{
-    view: frameTarget.colorView, loadOp: "load", storeOp: "store",
-  }], depthStencilAttachment: {
-    view: frameTarget.depthView, depthLoadOp: "load", depthStoreOp: "store",
-  } });
+  // One render pass per run of operations sharing a framebuffer; surfaces load their
+  // previous contents, as guest memory would.
+  let pass = null;
+  let passKey = null;
+  let lastColorSurface = prepared.lastColorSurface;
+  const beginPass = (targets) => {
+    pass = encoder.beginRenderPass({
+      colorAttachments: targets.colors.map((surface) => ({ view: surface.view, loadOp: "load", storeOp: "store" })),
+      depthStencilAttachment: targets.depth ? { view: targets.depth.view, depthLoadOp: "load", depthStoreOp: "store" } : undefined,
+    });
+    passKey = targets.key;
+    if (targets.colors.length) lastColorSurface = targets.colors[0];
+  };
+  const endPass = () => { if (pass) { pass.end(); pass = null; passKey = null; } };
   let drawIndex = 0;
   let clearIndex = 0;
+  let operationIndex = 0;
+  const clearLog = [];
+  // Diagnosis aid: draws listed in options.skipDraws are translated but not encoded.
+  const skipDraws = new Set(options.skipDraws ?? []);
   for (const operation of operations) {
+    const targets = operationTargetList[operationIndex++];
+    const precedingOps = gpuOpsBefore[operationIndex - 1];
+    if (precedingOps.length) {
+      endPass();
+      for (const op of precedingOps) encodeSurfaceOp(prepared, encoder, op, surfaceOpStats);
+    }
+    // An operation whose surface the renderer never received (ops lost with a dropped packet) is skipped whole
+    if (targets.missing) continue;
     if (operation.kind === PacketKind.clear) {
       const op = clearResources[clearIndex++];
+      clearLog.push({ target: targets.key, scissor: op.scissor, writeMask: op.writeMask, depthWrite: op.depthWrite, colors: targets.colors.length, depth: Boolean(targets.depth) });
       if (op.scissor.width === 0 || op.scissor.height === 0 || (op.writeMask === 0 && !op.depthWrite)) continue;
+      if (!targets.colors.length && !targets.depth) continue;
+      if (passKey !== targets.key) { endPass(); beginPass(targets); }
       pass.setPipeline(op.pipeline);
       pass.setScissorRect(op.scissor.x, op.scissor.y, op.scissor.width, op.scissor.height);
       pass.setBindGroup(0, clearBindGroup, [op.offset]);
@@ -2124,10 +2794,30 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       continue;
     }
     const index = drawIndex++;
+    if (skipDraws.has(index)) continue;
     const scissor = scissorStates[index].scaled;
     if (scissor.width === 0 || scissor.height === 0) continue;
+    if (!targets.colors.length && !targets.depth) continue;
     const resource = resources[index];
     const draw = translated[index];
+    if (resource.cyclicCopies.length) {
+      endPass();
+      for (const { surface, region } of resource.cyclicCopies) {
+        if (!region) {
+          encoder.copyTextureToTexture({ texture: surface.texture }, { texture: surface.scratch }, { width: surface.width, height: surface.height });
+        } else {
+          for (let slice = 0; slice < region.depth; slice += 1) {
+            encoder.copyTextureToTexture(
+              { texture: surface.texture, origin: { x: 0, y: region.scaledRow + slice * region.scaledHeight } },
+              { texture: region.texture, origin: { x: 0, y: 0, z: slice } },
+              { width: region.scaledWidth, height: region.scaledHeight, depthOrArrayLayers: 1 },
+            );
+          }
+        }
+        surfaceCyclicCopies += 1;
+      }
+    }
+    if (passKey !== targets.key) { endPass(); beginPass(targets); }
     pass.setPipeline(resource.pipeline);
     pass.setScissorRect(scissor.x, scissor.y, scissor.width, scissor.height);
     if (targetStates[index].blendEnabled) pass.setBlendConstant(targetStates[index].blendConstant);
@@ -2144,7 +2834,24 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       pass.draw(draw.vertexCount);
     }
   }
-  pass.end();
+  endPass();
+  // Present: the display buffer the guest flipped (or, without a flip, the last color target)
+  // is blitted into the frame target, which the canvas and the readback see.
+  for (const op of trailingGpuOps) encodeSurfaceOp(prepared, encoder, op, surfaceOpStats);
+  const flipPacket = packets.find((packet) => packet.kind === PacketKind.flip);
+  const presented = (flipPacket?.framebuffer && (prepared.surfaceTable?.get(flipPacket.framebuffer.displaySurfaceId)
+    || findColorSurfaceAt(prepared, flipPacket.framebuffer.colorAddresses[0]))) || lastColorSurface;
+  prepared.lastColorSurface = lastColorSurface;
+  if (presented) {
+    const blitPass = encoder.beginRenderPass({ colorAttachments: [{ view: frameTarget.colorView, loadOp: "load", storeOp: "store" }] });
+    blitPass.setPipeline(getBlitPipeline(prepared, format));
+    blitPass.setBindGroup(0, device.createBindGroup({ layout: prepared.blitBindGroupLayout, entries: [
+      { binding: 0, resource: presented.view },
+      { binding: 1, resource: prepared.blitSampler },
+    ] }));
+    blitPass.draw(3);
+    blitPass.end();
+  }
   const texture = frameTarget.color;
   if (context) {
     encoder.copyTextureToTexture({ texture }, { texture: context.getCurrentTexture() }, { width: canvas.width, height: canvas.height });
@@ -2160,6 +2867,17 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       { width: canvas.width, height: canvas.height });
   }
   device.queue.submit([encoder.finish()]);
+  const validationError = await device.popErrorScope();
+  if (validationError) console.error(`[rpcs3 webgpu] validation: ${validationError.message}`);
+  // Images RPCS3's store retired this frame (and per-op scratch) are released after the submit that last used them
+  for (const surface of retiredSurfaces) {
+    surface.texture.destroy();
+    surface.scratch?.destroy();
+    surface.regions.forEach((region) => region.texture.destroy());
+  }
+  for (const buffer of prepared.frameScratchBuffers ?? []) buffer.destroy();
+  prepared.frameScratchBuffers = [];
+  if (prepared.lastColorSurface && retiredSurfaces.includes(prepared.lastColorSurface)) prepared.lastColorSurface = undefined;
   const submittedAt = performance.now();
   // A GPU sync is only needed to read the frame back; direct presentation
   // leaves the queue asynchronous.
@@ -2209,6 +2927,38 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     frameHash >>>= 0;
   }
   const readbackScannedAt = performance.now();
+  // Diagnostics: every color surface as RGBA8 (blitted through the frame format), for
+  // inspecting intermediate render targets of a frame.
+  let surfaceDumps;
+  if (options.dumpSurfaces && prepared.surfaceTable) {
+    surfaceDumps = [];
+    for (const surface of prepared.surfaceTable.values()) {
+      if (surface.kind !== "color") continue;
+      const dumpTexture = device.createTexture({ size: { width: surface.width, height: surface.height }, format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+      const dumpEncoder = device.createCommandEncoder();
+      const dumpPass = dumpEncoder.beginRenderPass({ colorAttachments: [{ view: dumpTexture.createView(), loadOp: "clear", storeOp: "store" }] });
+      dumpPass.setPipeline(getBlitPipeline(prepared, format));
+      dumpPass.setBindGroup(0, device.createBindGroup({ layout: prepared.blitBindGroupLayout, entries: [{ binding: 0, resource: surface.view }, { binding: 1, resource: prepared.blitSampler }] }));
+      dumpPass.draw(3);
+      dumpPass.end();
+      const dumpRow = Math.ceil((surface.width * 4) / 256) * 256;
+      const dumpBuffer = device.createBuffer({ size: dumpRow * surface.height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      dumpEncoder.copyTextureToBuffer({ texture: dumpTexture }, { buffer: dumpBuffer, bytesPerRow: dumpRow, rowsPerImage: surface.height }, { width: surface.width, height: surface.height });
+      device.queue.submit([dumpEncoder.finish()]);
+      await dumpBuffer.mapAsync(GPUMapMode.READ);
+      const mapped = new Uint8Array(dumpBuffer.getMappedRange());
+      const out = new Uint8Array(surface.width * surface.height * 4);
+      for (let y = 0; y < surface.height; y += 1) {
+        for (let x = 0; x < surface.width; x += 1) {
+          const o = y * dumpRow + x * 4;
+          const d = (y * surface.width + x) * 4;
+          out[d] = mapped[o + (bgra ? 2 : 0)]; out[d + 1] = mapped[o + 1]; out[d + 2] = mapped[o + (bgra ? 0 : 2)]; out[d + 3] = mapped[o + 3];
+        }
+      }
+      dumpBuffer.unmap(); dumpBuffer.destroy(); dumpTexture.destroy();
+      surfaceDumps.push({ key: surface.diagKey, width: surface.width, height: surface.height, rgbaBase64: base64(out) });
+    }
+  }
   // Residency is decided by the packet builder; this is only a guard against a protocol
   // failure (twice the builder's budget), never the normal eviction path.
   if ((prepared.textureCacheBytes ?? 0) > textureCacheBudget * 2) {
@@ -2264,6 +3014,12 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     targetStates,
     drawDiagnostics: translated.map((draw, index) => ({
       ...drawDiagnostics(draw),
+      target: drawTargets[index].key,
+      scissor: scissorStates[index].scaled,
+      blend: targetStates[index].blendEnabled,
+      depthWrite: depthStates[index].writeEnabled,
+      fragmentOpcodes: draw.fragmentOpcodes,
+      shaderCode: options.captureShaders ? resources[index].shaderCode : undefined,
       texture: resources[index].textureResources[0]?.diagnostics,
       textures: resources[index].textureResources.map(({ slot, diagnostics }) => ({ slot, ...diagnostics })),
     })),
@@ -2271,6 +3027,7 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
     clearPixels,
     frameHash,
     changedBounds: !pixels || changedMaxX < 0 ? null : { minX: changedMinX, minY: changedMinY, maxX: changedMaxX, maxY: changedMaxY },
+    validationError: validationError?.message,
     timings: {
       translateMs: translatedAt - renderStartedAt,
       resourceAndPipelineMs: resourcesReadyAt - translatedAt,
@@ -2293,10 +3050,26 @@ export async function renderPacketsToWebGPU(prepared, packets, options = {}) {
       evictions: textureEvictions,
       missingPayloads: missingTexturePayloads,
     },
+    surfaces: {
+      list: [...(prepared.surfaceTable?.values() ?? [])].map((surface) => ({
+        id: surface.id, key: surface.diagKey, pitch: surface.pitch, rsxFormat: surface.rsxFormat,
+        surfaceWidth: surface.surfaceWidth, surfaceHeight: surface.surfaceHeight, samples: [surface.samplesX, surface.samplesY],
+        width: surface.width, height: surface.height,
+      })),
+      count: prepared.surfaceTable?.size ?? 0,
+      ops: surfaceOpStats,
+      missingTargets,
+      retired: retiredSurfaces.length,
+      clearLog,
+      textureHits: surfaceTextureHits,
+      cyclicCopies: surfaceCyclicCopies,
+      presented: presented?.key,
+    },
     uniformRingBytes: uniformRing.size,
     vertexRingBytes: vertexRing.size,
     streamRingBytes: streamRing.size,
     indexRingBytes: indexRing.size,
     rgbaBase64: rgba ? base64(rgba) : undefined,
+    surfaceDumps,
   };
 }

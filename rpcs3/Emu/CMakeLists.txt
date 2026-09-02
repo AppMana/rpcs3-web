@@ -638,6 +638,7 @@ if(RPCS3_WEB)
         RSX/WG/WebGPUCommand.cpp
         RSX/WG/WebGPUHost.cpp
         RSX/WG/WebGPUGSRender.cpp
+        RSX/WG/WebGPURenderTargets.cpp
     )
 endif()
 

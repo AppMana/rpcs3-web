@@ -1531,6 +1531,12 @@ extern "C"
 		g_spu_web_trace_hi = hi;
 	}
 
+	// RPCS3's own resolution scaling (rsx::surface_scaling_config_t from g_cfg.video): the surface
+	// store creates images at this scale, the way the Vulkan backend does. Applied at boot.
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_resolution_scale(u32 percent)
+	{
+		g_cfg.video.resolution_scale_percent.set(std::clamp(percent, 50u, 800u));
+	}
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_clock_scale(u32 percent)
 	{
 		g_rpcs3_web_clocks_scale = std::clamp(percent, 10u, 3000u);

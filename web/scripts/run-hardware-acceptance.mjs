@@ -69,10 +69,15 @@ const runOptions = {
   ppuAotBundle: process.env.RPCS3_PPU_AOT_BUNDLE || undefined,
   spuAotBundle: process.env.RPCS3_SPU_AOT_BUNDLE || undefined,
   spuFallbackHistogram: env.RPCS3_SPU_FALLBACK_HIST === "1",
+  diagnostics: env.RPCS3_DIAGNOSTICS === "1",
+  dumpSurfaces: env.RPCS3_DUMP_SURFACES === "1",
+  skipDraws: env.RPCS3_SKIP_DRAWS ? env.RPCS3_SKIP_DRAWS.split(",").flatMap((item) => { const [a, b] = item.split("-").map(Number); return b === undefined ? [a] : Array.from({ length: b - a + 1 }, (_, i) => a + i); }) : undefined,
+  vertexDiagnostics: env.RPCS3_VERTEX_DIAGNOSTICS === "1",
   spuTraceRange: env.RPCS3_SPU_TRACE_RANGE ? env.RPCS3_SPU_TRACE_RANGE.split("-").map((value) => Number(value)) : undefined,
   tolerateRenderErrors: env.RPCS3_TOLERATE_RENDER_ERRORS !== "0",
   inputTrace,
   clockScale: env.RPCS3_CLOCK_SCALE ? Number(env.RPCS3_CLOCK_SCALE) : undefined,
+  resolutionScale: env.RPCS3_RESOLUTION_SCALE ? Number(env.RPCS3_RESOLUTION_SCALE) : undefined,
   accurateSpuDma: env.RPCS3_ACCURATE_SPU_DMA ? env.RPCS3_ACCURATE_SPU_DMA === "1" : undefined,
   packetCaptureLevel: env.RPCS3_PACKET_CAPTURE_LEVEL ? Number(env.RPCS3_PACKET_CAPTURE_LEVEL) : undefined,
   pthreadPoolSize: env.RPCS3_POOL_SIZE ? Number(env.RPCS3_POOL_SIZE) : undefined,
@@ -360,7 +365,8 @@ try {
     && (untilDraw ? frameList.some((frame) => (frame.drawPacketCount ?? 0) > 0) : frameList.length >= frames);
   const { packetFixture, ...resultWithoutFixture } = result;
   const rgbaBase64 = result.gpu?.rgbaBase64;
-  if (resultWithoutFixture.gpu) resultWithoutFixture.gpu = { ...resultWithoutFixture.gpu, rgbaBase64: undefined };
+  const surfaceDumps = result.gpu?.surfaceDumps;
+  if (resultWithoutFixture.gpu) resultWithoutFixture.gpu = { ...resultWithoutFixture.gpu, rgbaBase64: undefined, surfaceDumps: undefined };
   const percentile = (values, fraction) => {
     const sorted = values.filter((value) => Number.isFinite(value)).sort((a, b) => a - b);
     return sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(fraction * sorted.length))] : undefined;
@@ -411,6 +417,11 @@ try {
       const png = new PNG({ width: result.gpu.width, height: result.gpu.height });
       png.data.set(Buffer.from(rgbaBase64, "base64"));
       await writeFile(outputPath.replace(/\.json$/, "") + ".frame.png", PNG.sync.write(png));
+    }
+    for (const dump of surfaceDumps ?? []) {
+      const png = new PNG({ width: dump.width, height: dump.height });
+      png.data.set(Buffer.from(dump.rgbaBase64, "base64"));
+      await writeFile(`${outputPath.replace(/\.json$/, "")}.${dump.key.replace(/[^a-z0-9]+/gi, "_")}.png`, PNG.sync.write(png));
     }
   }
   if (packetFixturePath) {

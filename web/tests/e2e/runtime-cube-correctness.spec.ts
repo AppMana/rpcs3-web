@@ -62,7 +62,7 @@ test("renders the RPCS3 textured cube with depth and alpha-blended text", async 
   expect(gpu.vertexBackend).toBe("webgpu-wgsl");
   expect(gpu.vertexBackendComparison).toMatchObject({
     oracleBackend: "cpu-oracle",
-    oracleFrameHash: 427_351_212,
+    oracleFrameHash: 3_289_484_600,
     frameHashMatch: true,
     changedPixelsMatch: true,
   });
@@ -122,6 +122,8 @@ test("renders the RPCS3 textured cube with depth and alpha-blended text", async 
   expect(textPixels).toBeLessThan(1_000);
   expect(textClearPixels).toBeGreaterThan(4_000);
   expect(lightTextPixels).toBeGreaterThan(50);
-  expect(gpu.changedBounds).toMatchObject({ minX: 16 });
+  // Surfaces render at RPCS3's resolution scale (1280x720) and are presented into the 320x180 canvas with a
+  // nearest blit, whose sample centres land one canvas pixel right of the text's left edge.
+  expect(gpu.changedBounds).toMatchObject({ minX: 17 });
   expect(gpu.changedBounds?.maxX).toBeGreaterThan(180);
 });

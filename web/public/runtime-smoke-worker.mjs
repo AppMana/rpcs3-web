@@ -1,4 +1,6 @@
 import { PacketKind, copyFrontPacket, discardFrontPacket, packetSummary } from "./rpcs3-webgpu-packet.mjs";
+// RPCS3 surface store effects carried by packets discarded without rendering; the next rendered frame applies them first
+let carriedSurfaceOps = [];
 import { createPpuDispatcher } from "./rpcs3-ppu-dispatcher.mjs";
 import { createSpuDispatcher } from "./rpcs3-spu-dispatcher.mjs";
 
@@ -306,7 +308,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
   if (presentLatestOnly) {
     let stale = pendingFlips() - 1;
     while (stale > 0) {
-      const kind = discardFrontPacket(module);
+      const kind = discardFrontPacket(module, carriedSurfaceOps);
       if (!kind) break;
       if (kind === PacketKind.flip) {
         consumedFlips += 1;
@@ -322,7 +324,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
   while (bootResult === 0 && flipPacketCount === 0 && status !== 0 && performance.now() < packetDeadline) {
     if (discardPackets) {
       let kind;
-      while ((kind = discardFrontPacket(module))) {
+      while ((kind = discardFrontPacket(module, carriedSurfaceOps))) {
         packetCount += 1;
         drawPacketCount += kind === PacketKind.draw ? 1 : 0;
         flipPacketCount += kind === PacketKind.flip ? 1 : 0;
@@ -370,6 +372,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     })))) : undefined;
   scope.postMessage({
     type,
+    carriedSurfaceOps: packets.length ? carriedSurfaceOps.splice(0) : undefined,
     ok: initialized === 1 && bootResult === 0 && flipPacketCount === 1,
     initialized,
     storageState: module.ccall("rpcs3_web_storage_state", "number", [], []),
@@ -583,6 +586,7 @@ scope.addEventListener("message", async (event) => {
     sparseVmProbe = module.ccall("rpcs3_web_sparse_vm_probe", "number", [], []);
     module.ccall("rpcs3_webgpu_set_capture_level", null, ["number"], [Number(event.data.packetCaptureLevel ?? 4)]);
     if (clockScale) module.ccall("rpcs3_web_set_clock_scale", null, ["number"], [clockScale]);
+    if (event.data.resolutionScalePercent) module.ccall("rpcs3_web_set_resolution_scale", null, ["number"], [Number(event.data.resolutionScalePercent) >>> 0]);
     if (typeof accurateSpuDma === "boolean") {
       module.ccall("rpcs3_web_set_accurate_spu_dma", null, ["number"], [accurateSpuDma ? 1 : 0]);
     }

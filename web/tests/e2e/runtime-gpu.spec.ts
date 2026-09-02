@@ -29,7 +29,7 @@ test("renders an authentic RPCS3 RSX draw through hardware WebGPU", async ({ pag
   expect(gpu.vertexBackend).toBe("webgpu-wgsl");
   expect(gpu.vertexBackendComparison).toMatchObject({
     oracleBackend: "cpu-oracle",
-    oracleFrameHash: 1_129_836_632,
+    oracleFrameHash: 2_769_363_428,
     frameHashMatch: true,
     changedPixelsMatch: true,
   });
@@ -41,7 +41,7 @@ test("renders an authentic RPCS3 RSX draw through hardware WebGPU", async ({ pag
   expect(gpu.fragmentOpcodes).toEqual([1]);
   expect(gpu.changedPixels).toBeGreaterThan(100);
   expect(gpu.clearPixels).toBeGreaterThan(100);
-  expect(gpu.frameHash).toBe(1_129_836_632);
+  expect(gpu.frameHash).toBe(2_769_363_428);
   // The worker posts its result before Chromium's compositor necessarily
   // presents that task's OffscreenCanvas frame. Yield two browser paints so
   // the screenshot verifies the displayed surface, not just GPU readback.

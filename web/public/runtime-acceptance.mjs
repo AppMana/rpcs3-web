@@ -15,7 +15,7 @@ function base64Of(bytes) {
 function compactFrame(frame, keepDetail) {
   if (keepDetail) return frame;
   const { logs: _logs, stackReport: _stack, packetSummaries: _summaries, textureWords: _words, gpu, ...rest } = frame;
-  return { ...rest, gpu: gpu && { ...gpu, drawDiagnostics: undefined, shaderPrograms: undefined, rgbaBase64: undefined, depthStates: undefined, rasterStates: undefined, scissorStates: undefined, targetStates: undefined } };
+  return { ...rest, gpu: gpu && { ...gpu, drawDiagnostics: undefined, shaderPrograms: undefined, surfaceDumps: undefined, rgbaBase64: undefined, depthStates: undefined, rasterStates: undefined, scissorStates: undefined, targetStates: undefined } };
 }
 
 let active;
@@ -122,6 +122,9 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
             if (options.compareVertexBackends === true) {
               const oracle = await renderPacketsToWebGPU(activeGpu, decodedPackets, {
                 captureRgba: Boolean(options.captureRgba),
+                dumpSurfaces: Boolean(options.dumpSurfaces),
+                skipDraws: options.skipDraws,
+                carriedSurfaceOps: event.data.carriedSurfaceOps,
                 replayPresentation: false,
                 vertexBackend: "cpu-oracle",
                 vertexDiagnostics: true,
@@ -138,6 +141,9 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
               decodedPackets,
               {
                 captureRgba: Boolean(options.captureRgba),
+                dumpSurfaces: Boolean(options.dumpSurfaces),
+                skipDraws: options.skipDraws,
+                carriedSurfaceOps: event.data.carriedSurfaceOps,
                 captureShaders: Boolean(options.captureShaders),
                 vertexDiagnostics: options.vertexDiagnostics === true,
                 textureCacheBytes: options.textureCacheBytes,
@@ -232,6 +238,9 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       discardPackets: !needsPackets(1) && !dispatchCompletion,
       untilDraw: untilDraw && !dispatchCompletion,
       diagnostics: options.diagnostics === true,
+      dumpSurfaces: options.dumpSurfaces === true,
+      skipDraws: Array.isArray(options.skipDraws) ? options.skipDraws : undefined,
+      vertexDiagnostics: options.vertexDiagnostics === true,
       presentLatestOnly: options.presentLatestOnly === true,
       debugAddresses: Array.isArray(options.debugAddresses) ? options.debugAddresses : [],
       pad: options.pad ?? currentPad,
@@ -245,6 +254,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       spuFallbackHistogram: options.spuFallbackHistogram === true,
       spuAot: options.spuAot === true,
       clockScale: options.clockScale,
+      resolutionScalePercent: typeof options.resolutionScale === "number" ? Math.round(options.resolutionScale * 100) : undefined,
       accurateSpuDma: options.accurateSpuDma,
       packetCaptureLevel: options.packetCaptureLevel,
       tracePc: options.tracePc,

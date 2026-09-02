@@ -66,7 +66,7 @@ describe("WebGPU packet ABI v5", () => {
       { index: SectionKind.resolvedState, bytes: state },
       { index: SectionKind.persistentVertices, bytes: Uint8Array.of(1, 2, 3, 4), alignment: 256 },
     ] }));
-    expect(packet.abi).toBe(5);
+    expect(packet.abi).toBe(7);
     expect(packet.sections).toHaveLength(DRAW_PACKET_SECTION_COUNT);
     expect(packet.sections[SectionKind.persistentVertices].offset % 256).toBe(0);
     expect(packet.sections[SectionKind.rawRegisters].size).toBe(0);

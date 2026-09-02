@@ -5,6 +5,7 @@
 #include <deque>
 
 #include "Emu/RSX/GSRender.h"
+#include "WebGPURenderTargets.h"
 #include "Emu/RSX/Core/RSXVertexTypes.h"
 #include "WebGPUCommand.h"
 
@@ -24,6 +25,13 @@ private:
 	void end() override;
 	void clear_surface(u32 mask) override;
 	void flip(const rsx::display_flip_info_t& info) override;
+	void on_init_thread() override;
+	void on_exit() override;
+
+	// VKGSRender::prepare_rtts: bind the framebuffer layout's surfaces through RPCS3's surface store
+	void prepare_rtts(rsx::framebuffer_creation_context context);
+	// Surfaces the referenced fragment textures alias get their memory barriers before the draw
+	void read_barrier_sampled_surfaces();
 
 	bool emit_draw_packet(u32 subdraw);
 	void emit_control_packet(rsx::webgpu::packet_kind kind, u32 value, u32 flags = 0);
@@ -31,6 +39,14 @@ private:
 
 	rsx::vertex_input_layout m_vertex_layout;
 	areau m_scissor{};
+	// Surface store effects not yet shipped (declared before the store so it outlives it)
+	rsx::webgpu::surface_command_list m_surface_ops;
+	rsx::webgpu::surface_cache m_rtts;
+	rsx::framebuffer_creation_context m_current_framebuffer_context = rsx::framebuffer_creation_context::context_draw;
+	bool m_rtts_bound = false;
+	// VKGSRender::clear_surface: a partial depth-stencil clear of an uninitialized surface initializes the other aspect
+	bool m_clear_initialize_depth = false;
+	bool m_clear_initialize_stencil = false;
 	// Textures the renderer currently holds (payload delivered earlier and not yet evicted).
 	// The builder decides eviction (LRU under a byte budget) and tells the renderer through
 	// stage-2 texture records, so both sides agree on residency without a return channel.

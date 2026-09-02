@@ -9,7 +9,7 @@
 namespace rsx::webgpu
 {
 	constexpr std::uint32_t draw_packet_magic = 0x52444757; // "WGDR" in little endian memory.
-	constexpr std::uint32_t draw_packet_abi = 5;
+	constexpr std::uint32_t draw_packet_abi = 7;
 
 	enum class packet_kind : std::uint32_t
 	{
@@ -149,6 +149,8 @@ namespace rsx::webgpu
 		raster_environment,
 		fragment_constants,
 		raw_registers, // full rsx::method_registers snapshot, capture level 5 only
+		framebuffer,   // framebuffer_packet: RPCS3's framebuffer_layout for draws/clears, the display buffer for flips
+		surface_ops,   // surface_op array: RPCS3 surface store effects the browser applies before this packet
 		count,
 	};
 
@@ -196,7 +198,74 @@ namespace rsx::webgpu
 	};
 
 	static_assert(sizeof(packet_section) == 8);
-	static_assert(sizeof(draw_packet_header) == 216);
+	static_assert(sizeof(draw_packet_header) == 232);
+
+	// Guest surfaces of a draw or clear (rsx::framebuffer_layout, absolute addresses) or, for a
+	// flip, the display buffer being presented in color_addresses[0]/color_pitches[0].
+	struct framebuffer_packet
+	{
+		std::uint32_t color_addresses[4] = {};
+		std::uint32_t color_pitches[4] = {};
+		std::uint32_t zeta_address = 0;
+		std::uint32_t zeta_pitch = 0;
+		std::uint32_t color_write_mask = 0;   // bit n = color target n written
+		std::uint32_t zeta_write_enabled = 0;
+		std::uint32_t aa_factor_x = 1;
+		std::uint32_t aa_factor_y = 1;
+		std::uint32_t raster_type = 0;
+		std::uint32_t display_buffer = 0;     // flip: index of the display buffer
+		// Surfaces RPCS3's surface store bound for this packet (surface_op ids, 0 = none)
+		std::uint32_t color_surface_ids[4] = {};
+		std::uint32_t zeta_surface_id = 0;
+		std::uint32_t display_surface_id = 0; // flip: the surface holding the display buffer, if any
+		std::uint32_t scale_percent = 100;    // rsx::surface_scaling_config_t of the surfaces (scissor space)
+		std::uint32_t reserved = 0;
+	};
+
+	static_assert(sizeof(framebuffer_packet) == 96);
+
+	// Effects of RPCS3's surface store (rsx::surface_store with WebGPURenderTargets.h traits)
+	// on the browser's images, in program order. The browser executes them before the packet
+	// they arrive in; a dropped packet's ops travel with the next one.
+	enum class surface_op_kind : std::uint32_t
+	{
+		create = 1,      // allocate image `id`: is_depth, host_format, image_width x image_height
+		describe = 2,    // guest placement of `id`: surface dims (pixels), sample factors, address, pitch, rsx_format
+		destroy = 3,     // release image `id`
+		erase = 4,       // vk::render_target::clear_memory: color (0,0,0,1) / depth 1.0, stencil 255
+		copy_scaled = 5, // nearest-filtered blit src rect of src_id into dst rect of id (rsx_format 1 = typeless)
+		load_memory = 6, // vk::render_target::load_memory: fill from guest memory (read_color/depth_buffers)
+	};
+
+	struct surface_op
+	{
+		std::uint32_t kind = 0;
+		std::uint32_t id = 0;
+		std::uint32_t is_depth = 0;
+		std::uint32_t host_format = 0;   // host_surface_format
+		std::uint32_t image_width = 0;
+		std::uint32_t image_height = 0;
+		std::uint32_t surface_width = 0;
+		std::uint32_t surface_height = 0;
+		std::uint32_t samples_x = 1;
+		std::uint32_t samples_y = 1;
+		std::uint32_t address = 0;
+		std::uint32_t pitch = 0;
+		std::uint32_t src_id = 0;
+		std::uint32_t src_x1 = 0;
+		std::uint32_t src_y1 = 0;
+		std::uint32_t src_x2 = 0;
+		std::uint32_t src_y2 = 0;
+		std::uint32_t dst_x1 = 0;
+		std::uint32_t dst_y1 = 0;
+		std::uint32_t dst_x2 = 0;
+		std::uint32_t dst_y2 = 0;
+		std::uint32_t filter_linear = 0;
+		std::uint32_t rsx_format = 0;
+		std::uint32_t reserved = 0;
+	};
+
+	static_assert(sizeof(surface_op) == 96);
 
 	class draw_packet_builder
 	{

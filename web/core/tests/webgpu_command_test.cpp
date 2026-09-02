@@ -51,7 +51,7 @@ int main()
 	assert(view.section(section_kind::indices).empty());
 	assert(view.section(section_kind::raw_registers).empty());
 	assert(view.section(section_kind::resolved_state).size() == sizeof(resolved_state_packet));
-	assert(view.header()->abi == 5);
+	assert(view.header()->abi == draw_packet_abi);
 	assert(view.header()->sections[static_cast<std::size_t>(section_kind::resolved_state)].offset >= sizeof(draw_packet_header));
 	assert(view.header()->sections[static_cast<std::size_t>(section_kind::resolved_state)].offset % 16 == 0);
 	assert(std::memcmp(view.section(section_kind::resolved_state).data(), &resolved, sizeof(resolved)) == 0);

@@ -11,6 +11,7 @@
 #include "Emu/RSX/rsx_methods.h"
 #include "Emu/RSX/rsx_utils.h"
 #include "Emu/Memory/vm.h"
+#include "Emu/system_config.h"
 
 #include <array>
 #include <list>
@@ -495,6 +496,34 @@ WebGPUGSRender::WebGPUGSRender(utils::serial* ar) noexcept
 	backend_config.supports_last_provoking_vertex = false;
 }
 
+static rsx::webgpu::framebuffer_packet framebuffer_from_layout(const rsx::framebuffer_layout& layout,
+	const rsx::webgpu::surface_cache& rtts, u32 scale_percent)
+{
+	rsx::webgpu::framebuffer_packet fb{};
+	for (u32 i = 0; i < 4; i++)
+	{
+		fb.color_addresses[i] = layout.color_addresses[i];
+		fb.color_pitches[i] = layout.color_pitch[i];
+		fb.color_write_mask |= layout.color_write_enabled[i] ? (1u << i) : 0u;
+		if (const auto& bound = rtts.m_bound_render_targets[i]; bound.second && bound.first == layout.color_addresses[i])
+		{
+			fb.color_surface_ids[i] = bound.second->id;
+		}
+	}
+	if (const auto& bound = rtts.m_bound_depth_stencil; bound.second && bound.first == layout.zeta_address)
+	{
+		fb.zeta_surface_id = bound.second->id;
+	}
+	fb.scale_percent = scale_percent;
+	fb.zeta_address = layout.zeta_address;
+	fb.zeta_pitch = layout.zeta_pitch;
+	fb.zeta_write_enabled = layout.zeta_write_enabled ? 1u : 0u;
+	fb.aa_factor_x = layout.aa_factors[0];
+	fb.aa_factor_y = layout.aa_factors[1];
+	fb.raster_type = static_cast<u32>(layout.raster_type);
+	return fb;
+}
+
 void WebGPUGSRender::begin()
 {
 	rsx::thread::begin();
@@ -504,8 +533,89 @@ void WebGPUGSRender::begin()
 	}
 
 	// Common RPCS3 framebuffer validation supplies the true dimensions,
-	// attachment formats and guest addresses.
-	get_framebuffer_layout(rsx::framebuffer_creation_context::context_draw, m_framebuffer_layout);
+	// attachment formats and guest addresses; the surface store binds them.
+	prepare_rtts(rsx::framebuffer_creation_context::context_draw);
+}
+
+void WebGPUGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
+{
+	if (m_current_framebuffer_context == context && !m_graphics_state.test(rsx::rtt_config_dirty) && m_rtts_bound)
+	{
+		return;
+	}
+
+	m_graphics_state.clear(
+		rsx::rtt_config_dirty |
+		rsx::rtt_config_contested |
+		rsx::rtt_config_valid |
+		rsx::rtt_cache_state_dirty);
+
+	get_framebuffer_layout(context, m_framebuffer_layout);
+	if (!m_graphics_state.test(rsx::rtt_config_valid))
+	{
+		return;
+	}
+
+	if (m_rtts_bound && m_framebuffer_layout.ignore_change)
+	{
+		return;
+	}
+
+	m_rtts.prepare_render_target(m_surface_ops,
+		m_framebuffer_layout.color_format, m_framebuffer_layout.depth_format,
+		m_framebuffer_layout.width, m_framebuffer_layout.height,
+		m_framebuffer_layout.target, m_framebuffer_layout.aa_mode, m_framebuffer_layout.raster_type,
+		m_framebuffer_layout.color_addresses, m_framebuffer_layout.zeta_address,
+		m_framebuffer_layout.actual_color_pitch, m_framebuffer_layout.actual_zeta_pitch,
+		resolution_scaling_config);
+
+	// No texture cache yet: nothing to discard or lock for superseded/orphaned surfaces
+	m_rtts.superseded_surfaces.clear();
+	m_rtts.orphaned_surfaces.clear();
+
+	m_current_framebuffer_context = context;
+	m_rtts_bound = true;
+}
+
+void WebGPUGSRender::read_barrier_sampled_surfaces()
+{
+	for (u32 i = 0; i < rsx::limits::fragment_textures_count; ++i)
+	{
+		if (!(current_fp_metadata.referenced_textures_mask & (1u << i)))
+		{
+			continue;
+		}
+
+		const auto& tex = rsx::method_registers.fragment_textures[i];
+		if (!tex.enabled())
+		{
+			continue;
+		}
+
+		const u32 address = rsx::get_address(tex.offset(), tex.location());
+		const u32 length = std::max<u32>(get_texture_size(tex), 1);
+		m_rtts.for_each_overlapping(rsx::address_range32::start_length(address, length), [&](rsx::webgpu::render_target* surface)
+		{
+			surface->read_barrier(m_surface_ops);
+		});
+	}
+}
+
+void WebGPUGSRender::on_init_thread()
+{
+	GSRender::on_init_thread();
+	// The Vulkan backend's texture cache and surface accessors consume rsx::get_shared_tag()
+	// values during initialization, so the surface store's first bind (cache_tag) is newer than
+	// its initial write_tag and the first clear's on_write is recorded. Consume the same way.
+	(void)rsx::get_shared_tag();
+	(void)rsx::get_shared_tag();
+}
+
+void WebGPUGSRender::on_exit()
+{
+	m_rtts.destroy();
+	m_surface_ops.ops.clear();
+	GSRender::on_exit();
 }
 
 void WebGPUGSRender::end()
@@ -530,6 +640,20 @@ void WebGPUGSRender::end()
 		get_current_vertex_program(vs_sampler_state);
 	}
 
+	// Apply write memory barriers (VKGSRender::end), then the read barriers of sampled surfaces
+	if (auto ds = std::get<1>(m_rtts.m_bound_depth_stencil))
+	{
+		ds->write_barrier(m_surface_ops);
+	}
+	for (auto& rtt : m_rtts.m_bound_render_targets)
+	{
+		if (auto surface = std::get<1>(rtt))
+		{
+			surface->write_barrier(m_surface_ops);
+		}
+	}
+	read_barrier_sampled_surfaces();
+
 	auto& clause = rsx::method_registers.current_draw_clause;
 	clause.begin();
 	u32 subdraw = 0;
@@ -539,6 +663,7 @@ void WebGPUGSRender::end()
 	}
 	while (clause.next());
 
+	m_rtts.on_write(m_framebuffer_layout.color_write_enabled, m_framebuffer_layout.zeta_write_enabled);
 	rsx::thread::end();
 }
 
@@ -546,6 +671,7 @@ bool WebGPUGSRender::emit_draw_packet(u32 subdraw)
 {
 	if (rsx::webgpu::packet_capture_level() < 2)
 	{
+		m_surface_ops.ops.clear();
 		return true;
 	}
 
@@ -708,6 +834,9 @@ bool WebGPUGSRender::emit_draw_packet(u32 subdraw)
 	packet_ok = packet.append(rsx::webgpu::section_kind::textures, textures.bytes, 16) && packet_ok;
 	packet_ok = packet.append(rsx::webgpu::section_kind::raster_environment,
 		std::as_bytes(std::span{&raster_environment, 1})) && packet_ok;
+	const rsx::webgpu::framebuffer_packet framebuffer = framebuffer_from_layout(m_framebuffer_layout, m_rtts, resolution_scaling_config.scale_percent);
+	packet_ok = packet.append(rsx::webgpu::section_kind::framebuffer, std::as_bytes(std::span{&framebuffer, 1})) && packet_ok;
+	packet_ok = packet.append(rsx::webgpu::section_kind::surface_ops, std::as_bytes(std::span(m_surface_ops.ops))) && packet_ok;
 
 	std::vector<u64> payload_keys;
 	payload_keys.reserve(textures.additions.size());
@@ -728,6 +857,7 @@ bool WebGPUGSRender::emit_draw_packet(u32 subdraw)
 		m_queued_packet_textures.push_back(std::move(payload_keys));
 	}
 
+	m_surface_ops.ops.clear();
 	return true;
 }
 
@@ -735,6 +865,7 @@ void WebGPUGSRender::emit_control_packet(rsx::webgpu::packet_kind kind, u32 valu
 {
 	if (rsx::webgpu::packet_capture_level() == 0)
 	{
+		m_surface_ops.ops.clear();
 		return;
 	}
 
@@ -747,9 +878,26 @@ void WebGPUGSRender::emit_control_packet(rsx::webgpu::packet_kind kind, u32 valu
 	header.height = m_framebuffer_layout.height;
 	header.color_format = static_cast<u32>(m_framebuffer_layout.color_format);
 	header.depth_format = static_cast<u32>(m_framebuffer_layout.depth_format);
+	header.color_target = static_cast<u32>(m_framebuffer_layout.target);
+	header.antialias_mode = static_cast<u32>(m_framebuffer_layout.aa_mode);
 
 	rsx::webgpu::resolved_state_packet resolved{};
 	fill_resolved_state(resolved, kind == rsx::webgpu::packet_kind::clear ? value : 0);
+	if (kind == rsx::webgpu::packet_kind::clear)
+	{
+		// VKGSRender::clear_surface initializes the aspect a partial depth-stencil clear leaves untouched
+		if (m_clear_initialize_depth)
+		{
+			resolved.clear_mask |= RSX_GCM_CLEAR_DEPTH_BIT;
+			resolved.clear_depth = 1.f;
+		}
+		if (m_clear_initialize_stencil)
+		{
+			resolved.clear_mask |= RSX_GCM_CLEAR_STENCIL_BIT;
+			resolved.clear_stencil = 0xff;
+		}
+		m_clear_initialize_depth = m_clear_initialize_stencil = false;
+	}
 
 	rsx::webgpu::draw_packet_builder packet(header);
 	bool packet_ok = packet.append(rsx::webgpu::section_kind::resolved_state,
@@ -773,10 +921,29 @@ void WebGPUGSRender::emit_control_packet(rsx::webgpu::packet_kind kind, u32 valu
 		packet_ok = packet.append(rsx::webgpu::section_kind::raster_environment,
 			std::as_bytes(std::span{&raster_environment, 1})) && packet_ok;
 	}
+	rsx::webgpu::framebuffer_packet framebuffer = framebuffer_from_layout(m_framebuffer_layout, m_rtts, resolution_scaling_config.scale_percent);
+	if (kind == rsx::webgpu::packet_kind::flip && value < display_buffers_count)
+	{
+		const auto& buffer = display_buffers[value];
+		framebuffer.display_buffer = value;
+		framebuffer.color_addresses[0] = rsx::get_address(buffer.offset, CELL_GCM_LOCATION_LOCAL);
+		framebuffer.color_pitches[0] = buffer.pitch;
+		header.width = buffer.width;
+		header.height = buffer.height;
+		// The display buffer RSX rendered lives in the surface store; make its contents current
+		if (auto surface = m_rtts.get_surface_at(framebuffer.color_addresses[0]))
+		{
+			surface->read_barrier(m_surface_ops);
+			framebuffer.display_surface_id = surface->id;
+		}
+	}
+	packet_ok = packet.append(rsx::webgpu::section_kind::framebuffer, std::as_bytes(std::span{&framebuffer, 1})) && packet_ok;
+	packet_ok = packet.append(rsx::webgpu::section_kind::surface_ops, std::as_bytes(std::span(m_surface_ops.ops))) && packet_ok;
 	if (packet_ok && rsx::webgpu::host_command_queue().push(packet.finish()))
 	{
 		std::lock_guard lock(m_texture_residency_mutex);
 		m_queued_packet_textures.emplace_back();
+		m_surface_ops.ops.clear();
 	}
 }
 
@@ -990,11 +1157,113 @@ void WebGPUGSRender::clear_surface(u32 mask)
 	u8 context = rsx::framebuffer_creation_context::context_draw;
 	if (mask & RSX_GCM_CLEAR_COLOR_RGBA_MASK) context |= rsx::framebuffer_creation_context::context_clear_color;
 	if (mask & RSX_GCM_CLEAR_DEPTH_STENCIL_MASK) context |= rsx::framebuffer_creation_context::context_clear_depth;
-	get_framebuffer_layout(static_cast<rsx::framebuffer_creation_context>(context), m_framebuffer_layout);
-	if (m_graphics_state.test(rsx::rtt_config_valid))
+	prepare_rtts(static_cast<rsx::framebuffer_creation_context>(context));
+	if (!m_graphics_state.test(rsx::rtt_config_valid))
 	{
-		emit_control_packet(rsx::webgpu::packet_kind::clear, mask);
+		return;
 	}
+
+	// VKGSRender::clear_surface: memory barriers and write tags of the surfaces being cleared
+	(void)get_scissor(m_scissor, true);
+	const auto [fb_width, fb_height] = rsx::apply_resolution_scale<true>(resolution_scaling_config, m_framebuffer_layout.width, m_framebuffer_layout.height);
+	u16 scissor_x = static_cast<u16>(m_scissor.x1);
+	u16 scissor_w = static_cast<u16>(m_scissor.width());
+	u16 scissor_y = static_cast<u16>(m_scissor.y1);
+	u16 scissor_h = static_cast<u16>(m_scissor.height());
+	std::tie(scissor_x, scissor_y, scissor_w, scissor_h) = rsx::clip_region<u16>(fb_width, fb_height, scissor_x, scissor_y, scissor_w, scissor_h, false);
+	const bool full_frame = (scissor_w == fb_width && scissor_h == fb_height);
+
+	bool update_color = false, update_z = false;
+	const auto surface_depth_format = rsx::method_registers.surface_depth_fmt();
+
+	if (auto ds = std::get<1>(m_rtts.m_bound_depth_stencil); ds && (mask & RSX_GCM_CLEAR_DEPTH_STENCIL_MASK))
+	{
+		constexpr u32 depth_aspect = 1, stencil_aspect = 2;
+		u32 depth_stencil_mask = 0;
+		if (mask & RSX_GCM_CLEAR_DEPTH_BIT) depth_stencil_mask |= depth_aspect;
+		const u32 aspect = is_depth_stencil_format(surface_depth_format) ? (depth_aspect | stencil_aspect) : depth_aspect;
+		if (is_depth_stencil_format(surface_depth_format) && (mask & RSX_GCM_CLEAR_STENCIL_BIT)) depth_stencil_mask |= stencil_aspect;
+
+		if ((depth_stencil_mask && depth_stencil_mask != aspect) || !full_frame)
+		{
+			// At least one aspect is not being cleared or the clear does not cover the full frame
+			// Steps to initialize memory are required
+			if (ds->state_flags & rsx::surface_state_flags::erase_bkgnd &&  // Needs initialization
+				ds->old_contents.empty() && !g_cfg.video.read_depth_buffer) // No way to load data from memory, so no initialization given
+			{
+				// Only one aspect was cleared. Make sure to memory initialize the other before removing dirty flag
+				const auto ds_mask = (mask & RSX_GCM_CLEAR_DEPTH_STENCIL_MASK);
+				if (ds_mask == RSX_GCM_CLEAR_DEPTH_BIT && (aspect & stencil_aspect))
+				{
+					m_clear_initialize_stencil = true;
+				}
+				else if (ds_mask == RSX_GCM_CLEAR_STENCIL_BIT)
+				{
+					m_clear_initialize_depth = true;
+				}
+			}
+			else
+			{
+				ds->write_barrier(m_surface_ops);
+			}
+		}
+
+		update_z = true;
+	}
+
+	if (auto colormask = (mask & RSX_GCM_CLEAR_COLOR_RGBA_MASK))
+	{
+		if (!m_rtts.m_bound_render_target_ids.empty())
+		{
+			bool use_fast_clear = (colormask == RSX_GCM_CLEAR_COLOR_RGBA_MASK);
+			switch (rsx::method_registers.surface_color())
+			{
+			case rsx::surface_color_format::x32:
+			case rsx::surface_color_format::w16z16y16x16:
+			case rsx::surface_color_format::w32z32y32x32:
+				colormask = 0;
+				break;
+			case rsx::surface_color_format::b8:
+				colormask = rsx::get_b8_clearmask(colormask);
+				use_fast_clear = (colormask & RSX_GCM_CLEAR_RED_BIT);
+				break;
+			case rsx::surface_color_format::g8b8:
+				colormask = rsx::get_g8b8_r8g8_clearmask(colormask);
+				use_fast_clear = ((colormask & RSX_GCM_CLEAR_COLOR_RG_MASK) == RSX_GCM_CLEAR_COLOR_RG_MASK);
+				break;
+			case rsx::surface_color_format::r5g6b5:
+				use_fast_clear = ((colormask & RSX_GCM_CLEAR_COLOR_RGB_MASK) == RSX_GCM_CLEAR_COLOR_RGB_MASK);
+				break;
+			case rsx::surface_color_format::a8b8g8r8:
+			case rsx::surface_color_format::x8b8g8r8_o8b8g8r8:
+			case rsx::surface_color_format::x8b8g8r8_z8b8g8r8:
+				colormask = rsx::get_abgr8_clearmask(colormask);
+				break;
+			default:
+				break;
+			}
+
+			if (colormask)
+			{
+				if (!use_fast_clear || !full_frame)
+				{
+					for (const auto& index : m_rtts.m_bound_render_target_ids)
+					{
+						m_rtts.m_bound_render_targets[index].second->write_barrier(m_surface_ops);
+					}
+				}
+
+				update_color = true;
+			}
+		}
+	}
+
+	if (update_color || update_z)
+	{
+		m_rtts.on_write({ update_color, update_color, update_color, update_color }, update_z);
+	}
+
+	emit_control_packet(rsx::webgpu::packet_kind::clear, mask);
 }
 
 void WebGPUGSRender::flip(const rsx::display_flip_info_t& info)
@@ -1002,6 +1271,8 @@ void WebGPUGSRender::flip(const rsx::display_flip_info_t& info)
 	const u32 flags = info.skip_frame ? rsx::webgpu::packet_skipped : 0u;
 	emit_control_packet(rsx::webgpu::packet_kind::flip, info.buffer, flags);
 	m_frame_texture_hashes.clear();
+	rsx::webgpu::set_current_frame_id(rsx::webgpu::current_frame_id() + 1);
+	m_rtts.trim(m_surface_ops, rsx::problem_severity::low);
 	if (m_frame)
 	{
 		m_frame->flip(m_context, info.skip_frame);

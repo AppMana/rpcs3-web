@@ -1,6 +1,6 @@
 export const DRAW_PACKET_MAGIC = 0x52444757;
-export const DRAW_PACKET_ABI = 5;
-export const DRAW_PACKET_SECTION_COUNT = 14;
+export const DRAW_PACKET_ABI = 7;
+export const DRAW_PACKET_SECTION_COUNT = 16;
 export const DRAW_PACKET_HEADER_SIZE = 104 + DRAW_PACKET_SECTION_COUNT * 8;
 export const TEXTURE_PACKET_RECORD_SIZE = 64;
 export const RESOLVED_STATE_SIZE = 256;
@@ -43,6 +43,8 @@ export const SectionKind = Object.freeze({
   rasterEnvironment: 11,
   fragmentConstants: 12,
   rawRegisters: 13,
+  framebuffer: 14,
+  surfaceOps: 15,
 });
 
 function u32(view, offset) {
@@ -223,7 +225,54 @@ export function decodeDrawPacket(bytes) {
   packet.textures = textureRecords.textures;
   packet.textureEvictions = textureRecords.evictions;
   packet.resolvedState = decodeResolvedState(sections[SectionKind.resolvedState].bytes);
+  packet.framebuffer = decodeFramebuffer(sections[SectionKind.framebuffer].bytes);
+  packet.surfaceOps = decodeSurfaceOps(sections[SectionKind.surfaceOps].bytes);
   return packet;
+}
+
+// framebuffer_packet: the guest surfaces of a draw/clear, or the display buffer of a flip.
+export const FRAMEBUFFER_PACKET_SIZE = 96;
+export function decodeFramebuffer(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) return undefined;
+  if (bytes.byteLength !== FRAMEBUFFER_PACKET_SIZE) throw new Error(`invalid WebGPU framebuffer section (${bytes.byteLength} bytes)`);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return {
+    colorAddresses: [0, 1, 2, 3].map((i) => u32(view, i * 4)),
+    colorPitches: [0, 1, 2, 3].map((i) => u32(view, 16 + i * 4)),
+    zetaAddress: u32(view, 32),
+    zetaPitch: u32(view, 36),
+    colorWriteMask: u32(view, 40),
+    zetaWriteEnabled: u32(view, 44),
+    aaFactors: [u32(view, 48), u32(view, 52)],
+    rasterType: u32(view, 56),
+    displayBuffer: u32(view, 60),
+    colorSurfaceIds: [0, 1, 2, 3].map((i) => u32(view, 64 + i * 4)),
+    zetaSurfaceId: u32(view, 80),
+    displaySurfaceId: u32(view, 84),
+    scalePercent: u32(view, 88),
+  };
+}
+
+// rsx::webgpu::surface_op: effects of RPCS3's surface store on the browser's images
+export const SURFACE_OP_SIZE = 96;
+export const SurfaceOpKind = Object.freeze({ create: 1, describe: 2, destroy: 3, erase: 4, copyScaled: 5, loadMemory: 6 });
+const SURFACE_OP_FIELDS = [
+  "kind", "id", "isDepth", "hostFormat", "imageWidth", "imageHeight", "surfaceWidth", "surfaceHeight",
+  "samplesX", "samplesY", "address", "pitch", "srcId", "srcX1", "srcY1", "srcX2",
+  "srcY2", "dstX1", "dstY1", "dstX2", "dstY2", "filterLinear", "rsxFormat", "reserved",
+];
+
+export function decodeSurfaceOps(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) return [];
+  if (bytes.byteLength % SURFACE_OP_SIZE !== 0) throw new Error(`invalid WebGPU surface ops section (${bytes.byteLength} bytes)`);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const ops = [];
+  for (let offset = 0; offset < bytes.byteLength; offset += SURFACE_OP_SIZE) {
+    const op = {};
+    SURFACE_OP_FIELDS.forEach((field, index) => { op[field] = u32(view, offset + index * 4); });
+    ops.push(op);
+  }
+  return ops;
 }
 
 // One copy: straight from the queue's own storage into a transferable
@@ -249,9 +298,26 @@ export function copyFrontPacket(module) {
   return decodeDrawPacket(bytes);
 }
 
-export function discardFrontPacket(module) {
+// Discards the front packet. Its surface ops (RPCS3 surface store effects) are not
+// discardable: they are decoded into `surfaceOpsSink` so the next rendered frame applies them.
+export function discardFrontPacket(module, surfaceOpsSink = undefined) {
   const kind = module.ccall("rpcs3_webgpu_front_kind", "number", [], []) >>> 0;
   if (!kind) return undefined;
+  if (surfaceOpsSink) {
+    const size = module.ccall("rpcs3_webgpu_front_size", "number", [], []) >>> 0;
+    const pointer = module.ccall("rpcs3_webgpu_front_data", "number", [], []) >>> 0;
+    if (size && pointer) {
+      if (pointer + size > module.HEAPU8.byteLength) module.ccall("rpcs3_web_ppu_last_function", "string", [], []);
+      const header = new DataView(module.HEAPU8.buffer, pointer, DRAW_PACKET_HEADER_SIZE);
+      const offset = header.getUint32(104 + SectionKind.surfaceOps * 8, true);
+      const length = header.getUint32(108 + SectionKind.surfaceOps * 8, true);
+      if (length) {
+        const bytes = new Uint8Array(length);
+        bytes.set(module.HEAPU8.subarray(pointer + offset, pointer + offset + length));
+        surfaceOpsSink.push(...decodeSurfaceOps(bytes));
+      }
+    }
+  }
   if (module.ccall("rpcs3_webgpu_discard_front", "number", [], []) !== 1) {
     throw new Error("WebGPU packet disappeared before discard");
   }
@@ -273,6 +339,10 @@ export function packetSummary(packet) {
     height: packet.height,
     colorFormat: packet.colorFormat,
     depthFormat: packet.depthFormat,
+    colorTarget: packet.colorTarget,
+    framebuffer: packet.framebuffer,
+    surfaceOps: packet.surfaceOps?.length ?? 0,
+    surfaceOpList: packet.surfaceOps,
     vertexProgramControl: packet.vertexProgramControl,
     vertexProgramOutputMask: packet.vertexProgramOutputMask,
     fragmentProgramControl: packet.fragmentProgramControl,
@@ -285,9 +355,25 @@ export function packetSummary(packet) {
   summary.shaderControl = state.shaderControl;
   summary.depthFunction = state.depthFunc;
   summary.depthWriteEnabled = state.depthWriteEnabled;
+  summary.depthClampEnabled = state.depthClampEnabled;
+  summary.resolvedState = { ...state };
+  summary.cullFaceEnabled = state.cullFaceEnabled;
+  summary.cullFaceMode = state.cullFaceMode;
+  summary.frontFaceMode = state.frontFaceMode;
+  summary.depthClipEnabled = state.depthClipEnabled;
+  {
+    const environment = packet.sections[SectionKind.vertexEnvironment].bytes;
+    const view = new DataView(environment.buffer, environment.byteOffset, environment.byteLength);
+    if (environment.byteLength >= 84) { summary.clipMin = view.getFloat32(76, true); summary.clipMax = view.getFloat32(80, true); }
+  }
   summary.depthTestEnabled = state.depthTestEnabled;
   summary.blendEnabledMask = state.blendEnabledMask;
   summary.colorWriteMask = state.colorWriteMask;
+  summary.stencilTestEnabled = state.stencilTestEnabled;
+  summary.alphaTestEnabled = state.alphaTestEnabled;
+  summary.alphaFunc = state.alphaFunc;
+  summary.alphaRef = state.alphaRef;
+  summary.logicOpEnabled = state.logicOpEnabled;
   const registers = packet.sections[SectionKind.rawRegisters].bytes;
   if (registers.byteLength >= 0x1d90 + 4) {
     const registerView = new DataView(registers.buffer, registers.byteOffset, registers.byteLength);

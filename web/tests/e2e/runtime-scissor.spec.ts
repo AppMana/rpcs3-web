@@ -41,13 +41,14 @@ test("applies RPCS3's resolved RSX scissor to WebGPU draws", async ({ page }, te
   const clipped = result.clipped as GpuResult;
   expect(full.scissorStates[0]).toEqual({
     x: 0, y: 0, width: 1280, height: 720,
-    scaled: { x: 0, y: 0, width: 320, height: 180 },
+    // RPCS3's resolution scale (100%) leaves the scissor in surface pixels; the canvas only sees the presented blit
+    scaled: { x: 0, y: 0, width: 1280, height: 720 },
   });
   expect(clipped.scissorStates[0]).toEqual({
     x: 0, y: 0, width: 640, height: 720,
-    scaled: { x: 0, y: 0, width: 160, height: 180 },
+    scaled: { x: 0, y: 0, width: 640, height: 720 },
   });
-  expect(full.frameHash).toBe(1_129_836_632);
+  expect(full.frameHash).toBe(2_769_363_428);
   expect(clipped.frameHash).not.toBe(full.frameHash);
   expect(clipped.changedPixels).toBeGreaterThan(0);
   expect(clipped.changedPixels).toBeLessThan(full.changedPixels);

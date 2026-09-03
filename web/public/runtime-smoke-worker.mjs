@@ -296,6 +296,17 @@ async function waitForFlip(timeoutMs) {
 // round trip, until one contains a draw packet (or the deadline passes).
 // Skipped frames are counted; nothing is transferred for them, so a title
 // that flips empty frames for seconds cannot back the host queue up.
+// Recorded SPU AOT misses (SPU cache format) for the native compile pass
+function spuMissBase64() {
+  const size = module.ccall("rpcs3_web_spu_miss_size", "number", [], []) >>> 0;
+  const pointer = module.ccall("rpcs3_web_spu_miss_data", "number", [], []) >>> 0;
+  if (!size || !pointer) return "";
+  const bytes = module.HEAPU8.subarray(pointer, pointer + size);
+  const chunks = [];
+  for (let i = 0; i < bytes.length; i += 0x8000) chunks.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
+  return btoa(chunks.join(""));
+}
+
 async function captureFrame(type, discardPackets = false, untilDraw = false) {
   let status = module.ccall("rpcs3_web_status", "number", [], []);
   let packetCount = 0;
@@ -411,6 +422,9 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     liveThreadNames: module.ccall("rpcs3_web_live_thread_names", "string", [], []).split("\n").filter(Boolean),
     threads: module.ccall("rpcs3_web_thread_snapshot", "string", [], []),
     spuFallbackReport: spuFallbackHistogram ? module.ccall("rpcs3_web_spu_aot_fallback_report", "string", ["number"], [48]) : undefined,
+    spuHot: module.rpcs3SpuHotStats ? module.rpcs3SpuHotStats() : undefined,
+    spuHotReport: module ? JSON.parse(module.ccall("rpcs3_web_spu_hot_report", "string", [], [])) : undefined,
+    spuMissCount: spuFallbackHistogram ? module.ccall("rpcs3_web_spu_miss_count", "number", [], []) >>> 0 : 0,
     stackReport: stackReport(),
     ppuInstructions: Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], [])),
     ppuAotTable: ppuAotTable
@@ -465,6 +479,28 @@ scope.addEventListener("message", async (event) => {
     });
     return;
   }
+  if (event.data?.type === "spu-wasm-selftest") {
+    // SPU wasm recompiler self-test over an SPU cache image (base64)
+    let report = "";
+    try {
+      const bytes = Uint8Array.from(atob(String(event.data.base64 || "")), (c) => c.charCodeAt(0));
+      const pointer = module._malloc(bytes.length + 16) >>> 0;
+      module.HEAPU8.set(bytes, pointer);
+      report = module.ccall("rpcs3_web_spu_wasm_selftest", "string", ["number", "number"], [pointer, bytes.length]);
+      module._free(pointer);
+    } catch (error) {
+      report = JSON.stringify({ error: String(error && error.message ? error.message : error) });
+    }
+    scope.postMessage({ type: "spu-wasm-selftest", report });
+    return;
+  }
+
+  if (event.data?.type === "spu-misses") {
+    // Recorded SPU AOT misses (SPU cache format) for the native compile pass
+    scope.postMessage({ type: "spu-misses", base64: spuFallbackHistogram && module ? spuMissBase64() : "" });
+    return;
+  }
+
   if (event.data?.type === "shutdown") {
     try {
       clearInterval(progressTimer);
@@ -672,6 +708,13 @@ scope.addEventListener("message", async (event) => {
         manifestUrl: new URL(event.data.spuAotBundle, scope.location.href).href,
         log: (line) => { recordLog(line); console.log(line); },
       });
+    }
+    if (!reuse) {
+      // Runtime SPU->wasm recompiler: compiled programs are hot-loaded into every worker's table
+      module.rpcs3InstallSpuHotLoad(spuAotTable);
+      // The binding map (one entry per patchpoint import) is not report material
+      if (spuAotTable) spuAotTable = { ...spuAotTable, bindings: undefined };
+      module.ccall("rpcs3_web_spu_set_hot_compile", null, ["number"], [event.data.spuHotCompile === false ? 0 : 1]);
     }
     if (aotWasm) module.ccall("rpcs3_web_set_ppu_aot_handoff", null, ["number"], [1]);
     if (spuAotWasm) module.ccall("rpcs3_web_set_spu_aot_handoff", null, ["number"], [1]);

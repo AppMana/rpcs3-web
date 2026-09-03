@@ -135,6 +135,12 @@ std::string spu_web_aot_fallback_report(u32 top)
 	return out;
 }
 extern "C" int rpcs3_web_spu_aot_worker_ready();
+extern void spu_web_record_miss(spu_thread& spu);
+extern bool spu_web_try_compile(spu_thread& spu);
+extern u32 spu_web_hot_count();
+extern u32 spu_web_hot_table_base();
+static atomic_t<u32> g_spu_web_hot_skipped{0};
+extern "C" u32 rpcs3_web_spu_hot_sync();
 
 // (entry address, table index) pairs; several programs may start at one address
 extern void spu_web_aot_register(const u32* pairs, u32 count)
@@ -1623,6 +1629,10 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 #endif
 
 	const bool aot_ready = rpcs3_web_spu_aot_worker_ready() != 0;
+	// True when the previous instruction branched: pc is then a block start, the only kind of
+	// address a compiled program can begin at (the miss recorder analyses those)
+	bool at_branch_target = true;
+	u32 hot_placed = rpcs3_web_spu_hot_sync();
 
 	// Re-entered after an escape longjmp as well, so restore the interpreter's setting here
 	spu.allow_interrupts_in_cpu_work = true;
@@ -1637,21 +1647,47 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 
 		if (aot_ready)
 		{
+			// Hot-compiled modules not yet placed in this worker's table (registry order)
+			if (spu_web_hot_count() != hot_placed) [[unlikely]]
+			{
+				hot_placed = rpcs3_web_spu_hot_sync();
+			}
+
 			if (const auto list = g_spu_web_aot_lists[(spu.pc & 0x3fffc) / 4].load())
 			{
 				// A program whose local-store verification fails increments block_failure and returns
 				// through spu_dispatch; any other return means it ran, whatever it did to pc.
 				const u64 failures = spu.block_failure;
+				const u32 pc_before = spu.pc;
 				bool ran = false;
 
 				// Compiled code takes interrupts at its own spu_check_interrupts sites, as the native
 				// recompiled path does; cpu_work must not redirect pc underneath it
 				spu.allow_interrupts_in_cpu_work = false;
 
+				u32 skipped = 0;
 				for (u32 i = 0; i < list->count && !ran; i++)
 				{
-					reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(list->indices[i]))(&spu, spu._ptr<u8>(0), 0);
-					ran = spu.block_failure == failures + i;
+					const u32 index = list->indices[i];
+					if (const u32 hot_base = spu_web_hot_table_base(); index >= hot_base) [[unlikely]]
+					{
+						// A hot-compiled program: this worker must have placed its registry entry
+						if (index - hot_base >= hot_placed)
+						{
+							hot_placed = rpcs3_web_spu_hot_sync();
+						}
+						if (index - hot_base >= hot_placed)
+						{
+							if (g_spu_web_hot_skipped++ < 16)
+							{
+								spu_log.error("SPU hot program at 0x%05x (table %u, base %u, placed %u, registry %u) not placed on this worker; skipped", spu.pc, index, hot_base, hot_placed, spu_web_hot_count());
+							}
+							skipped++;
+							continue;
+						}
+					}
+					reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(index))(&spu, spu._ptr<u8>(0), 0);
+					ran = spu.block_failure == failures + (i - skipped);
 				}
 
 				spu.allow_interrupts_in_cpu_work = true;
@@ -1659,25 +1695,41 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 				if (ran)
 				{
 					g_spu_web_aot_dispatch_count++;
-					continue;
+					// A program that returns at its own entry handed this instruction to the interpreter
+					// (stop, halt, interrupt state change): execute exactly one instruction below
+					if (spu.pc != pc_before)
+					{
+						continue;
+					}
 				}
+				else
+				{
 
 				g_spu_web_aot_fallback_count++;
+				spu_web_try_compile(spu);
 
 				if (g_spu_web_fallback_histogram)
 				{
 					g_spu_web_fallback_listed[(spu.pc & 0x3fffc) / 4]++;
 					spu_web_note_fallback_sample(spu);
+					spu_web_record_miss(spu);
+				}
 				}
 			}
-			else if (g_spu_web_fallback_histogram)
+			else
 			{
-				g_spu_web_fallback_unlisted[(spu.pc & 0x3fffc) / 4]++;
+				// A pc the bundle has no program for: compile it once it proves hot (block starts recur)
+				if (++g_spu_web_fallback_unlisted[(spu.pc & 0x3fffc) / 4] == 256 && at_branch_target)
+				{
+					spu_web_try_compile(spu);
+					if (g_spu_web_fallback_histogram) spu_web_record_miss(spu);
+				}
 			}
 		}
 
 		const u32 op = spu._ref<be_t<u32>>(spu.pc);
-		if (table.decode(op)(spu, {op}))
+		at_branch_target = !table.decode(op)(spu, {op});
+		if (!at_branch_target)
 			spu.pc += 4;
 
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)

@@ -225,3 +225,20 @@ std::vector<u32> spu_thread::discover_functions(u32 base_addr, std::span<const u
 	return addrs;
 }
 #endif
+
+// The analysis half of SPUCommonRecompiler.cpp is compiled on the web (spu_recompiler_base::analyse
+// feeds the SPU AOT miss recorder); the native recompiler factories and the JIT runtime it names
+// have no web implementation.
+spu_runtime::spu_runtime()
+{
+}
+
+std::unique_ptr<spu_recompiler_base> spu_recompiler_base::make_llvm_recompiler(u8)
+{
+	return nullptr;
+}
+
+std::unique_ptr<spu_recompiler_base> spu_recompiler_base::make_asmjit_recompiler()
+{
+	return nullptr;
+}

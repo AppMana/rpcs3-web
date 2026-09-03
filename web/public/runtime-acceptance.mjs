@@ -111,7 +111,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       if (event.data?.type === "runtime-result" || event.data?.type === "runtime-frame") {
         const receivedAt = performance.now();
         try {
-          if (!event.data.ok) throw new Error(`${event.data.detail}; events=${JSON.stringify(events.slice(-40))}`);
+          if (!event.data.ok) throw new Error(`${event.data.detail}; events=${JSON.stringify(events.slice(-40)).slice(0, 200_000)}`);
           let gpu;
           let packetFixture;
           let renderError;
@@ -231,7 +231,14 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
             return;
           }
           clearTimeout(timeout);
-          const result = { ...firstResult, ...frames.at(-1), gpu, renderError, packetFixture, events, frames: requestedFrames > 1 || untilDraw ? frames : undefined };
+          // Recorded SPU AOT misses (SPU cache format) travel separately: they can be megabytes
+          const spuMissBase64 = options.spuFallbackHistogram ? (await requestWorker(worker, "spu-misses", "spu-misses"))?.base64 : undefined;
+          let spuWasmSelftest;
+          if (options.spuWasmSelftestBase64) {
+            worker.postMessage({ type: "spu-wasm-selftest", base64: options.spuWasmSelftestBase64 });
+            spuWasmSelftest = (await requestWorker(worker, "spu-wasm-selftest-noop", "spu-wasm-selftest", 120_000))?.report;
+          }
+          const result = { ...firstResult, ...frames.at(-1), gpu, renderError, packetFixture, events, spuMissBase64, spuWasmSelftest, frames: requestedFrames > 1 || untilDraw ? frames : undefined };
           document.querySelector("#result").textContent = JSON.stringify(result, null, 2);
           // The worker waits up to 5 s for RPCS3's threads to exit and then
           // reports; allow that report to arrive before giving up on it.
@@ -300,6 +307,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       spuAotBundle: typeof options.spuAotBundle === "string" ? options.spuAotBundle : undefined,
       spuTraceRange: Array.isArray(options.spuTraceRange) ? options.spuTraceRange : undefined,
       spuFallbackHistogram: options.spuFallbackHistogram === true,
+      spuHotCompile: options.spuHotCompile !== false,
       spuAot: options.spuAot === true,
       clockScale: options.clockScale,
       resolutionScalePercent: typeof options.resolutionScale === "number" ? Math.round(options.resolutionScale * 100) : undefined,
@@ -331,6 +339,21 @@ function snapshot() {
 }
 
 // Frame-indexed pad states recorded from setPad() during this run.
+// One request/reply exchange with the worker
+function requestWorker(worker, requestType, replyType, timeoutMs = 10_000) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => { worker.removeEventListener("message", onReply); resolve(undefined); }, timeoutMs);
+    const onReply = (event) => {
+      if (event.data?.type !== replyType) return;
+      clearTimeout(timer);
+      worker.removeEventListener("message", onReply);
+      resolve(event.data);
+    };
+    worker.addEventListener("message", onReply);
+    worker.postMessage({ type: requestType });
+  });
+}
+
 function exportInputTrace() {
   const worker = activeWorker;
   if (!worker) return Promise.resolve(undefined);

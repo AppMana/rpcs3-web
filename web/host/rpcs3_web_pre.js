@@ -131,6 +131,64 @@ Module["rpcs3PopulateSpuAot"] = (load) => {
 // RSX thread creates the GPU device and receives the presentation OffscreenCanvas before the
 // thread starts, and the worker allocator hands that worker to the RSX thread when RPCS3 spawns
 // it (Utilities/Thread.cpp sets the flag at rpcs3_web_rsx_spawn_flag_address).
+// SPU hot load: compiled programs live in a registry in wasm memory (SPUWasmRecompiler.cpp);
+// each SPU thread calls rpcs3_web_spu_hot_sync before dispatching to place the entries this
+// worker has not placed yet into its own function table (busy pool workers never process
+// posted messages, so nothing here may depend on messaging).
+const rpcs3SpuHotBindings = Object.freeze({
+  spu_escape: "rpcs3_web_spu_direct_escape", spu_dispatch: "rpcs3_web_spu_direct_dispatch",
+  spu_dispatcher: "rpcs3_web_spu_direct_dispatcher_address", spu_exec_check_state: "rpcs3_web_spu_direct_check_state",
+  spu_exec_mfc_cmd: "rpcs3_web_spu_direct_mfc_cmd", spu_exec_mfc_cmd_saveable: "rpcs3_web_spu_direct_mfc_cmd_saveable",
+  spu_read_channel: "rpcs3_web_spu_direct_read_channel", spu_read_channel_count: "rpcs3_web_spu_direct_read_channel_count",
+  spu_read_in_mbox: "rpcs3_web_spu_direct_read_in_mbox", spu_read_decrementer: "rpcs3_web_spu_direct_read_decrementer",
+  spu_read_events: "rpcs3_web_spu_direct_read_events", spu_get_events: "rpcs3_web_spu_direct_get_events",
+  spu_write_channel: "rpcs3_web_spu_direct_write_channel", spu_list_unstall: "rpcs3_web_spu_direct_list_unstall",
+  spu_check_interrupts: "rpcs3_web_spu_direct_check_interrupts", spu_syscall: "rpcs3_web_spu_direct_syscall",
+  spu_unknown: "rpcs3_web_spu_direct_unknown", spu_web_fatal: "rpcs3_web_spu_direct_fatal", spu_memcpy: "rpcs3_web_spu_direct_memcpy",
+  wait_on_spu_channel: "rpcs3_web_spu_direct_wait_on_channel", wait_spu_inbox: "rpcs3_web_spu_direct_wait_inbox",
+  get_timebased_time: "rpcs3_web_spu_direct_get_tb",
+});
+function rpcs3InstantiateSpuHot(module) {
+  const env = { memory: wasmMemory };
+  for (const imported of WebAssembly.Module.imports(module)) {
+    if (imported.module !== "env" || imported.name in env) continue;
+    if (imported.kind !== "function") throw new Error(`unsupported SPU hot import ${imported.kind} ${imported.name}`);
+    const target = rpcs3SpuHotBindings[imported.name];
+    if (!target || typeof wasmExports[target] !== "function") throw new Error(`no runtime binding for SPU hot import ${imported.name}`);
+    env[imported.name] = wasmExports[target];
+  }
+  const instance = new WebAssembly.Instance(module, { env });
+  const name = WebAssembly.Module.exports(module).find((e) => e.kind === "function" && /^__spu-0x[0-9a-f]+-/i.test(e.name));
+  if (!name) throw new Error("SPU hot module exports no program");
+  return instance.exports[name.name];
+}
+// Called from the SPU thread (C++) on this worker; returns the number of registry entries placed here
+function rpcs3SpuHotSyncImpl() {
+  const count = wasmExports["rpcs3_web_spu_hot_count"]() >>> 0;
+  let placed = self.__rpcs3SpuHotPlaced >>> 0;
+  if (placed >= count) return placed;
+  const table = wasmExports["__indirect_function_table"];
+  for (; placed < count; placed++) {
+    const index = wasmExports["rpcs3_web_spu_hot_index"](placed) >>> 0;
+    const pointer = wasmExports["rpcs3_web_spu_hot_bytes"](placed) >>> 0;
+    const size = wasmExports["rpcs3_web_spu_hot_size"](placed) >>> 0;
+    const bytes = new Uint8Array(wasmMemory.buffer, pointer, size).slice();
+    const module = new WebAssembly.Module(bytes);
+    if (table.length <= index) table.grow(index + 1 - table.length);
+    table.set(index, rpcs3InstantiateSpuHot(module));
+    if ((self.__rpcs3SpuHotLogged = (self.__rpcs3SpuHotLogged | 0) + 1) <= 40) console.log(`[rpcs3 spu hot] worker placed entry ${placed} at table index ${index} (table length ${table.length}, ${size} bytes)`);
+  }
+  self.__rpcs3SpuHotPlaced = placed;
+  return placed;
+}
+Module["rpcs3InstallSpuHotLoad"] = (load) => {
+  const table = wasmExports["__indirect_function_table"];
+  const base = load ? load.tableBase + load.tableSize : table.length;
+  Module["ccall"]("rpcs3_web_spu_set_hot_table_base", null, ["number"], [base]);
+  return { base };
+};
+Module["rpcs3SpuHotStats"] = () => ({ placedHere: self.__rpcs3SpuHotPlaced >>> 0, count: wasmExports["rpcs3_web_spu_hot_count"]() >>> 0 });
+
 Module["rpcs3PrepareGpu"] = (canvas, flagAddress) => new Promise((resolve, reject) => {
   const PThread = Module["PThread"];
   const worker = PThread.unusedWorkers[PThread.unusedWorkers.length - 1];

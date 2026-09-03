@@ -428,7 +428,8 @@ target_sources(rpcs3_emu PRIVATE
 )
 
 if(RPCS3_WEB)
-	target_sources(rpcs3_emu PRIVATE Cell/SPUWebRuntime.cpp)
+	# SPUCommonRecompiler.cpp contributes only its analysis half on the web (see the RPCS3_WEB guards there)
+	target_sources(rpcs3_emu PRIVATE Cell/SPUWebRuntime.cpp Cell/SPUCommonRecompiler.cpp Cell/SPUWasmRecompiler.cpp)
 else()
 	target_sources(rpcs3_emu PRIVATE
 		Cell/PPUTranslator.cpp

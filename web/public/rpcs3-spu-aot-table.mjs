@@ -186,6 +186,7 @@ export async function loadSpuAotBundle({ module, mainInstance, mainMemory, manif
     programs: pairs.length / 2,
     tableBase,
     tableSize: load.tableSize,
+    bindings: load.bindings,
     compileMs,
     populateMs,
     idleWorkersReady: ready.idleWorkersReady,

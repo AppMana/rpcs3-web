@@ -19,6 +19,7 @@
 //   RPCS3_CPU_PROFILE=/path/run.cpuprofile   RPCS3_CPU_INTERVAL_US=10000   RPCS3_TRACE=/path/trace.json
 //   RPCS3_WATCH_ADDRESS / RPCS3_TRACE_PC / RPCS3_TRACE_DELAY_PC / RPCS3_TRACE_DELAY_MS / RPCS3_DEBUG_ADDRESSES=a,b
 //   RPCS3_INPUT_TRACE=/path/trace.json   frame-indexed pad states recorded on play.html
+import { readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -71,6 +72,8 @@ const runOptions = {
   ppuAotBundle: process.env.RPCS3_PPU_AOT_BUNDLE || undefined,
   spuAotBundle: process.env.RPCS3_SPU_AOT_BUNDLE || undefined,
   spuFallbackHistogram: env.RPCS3_SPU_FALLBACK_HIST === "1",
+  spuHotCompile: env.RPCS3_SPU_HOT_COMPILE !== "0",
+  spuWasmSelftestBase64: env.RPCS3_SPU_WASM_SELFTEST ? readFileSync(path.resolve(env.RPCS3_SPU_WASM_SELFTEST)).toString("base64") : undefined,
   diagnostics: env.RPCS3_DIAGNOSTICS === "1",
   dumpSurfaces: env.RPCS3_DUMP_SURFACES === "1",
   skipDraws: env.RPCS3_SKIP_DRAWS ? env.RPCS3_SKIP_DRAWS.split(",").flatMap((item) => { const [a, b] = item.split("-").map(Number); return b === undefined ? [a] : Array.from({ length: b - a + 1 }, (_, i) => a + i); }) : undefined,
@@ -367,6 +370,11 @@ try {
     && (untilDraw ? frameList.some((frame) => (frame.drawPacketCount ?? 0) > 0) : frameList.length >= frames);
   const { packetFixture, ...resultWithoutFixture } = result;
   const rgbaBase64 = result.gpu?.rgbaBase64;
+  if (result.spuMissBase64) {
+    // Recorded SPU AOT misses in SPU cache format: append to the title's native cache and rerun the IR dump
+    await writeFile(outputPath.replace(/\.json$/, "") + ".spu-misses.dat", Buffer.from(result.spuMissBase64, "base64"));
+    delete result.spuMissBase64;
+  }
   for (const image of result.gpu?.frameImages ?? []) {
     const data = String(image.png).replace(/^data:image\/png;base64,/, "");
     await writeFile(outputPath.replace(/\.json$/, "") + `.frame${image.frame}.png`, Buffer.from(data, "base64"));

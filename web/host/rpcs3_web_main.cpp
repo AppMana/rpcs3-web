@@ -83,6 +83,16 @@ extern atomic_t<u32> g_spu_web_aot_hold;
 extern atomic_t<u32> g_spu_web_aot_ready_mask;
 extern atomic_t<u32> g_spu_web_fallback_histogram;
 extern std::string spu_web_aot_fallback_report(u32 top);
+extern u32 spu_web_miss_count();
+extern std::string spu_web_wasm_selftest(const u8* cache, u32 size);
+extern std::string spu_web_hot_report();
+extern void spu_web_set_hot_compile(bool enabled);
+extern void spu_web_set_hot_table_base(u32 base);
+extern u32 spu_web_hot_count();
+extern u32 spu_web_hot_index(u32 i);
+extern const u8* spu_web_hot_bytes(u32 i);
+extern u32 spu_web_hot_size(u32 i);
+extern std::pair<const u8*, u32> spu_web_miss_data();
 extern atomic_t<spu_thread*> g_spu_web_aot_context[6];
 extern atomic_t<u32> g_spu_web_aot_step_request[6];
 extern atomic_t<u32> g_spu_web_aot_step_complete[6];
@@ -1018,6 +1028,68 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_spu_aot_dispatches()
 	{
 		return g_spu_web_aot_dispatch_count.load();
+	}
+
+	// SPU wasm recompiler self-test over an SPU cache image (see spu_web_wasm_selftest)
+	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_spu_wasm_selftest(const u8* cache, u32 size)
+	{
+		static std::string report;
+		report = spu_web_wasm_selftest(cache, size);
+		return report.c_str();
+	}
+
+	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_spu_hot_report()
+	{
+		static std::string report;
+		report = spu_web_hot_report();
+		return report.c_str();
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_set_hot_compile(s32 enabled)
+	{
+		spu_web_set_hot_compile(enabled != 0);
+	}
+
+	// Hot module registry (rpcs3_web_spu_hot_sync places entries [placed, count) in a worker's table)
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_set_hot_table_base(u32 base)
+	{
+		spu_web_set_hot_table_base(base);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_hot_count()
+	{
+		return spu_web_hot_count();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_hot_index(u32 i)
+	{
+		return spu_web_hot_index(i);
+	}
+
+	EMSCRIPTEN_KEEPALIVE const u8* rpcs3_web_spu_hot_bytes(u32 i)
+	{
+		return spu_web_hot_bytes(i);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_hot_size(u32 i)
+	{
+		return spu_web_hot_size(i);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_miss_count()
+	{
+		return spu_web_miss_count();
+	}
+
+	// Pointer to the recorded SPU programs (SPU cache format); size through rpcs3_web_spu_miss_size
+	EMSCRIPTEN_KEEPALIVE const u8* rpcs3_web_spu_miss_data()
+	{
+		return spu_web_miss_data().first;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_miss_size()
+	{
+		return spu_web_miss_data().second;
 	}
 
 	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_spu_aot_fallbacks()

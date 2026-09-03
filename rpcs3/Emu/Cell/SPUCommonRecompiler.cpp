@@ -82,6 +82,9 @@ void fmt_class_string<spu_recompiler_base::compare_direction>::format(std::strin
 	});
 }
 
+// The web build compiles only the analysis half of this file: native trampolines, the JIT
+// runtime and the SPU cache builder live in SPUWebRuntime.cpp there.
+#ifndef RPCS3_WEB
 #ifdef ARCH_ARM64
 constexpr const char s_spu_llvm_reg_scavenge_error[] = "Cannot scavenge register without an emergency spill slot";
 
@@ -732,6 +735,8 @@ extern void utilize_spu_data_segment(u32 vaddr, const void* ls_data_vaddr, u32 s
 	g_fxo->get<spu_cache>().precompile_funcs.push(std::move(obj));
 }
 
+#endif // !RPCS3_WEB
+
 // For SPU cache validity check
 static u16 calculate_crc16(const uchar* data, usz length)
 {
@@ -746,6 +751,8 @@ static u16 calculate_crc16(const uchar* data, usz length)
 
 	return crc;
 }
+
+#ifndef RPCS3_WEB
 
 std::deque<spu_program> spu_cache::get()
 {
@@ -1337,6 +1344,8 @@ void spu_cache::initialize(bool build_existing_cache)
 	}
 }
 
+#endif // !RPCS3_WEB
+
 bool spu_program::operator==(const spu_program& rhs) const noexcept
 {
 	// TODO
@@ -1373,6 +1382,8 @@ bool spu_program::operator<(const spu_program& rhs) const noexcept
 	// TODO
 	return lhs_offs < rhs_offs;
 }
+
+#ifndef RPCS3_WEB
 
 spu_runtime::spu_runtime()
 {
@@ -2123,6 +2134,8 @@ spu_function_t spu_runtime::make_branch_patchpoint(u16 data) const
 #endif
 }
 
+
+#endif // !RPCS3_WEB
 spu_recompiler_base::spu_recompiler_base()
 {
 }
@@ -2131,6 +2144,7 @@ spu_recompiler_base::~spu_recompiler_base()
 {
 }
 
+#ifndef RPCS3_WEB
 void spu_recompiler_base::dispatch(spu_thread& spu, void*, u8* rip)
 {
 	// If code verification failed from a patched patchpoint, clear it with a dispatcher jump
@@ -2613,6 +2627,8 @@ std::vector<u32> spu_thread::discover_functions(u32 base_addr, std::span<const u
 
 	return addrs;
 }
+
+#endif // !RPCS3_WEB (native dispatch, branch and interpreter gateways)
 
 using reg_state_t = spu_recompiler_base::reg_state_t;
 using vf = spu_recompiler_base::vf;
@@ -9954,7 +9970,7 @@ std::array<reg_state_t, s_reg_max>& block_reg_info::evaluate_start_state(const s
 					// TODO: The true maximum occurence count need to depend on the amount of branching-outs passed through
 					// Currently allow 2 for short-term code and 1 for long-term code
 					// Ignore large jumptables as well
-					const bool loop_terminator_detected = std::count(been_there.begin(), been_there.end(), prev_pc) >= (qi < 20 ? 2u : 1u);
+					const bool loop_terminator_detected = std::count(been_there.begin(), been_there.end(), prev_pc) >= (qi < 20 ? 2 : 1);
 					const bool avoid_extensive_analysis = qi >= (extensive_evaluation ? 22 : 16) || it->state_prev.size() >= 8;
 
 					if (!loop_terminator_detected && !avoid_extensive_analysis)
@@ -10026,3 +10042,86 @@ extern std::string format_spu_func_info(u32 addr, cpu_thread* spu)
 
 	return info;
 }
+
+#ifdef RPCS3_WEB
+// SPU AOT miss recorder: at a dispatch fallback the program at the current pc is analysed with
+// the same analyser the native recompiler uses and serialized in the SPU cache format
+// (be size|crc16<<16, be entry, program words), so the native build's wasm IR dump compiles
+// exactly these programs and the bundle grows to cover code the cache had not seen.
+namespace
+{
+	struct spu_web_analyser final : spu_recompiler_base
+	{
+		void init() override {}
+		spu_function_t compile(spu_program&&) override { return nullptr; }
+	};
+
+	shared_mutex g_spu_web_miss_mutex;
+	std::unordered_set<u64> g_spu_web_miss_prekeys;   // (pc, first words) already analysed
+	std::unordered_set<u64> g_spu_web_miss_programs;  // program hashes already recorded
+	std::vector<u8> g_spu_web_miss_bytes;             // cache-format entries
+	atomic_t<u32> g_spu_web_miss_count{0};
+	constexpr usz spu_web_miss_limit = 8u << 20;
+}
+
+extern void spu_web_record_miss(spu_thread& spu)
+{
+	const u32 pc = spu.pc & 0x3fffc;
+	const auto ls = spu._ptr<be_t<u32>>(0);
+
+	// Cheap pre-key: pc and the first 16 words; a program is analysed once per distinct code at a pc
+	u64 prekey = pc;
+	for (u32 i = 0; i < 16; i++)
+	{
+		prekey = (prekey ^ ls[(pc / 4 + i) & 0xffff]) * 0x100000001b3ull;
+	}
+
+	{
+		std::lock_guard lock(g_spu_web_miss_mutex);
+		if (!g_spu_web_miss_prekeys.insert(prekey).second || g_spu_web_miss_bytes.size() >= spu_web_miss_limit)
+		{
+			return;
+		}
+	}
+
+	thread_local std::unique_ptr<spu_web_analyser> analyser;
+	if (!analyser) analyser = std::make_unique<spu_web_analyser>();
+	const spu_program program = analyser->analyse(ls, pc);
+	if (program.data.empty())
+	{
+		return;
+	}
+
+	u64 hash = program.entry_point;
+	for (const u32 word : program.data) hash = (hash ^ word) * 0x100000001b3ull;
+
+	const u32 size = ::size32(program.data);
+	const be_t<u32> size_crc = size | std::max<u32>(calculate_crc16(reinterpret_cast<const uchar*>(program.data.data()), size * 4), 1) << 16;
+	const be_t<u32> addr = program.entry_point;
+
+	std::lock_guard lock(g_spu_web_miss_mutex);
+	if (!g_spu_web_miss_programs.insert(hash).second)
+	{
+		return;
+	}
+	const auto append = [&](const void* data, usz bytes)
+	{
+		const auto p = static_cast<const u8*>(data);
+		g_spu_web_miss_bytes.insert(g_spu_web_miss_bytes.end(), p, p + bytes);
+	};
+	append(&size_crc, 4);
+	append(&addr, 4);
+	append(program.data.data(), program.data.size() * 4);
+	g_spu_web_miss_count++;
+}
+
+extern u32 spu_web_miss_count() { return g_spu_web_miss_count; }
+
+// Bytes of every recorded program in SPU cache format; valid until the next record
+extern std::pair<const u8*, u32> spu_web_miss_data()
+{
+	std::lock_guard lock(g_spu_web_miss_mutex);
+	return { g_spu_web_miss_bytes.data(), ::size32(g_spu_web_miss_bytes) };
+}
+#endif
+

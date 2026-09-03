@@ -222,6 +222,19 @@ namespace utils
 		
 	inline void busy_wait(u64 cycles = 3000)
 	{
+#if defined(ARCH_WASM32)
+		// Reading this platform's clock is a call out of the module, so polling one would spend more
+		// time asking the time than waiting. Spin a bounded number of iterations instead: callers use
+		// this as a backoff hint before re-reading an atomic, and its real duration already varies by
+		// an order of magnitude between the architectures above.
+		volatile u64 sink = 0;
+
+		for (u64 i = 0, count = std::max<u64>(cycles / 8, 1); i < count; i++)
+		{
+			sink = sink + 1;
+			pause();
+		}
+#else
 #ifdef ARCH_ARM64
 		const u64 stop = get_tsc() + ((cycles / 100) * arm_timer_scale);
 #else
@@ -229,6 +242,7 @@ namespace utils
 #endif
 		do pause();
 		while (get_tsc() < stop);
+#endif
 	}
 
 #ifdef ARCH_X64

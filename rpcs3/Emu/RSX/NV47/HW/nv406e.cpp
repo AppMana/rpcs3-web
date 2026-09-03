@@ -50,6 +50,12 @@ namespace rsx
 			u64 start = get_system_time();
 			u64 last_check_val = start;
 
+			// The watchdog below is measured in seconds, so the clock only has to be read every so
+			// many turns of the spin; on hosts where reading it is not a register read, doing so on
+			// every turn costs more than the wait itself
+			constexpr u32 watchdog_period = 256;
+			u32 turns_until_watchdog = 0;
+
 			while (sema != arg)
 			{
 				if (RSX(ctx)->test_stopped())
@@ -58,8 +64,9 @@ namespace rsx
 					return;
 				}
 
-				if (const auto tdr = static_cast<u64>(g_cfg.video.driver_recovery_timeout))
+				if (const auto tdr = static_cast<u64>(g_cfg.video.driver_recovery_timeout); tdr && turns_until_watchdog-- == 0)
 				{
+					turns_until_watchdog = watchdog_period;
 					const u64 current = get_system_time();
 
 					if (current - last_check_val > 20'000)

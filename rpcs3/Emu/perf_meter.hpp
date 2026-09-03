@@ -165,10 +165,8 @@ public:
 		m_timestamps[0] = 0;
 	}
 
-	// Re-initialize first timestamp. A zero start time is the "disabled counter" the destructor
-	// already looks for, so when no report will be printed the counter costs no timestamp at all.
-	// That matters where the clock is not a register: the browser reaches it through a JS call, and
-	// these meters sit in the SPU DMA, MFC list and reservation paths.
+	// Re-initialize first timestamp, or leave the counter in the disabled state a zero start time
+	// already means to the destructor when nothing will read the measurement
 	FORCE_INLINE SAFE_BUFFERS(void) restart() noexcept
 	{
 		m_timestamps[0] = g_cfg.core.perf_report ? utils::get_tsc() : 0;

@@ -1664,10 +1664,8 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 		}
 
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
-		// Only a block start can be the entry of a compiled program, and the previous instruction
-		// having branched is what makes this pc one. Looking at every instruction instead cost three
-		// shared-memory atomics per interpreted instruction, including a read-modify-write on a
-		// counter that every thread running the same program shares.
+		// Only a block start can be the entry of a compiled program, and a pc is one exactly when the
+		// previous instruction branched to it
 		if (aot_ready && at_branch_target)
 		{
 			// Hot-compiled modules not yet placed in this worker's table (registry order)

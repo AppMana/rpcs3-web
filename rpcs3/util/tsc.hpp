@@ -27,11 +27,9 @@ namespace utils
 #elif defined(ARCH_X64)
 		return __builtin_ia32_rdtsc();
 #elif defined(ARCH_WASM32)
-		// The browser has no cycle counter, so the monotonic clock stands in for one and
-		// utils::get_tsc_freq() reports a nanosecond tick. This is the same clock
-		// std::chrono::steady_clock reads (performance.now()), reached without the WASI
-		// clock_time_get shim and its timespec and i64 conversions: on the SPU and RSX threads
-		// those layers were a measurable part of every DMA, semaphore wait and timebase read.
+		// No cycle counter here: the monotonic clock stands in for one, ticking once per nanosecond
+		// (utils::get_tsc_freq()). emscripten_get_now() is performance.now(), the clock
+		// std::chrono::steady_clock reads, without the WASI clock_time_get shim in between.
 		return static_cast<u64>(emscripten_get_now() * 1'000'000.0);
 #else
 #error "Missing utils::get_tsc() implementation"

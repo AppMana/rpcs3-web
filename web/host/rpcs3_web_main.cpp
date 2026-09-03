@@ -114,8 +114,8 @@ extern spu_decoder_type g_rpcs3_web_spu_decoder;
 extern void spu_web_aot_register(const u32* pairs, u32 count);
 extern u32 g_spu_web_trace_lo;
 extern u32 g_spu_web_trace_hi;
-extern atomic_t<u64> g_spu_web_aot_dispatch_count;
-extern atomic_t<u64> g_spu_web_aot_fallback_count;
+extern u64 spu_web_aot_dispatch_count();
+extern u64 spu_web_aot_fallback_count();
 [[noreturn]] extern void spu_web_escape_now(spu_thread* spu);
 
 extern void ppu_web_aot_register(const u32* pairs, u32 count);
@@ -1034,7 +1034,7 @@ extern "C"
 
 	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_spu_aot_dispatches()
 	{
-		return g_spu_web_aot_dispatch_count.load();
+		return spu_web_aot_dispatch_count();
 	}
 
 	// SPU wasm recompiler self-test over an SPU cache image (see spu_web_wasm_selftest)
@@ -1135,7 +1135,7 @@ extern "C"
 
 	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_spu_aot_fallbacks()
 	{
-		return g_spu_web_aot_fallback_count.load();
+		return spu_web_aot_fallback_count();
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_spu_fallback_histogram(s32 enabled)

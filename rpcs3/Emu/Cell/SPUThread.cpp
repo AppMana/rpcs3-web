@@ -79,10 +79,32 @@ struct spu_web_aot_list
 
 // Per local-store word: immutable candidate lists published by the module thread, read by SPU threads
 static std::array<atomic_t<spu_web_aot_list*>, SPU_LS_SIZE / 4> g_spu_web_aot_lists{};
-atomic_t<u64> g_spu_web_aot_dispatch_count{0};
+// Dispatch statistics. Every SPU thread increments these on every block it dispatches, so each
+// thread owns a cache line of its own and the totals are summed when something asks for them.
+struct alignas(128) spu_web_dispatch_stats
+{
+	atomic_t<u64> dispatches{0};
+	atomic_t<u64> fallbacks{0};
+};
+
+static std::array<spu_web_dispatch_stats, 8> g_spu_web_stats{};
+
+u64 spu_web_aot_dispatch_count()
+{
+	u64 total = 0;
+	for (const auto& slot : g_spu_web_stats) total += slot.dispatches.load();
+	return total;
+}
+
+u64 spu_web_aot_fallback_count()
+{
+	u64 total = 0;
+	for (const auto& slot : g_spu_web_stats) total += slot.fallbacks.load();
+	return total;
+}
+
 // Misses at an unlisted block start before it is compiled (rpcs3_web_spu_set_hot_threshold)
 atomic_t<u32> g_spu_web_hot_threshold{256};
-atomic_t<u64> g_spu_web_aot_fallback_count{0};
 
 // Diagnosis: per-pc counts of dispatch attempts whose candidates all failed verification
 // ("listed") and of interpreter iterations at pcs without compiled candidates ("unlisted").
@@ -141,7 +163,7 @@ extern void spu_web_record_miss(spu_thread& spu);
 extern bool spu_web_try_compile(spu_thread& spu);
 extern u32 spu_web_hot_count();
 extern u32 spu_web_hot_table_base();
-extern void spu_web_note_hot_dispatch(u32 index);
+extern void spu_web_note_hot_dispatch(u32 index, u32 thread_slot);
 static atomic_t<u32> g_spu_web_hot_skipped{0};
 extern "C" u32 rpcs3_web_spu_hot_sync();
 
@@ -1646,6 +1668,8 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 	// address a compiled program can begin at (the miss recorder analyses those)
 	bool at_branch_target = true;
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
+	const u32 stats_slot = index % g_spu_web_stats.size();
+	auto& stats = g_spu_web_stats[stats_slot];
 	// Compiled programs come from the offline bundle (placed on this worker) and from the recompilers'
 	// registry (present once the host installed its table base); either makes the dispatch path live
 	const bool aot_ready = rpcs3_web_spu_aot_worker_ready() != 0 || spu_web_hot_table_base() != 0;
@@ -1709,14 +1733,14 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 					}
 					reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(index))(&spu, spu._ptr<u8>(0), 0);
 					ran = spu.block_failure == failures + (i - skipped);
-					if (ran && index >= spu_web_hot_table_base()) spu_web_note_hot_dispatch(index);
+					if (ran && index >= spu_web_hot_table_base()) spu_web_note_hot_dispatch(index, stats_slot);
 				}
 
 				spu.allow_interrupts_in_cpu_work = true;
 
 				if (ran)
 				{
-					g_spu_web_aot_dispatch_count++;
+					stats.dispatches.raw()++;
 					// A program that returns at its own entry handed this instruction to the interpreter
 					// (stop, halt, interrupt state change): execute exactly one instruction below
 					if (spu.pc != pc_before)
@@ -1727,7 +1751,7 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 				else
 				{
 
-				g_spu_web_aot_fallback_count++;
+				stats.fallbacks.raw()++;
 				spu_web_try_compile(spu);
 
 				if (g_spu_web_fallback_histogram)

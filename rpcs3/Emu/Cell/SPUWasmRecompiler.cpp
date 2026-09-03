@@ -2082,7 +2082,15 @@ namespace
 	constexpr u32 spu_web_hot_limit = 65536;              // programs per run
 	// Per hot table slot (index - base): 1 for an LLVM-tier side module, so dispatches count per tier
 	atomic_t<u8> g_spu_web_hot_kinds[spu_web_hot_limit * 2]{};
-	atomic_t<u64> g_spu_web_hot_dispatches{0}, g_spu_web_llvm_dispatches{0};
+
+	// One padded slot per SPU thread: these count every dispatch, so they must not share a line
+	struct alignas(128) spu_web_tier_counts
+	{
+		atomic_t<u64> hot{0};
+		atomic_t<u64> llvm{0};
+	};
+
+	std::array<spu_web_tier_counts, 8> g_spu_web_tier_counts{};
 }
 
 extern void spu_web_set_hot_table_base(u32 base)
@@ -2102,18 +2110,19 @@ extern u32 spu_web_hot_table_base()
 	return g_spu_web_hot_base.load();
 }
 
-// Dispatch loop: a hot-region candidate ran (SPUThread.cpp)
-extern void spu_web_note_hot_dispatch(u32 index)
+// Dispatch loop: a hot-region candidate ran (SPUThread.cpp), counted into the calling thread's slot
+extern void spu_web_note_hot_dispatch(u32 index, u32 thread_slot)
 {
 	const u32 slot = index - g_spu_web_hot_base.load();
+	auto& counts = g_spu_web_tier_counts[thread_slot % g_spu_web_tier_counts.size()];
 
 	if (slot < spu_web_hot_limit * 2 && g_spu_web_hot_kinds[slot].load())
 	{
-		g_spu_web_llvm_dispatches++;
+		counts.llvm.raw()++;
 	}
 	else
 	{
-		g_spu_web_hot_dispatches++;
+		counts.hot.raw()++;
 	}
 }
 
@@ -2399,7 +2408,13 @@ extern std::string spu_web_hot_report()
 	for (const auto& [why, n] : g_spu_web_hot_refusals) sorted.emplace_back(n, why);
 	std::sort(sorted.rbegin(), sorted.rend());
 	for (usz i = 0; i < sorted.size() && i < 24; i++) fmt::append(out, "%s\"%s\":%u", i ? "," : "", sorted[i].second, sorted[i].first);
-	fmt::append(out, "},\"dispatches\":%u,\"llvm\":{\"enabled\":%u,\"requested\":%u,\"failed\":%u,\"abandoned\":%u,\"registered\":%u,\"bytes\":%u,\"dispatches\":%u}}", +g_spu_web_hot_dispatches, +g_spu_web_llvm_enabled, +g_spu_web_llvm_requested, +g_spu_web_llvm_failed, +g_spu_web_llvm_abandoned, +g_spu_web_llvm_registered, +g_spu_web_llvm_bytes, +g_spu_web_llvm_dispatches);
+	u64 hot_dispatches = 0, llvm_dispatches = 0;
+	for (const auto& counts : g_spu_web_tier_counts)
+	{
+		hot_dispatches += counts.hot.load();
+		llvm_dispatches += counts.llvm.load();
+	}
+	fmt::append(out, "},\"dispatches\":%u,\"llvm\":{\"enabled\":%u,\"requested\":%u,\"failed\":%u,\"abandoned\":%u,\"registered\":%u,\"bytes\":%u,\"dispatches\":%u}}", hot_dispatches, +g_spu_web_llvm_enabled, +g_spu_web_llvm_requested, +g_spu_web_llvm_failed, +g_spu_web_llvm_abandoned, +g_spu_web_llvm_registered, +g_spu_web_llvm_bytes, llvm_dispatches);
 	return out;
 }
 #endif

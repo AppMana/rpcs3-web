@@ -143,8 +143,8 @@ public:
 		// TODO: should use more efficient search with type comparison, then value comparison, or pattern matching
 		if constexpr (std::array<bool, sizeof...(SubEvents)>{(SubEvents == Event)...}[Index])
 		{
-			// Push actual timestamp into an array
-			m_timestamps[Index + 1] = utils::get_tsc();
+			// Push actual timestamp into an array (nothing to push into a disabled counter)
+			m_timestamps[Index + 1] = m_timestamps[0] ? utils::get_tsc() : 0;
 		}
 		else if constexpr (Index < sizeof...(SubEvents))
 		{
@@ -165,10 +165,13 @@ public:
 		m_timestamps[0] = 0;
 	}
 
-	// Re-initialize first timestamp
+	// Re-initialize first timestamp. A zero start time is the "disabled counter" the destructor
+	// already looks for, so when no report will be printed the counter costs no timestamp at all.
+	// That matters where the clock is not a register: the browser reaches it through a JS call, and
+	// these meters sit in the SPU DMA, MFC list and reservation paths.
 	FORCE_INLINE SAFE_BUFFERS(void) restart() noexcept
 	{
-		m_timestamps[0] = utils::get_tsc();
+		m_timestamps[0] = g_cfg.core.perf_report ? utils::get_tsc() : 0;
 		std::memset(m_timestamps + 1, 0, sizeof(m_timestamps) - sizeof(u64));
 	}
 

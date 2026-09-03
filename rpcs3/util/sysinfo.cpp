@@ -928,6 +928,12 @@ static const bool s_tsc_freq_evaluated = []() -> bool
 		return r;
 #endif
 
+#ifdef ARCH_WASM32
+		// utils::get_tsc() is the monotonic clock in nanoseconds (util/tsc.hpp). Reporting its
+		// tick rate keeps get_system_time() on the counter instead of a second clock_gettime.
+		return 1'000'000'000;
+#endif
+
 		if (!utils::has_invariant_tsc())
 		{
 			return 0;

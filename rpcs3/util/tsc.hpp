@@ -10,6 +10,10 @@ extern "C" u64 __rdtsc();
 #endif
 #endif
 
+#ifdef ARCH_WASM32
+#include <emscripten.h>
+#endif
+
 namespace utils
 {
 	inline u64 get_tsc()
@@ -23,8 +27,12 @@ namespace utils
 #elif defined(ARCH_X64)
 		return __builtin_ia32_rdtsc();
 #elif defined(ARCH_WASM32)
-		return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-			std::chrono::steady_clock::now().time_since_epoch()).count());
+		// The browser has no cycle counter, so the monotonic clock stands in for one and
+		// utils::get_tsc_freq() reports a nanosecond tick. This is the same clock
+		// std::chrono::steady_clock reads (performance.now()), reached without the WASI
+		// clock_time_get shim and its timespec and i64 conversions: on the SPU and RSX threads
+		// those layers were a measurable part of every DMA, semaphore wait and timebase read.
+		return static_cast<u64>(emscripten_get_now() * 1'000'000.0);
 #else
 #error "Missing utils::get_tsc() implementation"
 #endif

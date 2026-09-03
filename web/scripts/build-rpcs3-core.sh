@@ -3,13 +3,29 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 emsdk_root="${RPCS3_WEB_EMSDK:-${XDG_CACHE_HOME:-${HOME}/.cache}/emsdk-6.0.8}"
-build_jobs="${RPCS3_WEB_JOBS:-4}"
+build_jobs="${RPCS3_WEB_JOBS:-$(nproc)}"
 
 if [[ -f "${emsdk_root}/emsdk_env.sh" ]]; then
   source "${emsdk_root}/emsdk_env.sh" >/dev/null
 elif ! command -v emcmake >/dev/null 2>&1; then
   echo "Emscripten is not active and no SDK was found at ${emsdk_root}. Set RPCS3_WEB_EMSDK." >&2
   exit 1
+fi
+
+# Compilation cache: emcc is a Python driver, so the cache wraps the clang it invokes
+# (Emscripten's EM_COMPILER_WRAPPER) rather than emcc itself. ccache keys on the preprocessed
+# source, so a rebuild after a header touch pays only for the objects whose preprocessed text
+# changed. sccache is not an option here: it refuses Emscripten's -Xclang arguments and caches
+# nothing. RPCS3_WEB_COMPILER_WRAPPER= disables the wrapper.
+if [[ -z "${RPCS3_WEB_COMPILER_WRAPPER+x}" ]]; then
+  if command -v ccache >/dev/null 2>&1; then
+    RPCS3_WEB_COMPILER_WRAPPER=ccache
+  else
+    RPCS3_WEB_COMPILER_WRAPPER=
+  fi
+fi
+if [[ -n "${RPCS3_WEB_COMPILER_WRAPPER}" ]]; then
+  export EM_COMPILER_WRAPPER="${RPCS3_WEB_COMPILER_WRAPPER}"
 fi
 
 # RPCS3_WEB_PROFILE=1 builds the symbolized profiling variant into a separate
@@ -36,21 +52,56 @@ else
   llvm_dir=""
 fi
 
-emcmake cmake -S "${repo_root}" -B "${build_dir}" \
-  -DRPCS3_WEB=ON \
-  -DRPCS3_WEB_PROFILE="${profile_flag}" \
-  -DRPCS3_WEB_LLVM_DIR="${llvm_dir}" \
-  -DCMAKE_BUILD_TYPE=Release
+# RPCS3_WEB_FAST_LINK=1 links at -O1 for correctness iterations (never for measurements);
+# RPCS3_WEB_TARGETS="rpcs3_web_runtime" limits the build to the module being iterated on.
+fast_link="${RPCS3_WEB_FAST_LINK:-0}"
+if [[ "${fast_link}" == "1" ]]; then fast_link=ON; else fast_link=OFF; fi
+if [[ -n "${RPCS3_WEB_TARGETS:-}" ]]; then
+  read -r -a targets <<< "${RPCS3_WEB_TARGETS}"
+fi
+
+# Ninja schedules the ~900 objects far better than the Makefiles generator and rebuilds only what
+# changed; a tree configured with another generator is reconfigured from scratch (the objects come
+# back from the compilation cache). Configure runs only when the tree is missing or an option
+# changed: every configure regenerates third-party headers (wolfssl's config.h among them), which
+# recompiles their dependents and relinks every module.
+cache_value() { grep -E "^$1:[A-Z]+=" "${build_dir}/CMakeCache.txt" 2>/dev/null | head -1 | cut -d= -f2-; }
+if [[ -f "${build_dir}/CMakeCache.txt" ]] && ! grep -q "^CMAKE_GENERATOR:INTERNAL=Ninja$" "${build_dir}/CMakeCache.txt"; then
+  echo "Reconfiguring ${build_dir} with Ninja" >&2
+  rm -rf "${build_dir}"
+fi
+if [[ ! -f "${build_dir}/build.ninja" \
+   || "$(cache_value RPCS3_WEB_LLVM_DIR)" != "${llvm_dir}" \
+   || "$(cache_value RPCS3_WEB_FAST_LINK)" != "${fast_link}" \
+   || "$(cache_value RPCS3_WEB_PROFILE)" != "${profile_flag}" ]]; then
+  # No C++ modules here: the Ninja generator's module dependency scan (emscan-deps) fails on the
+  # emdawnwebgpu port headers and would only add a pass over every source
+  emcmake cmake -S "${repo_root}" -B "${build_dir}" -G Ninja \
+    -DRPCS3_WEB=ON \
+    -DRPCS3_WEB_PROFILE="${profile_flag}" \
+    -DRPCS3_WEB_LLVM_DIR="${llvm_dir}" \
+    -DRPCS3_WEB_FAST_LINK="${fast_link}" \
+    -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
+    -DCMAKE_BUILD_TYPE=Release
+fi
 cmake --build "${build_dir}" --target "${targets[@]}" --parallel "${build_jobs}"
+if [[ "${RPCS3_WEB_COMPILER_WRAPPER}" == "ccache" ]]; then
+  ccache -s | grep -E "Hits|Misses" | head -2 || true
+fi
 mkdir -p "${stage_dir}"
-cmake -E copy_if_different "${build_dir}/bin/rpcs3-web.mjs" "${stage_dir}/rpcs3-web.mjs"
-cmake -E copy_if_different "${build_dir}/bin/rpcs3-web.wasm" "${stage_dir}/rpcs3-web.wasm"
+stage() {
+  if [[ -f "${build_dir}/bin/$1" ]]; then
+    cmake -E copy_if_different "${build_dir}/bin/$1" "${stage_dir}/$1"
+  fi
+}
+stage rpcs3-web.mjs
+stage rpcs3-web.wasm
 if [[ "${profile_flag}" == "OFF" ]]; then
-  cmake -E copy_if_different "${build_dir}/bin/rpcs3-web-units.mjs" "${stage_dir}/rpcs3-web-units.mjs"
-  cmake -E copy_if_different "${build_dir}/bin/rpcs3-web-units.wasm" "${stage_dir}/rpcs3-web-units.wasm"
+  stage rpcs3-web-units.mjs
+  stage rpcs3-web-units.wasm
 fi
 if [[ -n "${llvm_dir}" ]]; then
-  cmake -E copy_if_different "${build_dir}/bin/rpcs3-spu-llvm.mjs" "${stage_dir}/rpcs3-spu-llvm.mjs"
-  cmake -E copy_if_different "${build_dir}/bin/rpcs3-spu-llvm.wasm" "${stage_dir}/rpcs3-spu-llvm.wasm"
+  stage rpcs3-spu-llvm.mjs
+  stage rpcs3-spu-llvm.wasm
 fi
 ls -l "${stage_dir}/rpcs3-web.wasm"

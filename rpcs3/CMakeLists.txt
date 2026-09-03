@@ -224,6 +224,17 @@ if(RPCS3_WEB)
 		"-sASSERTIONS=1"
 		"-sSTACK_OVERFLOW_CHECK=0"
 		"-sWASM_BIGINT=1")
+
+	# Correctness iterations: link at -O1 (seconds of wasm-opt instead of a minute per module). The
+	# shipped and measured builds stay at the Release level.
+	option(RPCS3_WEB_FAST_LINK "Link the browser modules at -O1 for iteration; never for measurements" OFF)
+	if(RPCS3_WEB_FAST_LINK)
+		foreach(fast_target rpcs3_web_runtime rpcs3_web_unit_tests rpcs3_web_spu_llvm)
+			if(TARGET ${fast_target})
+				target_link_options(${fast_target} PRIVATE -O1)
+			endif()
+		endforeach()
+	endif()
     return()
 endif()
 

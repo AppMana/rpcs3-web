@@ -19,15 +19,47 @@ Memory64 could raise the host linear-memory ceiling in supporting browsers, but 
 
 ## Building
 
-`npm run build:runtime` configures and builds the browser modules (`web/scripts/build-rpcs3-core.sh`): the runtime, the compiled unit-test artifact, and the SPU LLVM compiler module when an Emscripten LLVM tree is present. It uses Ninja on every core and wraps Emscripten's clang with `ccache`, and it re-runs CMake only when the build tree is missing or one of its options changed. On 32 cores a cold build takes about four minutes and a one-file change about fifteen seconds.
+### The browser modules
+
+`npm run build:runtime` builds everything that runs inside the browser (`web/scripts/build-rpcs3-core.sh`): the RPCS3 runtime, the compiled unit-test artifact, and the SPU LLVM compiler module when an Emscripten LLVM tree is present. It uses Ninja on every core, wraps Emscripten's clang with `ccache`, and re-runs CMake only when the build tree is missing or one of its options changed. On 32 cores a cold build takes about four minutes and a one-file change about fifteen seconds.
 
 ```sh
 RPCS3_WEB_FAST_LINK=1 RPCS3_WEB_TARGETS=rpcs3_web_runtime npm run build:runtime
 ```
 
-`RPCS3_WEB_FAST_LINK=1` links at `-O1` instead of the Release level, which turns the per-module `wasm-opt` pass from tens of seconds into one or two; use it while iterating on correctness and never for anything you intend to measure. `RPCS3_WEB_TARGETS` limits the build to the named CMake targets. Together they bring a one-file change down to about two seconds. Switching either option back reconfigures the tree, so a measurement build after fast-link iteration pays one full link.
+`RPCS3_WEB_FAST_LINK=1` links at `-O1` instead of the Release level, which turns the per-module `wasm-opt` pass from tens of seconds into one or two; use it while iterating on correctness and never for anything you intend to measure. `RPCS3_WEB_TARGETS` limits the build to the named CMake targets. Together they bring a one-file change down to about two seconds. Switching either option back reconfigures the tree, so the first measurement build after fast-link iteration pays one full link.
 
-Other variables: `RPCS3_WEB_JOBS` (default: every core), `RPCS3_WEB_COMPILER_WRAPPER=` (empty disables `ccache`; `sccache` does not work here, it refuses Emscripten's `-Xclang` arguments and caches nothing), `RPCS3_WEB_PROFILE=1` (a separate tree staged under `web/public/core/profile/` that keeps function names for CPU profiles), and `RPCS3_WEB_LLVM_DIR` (an Emscripten build tree of LLVM and lld; `web/scripts/build-llvm-wasm.sh` produces one, default `~/llvm-wasm/build-wasm`).
+Other variables: `RPCS3_WEB_JOBS` (default: every core), `RPCS3_WEB_COMPILER_WRAPPER=` (empty disables `ccache`; `sccache` does not work here, it refuses Emscripten's `-Xclang` arguments and caches nothing), and `RPCS3_WEB_EMSDK` (default `~/.cache/emsdk-6.0.8`).
+
+### The page
+
+`npm run build` typechecks and bundles the site. Playwright serves the bundle, so a change to anything under `web/public/` or `web/src/` needs this before the browser tests see it; a change to the Wasm modules needs `build:runtime` first. `npm run check` is the two of them plus the Node unit tests.
+
+### The symbolized profile core
+
+`RPCS3_WEB_PROFILE=1 npm run build:runtime` builds a second runtime that keeps the Wasm function-name section, staged under `web/public/core/profile/`. It uses a separate build tree, but its compile flags match the Release build, so `ccache` serves the objects and only the link is new. Runners select it with `RPCS3_CORE=profile`, which is what makes a CPU profile show RPCS3 function names instead of `wasm-function[12645]`. Like every other staged artifact it reaches the browser only through `npm run build`, so a profile taken without that step silently measures the previous core.
+
+### LLVM for WebAssembly
+
+The SPU LLVM tier needs LLVM and lld compiled to Wasm by Emscripten. `web/scripts/build-llvm-wasm.sh` clones `release/22.x` and builds only the WebAssembly target with threads off, which takes roughly fifteen minutes once. The result lands in `~/llvm-wasm/build-wasm`; `build:runtime` picks it up from there, or from `RPCS3_WEB_LLVM_DIR`, and silently skips the compiler module when no such tree exists.
+
+### Native RPCS3
+
+Two native trees back the browser work, and neither is configured with a compiler launcher by default; add `-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache` when configuring one, since these are the slowest builds in the repository.
+
+`build-rpcs3-native` is configured with `-DRPCS3_PORTABLE_SPU_INTERPRETER=ON`. It compiles the same portable SPU interpreter the browser executes, so it is the differential oracle for SPU semantics and the build that proves web-guarded changes to shared files still compile for a desktop target. `build-rpcs3-native-stock` is stock upstream RPCS3, used for reference frames, SPU program dumps, and native gameplay comparison.
+
+`build-web-native` compiles the WebGPU packet and host sources natively for `ctest`, which catches packet ABI, ownership, and queue regressions without a browser:
+
+```sh
+cmake --build build-web-native --target \
+  rpcs3_webgpu_command_tests rpcs3_webgpu_host_tests -j2
+ctest --test-dir build-web-native --output-on-failure -R webgpu
+```
+
+### Ahead-of-time bundles
+
+`npm run ppu:aot:bundle` and `npm run spu:aot:bundle` turn directories of LLVM IR dumped by native RPCS3 into the Wasm side modules the runtime loads before boot. They are inputs to commercial runs rather than part of a normal build, and they are rebuilt only when new programs are dumped.
 
 ## Validation
 

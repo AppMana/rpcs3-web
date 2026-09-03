@@ -1664,7 +1664,11 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 		}
 
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
-		if (aot_ready)
+		// Only a block start can be the entry of a compiled program, and the previous instruction
+		// having branched is what makes this pc one. Looking at every instruction instead cost three
+		// shared-memory atomics per interpreted instruction, including a read-modify-write on a
+		// counter that every thread running the same program shares.
+		if (aot_ready && at_branch_target)
 		{
 			// Hot-compiled modules not yet placed in this worker's table (registry order)
 			if (spu_web_hot_count() != hot_placed) [[unlikely]]
@@ -1739,7 +1743,7 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 			else
 			{
 				// A pc the bundle has no program for: compile it once it proves hot (block starts recur)
-				if (++g_spu_web_fallback_unlisted[(spu.pc & 0x3fffc) / 4] == g_spu_web_hot_threshold.load() && at_branch_target)
+				if (++g_spu_web_fallback_unlisted[(spu.pc & 0x3fffc) / 4] == g_spu_web_hot_threshold.load())
 				{
 					spu_web_try_compile(spu);
 					if (g_spu_web_fallback_histogram) spu_web_record_miss(spu);

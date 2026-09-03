@@ -17,6 +17,18 @@ The full Web build replaces the desktop fixed-address aliases with two 4 KiB pag
 
 Memory64 could raise the host linear-memory ceiling in supporting browsers, but it is not required for the current 32-bit PS3 process map. Larger games will still need better RSX resource residency and eviction rather than treating every mapped aperture as permanently resident.
 
+## Building
+
+`npm run build:runtime` configures and builds the browser modules (`web/scripts/build-rpcs3-core.sh`): the runtime, the compiled unit-test artifact, and the SPU LLVM compiler module when an Emscripten LLVM tree is present. It uses Ninja on every core and wraps Emscripten's clang with `ccache`, and it re-runs CMake only when the build tree is missing or one of its options changed. On 32 cores a cold build takes about four minutes and a one-file change about fifteen seconds.
+
+```sh
+RPCS3_WEB_FAST_LINK=1 RPCS3_WEB_TARGETS=rpcs3_web_runtime npm run build:runtime
+```
+
+`RPCS3_WEB_FAST_LINK=1` links at `-O1` instead of the Release level, which turns the per-module `wasm-opt` pass from tens of seconds into one or two; use it while iterating on correctness and never for anything you intend to measure. `RPCS3_WEB_TARGETS` limits the build to the named CMake targets. Together they bring a one-file change down to about two seconds. Switching either option back reconfigures the tree, so a measurement build after fast-link iteration pays one full link.
+
+Other variables: `RPCS3_WEB_JOBS` (default: every core), `RPCS3_WEB_COMPILER_WRAPPER=` (empty disables `ccache`; `sccache` does not work here, it refuses Emscripten's `-Xclang` arguments and caches nothing), `RPCS3_WEB_PROFILE=1` (a separate tree staged under `web/public/core/profile/` that keeps function names for CPU profiles), and `RPCS3_WEB_LLVM_DIR` (an Emscripten build tree of LLVM and lld; `web/scripts/build-llvm-wasm.sh` produces one, default `~/llvm-wasm/build-wasm`).
+
 ## Validation
 
 ```sh

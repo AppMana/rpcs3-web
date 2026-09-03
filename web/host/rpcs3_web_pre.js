@@ -162,20 +162,52 @@ function rpcs3InstantiateSpuHot(module) {
   if (!name) throw new Error("SPU hot module exports no program");
   return instance.exports[name.name];
 }
+// LLVM-tier side modules (dylink, wasm-ld --shared): same placement as a bundle part in
+// rpcs3PopulateSpuAot, with the element segment at elemBase and the data at memoryBase that the
+// registry reserved (spu_web_llvm_register); the stack pointer is this worker's own.
+const rpcs3SpuPatchpointPattern = /^__spu-0x[0-9a-f]+-.+-(?:pp|chunkpp)-/i;
+function rpcs3InstantiateSpuSide(module, elemBase, memoryBase, importsTable, table) {
+  const env = {
+    memory: wasmMemory,
+    __memory_base: new WebAssembly.Global({ value: "i32", mutable: false }, memoryBase),
+    __table_base: new WebAssembly.Global({ value: "i32", mutable: false }, elemBase),
+  };
+  if (importsTable) env.__indirect_function_table = table;
+  for (const imported of WebAssembly.Module.imports(module)) {
+    if (imported.module !== "env" || imported.name in env) continue;
+    if (imported.kind === "global" && imported.name === "__stack_pointer") {
+      if (!(wasmExports["__stack_pointer"] instanceof WebAssembly.Global)) throw new Error("the runtime does not export __stack_pointer");
+      env.__stack_pointer = wasmExports["__stack_pointer"];
+      continue;
+    }
+    if (imported.kind !== "function") throw new Error(`unsupported SPU side-module import ${imported.kind} ${imported.name}`);
+    const target = rpcs3SpuHotBindings[imported.name] ?? (rpcs3SpuPatchpointPattern.test(imported.name) ? "rpcs3_web_spu_direct_patchpoint" : undefined);
+    if (!target || typeof wasmExports[target] !== "function") throw new Error(`no runtime binding for SPU side-module import ${imported.name}`);
+    env[imported.name] = wasmExports[target];
+  }
+  const instance = new WebAssembly.Instance(module, { env });
+  for (const init of ["__wasm_init_memory", "__wasm_apply_data_relocs", "__wasm_call_ctors"]) {
+    if (typeof instance.exports[init] === "function") instance.exports[init]();
+  }
+  const name = WebAssembly.Module.exports(module).find((e) => e.kind === "function" && /^__spu-0x[0-9a-f]+-/i.test(e.name) && !rpcs3SpuPatchpointPattern.test(e.name));
+  if (!name) throw new Error("SPU side module exports no program");
+  return instance.exports[name.name];
+}
 // Called from the SPU thread (C++) on this worker; returns the number of registry entries placed here
 function rpcs3SpuHotSyncImpl() {
   const count = wasmExports["rpcs3_web_spu_hot_count"]() >>> 0;
   let placed = self.__rpcs3SpuHotPlaced >>> 0;
   if (placed >= count) return placed;
   const table = wasmExports["__indirect_function_table"];
+  const info = self.__rpcs3SpuHotInfo ??= wasmExports["malloc"](32) >>> 0;
   for (; placed < count; placed++) {
-    const index = wasmExports["rpcs3_web_spu_hot_index"](placed) >>> 0;
-    const pointer = wasmExports["rpcs3_web_spu_hot_bytes"](placed) >>> 0;
-    const size = wasmExports["rpcs3_web_spu_hot_size"](placed) >>> 0;
+    wasmExports["rpcs3_web_spu_hot_info"](placed, info);
+    const [kind, index, pointer, size, elemBase, tableSize, memoryBase, importsTable] = new Uint32Array(wasmMemory.buffer, info, 8);
     const bytes = new Uint8Array(wasmMemory.buffer, pointer, size).slice();
     const module = new WebAssembly.Module(bytes);
-    if (table.length <= index) table.grow(index + 1 - table.length);
-    table.set(index, rpcs3InstantiateSpuHot(module));
+    const need = kind === 1 ? Math.max(index + 1, elemBase + tableSize) : index + 1;
+    if (table.length < need) table.grow(need - table.length);
+    table.set(index, kind === 1 ? rpcs3InstantiateSpuSide(module, elemBase, memoryBase, importsTable, table) : rpcs3InstantiateSpuHot(module));
     if ((self.__rpcs3SpuHotLogged = (self.__rpcs3SpuHotLogged | 0) + 1) <= 40) console.log(`[rpcs3 spu hot] worker placed entry ${placed} at table index ${index} (table length ${table.length}, ${size} bytes)`);
   }
   self.__rpcs3SpuHotPlaced = placed;

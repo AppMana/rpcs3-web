@@ -3,6 +3,8 @@
 #include "SPUThread.h"
 #include "SPUOpcodes.h"
 #include "SPUWasmAbi.h"
+#include "Emu/IdManager.h"
+#include "Emu/system_config.h"
 
 #include <cstring>
 #include <cmath>
@@ -284,7 +286,7 @@ void spu_wasm_recompiler::per_lane32(auto&& emit_scalar)
 // ---------------------------------------------------------------------------------------------
 // Program compilation
 
-spu_function_t spu_wasm_recompiler::compile(spu_program&& func)
+bool spu_wasm_recompiler::build(const spu_program& func)
 {
 	m_module.clear();
 	m_refusal.clear();
@@ -298,7 +300,7 @@ spu_function_t spu_wasm_recompiler::compile(spu_program&& func)
 	if (!words || entry < m_lower || entry >= m_upper)
 	{
 		m_refusal = "empty program";
-		return nullptr;
+		return false;
 	}
 
 	// Block starts within the program: the analyser's block info plus the entry
@@ -444,7 +446,7 @@ spu_function_t spu_wasm_recompiler::compile(spu_program&& func)
 
 	if (refused())
 	{
-		return nullptr;
+		return false;
 	}
 
 	// --- module ---
@@ -530,7 +532,7 @@ spu_function_t spu_wasm_recompiler::compile(spu_program&& func)
 		section(10, cs);
 	}
 	m_module = std::move(m.b);
-	return nullptr;
+	return true;
 }
 
 std::vector<u8> spu_web_compile_ls(const be_t<u32>* ls, u32 pc, std::string& export_name, u32& entry, std::string& why)
@@ -2040,23 +2042,47 @@ namespace
 		u32 entry;
 		u32 index;
 		std::vector<u8> bytes;
+		// kind 1: a dylink side module from the LLVM tier (web/host/rpcs3_spu_llvm_main.cpp); its
+		// element segment occupies [elem_base, elem_base + table_size) and its data lives at memory_base
+		u32 kind = 0;
+		u32 elem_base = 0;
+		u32 table_size = 0;
+		u32 memory_base = 0;
+		u32 imports_table = 0;
 	};
 
+	// LLVM tier hand-off: an SPU LLVM worker thread (spu_llvm_worker, SPUCommonRecompiler.cpp) fills a
+	// slot with its local-store snapshot and waits; the module thread forwards the slot to a compiler
+	// worker (rpcs3-spu-llvm.mjs) and writes the side module back
+	struct spu_web_llvm_request
+	{
+		atomic_t<u32> state{0}; // 0 free, 1 filling, 2 ready, 3 taken by the module thread, 4 done, 5 failed, 6 abandoned
+		u32 pc = 0;
+		u8* result = nullptr; // malloc'd by the module thread, freed by the waiting worker
+		u32 result_size = 0;
+		u32 memory_size = 0;
+		u32 memory_align = 0;
+		u32 table_size = 0;
+		u32 imports_table = 0;
+		alignas(16) u8 ls[SPU_LS_SIZE];
+	};
+
+	constexpr u32 spu_web_llvm_slots = 8;
+	spu_web_llvm_request* g_spu_web_llvm_requests = nullptr;
+	atomic_t<u32> g_spu_web_llvm_enabled{0};
+	atomic_t<u32> g_spu_web_llvm_requested{0}, g_spu_web_llvm_failed{0}, g_spu_web_llvm_abandoned{0}, g_spu_web_llvm_registered{0}, g_spu_web_llvm_bytes{0};
+
 	shared_mutex g_spu_web_hot_mutex;
-	std::unordered_set<u64> g_spu_web_hot_prekeys;
 	std::map<std::string, u32> g_spu_web_hot_refusals;
 	std::deque<spu_web_hot_entry> g_spu_web_hot_entries; // stable addresses
 	atomic_t<u32> g_spu_web_hot_count{0};                 // entries published (release)
 	atomic_t<u32> g_spu_web_hot_compiled{0}, g_spu_web_hot_refused{0}, g_spu_web_hot_bytes{0};
-	atomic_t<u32> g_spu_web_hot_enabled{1};
 	u32 g_spu_web_hot_next_index = 0;                     // first free table index beyond the bundle layout
 	atomic_t<u32> g_spu_web_hot_base{0};                  // first hot table index (dispatch hot path reads it)
 	constexpr u32 spu_web_hot_limit = 65536;              // programs per run
-}
-
-extern void spu_web_set_hot_compile(bool enabled)
-{
-	g_spu_web_hot_enabled = enabled ? 1 : 0;
+	// Per hot table slot (index - base): 1 for an LLVM-tier side module, so dispatches count per tier
+	atomic_t<u8> g_spu_web_hot_kinds[spu_web_hot_limit * 2]{};
+	atomic_t<u64> g_spu_web_hot_dispatches{0}, g_spu_web_llvm_dispatches{0};
 }
 
 extern void spu_web_set_hot_table_base(u32 base)
@@ -2074,6 +2100,21 @@ extern u32 spu_web_hot_count()
 extern u32 spu_web_hot_table_base()
 {
 	return g_spu_web_hot_base.load();
+}
+
+// Dispatch loop: a hot-region candidate ran (SPUThread.cpp)
+extern void spu_web_note_hot_dispatch(u32 index)
+{
+	const u32 slot = index - g_spu_web_hot_base.load();
+
+	if (slot < spu_web_hot_limit * 2 && g_spu_web_hot_kinds[slot].load())
+	{
+		g_spu_web_llvm_dispatches++;
+	}
+	else
+	{
+		g_spu_web_hot_dispatches++;
+	}
 }
 
 extern u32 spu_web_hot_index(u32 i)
@@ -2095,28 +2136,185 @@ extern u32 spu_web_hot_size(u32 i)
 }
 
 // Compiles the program at the thread's pc once per distinct code image at that address
-extern bool spu_web_try_compile(spu_thread& spu)
+extern void spu_web_llvm_set_enabled(bool enabled)
 {
-	if (!g_spu_web_hot_enabled) return false;
-	const u32 pc = spu.pc & 0x3fffc;
-	const auto ls = spu._ptr<be_t<u32>>(0);
-	u64 prekey = pc;
-	for (u32 i = 0; i < 16; i++) prekey = (prekey ^ ls[(pc / 4 + i) & 0xffff]) * 0x100000001b3ull;
+	std::lock_guard lock(g_spu_web_hot_mutex);
+	if (enabled && !g_spu_web_llvm_requests) g_spu_web_llvm_requests = new spu_web_llvm_request[spu_web_llvm_slots];
+	g_spu_web_llvm_enabled = enabled ? 1 : 0;
+}
+
+// Module thread: next ready slot (taken), -1 when none
+extern s32 spu_web_llvm_poll()
+{
+	if (!g_spu_web_llvm_requests) return -1;
+	for (u32 i = 0; i < spu_web_llvm_slots; i++)
+	{
+		u32 expected = 2;
+		if (g_spu_web_llvm_requests[i].state.compare_exchange(expected, 3)) return static_cast<s32>(i);
+	}
+	return -1;
+}
+
+extern const u8* spu_web_llvm_slot_ls(u32 i)
+{
+	return i < spu_web_llvm_slots ? g_spu_web_llvm_requests[i].ls : nullptr;
+}
+
+extern u32 spu_web_llvm_slot_pc(u32 i)
+{
+	return i < spu_web_llvm_slots ? g_spu_web_llvm_requests[i].pc : 0;
+}
+
+// Module thread: the compiler worker's answer for a taken slot (bytes from malloc, null on failure)
+extern void spu_web_llvm_slot_finish(u32 i, u8* bytes, u32 size, u32 memory_size, u32 memory_align, u32 table_size, u32 imports_table)
+{
+	if (i >= spu_web_llvm_slots) return;
+	auto& slot = g_spu_web_llvm_requests[i];
+
+	if (slot.state.load() == 6)
+	{
+		// The waiting worker gave up (shutdown)
+		std::free(bytes);
+		slot.state.store(0);
+		return;
+	}
+
+	slot.result = bytes;
+	slot.result_size = size;
+	slot.memory_size = memory_size;
+	slot.memory_align = memory_align;
+	slot.table_size = table_size;
+	slot.imports_table = imports_table;
+	slot.state.store(bytes ? 4 : 5);
+}
+
+extern void spu_web_aot_register_front(const u32* pairs, u32 count);
+extern u32 spu_web_llvm_register(const u8* bytes, u32 size, u32 entry, u32 memory_size, u32 memory_align, u32 table_size, u32 imports_table);
+
+// SPU LLVM worker thread: compile the snapshot in a compiler worker and register the side module
+extern bool spu_web_llvm_compile_remote(const be_t<u32>* ls, u32 entry)
+{
+	if (!g_spu_web_llvm_enabled) return false;
+
+	spu_web_llvm_request* slot = nullptr;
+
+	while (!slot)
+	{
+		for (u32 i = 0; i < spu_web_llvm_slots && !slot; i++)
+		{
+			u32 expected = 0;
+			if (g_spu_web_llvm_requests[i].state.compare_exchange(expected, 1)) slot = &g_spu_web_llvm_requests[i];
+		}
+
+		if (!slot)
+		{
+			if (thread_ctrl::state() == thread_state::aborting) return false;
+			thread_ctrl::wait_for(1000);
+		}
+	}
+
+	std::memcpy(slot->ls, ls, SPU_LS_SIZE);
+	slot->pc = entry;
+	slot->result = nullptr;
+	slot->state.store(2);
+	g_spu_web_llvm_requested++;
+	spu_log.notice("SPU LLVM tier: 0x%05x handed to a compiler worker (slot %u)", entry, static_cast<u32>(slot - g_spu_web_llvm_requests));
+
+	while (slot->state.load() < 4)
+	{
+		if (thread_ctrl::state() == thread_state::aborting)
+		{
+			// Emulation is stopping: leave the slot to the module thread's answer (it frees the bytes
+			// and releases the slot)
+			g_spu_web_llvm_abandoned++;
+			u32 expected = 2;
+			if (slot->state.compare_exchange(expected, 0)) return false;
+			slot->state.store(6);
+			return false;
+		}
+
+		thread_ctrl::wait_for(500);
+	}
+
+	const bool ok = slot->state.load() == 4;
+
+	if (ok)
+	{
+		const u32 index = spu_web_llvm_register(slot->result, slot->result_size, entry, slot->memory_size, slot->memory_align, slot->table_size, slot->imports_table);
+		spu_log.notice("SPU LLVM tier: 0x%05x registered at table index %u (%u bytes)", entry, index, slot->result_size);
+	}
+	else
+	{
+		g_spu_web_llvm_failed++;
+		spu_log.error("SPU LLVM tier: 0x%05x failed in the compiler worker", entry);
+	}
+
+	std::free(slot->result);
+	slot->result = nullptr;
+	slot->state.store(0);
+	return ok;
+}
+
+// Registers a compiled side module as the first dispatch candidate of its entry; returns its table index
+extern u32 spu_web_llvm_register(const u8* bytes, u32 size, u32 entry, u32 memory_size, u32 memory_align, u32 table_size, u32 imports_table)
+{
+	std::vector<u8> module(bytes, bytes + size);
+	u32 memory_base = 0;
+	if (memory_size)
+	{
+		const u32 align = std::max<u32>(16, 1u << std::min<u32>(memory_align, 16)); // dylink.0 carries log2
+		const auto allocation = reinterpret_cast<uptr>(std::malloc(memory_size + align));
+		memory_base = static_cast<u32>((allocation + align - 1) & ~uptr{align - 1});
+		std::memset(reinterpret_cast<void*>(static_cast<uptr>(memory_base)), 0, memory_size);
+	}
+	u32 index;
 	{
 		std::lock_guard lock(g_spu_web_hot_mutex);
-		if (!g_spu_web_hot_next_index || g_spu_web_hot_prekeys.size() >= spu_web_hot_limit || !g_spu_web_hot_prekeys.insert(prekey).second) return false;
+		const u32 elem_base = g_spu_web_hot_next_index;
+		g_spu_web_hot_next_index += table_size;
+		index = g_spu_web_hot_next_index++;
+		g_spu_web_hot_entries.push_back({ entry, index, std::move(module), 1, elem_base, table_size, memory_base, imports_table });
+		if (const u32 slot = index - g_spu_web_hot_base.load(); slot < spu_web_hot_limit * 2) g_spu_web_hot_kinds[slot].store(1);
+		g_spu_web_hot_count.store(::size32(g_spu_web_hot_entries));
 	}
-	std::string name, why;
-	u32 entry = 0;
-	auto module = spu_web_compile_ls(ls, pc, name, entry, why);
-	if (module.empty())
+	g_spu_web_llvm_registered++;
+	g_spu_web_llvm_bytes += size;
+	const u32 pair[2] = { entry, index };
+	spu_web_aot_register_front(pair, 1);
+	return index;
+}
+
+// Eight words for the per-worker placement (rpcs3_web_pre.js): kind, index, bytes, size, elem base, table size, memory base, imports table
+extern void spu_web_hot_info(u32 i, u32* out)
+{
+	std::lock_guard lock(g_spu_web_hot_mutex);
+	if (i >= g_spu_web_hot_entries.size())
 	{
-		g_spu_web_hot_refused++;
-		const auto colon = why.find(": ");
-		std::lock_guard lock(g_spu_web_hot_mutex);
-		if (g_spu_web_hot_refusals.size() < 256) g_spu_web_hot_refusals[colon == std::string::npos ? why : why.substr(colon + 2)]++;
-		return false;
+		std::fill_n(out, 8, 0);
+		return;
 	}
+	const auto& e = g_spu_web_hot_entries[i];
+	out[0] = e.kind;
+	out[1] = e.index;
+	out[2] = static_cast<u32>(reinterpret_cast<uptr>(e.bytes.data()));
+	out[3] = ::size32(e.bytes);
+	out[4] = e.elem_base;
+	out[5] = e.table_size;
+	out[6] = e.memory_base;
+	out[7] = e.imports_table;
+}
+
+void spu_wasm_recompiler::init()
+{
+	if (!m_spurt)
+	{
+		m_spurt = &g_fxo->get<spu_runtime>();
+	}
+}
+
+// A built module becomes a dispatch candidate of its entry; returns the table index
+static u32 spu_web_hot_register_module(u32 entry, std::vector<u8> module)
+{
 	g_spu_web_hot_compiled++;
 	g_spu_web_hot_bytes += ::size32(module);
 	u32 index;
@@ -2128,7 +2326,69 @@ extern bool spu_web_try_compile(spu_thread& spu)
 	}
 	const u32 pair[2] = { entry, index };
 	spu_web_aot_register(pair, 1);
-	return true;
+	return index;
+}
+
+// SPUCommonRecompiler.cpp: hands an item to the SPU LLVM thread (spu_llvm::registered)
+extern void spu_web_llvm_enqueue_item(u64 hash, spu_item* item);
+
+spu_function_t spu_wasm_recompiler::compile(spu_program&& _func)
+{
+	init();
+
+	// One item per (program, entry): a second miss on a registered or refused program returns here
+	const auto add_loc = m_spurt->add_empty(std::move(_func));
+
+	if (!add_loc)
+	{
+		return nullptr;
+	}
+
+	if (const auto compiled = add_loc->compiled.load())
+	{
+		return compiled;
+	}
+
+	const spu_program& func = add_loc->data;
+
+	if (!build(func))
+	{
+		// Stays on the interpreter; the marker keeps the next miss from retrying
+		g_spu_web_hot_refused++;
+		const auto colon = m_refusal.find(": ");
+		{
+			std::lock_guard lock(g_spu_web_hot_mutex);
+			if (g_spu_web_hot_refusals.size() < 256) g_spu_web_hot_refusals[colon == std::string::npos ? m_refusal : m_refusal.substr(colon + 2)]++;
+		}
+		add_loc->compiled = spu_runtime::tr_interpreter;
+		add_loc->compiled.notify_all();
+		return nullptr;
+	}
+
+	spu_web_hot_register_module(func.entry_point, take_module());
+	add_loc->compiled = spu_runtime::tr_interpreter;
+
+	if (g_cfg.core.spu_decoder == spu_decoder_type::llvm)
+	{
+		// Send work to the SPU LLVM thread, as the native fast tier does
+		spu_web_llvm_enqueue_item(m_hash_start, add_loc);
+	}
+
+	add_loc->compiled.notify_all();
+	return add_loc->compiled;
+}
+
+// Dispatch miss in spu_web_interpreter_loop: the sequence of spu_recompiler_base::dispatch
+extern bool spu_web_try_compile(spu_thread& spu)
+{
+	if (!spu.jit || !g_spu_web_hot_next_index || spu._ref<u32>(spu.pc) == 0u)
+	{
+		return false;
+	}
+
+	spu.jit->init();
+	auto program = spu.jit->analyse(spu._ptr<u32>(0), spu.pc);
+	return spu.jit->compile(std::move(program)) != nullptr;
 }
 
 extern std::string spu_web_hot_report()
@@ -2139,7 +2399,7 @@ extern std::string spu_web_hot_report()
 	for (const auto& [why, n] : g_spu_web_hot_refusals) sorted.emplace_back(n, why);
 	std::sort(sorted.rbegin(), sorted.rend());
 	for (usz i = 0; i < sorted.size() && i < 24; i++) fmt::append(out, "%s\"%s\":%u", i ? "," : "", sorted[i].second, sorted[i].first);
-	out += "}}";
+	fmt::append(out, "},\"dispatches\":%u,\"llvm\":{\"enabled\":%u,\"requested\":%u,\"failed\":%u,\"abandoned\":%u,\"registered\":%u,\"bytes\":%u,\"dispatches\":%u}}", +g_spu_web_hot_dispatches, +g_spu_web_llvm_enabled, +g_spu_web_llvm_requested, +g_spu_web_llvm_failed, +g_spu_web_llvm_abandoned, +g_spu_web_llvm_registered, +g_spu_web_llvm_bytes, +g_spu_web_llvm_dispatches);
 	return out;
 }
 #endif

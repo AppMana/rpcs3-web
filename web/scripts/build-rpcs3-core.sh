@@ -27,9 +27,19 @@ else
   targets=(rpcs3_web_runtime rpcs3_web_unit_tests)
 fi
 
+# The browser SPU LLVM tier builds when an Emscripten LLVM+lld tree is available
+# (RPCS3_WEB_LLVM_DIR, default ~/llvm-wasm/build-wasm; see PLAN.md for the build recipe).
+llvm_dir="${RPCS3_WEB_LLVM_DIR:-${HOME}/llvm-wasm/build-wasm}"
+if [[ -f "${llvm_dir}/lib/cmake/llvm/LLVMConfig.cmake" && "${profile_flag}" == "OFF" ]]; then
+  targets+=(rpcs3_web_spu_llvm)
+else
+  llvm_dir=""
+fi
+
 emcmake cmake -S "${repo_root}" -B "${build_dir}" \
   -DRPCS3_WEB=ON \
   -DRPCS3_WEB_PROFILE="${profile_flag}" \
+  -DRPCS3_WEB_LLVM_DIR="${llvm_dir}" \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build "${build_dir}" --target "${targets[@]}" --parallel "${build_jobs}"
 mkdir -p "${stage_dir}"
@@ -38,5 +48,9 @@ cmake -E copy_if_different "${build_dir}/bin/rpcs3-web.wasm" "${stage_dir}/rpcs3
 if [[ "${profile_flag}" == "OFF" ]]; then
   cmake -E copy_if_different "${build_dir}/bin/rpcs3-web-units.mjs" "${stage_dir}/rpcs3-web-units.mjs"
   cmake -E copy_if_different "${build_dir}/bin/rpcs3-web-units.wasm" "${stage_dir}/rpcs3-web-units.wasm"
+fi
+if [[ -n "${llvm_dir}" ]]; then
+  cmake -E copy_if_different "${build_dir}/bin/rpcs3-spu-llvm.mjs" "${stage_dir}/rpcs3-spu-llvm.mjs"
+  cmake -E copy_if_different "${build_dir}/bin/rpcs3-spu-llvm.wasm" "${stage_dir}/rpcs3-spu-llvm.wasm"
 fi
 ls -l "${stage_dir}/rpcs3-web.wasm"

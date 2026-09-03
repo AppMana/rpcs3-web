@@ -45,7 +45,7 @@ function readLeb(bytes, offset) {
   }
 }
 
-function dylinkInfo(module) {
+export function dylinkInfo(module) {
   const sections = WebAssembly.Module.customSections(module, "dylink.0");
   const info = { memorySize: 0, memoryAlign: 0, tableSize: 0, tableAlign: 0 };
   if (!sections.length) return info;

@@ -1,6 +1,7 @@
 #include "stdafx.h"
 
 #include "SPURecompiler.h"
+#include "SPUWasmRecompiler.h"
 #include "SPUInterpreter.h"
 #include "SPUOpcodes.h"
 
@@ -60,6 +61,44 @@ const spu_function_t spu_runtime::g_gateway = &web_spu_gateway;
 void (*const spu_runtime::g_escape)(spu_thread*) = &web_spu_escape;
 void (*const spu_runtime::g_tail_escape)(spu_thread*, spu_function_t, u8*) = &web_spu_tail_escape;
 std::array<u64, 256> spu_runtime::g_interpreter_table{};
+
+// The x86 trampolines have no wasm equivalent; the LLVM recompiler names them only to type its
+// helper calls, and returns tr_interpreter as the non-null "exported" marker.
+const spu_function_t spu_runtime::tr_dispatch = &web_spu_gateway;
+const spu_function_t spu_runtime::tr_branch = &web_spu_gateway;
+const spu_function_t spu_runtime::tr_interpreter = &web_spu_gateway;
+const spu_function_t spu_runtime::tr_all = &web_spu_gateway;
+
+// The native registry dedupes by code words alone because a native function serves every entry of
+// its program; a wasm side module serves one exported entry, so a new entry into identical code is
+// a new item (otherwise compile() would wait for a `compiled` flag the web path never sets).
+spu_item* spu_runtime::add_empty(spu_program&& data)
+{
+	if (data.data.empty())
+	{
+		return nullptr;
+	}
+
+	spu_item* prev = nullptr;
+
+	const auto ret = m_stuff[data.data[0] >> 12].push_if([&](spu_item& _new, spu_item& _old)
+	{
+		if (_new.data == _old.data && _new.data.entry_point == _old.data.entry_point)
+		{
+			prev = &_old;
+			return false;
+		}
+
+		return true;
+	}, std::move(data));
+
+	if (ret)
+	{
+		return ret;
+	}
+
+	return prev;
+}
 spu_function_t spu_runtime::g_interpreter = nullptr;
 
 spu_cache::spu_cache(const std::string& loc)
@@ -68,6 +107,11 @@ spu_cache::spu_cache(const std::string& loc)
 }
 
 spu_cache::~spu_cache() = default;
+
+// The browser keeps no SPU program cache file (the LLVM tier registers into the live table instead)
+void spu_cache::add(const spu_program&)
+{
+}
 
 // This hook only mines embedded SPU programs for the native LLVM
 // precompilation cache. The browser selects RPCS3's static interpreter, so
@@ -226,19 +270,17 @@ std::vector<u32> spu_thread::discover_functions(u32 base_addr, std::span<const u
 }
 #endif
 
+#if !defined(RPCS3_PORTABLE_SPU_INTERPRETER)
 // The analysis half of SPUCommonRecompiler.cpp is compiled on the web (spu_recompiler_base::analyse
-// feeds the SPU AOT miss recorder); the native recompiler factories and the JIT runtime it names
-// have no web implementation.
+// feeds the SPU AOT miss recorder); the native JIT runtime it names has no web implementation.
+// The native portable-interpreter lane links the native recompilers alongside this file.
 spu_runtime::spu_runtime()
 {
 }
 
-std::unique_ptr<spu_recompiler_base> spu_recompiler_base::make_llvm_recompiler(u8)
-{
-	return nullptr;
-}
-
+// The web's fast tier in asmjit's role: the SPU->wasm recompiler
 std::unique_ptr<spu_recompiler_base> spu_recompiler_base::make_asmjit_recompiler()
 {
-	return nullptr;
+	return std::make_unique<spu_wasm_recompiler>();
 }
+#endif

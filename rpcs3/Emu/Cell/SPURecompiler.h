@@ -909,6 +909,12 @@ public:
 	// Create recompiler instance (LLVM)
 	static std::unique_ptr<spu_recompiler_base> make_llvm_recompiler(u8 magn = 0);
 
+
 	// Create recompiler instance (interpreter-based LLVM)
 	static std::unique_ptr<spu_recompiler_base> make_fast_llvm_recompiler();
 };
+
+#ifdef RPCS3_WEB
+// Browser LLVM tier: the side module the last spu_llvm_recompiler::compile() produced (web/host/rpcs3_spu_llvm_main.cpp)
+extern std::vector<u8> g_spu_web_llvm_output;
+#endif

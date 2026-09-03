@@ -28,8 +28,12 @@ struct cfg_root : cfg::node
 		cfg::_bool llvm_precompilation{ this, "LLVM Precompilation", true };
 		cfg::_enum<thread_scheduler_mode> thread_scheduler{this, "Thread Scheduler Mode", thread_scheduler_mode::os};
 		cfg::_bool set_daz_and_ftz{ this, "Set DAZ and FTZ", false };
-#if defined(RPCS3_WEB_INTERPRETER_ONLY) || defined(RPCS3_PORTABLE_SPU_INTERPRETER)
+#if defined(RPCS3_PORTABLE_SPU_INTERPRETER)
 		cfg::_enum<spu_decoder_type> spu_decoder{ this, "SPU Decoder", spu_decoder_type::_static };
+#elif defined(RPCS3_WEB_INTERPRETER_ONLY)
+		// Browser: asmjit selects the SPU->wasm recompiler as the fast tier; llvm adds the SPU LLVM
+		// thread whose workers compile in the browser's compiler workers (rpcs3-spu-llvm.mjs)
+		cfg::_enum<spu_decoder_type> spu_decoder{ this, "SPU Decoder", spu_decoder_type::asmjit };
 #else
 		cfg::_enum<spu_decoder_type> spu_decoder{ this, "SPU Decoder", spu_decoder_type::llvm };
 #endif

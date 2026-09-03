@@ -30,12 +30,20 @@ public:
 	spu_wasm_recompiler();
 	~spu_wasm_recompiler() override;
 
-	void init() override {}
+	void init() override;
 
-	// Returns nullptr always (wasm has no native entry); the module bytes are in take_module()
+	// The fast tier of the web build, in the role spu_fast plays natively: registers the program
+	// with spu_runtime (add_empty), builds its module into the hot registry as a dispatch
+	// candidate, and hands the item to the SPU LLVM thread when the decoder is llvm. Returns the
+	// non-null marker spu_runtime::tr_interpreter for a registered program (wasm has no native
+	// entry address), nullptr when the program was refused.
 	spu_function_t compile(spu_program&&) override;
 
-	// Module bytes of the last successful compile (empty after a refusal)
+	// Module construction alone (the self-test and the native differential lanes): the bytes are
+	// in take_module(), empty after a refusal
+	bool build(const spu_program& func);
+
+	// Module bytes of the last successful build (empty after a refusal)
 	std::vector<u8> take_module();
 
 	const std::string& last_export_name() const { return m_export_name; }

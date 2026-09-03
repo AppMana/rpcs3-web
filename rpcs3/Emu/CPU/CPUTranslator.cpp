@@ -46,6 +46,12 @@ cpu_translator::cpu_translator(llvm::Module* _module, bool is_be)
 			auto vec_len = llvm::ConstantInt::get(get_type<u32>(), 16);
 			auto index_masked = m_ir->CreateCall(get_intrinsic<u8[16]>(llvm::Intrinsic::vp_and), {index, mask, and_mask, vec_len});
 			return m_ir->CreateCall(get_intrinsic<u8[16]>(llvm::Intrinsic::aarch64_neon_tbl1), {data0, index_masked});
+#elif defined(ARCH_WASM32)
+			// i8x16.swizzle zeroes lanes whose index is out of range, so masking to pshufb's 0x8f keeps
+			// bit 7 as the zeroing bit and bits 0-3 as the lane
+			auto mask = llvm::ConstantInt::get(get_type<u8[16]>(), 0x8F);
+			auto index_masked = m_ir->CreateAnd(index, mask);
+			return m_ir->CreateCall(get_intrinsic(llvm::Intrinsic::wasm_swizzle), {data0, index_masked});
 #else
 #error "Unimplemented"
 #endif
@@ -95,6 +101,22 @@ cpu_translator::cpu_translator(llvm::Module* _module, bool is_be)
 	});
 }
 
+#ifdef RPCS3_WEB
+void cpu_translator::initialize(llvm::LLVMContext& context, llvm::TargetMachine& target)
+{
+	m_context = context;
+	m_target_machine = &target;
+
+	// wasm32 has none of the x86 feature paths; the SPU recompiler disables them again in wasm mode
+	m_use_ssse3 = false;
+	m_use_fma = false;
+	m_use_avx = false;
+	m_use_avx512 = false;
+	m_use_avx512_icl = false;
+}
+#endif
+
+#ifndef RPCS3_WEB
 void cpu_translator::initialize(llvm::LLVMContext& context, llvm::ExecutionEngine& engine)
 {
 	m_context = context;
@@ -228,6 +250,7 @@ void cpu_translator::initialize(llvm::LLVMContext& context, llvm::ExecutionEngin
 	}
 #endif
 }
+#endif
 
 llvm::Value* cpu_translator::bitcast(llvm::Value* val, llvm::Type* type, std::source_location src_loc) const
 {

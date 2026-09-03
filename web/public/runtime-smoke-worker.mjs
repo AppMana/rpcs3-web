@@ -29,6 +29,7 @@ let dispatchLines = [];
 let ppuDispatcher;
 let ppuAotTable = null;
 let spuAotTable = null;
+let spuLlvmPool = null;
 let spuDispatcher;
 let padState = { digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 };
 let moduleCreateMs = 0;
@@ -80,6 +81,8 @@ async function captureDispatch(expectedVerdict = "", timeoutMs = 30_000) {
   module.ccall("rpcs3_web_sync_logs", null, [], []);
   refreshDispatchLines();
   terminal ||= dispatchLines.findLast((line) => / (PASS|FAIL) /.test(line)) ?? "";
+  // The SPU LLVM tier answers asynchronously; let its outstanding compiles land in the report
+  if (spuLlvmPool) await spuLlvmPool.drain(15_000);
   const verdict = terminal.startsWith("RPCS3-DISPATCH/1 PASS ") ? terminal.split(" ").at(-1) : "";
   const ppuInstructions = Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], []));
   const spuInstructions = Number(module.ccall("rpcs3_web_spu_instruction_count", "bigint", [], []));
@@ -113,6 +116,8 @@ async function captureDispatch(expectedVerdict = "", timeoutMs = 30_000) {
     spuAot: spuDispatcher?.snapshot() ?? null,
     spuAotAbi: Array.from({ length: 7 }, (_, field) =>
       module.ccall("rpcs3_web_spu_aot_abi", "number", ["number"], [field]) >>> 0),
+    spuHotReport: JSON.parse(module.ccall("rpcs3_web_spu_hot_report", "string", [], [])),
+    spuLlvm: spuLlvmPool ? spuLlvmPool.stats() : undefined,
     elapsedMs: performance.now() - bootStartedAt,
     logs: logs.slice(-300),
     detail: terminal || `dispatch protocol did not finish within ${timeoutMs} ms`,
@@ -424,6 +429,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     spuFallbackReport: spuFallbackHistogram ? module.ccall("rpcs3_web_spu_aot_fallback_report", "string", ["number"], [48]) : undefined,
     spuHot: module.rpcs3SpuHotStats ? module.rpcs3SpuHotStats() : undefined,
     spuHotReport: module ? JSON.parse(module.ccall("rpcs3_web_spu_hot_report", "string", [], [])) : undefined,
+    spuLlvm: spuLlvmPool ? spuLlvmPool.stats() : undefined,
     spuMissCount: spuFallbackHistogram ? module.ccall("rpcs3_web_spu_miss_count", "number", [], []) >>> 0 : 0,
     stackReport: stackReport(),
     ppuInstructions: Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], [])),
@@ -504,6 +510,8 @@ scope.addEventListener("message", async (event) => {
   if (event.data?.type === "shutdown") {
     try {
       clearInterval(progressTimer);
+      spuLlvmPool?.stop();
+      spuLlvmPool = null;
       ppuDispatcher?.release();
       ppuDispatcher = undefined;
       spuDispatcher?.release();
@@ -663,6 +671,9 @@ scope.addEventListener("message", async (event) => {
     sparseVmProbe = module.ccall("rpcs3_web_sparse_vm_probe", "number", [], []);
     module.ccall("rpcs3_webgpu_set_capture_level", null, ["number"], [Number(event.data.packetCaptureLevel ?? 4)]);
     if (clockScale) module.ccall("rpcs3_web_set_clock_scale", null, ["number"], [clockScale]);
+    // RPCS3's SPU decoder: static (interpreter only), asmjit (SPU->wasm recompiler), llvm (adds the LLVM tier)
+    const spuDecoder = ["static", "asmjit", "llvm"].includes(event.data.spuDecoder) ? event.data.spuDecoder : "asmjit";
+    module.ccall("rpcs3_web_set_spu_decoder", null, ["number"], [{ static: 0, asmjit: 1, llvm: 2 }[spuDecoder]]);
     if (event.data.resolutionScalePercent) module.ccall("rpcs3_web_set_resolution_scale", null, ["number"], [Number(event.data.resolutionScalePercent) >>> 0]);
     if (typeof accurateSpuDma === "boolean") {
       module.ccall("rpcs3_web_set_accurate_spu_dma", null, ["number"], [accurateSpuDma ? 1 : 0]);
@@ -714,7 +725,21 @@ scope.addEventListener("message", async (event) => {
       module.rpcs3InstallSpuHotLoad(spuAotTable);
       // The binding map (one entry per patchpoint import) is not report material
       if (spuAotTable) spuAotTable = { ...spuAotTable, bindings: undefined };
-      module.ccall("rpcs3_web_spu_set_hot_compile", null, ["number"], [event.data.spuHotCompile === false ? 0 : 1]);
+      if (Number(event.data.spuHotThreshold) > 0) {
+        module.ccall("rpcs3_web_spu_set_hot_threshold", null, ["number"], [Number(event.data.spuHotThreshold)]);
+      }
+      if (spuDecoder === "llvm") {
+        // RPCS3's SPU LLVM thread compiles in these compiler workers (see rpcs3-spu-llvm.mjs)
+        const { createSpuLlvmPool } = await import("./rpcs3-spu-llvm.mjs");
+        spuLlvmPool = await createSpuLlvmPool({
+          module,
+          memory: mainMemory ?? module.wasmMemory,
+          workers: Number(event.data.spuLlvmWorkers) > 0 ? Number(event.data.spuLlvmWorkers) : 2,
+          moduleUrl: new URL("./core/rpcs3-spu-llvm.mjs", scope.location.href).href,
+          log: (line) => { recordLog(line); console.log(line); },
+        });
+        module.ccall("rpcs3_web_spu_llvm_set_enabled", null, ["number"], [1]);
+      }
     }
     if (aotWasm) module.ccall("rpcs3_web_set_ppu_aot_handoff", null, ["number"], [1]);
     if (spuAotWasm) module.ccall("rpcs3_web_set_spu_aot_handoff", null, ["number"], [1]);

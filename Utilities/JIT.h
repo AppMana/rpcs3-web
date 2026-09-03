@@ -533,6 +533,7 @@ inline FT build_function_asm(std::string_view name, F&& builder, ::jit_runtime* 
 namespace llvm
 {
 	class LLVMContext;
+	class TargetMachine;
 	class ExecutionEngine;
 	class Module;
 	class StringRef;
@@ -540,6 +541,7 @@ namespace llvm
 
 enum class thread_state : u32;
 
+#ifndef RPCS3_WEB
 // Temporary compiler interface
 class jit_compiler final
 {
@@ -612,6 +614,40 @@ public:
 
 	bool add_sub_disk_space(ssz space);
 };
+
+#else // RPCS3_WEB
+// Browser compiler: the same interface the recompilers construct, but LLVM only lowers IR
+// to a wasm32 dylink module (the WebAssembly backend plus wasm-ld) that the runtime places
+// into its function tables (web/host/rpcs3_web_pre.js). Nothing executes in this module.
+class jit_compiler final
+{
+	std::unique_ptr<llvm::LLVMContext> m_context{};
+	std::unique_ptr<llvm::TargetMachine> m_target_machine{};
+	u32 m_serial = 0;
+
+public:
+	jit_compiler(const std::unordered_map<std::string, u64>& _link, std::string_view _cpu, u32 flags = 0, std::function<u64(const std::string&)> symbols_cement = {});
+	~jit_compiler() noexcept;
+
+	auto& get_context()
+	{
+		return *m_context;
+	}
+
+	llvm::TargetMachine& get_target_machine() const
+	{
+		return *m_target_machine;
+	}
+
+	// Object emission (llc -O2 -relocation-model=pic) and a wasm-ld --shared link with the flags of
+	// web/scripts/compile-ppu-ir-to-wasm.mjs; returns the side module bytes, empty on failure
+	std::vector<u8> emit_wasm(llvm::Module& module, std::string& error);
+
+	static std::string cpu(std::string_view _cpu);
+	static std::string triple1();
+	static std::string triple2();
+};
+#endif // RPCS3_WEB
 
 const char *fallback_cpu_detection();
 

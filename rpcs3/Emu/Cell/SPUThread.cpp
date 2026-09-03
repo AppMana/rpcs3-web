@@ -80,6 +80,8 @@ struct spu_web_aot_list
 // Per local-store word: immutable candidate lists published by the module thread, read by SPU threads
 static std::array<atomic_t<spu_web_aot_list*>, SPU_LS_SIZE / 4> g_spu_web_aot_lists{};
 atomic_t<u64> g_spu_web_aot_dispatch_count{0};
+// Misses at an unlisted block start before it is compiled (rpcs3_web_spu_set_hot_threshold)
+atomic_t<u32> g_spu_web_hot_threshold{256};
 atomic_t<u64> g_spu_web_aot_fallback_count{0};
 
 // Diagnosis: per-pc counts of dispatch attempts whose candidates all failed verification
@@ -139,11 +141,12 @@ extern void spu_web_record_miss(spu_thread& spu);
 extern bool spu_web_try_compile(spu_thread& spu);
 extern u32 spu_web_hot_count();
 extern u32 spu_web_hot_table_base();
+extern void spu_web_note_hot_dispatch(u32 index);
 static atomic_t<u32> g_spu_web_hot_skipped{0};
 extern "C" u32 rpcs3_web_spu_hot_sync();
 
 // (entry address, table index) pairs; several programs may start at one address
-extern void spu_web_aot_register(const u32* pairs, u32 count)
+static void spu_web_aot_register_pairs(const u32* pairs, u32 count, bool front)
 {
 	std::unordered_map<u32, std::vector<u32>> merged;
 
@@ -159,7 +162,8 @@ extern void spu_web_aot_register(const u32* pairs, u32 count)
 
 		if (const auto old = slot.load())
 		{
-			indices.insert(indices.begin(), old->indices, old->indices + old->count);
+			// New candidates go behind the existing ones, except optimizing-tier programs, which lead
+			indices.insert(front ? indices.end() : indices.begin(), old->indices, old->indices + old->count);
 		}
 
 		const auto list = static_cast<spu_web_aot_list*>(std::malloc(sizeof(spu_web_aot_list) + indices.size() * sizeof(u32)));
@@ -167,6 +171,16 @@ extern void spu_web_aot_register(const u32* pairs, u32 count)
 		std::copy(indices.begin(), indices.end(), list->indices);
 		slot.store(list); // copy-on-write; the old list stays valid for readers
 	}
+}
+
+extern void spu_web_aot_register(const u32* pairs, u32 count)
+{
+	spu_web_aot_register_pairs(pairs, count, false);
+}
+
+extern void spu_web_aot_register_front(const u32* pairs, u32 count)
+{
+	spu_web_aot_register_pairs(pairs, count, true);
 }
 atomic_t<u64> g_spu_web_ls_boundary_count{0};
 atomic_t<u64> g_spu_web_ls_boundary_last{0};
@@ -1628,11 +1642,15 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 	u32 web_progress_batch = 0;
 #endif
 
-	const bool aot_ready = rpcs3_web_spu_aot_worker_ready() != 0;
 	// True when the previous instruction branched: pc is then a block start, the only kind of
 	// address a compiled program can begin at (the miss recorder analyses those)
 	bool at_branch_target = true;
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+	// Compiled programs come from the offline bundle (placed on this worker) and from the recompilers'
+	// registry (present once the host installed its table base); either makes the dispatch path live
+	const bool aot_ready = rpcs3_web_spu_aot_worker_ready() != 0 || spu_web_hot_table_base() != 0;
 	u32 hot_placed = rpcs3_web_spu_hot_sync();
+#endif
 
 	// Re-entered after an escape longjmp as well, so restore the interpreter's setting here
 	spu.allow_interrupts_in_cpu_work = true;
@@ -1645,6 +1663,7 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 				return true;
 		}
 
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
 		if (aot_ready)
 		{
 			// Hot-compiled modules not yet placed in this worker's table (registry order)
@@ -1688,6 +1707,7 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 					}
 					reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(index))(&spu, spu._ptr<u8>(0), 0);
 					ran = spu.block_failure == failures + (i - skipped);
+					if (ran && index >= spu_web_hot_table_base()) spu_web_note_hot_dispatch(index);
 				}
 
 				spu.allow_interrupts_in_cpu_work = true;
@@ -1719,13 +1739,14 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 			else
 			{
 				// A pc the bundle has no program for: compile it once it proves hot (block starts recur)
-				if (++g_spu_web_fallback_unlisted[(spu.pc & 0x3fffc) / 4] == 256 && at_branch_target)
+				if (++g_spu_web_fallback_unlisted[(spu.pc & 0x3fffc) / 4] == g_spu_web_hot_threshold.load() && at_branch_target)
 				{
 					spu_web_try_compile(spu);
 					if (g_spu_web_fallback_histogram) spu_web_record_miss(spu);
 				}
 			}
 		}
+#endif
 
 		const u32 op = spu._ref<be_t<u32>>(spu.pc);
 		at_branch_target = !table.decode(op)(spu, {op});
@@ -1821,7 +1842,12 @@ void spu_thread::cpu_task()
 		}
 	}
 
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+	// No native gateway: the interpreter loop below dispatches to the recompilers' wasm modules
+	if (false)
+#else
 	if (jit)
+#endif
 	{
 		while (true)
 		{
@@ -2168,9 +2194,15 @@ void spu_thread::init_spu_decoder()
 	ensure(!jit);
 
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
-	if (g_cfg.core.spu_decoder != spu_decoder_type::_static)
+	// The interpreter runs every block first; asmjit and llvm add the SPU->wasm recompiler as the
+	// fast tier at dispatch misses (spu_web_interpreter_loop), llvm also the SPU LLVM thread
+	if (g_cfg.core.spu_decoder == spu_decoder_type::asmjit || g_cfg.core.spu_decoder == spu_decoder_type::llvm)
 	{
-		fmt::throw_exception("Browser SPU backend requires the static interpreter");
+		jit = spu_recompiler_base::make_asmjit_recompiler();
+	}
+	else if (g_cfg.core.spu_decoder != spu_decoder_type::_static)
+	{
+		fmt::throw_exception("Unsupported spu decoder '%s' in the browser", g_cfg.core.spu_decoder);
 	}
 #elif !defined(ARCH_X64) && !defined(ARCH_ARM64)
 #error "Unimplemented"
@@ -5805,10 +5837,14 @@ void spu_thread::set_interrupt_status(bool enable)
 		// Detect enabling interrupts with events masked
 		if (auto mask = ch_events.load().mask; mask & SPU_EVENT_INTR_BUSY_CHECK)
 		{
+#ifndef RPCS3_WEB_INTERPRETER_ONLY
+			// The browser runs every block through the interpreter loop's cpu_work checking whatever the
+			// decoder (compiled blocks take interrupts at their own check sites), so it keeps this mode
 			if (g_cfg.core.spu_decoder != spu_decoder_type::_static && g_cfg.core.spu_decoder != spu_decoder_type::dynamic)
 			{
 				fmt::throw_exception("SPU Interrupts not implemented (mask=0x%x): Use [%s] SPU decoder", mask, spu_decoder_type::dynamic);
 			}
+#endif
 
 			spu_log.trace("SPU Interrupts (mask=0x%x) are using CPU busy checking mode", mask);
 

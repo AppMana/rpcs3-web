@@ -86,7 +86,7 @@ if(RPCS3_WEB)
 		"SHELL:--pre-js ${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_pre.js"
 		"-sNO_EXIT_RUNTIME=1"
 		"-sFORCE_FILESYSTEM=1"
-		"-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8','HEAPU32','PThread','specialHTMLTargets','stringToNewUTF8','UTF8ToString']"
+		"-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8','HEAPU32','PThread','specialHTMLTargets','stringToNewUTF8','UTF8ToString','wasmMemory']"
 		"--use-port=emdawnwebgpu"
 		"-sEXPORTED_FUNCTIONS=['_main','_malloc','_free']"
 		"-sWASM_BIGINT=1")
@@ -109,6 +109,65 @@ if(RPCS3_WEB)
 		target_link_options(rpcs3_web_runtime PRIVATE "-sALLOW_MEMORY_GROWTH=1")
 	else()
 		target_link_options(rpcs3_web_runtime PRIVATE "-sALLOW_MEMORY_GROWTH=0")
+	endif()
+
+	# Browser SPU LLVM tier: RPCS3's LLVM SPU recompiler (wasm-IR mode) with LLVM's WebAssembly
+	# backend and wasm-ld as a separate compiler worker module. Needs an Emscripten build tree of
+	# LLVM (WebAssembly target, no threads, compiled with -pthread for shared-memory linking) and lld.
+	set(RPCS3_WEB_LLVM_DIR "" CACHE PATH
+		"Emscripten build tree of LLVM (WebAssembly target) and lld for the browser SPU LLVM tier")
+	if(RPCS3_WEB_LLVM_DIR)
+		find_package(LLVM REQUIRED CONFIG PATHS "${RPCS3_WEB_LLVM_DIR}/lib/cmake/llvm" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+		find_package(LLD REQUIRED CONFIG PATHS "${RPCS3_WEB_LLVM_DIR}/lib/cmake/lld" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+		add_executable(rpcs3_web_spu_llvm
+			${CMAKE_SOURCE_DIR}/web/host/rpcs3_spu_llvm_main.cpp
+			${CMAKE_SOURCE_DIR}/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
+			${CMAKE_SOURCE_DIR}/rpcs3/Emu/CPU/CPUTranslator.cpp
+			${CMAKE_SOURCE_DIR}/Utilities/JITWeb.cpp)
+		target_compile_definitions(rpcs3_web_spu_llvm PRIVATE LLVM_AVAILABLE)
+		target_include_directories(rpcs3_web_spu_llvm SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${LLD_INCLUDE_DIRS})
+		target_compile_options(rpcs3_web_spu_llvm PRIVATE "--use-port=emdawnwebgpu" -msimd128 -msse4.1)
+		target_link_libraries(rpcs3_web_spu_llvm PRIVATE
+			rpcs3_emu
+			3rdparty::fusion
+			3rdparty::zlib
+			lldWasm
+			lldCommon
+			LLVMIRReader
+			LLVMWebAssemblyCodeGen
+			LLVMWebAssemblyAsmParser
+			LLVMWebAssemblyDesc
+			LLVMWebAssemblyInfo
+			LLVMPasses
+			LLVMCodeGen
+			LLVMTarget
+			LLVMMC
+			LLVMCore
+			LLVMSupport)
+		set_target_properties(rpcs3_web_spu_llvm PROPERTIES
+			OUTPUT_NAME "rpcs3-spu-llvm"
+			SUFFIX ".mjs")
+		target_link_options(rpcs3_web_spu_llvm PRIVATE
+			-pthread
+			"-Wl,--error-limit=0"
+			"-sMODULARIZE=1"
+			"-sEXPORT_ES6=1"
+			"-sEXPORT_NAME=createRPCS3SpuLlvm"
+			"-sENVIRONMENT=worker"
+			"-sMAXIMUM_MEMORY=2147483648"
+			"-sINITIAL_MEMORY=268435456"
+			"-sALLOW_MEMORY_GROWTH=1"
+			"-sSTACK_SIZE=16777216"
+			"-sDEFAULT_PTHREAD_STACK_SIZE=1048576"
+			"-sPTHREAD_POOL_SIZE=0"
+			"-sNO_EXIT_RUNTIME=1"
+			"-sFORCE_FILESYSTEM=1"
+			"-sEXPORTED_RUNTIME_METHODS=['ccall','HEAPU8','UTF8ToString','wasmMemory']"
+			"--use-port=emdawnwebgpu"
+			"-sEXPORTED_FUNCTIONS=['_main','_malloc','_free']"
+			"-sASSERTIONS=1"
+			"-sSTACK_OVERFLOW_CHECK=0"
+			"-sWASM_BIGINT=1")
 	endif()
 
 	# Compile the original low-dependency RPCS3 GoogleTest sources to Wasm.  The

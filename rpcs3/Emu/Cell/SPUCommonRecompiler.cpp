@@ -9039,6 +9039,11 @@ void spu_recompiler_base::dump(const spu_program& result, std::string& out, u32 
 	out += '\n';
 }
 
+#ifdef RPCS3_WEB
+// Browser: compiles a local-store snapshot in a compiler worker and registers the side module (SPUWasmRecompiler.cpp)
+extern bool spu_web_llvm_compile_remote(const be_t<u32>* ls, u32 entry);
+#endif
+
 struct spu_llvm_worker
 {
 	lf_queue<std::pair<u64, const spu_program*>> registered;
@@ -9095,7 +9100,13 @@ struct spu_llvm_worker
 			if (!compiler)
 			{
 				// Postponed initialization
+#ifdef RPCS3_WEB
+				// The browser runtime carries no LLVM: the analyser comes from the wasm recompiler and
+				// the compile runs in a compiler worker (spu_web_llvm_compile_remote)
+				compiler = spu_recompiler_base::make_asmjit_recompiler();
+#else
 				compiler = spu_recompiler_base::make_llvm_recompiler();
+#endif
 				compiler->init();
 
 				ls.resize(SPU_LS_SIZE / sizeof(be_t<u32>));
@@ -9128,6 +9139,16 @@ struct spu_llvm_worker
 			}
 			else
 			{
+#ifdef RPCS3_WEB
+				// The side module the compiler worker returns becomes the leading dispatch candidate of
+				// the entry (SPUWasmRecompiler.cpp); nothing to patch, the SPU threads pick it up at
+				// their next hot sync
+				if (!spu_web_llvm_compile_remote(ls.data(), func.entry_point) && thread_ctrl::state() != thread_state::aborting)
+				{
+					spu_log.error("[0x%05x] SPU LLVM tier compile failed.", func.entry_point);
+				}
+			}
+#else
 #ifdef ARCH_ARM64
 				const auto target = compile_spu_llvm_with_retry(compiler, func2);
 #else
@@ -9157,6 +9178,7 @@ struct spu_llvm_worker
 
 				atomic_storage<u64>::release(*reinterpret_cast<u64*>(prog->first), result);
 			}
+#endif
 
 			// Clear fake LS
 			std::memset(ls.data() + start / 4, 0, 4 * (size0 - 1));
@@ -9392,6 +9414,14 @@ struct spu_llvm
 };
 
 using spu_llvm_thread = named_thread<spu_llvm>;
+
+#ifdef RPCS3_WEB
+// The web fast tier (spu_wasm_recompiler::compile) sends its items here, as spu_fast::compile does
+extern void spu_web_llvm_enqueue_item(u64 hash, spu_item* item)
+{
+	g_fxo->get<spu_llvm_thread>().registered.push(hash, item);
+}
+#endif
 
 struct spu_fast : public spu_recompiler_base
 {

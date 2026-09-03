@@ -429,7 +429,7 @@ target_sources(rpcs3_emu PRIVATE
 
 if(RPCS3_WEB)
 	# SPUCommonRecompiler.cpp contributes only its analysis half on the web (see the RPCS3_WEB guards there)
-	target_sources(rpcs3_emu PRIVATE Cell/SPUWebRuntime.cpp Cell/SPUCommonRecompiler.cpp Cell/SPUWasmRecompiler.cpp)
+	target_sources(rpcs3_emu PRIVATE Cell/SPUWebRuntime.cpp Cell/SPUWebNoLlvm.cpp Cell/SPUCommonRecompiler.cpp Cell/SPUWasmRecompiler.cpp)
 else()
 	target_sources(rpcs3_emu PRIVATE
 		Cell/PPUTranslator.cpp
@@ -438,7 +438,7 @@ else()
 		Cell/SPULLVMRecompiler.cpp
 	)
 	if(RPCS3_PORTABLE_SPU_INTERPRETER)
-		target_sources(rpcs3_emu PRIVATE Cell/SPUWebRuntime.cpp)
+		target_sources(rpcs3_emu PRIVATE Cell/SPUWebRuntime.cpp Cell/SPUWebNoLlvm.cpp)
 	endif()
 endif()
 

@@ -75,6 +75,10 @@ void spu_llvm_set_compile_context(spu_llvm_compile_context* context) noexcept
 }
 #endif
 
+#ifdef RPCS3_WEB
+std::vector<u8> g_spu_web_llvm_output;
+#endif
+
 class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 {
 	// JIT Instance
@@ -82,7 +86,12 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 
 	// Interpreter table size power
 	const u8 m_interp_magn;
+#ifdef RPCS3_WEB
+	// The browser tier only targets wasm32 (web/host/rpcs3_spu_llvm_main.cpp)
+	const bool m_wasm_aot = true;
+#else
 	const bool m_wasm_aot = std::getenv("RPCS3_SPU_WASM_AOT_IR");
+#endif
 
 	// Constant opcode bits
 	u32 m_op_const_mask = -1;
@@ -308,7 +317,9 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 
 			// Register under a unique linkable name
 			const std::string ppname = fmt::format("%s-pp-%u", m_hash, m_pp_id++);
+#ifndef RPCS3_WEB
 			m_engine->updateGlobalMapping(ppname, reinterpret_cast<u64>(m_spurt->make_branch_patchpoint()));
+#endif
 
 			// Create function with not exactly correct type
 			const auto ppfunc = llvm::cast<llvm::Function>(m_module->getOrInsertFunction(ppname, m_finfo->chunk->getFunctionType()).getCallee());
@@ -1628,7 +1639,11 @@ public:
 		if (!m_spurt)
 		{
 			m_spurt = &g_fxo->get<spu_runtime>();
+#ifdef RPCS3_WEB
+			cpu_translator::initialize(m_jit.get_context(), m_jit.get_target_machine());
+#else
 			cpu_translator::initialize(m_jit.get_context(), m_jit.get_engine());
+#endif
 			if (m_wasm_aot)
 			{
 				m_use_ssse3 = false;
@@ -1725,7 +1740,7 @@ public:
 
 		bool add_to_file = false;
 
-		if (auto& cache = g_fxo->get<spu_cache>(); cache && g_cfg.core.spu_cache && !add_loc->cached.exchange(1))
+		if (auto* cache = g_fxo->try_get<spu_cache>(); cache && *cache && g_cfg.core.spu_cache && !add_loc->cached.exchange(1))
 		{
 			add_to_file = true;
 		}
@@ -1798,14 +1813,20 @@ public:
 
 		using namespace llvm;
 
+#ifndef RPCS3_WEB
 		m_engine->clearAllGlobalMappings();
+#endif
 
 		// Create LLVM module
 		std::unique_ptr<Module> _module = std::make_unique<Module>(m_hash + ".obj", m_context);
 		_module->setTargetTriple(Triple(m_wasm_aot ? "wasm32-unknown-unknown" : jit_compiler::triple2()));
 		_module->setDataLayout(m_wasm_aot
 			? DataLayout("e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128")
+#ifdef RPCS3_WEB
+			: DataLayout(""));
+#else
 			: m_jit.get_engine().getTargetMachine()->createDataLayout());
+#endif
 		m_module = _module.get();
 
 		// Initialize IR Builder
@@ -2502,7 +2523,9 @@ public:
 		entry_call->setCallingConv(entry_chunk->chunk->getCallingConv());
 
 		const auto dispatcher = llvm::cast<llvm::Function>(m_module->getOrInsertFunction("spu_dispatcher", main_func->getType()).getCallee());
+#ifndef RPCS3_WEB
 		m_engine->updateGlobalMapping("spu_dispatcher", reinterpret_cast<u64>(spu_runtime::tr_all));
+#endif
 		dispatcher->setCallingConv(main_func->getCallingConv());
 
 		// Proceed to the next code
@@ -3839,7 +3862,9 @@ public:
 					if (false && g_cfg.core.spu_verification)
 					{
 						const std::string ppname = fmt::format("%s-chunkpp-0x%05x", m_hash, i);
+#ifndef RPCS3_WEB
 						m_engine->updateGlobalMapping(ppname, reinterpret_cast<u64>(m_spurt->make_branch_patchpoint(i / 4)));
+#endif
 
 						const auto ppfunc = llvm::cast<llvm::Function>(m_module->getOrInsertFunction(ppname, m_finfo->chunk->getFunctionType()).getCallee());
 						ppfunc->setCallingConv(m_finfo->chunk->getCallingConv());
@@ -3927,11 +3952,11 @@ public:
 				fs::write_file(m_spurt->get_cache_path() + "spu-ir.log", fs::write + fs::append, llvm_log);
 			}
 
-			if (auto& cache = g_fxo->get<spu_cache>())
+			if (auto* cache = g_fxo->try_get<spu_cache>(); cache && *cache)
 			{
 				if (add_to_file)
 				{
-					cache.add(func);
+					cache->add(func);
 				}
 			}
 
@@ -3940,6 +3965,21 @@ public:
 
 		if (m_wasm_aot)
 		{
+#ifdef RPCS3_WEB
+			// Browser tier: lower and link in place; the driver hands the side module to the runtime
+			std::string error;
+			g_spu_web_llvm_output = m_jit.emit_wasm(*_module, error);
+
+			if (g_spu_web_llvm_output.empty())
+			{
+				spu_log.error("LLVM: wasm emission failed for %s: %s", m_hash, error);
+				return nullptr;
+			}
+
+			add_loc->compiled = spu_runtime::tr_interpreter;
+			add_loc->compiled.notify_all();
+			return spu_runtime::tr_interpreter;
+#else
 			std::string ir;
 			raw_string_ostream ir_out(ir);
 			ir_out << *_module;
@@ -3975,8 +4015,10 @@ public:
 			// Cache precompilation never executes the returned address. It only
 			// requires a non-null result so it can continue exporting other units.
 			return spu_runtime::tr_interpreter;
+#endif
 		}
 
+#ifndef RPCS3_WEB
 #if defined(__APPLE__)
 		// Apple Silicon W^X: enter write mode for JIT memory and pair
 		// it with an RAII guard so execute mode is restored on every
@@ -4099,6 +4141,9 @@ public:
 		}
 
 		return fn;
+#else
+		return nullptr;
+#endif
 	}
 
 	static void interp_check(spu_thread* _spu, bool after)
@@ -4135,9 +4180,14 @@ public:
 
 	spu_function_t compile_interpreter()
 	{
+#ifdef RPCS3_WEB
+		return nullptr;
+#else
 		using namespace llvm;
 
+#ifndef RPCS3_WEB
 		m_engine->clearAllGlobalMappings();
+#endif
 
 		// Create LLVM module
 		std::unique_ptr<Module> _module = std::make_unique<Module>("spu_interpreter.obj", m_context);
@@ -4525,6 +4575,7 @@ public:
 		}
 
 		return spu_runtime::g_interpreter;
+#endif
 	}
 
 	static bool exec_check_state(spu_thread* _spu)
@@ -6564,7 +6615,7 @@ public:
 		alignas(32) const __m128i buf[2]{a, a};
 		return _mm_loadu_si128(reinterpret_cast<const __m128i*>(reinterpret_cast<const u8*>(buf) + (16 - (b & 0xf))));
 	}
-#elif defined(ARCH_ARM64)
+#elif defined(ARCH_ARM64) || defined(ARCH_WASM32)
 #else
 #error "Unimplemented"
 #endif
@@ -10474,7 +10525,9 @@ public:
 	{
 		const auto type = llvm::FunctionType::get(get_type<void>(), {}, false);
 		const auto func = llvm::cast<llvm::Function>(m_module->getOrInsertFunction("spu_segment_base", type).getCallee());
+#ifndef RPCS3_WEB
 		m_engine->updateGlobalMapping("spu_segment_base", reinterpret_cast<u64>(jit_runtime::alloc(0, 0)));
+#endif
 		return func;
 	}
 

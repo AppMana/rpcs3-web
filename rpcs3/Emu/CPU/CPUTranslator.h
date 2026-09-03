@@ -26,7 +26,15 @@
 #pragma GCC diagnostic ignored "-Wredundant-decls"
 #endif
 #include "llvm/IR/LLVMContext.h"
+#ifndef RPCS3_WEB
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
+#else
+namespace llvm
+{
+	class ExecutionEngine;
+	class TargetMachine;
+}
+#endif
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Target/TargetMachine.h"
@@ -3208,6 +3216,11 @@ protected:
 	// Execution engine from JIT instance
 	llvm::ExecutionEngine* m_engine{};
 
+#ifdef RPCS3_WEB
+	// Browser compiler: the target machine stands in for the execution engine (Utilities/JIT.h)
+	llvm::TargetMachine* m_target_machine{};
+#endif
+
 	// Endianness, affects vector element numbering (TODO)
 	bool m_is_be;
 
@@ -3261,6 +3274,10 @@ protected:
 	std::vector<std::unique_ptr<translator_pass>> m_transform_passes;
 
 	void initialize(llvm::LLVMContext& context, llvm::ExecutionEngine& engine);
+
+#ifdef RPCS3_WEB
+	void initialize(llvm::LLVMContext& context, llvm::TargetMachine& target);
+#endif
 
 	// Run intrinsics replacement pass
 	void replace_intrinsics(llvm::Function&);
@@ -3328,7 +3345,9 @@ public:
 #ifdef _WIN32
 		func->setCallingConv(llvm::CallingConv::Win64);
 #endif
+#ifndef RPCS3_WEB
 		m_engine->updateGlobalMapping({lame.data(), lame.size()}, reinterpret_cast<uptr>(_func));
+#endif
 
 		const auto inst = m_ir->CreateCall(func, {args...});
 		inst->setTailCallKind(llvm::CallInst::TCK_NoTail);
@@ -4608,6 +4627,9 @@ public:
 		return llvm_calli<f32[4], T>{"llvm.x86.sse.rcp.ps", {std::forward<T>(a)}};
 #elif defined(ARCH_ARM64)
 		return llvm_calli<f32[4], T>{"llvm.aarch64.neon.frecpe.v4f32", {std::forward<T>(a)}};
+#elif defined(ARCH_WASM32)
+		// wasm has no reciprocal estimate; the exact quotient is within the relaxed accuracy contract
+		return fsplat<f32[4]>(1.0f) / std::forward<T>(a);
 #endif
 	}
 
@@ -4619,6 +4641,8 @@ public:
 		return llvm_calli<f32[4], T>{"llvm.x86.sse.rsqrt.ps", {std::forward<T>(a)}};
 #elif defined(ARCH_ARM64)
 		return llvm_calli<f32[4], T>{"llvm.aarch64.neon.frsqrte.v4f32", {std::forward<T>(a)}};
+#elif defined(ARCH_WASM32)
+		return fsplat<f32[4]>(1.0f) / fsqrt(std::forward<T>(a));
 #endif
 	}
 
@@ -4630,6 +4654,9 @@ public:
 		return llvm_calli<f32[4], T, U>{"llvm.x86.sse.max.ps", {std::forward<T>(a), std::forward<U>(b)}};
 #elif defined(ARCH_ARM64)
 		return llvm_calli<f32[4], T, U>{"llvm.aarch64.neon.fmax.v4f32", {std::forward<T>(a), std::forward<U>(b)}};
+#elif defined(ARCH_WASM32)
+		// maxps semantics (second operand when either is NaN or both compare equal): f32x4.pmax
+		return select(b < a, a, b);
 #endif
 	}
 
@@ -4641,6 +4668,9 @@ public:
 		return llvm_calli<f32[4], T, U>{"llvm.x86.sse.min.ps", {std::forward<T>(a), std::forward<U>(b)}};
 #elif defined(ARCH_ARM64)
 		return llvm_calli<f32[4], T, U>{"llvm.aarch64.neon.fmin.v4f32", {std::forward<T>(a), std::forward<U>(b)}};
+#elif defined(ARCH_WASM32)
+		// minps semantics: f32x4.pmin
+		return select(a < b, a, b);
 #endif
 	}
 

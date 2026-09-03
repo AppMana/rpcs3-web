@@ -86,12 +86,18 @@ extern std::string spu_web_aot_fallback_report(u32 top);
 extern u32 spu_web_miss_count();
 extern std::string spu_web_wasm_selftest(const u8* cache, u32 size);
 extern std::string spu_web_hot_report();
-extern void spu_web_set_hot_compile(bool enabled);
 extern void spu_web_set_hot_table_base(u32 base);
 extern u32 spu_web_hot_count();
 extern u32 spu_web_hot_index(u32 i);
 extern const u8* spu_web_hot_bytes(u32 i);
 extern u32 spu_web_hot_size(u32 i);
+extern atomic_t<u32> g_spu_web_hot_threshold;
+extern void spu_web_hot_info(u32 i, u32* out);
+extern void spu_web_llvm_set_enabled(bool enabled);
+extern s32 spu_web_llvm_poll();
+extern const u8* spu_web_llvm_slot_ls(u32 i);
+extern u32 spu_web_llvm_slot_pc(u32 i);
+extern void spu_web_llvm_slot_finish(u32 i, u8* bytes, u32 size, u32 memory_size, u32 memory_align, u32 table_size, u32 imports_table);
 extern std::pair<const u8*, u32> spu_web_miss_data();
 extern atomic_t<spu_thread*> g_spu_web_aot_context[6];
 extern atomic_t<u32> g_spu_web_aot_step_request[6];
@@ -104,6 +110,7 @@ EM_JS(int, rpcs3_web_ppu_aot_worker_ready, (), { if (!self.__rpcs3PpuAotReady &&
 EM_JS(int, rpcs3_web_spu_aot_worker_ready, (), { if (!self.__rpcs3SpuAotReady && Module["rpcs3EnsureAot"]) Module["rpcs3EnsureAot"]("rpcs3SpuAot"); return self.__rpcs3SpuAotReady ? 1 : 0; });
 
 extern u32 g_rpcs3_web_clocks_scale;
+extern spu_decoder_type g_rpcs3_web_spu_decoder;
 extern void spu_web_aot_register(const u32* pairs, u32 count);
 extern u32 g_spu_web_trace_lo;
 extern u32 g_spu_web_trace_hi;
@@ -1045,9 +1052,10 @@ extern "C"
 		return report.c_str();
 	}
 
-	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_set_hot_compile(s32 enabled)
+	// Misses at an unlisted block start before the recompilers compile it (default 256)
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_set_hot_threshold(u32 misses)
 	{
-		spu_web_set_hot_compile(enabled != 0);
+		g_spu_web_hot_threshold = misses ? misses : 256;
 	}
 
 	// Hot module registry (rpcs3_web_spu_hot_sync places entries [placed, count) in a worker's table)
@@ -1069,6 +1077,39 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE const u8* rpcs3_web_spu_hot_bytes(u32 i)
 	{
 		return spu_web_hot_bytes(i);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_hot_info(u32 i, u32* out)
+	{
+		spu_web_hot_info(i, out);
+	}
+
+	// LLVM tier (web/public/rpcs3-spu-llvm.mjs drives the compiler workers from the module thread)
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_llvm_set_enabled(s32 enabled)
+	{
+		spu_web_llvm_set_enabled(enabled != 0);
+	}
+
+	EMSCRIPTEN_KEEPALIVE s32 rpcs3_web_spu_llvm_poll()
+	{
+		return spu_web_llvm_poll();
+	}
+
+	EMSCRIPTEN_KEEPALIVE const u8* rpcs3_web_spu_llvm_slot_ls(u32 i)
+	{
+		return spu_web_llvm_slot_ls(i);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_llvm_slot_pc(u32 i)
+	{
+		return spu_web_llvm_slot_pc(i);
+	}
+
+	// The compiler worker's answer: side module bytes from malloc (the waiting SPU LLVM worker thread
+	// registers and frees them), or null with size 0 on failure
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_llvm_slot_finish(u32 i, u8* bytes, u32 size, u32 memory_size, u32 memory_align, u32 table_size, u32 imports_table)
+	{
+		spu_web_llvm_slot_finish(i, bytes, size, memory_size, memory_align, table_size, imports_table);
 	}
 
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_hot_size(u32 i)
@@ -1656,6 +1697,16 @@ extern "C"
 	{
 		g_rpcs3_web_clocks_scale = std::clamp(percent, 10u, 3000u);
 		g_cfg.core.clocks_scale.set(g_rpcs3_web_clocks_scale);
+	}
+
+	// RPCS3's SPU decoder choice (system_config.h): 0 static interpreter, 1 asmjit (the SPU->wasm
+	// recompiler as the fast tier), 2 llvm (adds the SPU LLVM thread, compiling in the browser's
+	// compiler workers). Applied before boot.
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_spu_decoder(u32 decoder)
+	{
+		// Emulator::Init() resets the config on Load and reapplies this global (System.cpp)
+		g_rpcs3_web_spu_decoder = decoder == 2 ? spu_decoder_type::llvm : decoder == 1 ? spu_decoder_type::asmjit : spu_decoder_type::_static;
+		g_cfg.core.spu_decoder.set(g_rpcs3_web_spu_decoder);
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_webgpu_set_texture_hash_per_draw(s32 enabled)

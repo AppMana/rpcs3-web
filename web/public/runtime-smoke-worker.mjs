@@ -674,6 +674,9 @@ scope.addEventListener("message", async (event) => {
     // RPCS3's SPU decoder: static (interpreter only), asmjit (SPU->wasm recompiler), llvm (adds the LLVM tier)
     const spuDecoder = ["static", "asmjit", "llvm"].includes(event.data.spuDecoder) ? event.data.spuDecoder : "asmjit";
     module.ccall("rpcs3_web_set_spu_decoder", null, ["number"], [{ static: 0, asmjit: 1, llvm: 2 }[spuDecoder]]);
+    // How much code one SPU program may cover: safe, mega or giga (RPCS3's own setting)
+    const spuBlockSize = ["safe", "mega", "giga"].includes(event.data.spuBlockSize) ? event.data.spuBlockSize : "safe";
+    module.ccall("rpcs3_web_set_spu_block_size", null, ["number"], [{ safe: 0, mega: 1, giga: 2 }[spuBlockSize]]);
     if (event.data.resolutionScalePercent) module.ccall("rpcs3_web_set_resolution_scale", null, ["number"], [Number(event.data.resolutionScalePercent) >>> 0]);
     if (typeof accurateSpuDma === "boolean") {
       module.ccall("rpcs3_web_set_accurate_spu_dma", null, ["number"], [accurateSpuDma ? 1 : 0]);

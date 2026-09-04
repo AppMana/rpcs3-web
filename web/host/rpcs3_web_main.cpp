@@ -111,6 +111,7 @@ EM_JS(int, rpcs3_web_spu_aot_worker_ready, (), { if (!self.__rpcs3SpuAotReady &&
 
 extern u32 g_rpcs3_web_clocks_scale;
 extern spu_decoder_type g_rpcs3_web_spu_decoder;
+extern spu_block_size_type g_rpcs3_web_spu_block_size;
 extern void spu_web_aot_register(const u32* pairs, u32 count);
 extern u32 g_spu_web_trace_lo;
 extern u32 g_spu_web_trace_hi;
@@ -1707,6 +1708,14 @@ extern "C"
 		// Emulator::Init() resets the config on Load and reapplies this global (System.cpp)
 		g_rpcs3_web_spu_decoder = decoder == 2 ? spu_decoder_type::llvm : decoder == 1 ? spu_decoder_type::asmjit : spu_decoder_type::_static;
 		g_cfg.core.spu_decoder.set(g_rpcs3_web_spu_decoder);
+	}
+
+	// How much code the analyser may take into one SPU program: 0 safe, 1 mega, 2 giga. Bigger
+	// programs mean fewer dispatches out of the SPU thread loop.
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_spu_block_size(u32 size)
+	{
+		g_rpcs3_web_spu_block_size = size == 2 ? spu_block_size_type::giga : size == 1 ? spu_block_size_type::mega : spu_block_size_type::safe;
+		g_cfg.core.spu_block_size.set(g_rpcs3_web_spu_block_size);
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_webgpu_set_texture_hash_per_draw(s32 enabled)

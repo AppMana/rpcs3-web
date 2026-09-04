@@ -308,6 +308,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       spuTraceRange: Array.isArray(options.spuTraceRange) ? options.spuTraceRange : undefined,
       spuFallbackHistogram: options.spuFallbackHistogram === true,
       spuDecoder: options.spuDecoder,
+      spuBlockSize: options.spuBlockSize,
       spuLlvmWorkers: options.spuLlvmWorkers,
       spuHotThreshold: options.spuHotThreshold,
       spuAot: options.spuAot === true,

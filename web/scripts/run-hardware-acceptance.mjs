@@ -73,6 +73,7 @@ const runOptions = {
   spuAotBundle: process.env.RPCS3_SPU_AOT_BUNDLE || undefined,
   spuFallbackHistogram: env.RPCS3_SPU_FALLBACK_HIST === "1",
   spuDecoder: env.RPCS3_SPU_DECODER || undefined,
+  spuBlockSize: env.RPCS3_SPU_BLOCK_SIZE || undefined,
   spuLlvmWorkers: Number(env.RPCS3_SPU_LLVM_WORKERS) || undefined,
   spuHotThreshold: Number(env.RPCS3_SPU_HOT_THRESHOLD) || undefined,
   spuWasmSelftestBase64: env.RPCS3_SPU_WASM_SELFTEST ? readFileSync(path.resolve(env.RPCS3_SPU_WASM_SELFTEST)).toString("base64") : undefined,

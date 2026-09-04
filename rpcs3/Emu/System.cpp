@@ -429,6 +429,8 @@ extern void dump_executable(std::span<const u8> data, const ppu_module<lv2_obj>*
 u32 g_rpcs3_web_clocks_scale = 10;
 // The host's SPU decoder choice (rpcs3_web_set_spu_decoder); the config default is asmjit
 spu_decoder_type g_rpcs3_web_spu_decoder = spu_decoder_type::asmjit;
+// The host's SPU block size choice (rpcs3_web_set_spu_block_size)
+spu_block_size_type g_rpcs3_web_spu_block_size = spu_block_size_type::safe;
 #endif
 
 void Emulator::Init()
@@ -502,6 +504,7 @@ void Emulator::Init()
 	// runs again on Load) must keep the override
 	g_cfg.core.clocks_scale.set(g_rpcs3_web_clocks_scale);
 	g_cfg.core.spu_decoder.set(g_rpcs3_web_spu_decoder);
+	g_cfg.core.spu_block_size.set(g_rpcs3_web_spu_block_size);
 #endif
 	g_cfg.name.clear();
 

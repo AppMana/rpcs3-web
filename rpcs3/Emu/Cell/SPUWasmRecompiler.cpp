@@ -2114,10 +2114,11 @@ extern u32 spu_web_hot_table_base()
 	return g_spu_web_hot_base.load();
 }
 
-// Dispatch loop: a hot-region candidate ran (SPUThread.cpp), counted into the calling thread's slot
-extern void spu_web_note_hot_dispatch(u32 index, u32 thread_slot)
+// Dispatch loop: a hot-region candidate ran (SPUThread.cpp), counted into the calling thread's slot.
+// This runs once per dispatched block, so the slot is the caller's — it already holds the table base
+// the whole time it is in the loop, and reloading it here was an atomic load per block.
+extern void spu_web_note_hot_dispatch(u32 slot, u32 thread_slot)
 {
-	const u32 slot = index - g_spu_web_hot_base.load();
 	auto& counts = g_spu_web_tier_counts[thread_slot % g_spu_web_tier_counts.size()];
 
 	if (slot < spu_web_hot_limit * 2 && g_spu_web_hot_kinds[slot].load())

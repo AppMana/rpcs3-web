@@ -163,7 +163,7 @@ extern void spu_web_record_miss(spu_thread& spu);
 extern bool spu_web_try_compile(spu_thread& spu);
 extern u32 spu_web_hot_count();
 extern u32 spu_web_hot_table_base();
-extern void spu_web_note_hot_dispatch(u32 index, u32 thread_slot);
+extern void spu_web_note_hot_dispatch(u32 slot, u32 thread_slot);
 static atomic_t<u32> g_spu_web_hot_skipped{0};
 extern "C" u32 rpcs3_web_spu_hot_sync();
 
@@ -1733,7 +1733,7 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 					}
 					reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(index))(&spu, spu._ptr<u8>(0), 0);
 					ran = spu.block_failure == failures + (i - skipped);
-					if (ran && index >= hot_base) spu_web_note_hot_dispatch(index, stats_slot);
+					if (ran && index >= hot_base) spu_web_note_hot_dispatch(index - hot_base, stats_slot);
 				}
 
 				spu.allow_interrupts_in_cpu_work = true;
@@ -1764,11 +1764,20 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 			}
 			else
 			{
-				// A pc the bundle has no program for: compile it once it proves hot (block starts recur)
-				if (++g_spu_web_fallback_unlisted[(spu.pc & 0x3fffc) / 4] == g_spu_web_hot_threshold.load())
+				// A pc the bundle has no program for: compile it once it proves hot (block starts recur).
+				// The count only decides that one offer, so it stops rising afterwards: this array is
+				// shared by every SPU worker, and a block that has been offered is a block the guest is
+				// entering constantly, which is a read-modify-write on a contended line per entry for a
+				// number nothing reads again.
+				auto& visits = g_spu_web_fallback_unlisted[(spu.pc & 0x3fffc) / 4];
+
+				if (visits.load() < g_spu_web_hot_threshold) [[unlikely]]
 				{
-					spu_web_try_compile(spu);
-					if (g_spu_web_fallback_histogram) spu_web_record_miss(spu);
+					if (++visits == g_spu_web_hot_threshold.load())
+					{
+						spu_web_try_compile(spu);
+						if (g_spu_web_fallback_histogram) spu_web_record_miss(spu);
+					}
 				}
 			}
 		}

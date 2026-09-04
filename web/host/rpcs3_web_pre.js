@@ -225,6 +225,10 @@ Module["rpcs3PrepareGpu"] = (canvas, flagAddress) => new Promise((resolve, rejec
   const PThread = Module["PThread"];
   const worker = PThread.unusedWorkers[PThread.unusedWorkers.length - 1];
   if (!worker) { reject(new Error("no idle pthread worker to host the GPU device")); return; }
+  // This worker holds the only WebGPU device, and a thread that is not the RSX thread must never be
+  // given it: emscripten_webgpu_get_device asserts on a worker that was never prepared. Hold it out
+  // of the pool from here, so neither the device setup below nor a saturated pool can spend it.
+  PThread.unusedWorkers.splice(PThread.unusedWorkers.indexOf(worker), 1);
   const deadline = setTimeout(() => reject(new Error("GPU worker did not answer")), 60_000);
   let sentCanvas = false;
   const onMessage = (event) => {
@@ -261,17 +265,10 @@ Module["rpcs3PrepareGpu"] = (canvas, flagAddress) => new Promise((resolve, rejec
       const flag = Module["__rpcs3RsxSpawnFlag"];
       if (gpuWorker && flag) {
         const words = new Uint32Array(Module["HEAPU8"].buffer);
-        const wantsRsx = Atomics.load(words, flag >>> 2) !== 0;
-        const index = PThread.unusedWorkers.indexOf(gpuWorker);
-        if (wantsRsx && index >= 0) {
+        if (Atomics.load(words, flag >>> 2) !== 0) {
           Atomics.store(words, flag >>> 2, 0);
-          PThread.unusedWorkers.splice(index, 1);
+          Module["__rpcs3GpuWorker"] = undefined;
           return gpuWorker;
-        }
-        if (!wantsRsx && index >= 0 && PThread.unusedWorkers.length > 1) {
-          // Keep the GPU worker for the RSX thread
-          PThread.unusedWorkers.splice(index, 1);
-          PThread.unusedWorkers.unshift(gpuWorker);
         }
       }
       return originalGetNewWorker();

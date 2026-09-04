@@ -19,7 +19,12 @@ export function broadcastAotLoad({ module, key, load, readyTimeoutMs = 60_000 })
     // Uncaught errors forwarded by the worker hook (stays registered for the worker's lifetime)
     worker.addEventListener("message", (event) => {
       const data = event.data;
-      if (data && typeof data.rpcs3WorkerError === "string") console.log(`[rpcs3 worker error] ${data.rpcs3WorkerError}`);
+      if (data && typeof data.rpcs3WorkerError === "string") {
+        console.log(`[rpcs3 worker error] ${data.rpcs3WorkerError}`);
+        // An uncaught error in a pthread worker reaches the page as an opaque ErrorEvent, so the
+        // stack the worker hook forwarded is the only account of what actually failed
+        self.postMessage({ type: "worker-error", error: data.rpcs3WorkerError.slice(0, 2000) });
+      }
     });
     const promise = new Promise((resolve) => {
       worker.addEventListener("message", function listener(event) {

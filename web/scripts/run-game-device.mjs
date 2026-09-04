@@ -128,6 +128,15 @@ async function findPage(predicate) {
 const runtimeUrl = new URL(`runtime.html?device=${Date.now()}`, origin).href;
 const initial = await findPage((page) => page.title !== "ServiceWorker" && !page.url.startsWith("safari-web-extension:"));
 let connection = await new WebKitConnection(initial.page.webSocketDebuggerUrl).open();
+// The runtime's memory is shared, so it reserves its maximum when it is created rather than as it
+// grows, and a same-origin navigation leaves the previous run's reservation in place: WebKit keeps
+// the process. A cross-origin round trip swaps the process and gives the memory back, without which
+// a second run on a device fails in the WebAssembly.Memory constructor before RPCS3 starts.
+await connection.evaluate(`location.assign("https://example.com/?rpcs3-reset=${Date.now()}")`);
+connection.close();
+await delay(4_000);
+const blanked = await findPage((page) => page.url.startsWith("https://example.com/"));
+connection = await new WebKitConnection(blanked.page.webSocketDebuggerUrl).open();
 await connection.evaluate(`location.assign(${JSON.stringify(runtimeUrl)})`);
 connection.close();
 const navigated = await findPage((page) => page.url.startsWith(new URL("runtime.html", origin).href));
@@ -140,7 +149,10 @@ for (let i = 0; i < 240; i++) {
 
 const options = {
   frames: frameCount, render: true, width, height, readback: false, directRenderer: true,
-  renderEvery: 1, timeoutMs: timeoutMs - 60_000, clockScale, spuDecoder, spuLlvmWorkers: 2,
+  renderEvery: 1, timeoutMs: timeoutMs - 60_000, clockScale, spuDecoder,
+  // Each compiler worker holds its own LLVM instance, and the device's memory ceiling is far tighter
+  // than the desktop's, so how many it can afford is a per-device answer
+  spuLlvmWorkers: Number(process.env.RPCS3_SPU_LLVM_WORKERS) || 2,
   ppuAotBundle: useAot && process.env.RPCS3_NO_PPU_AOT !== "1" ? (process.env.RPCS3_PPU_AOT_BUNDLE || "local-aot/lbp2/manifest.json") : undefined,
   spuAotBundle: useAot && process.env.RPCS3_NO_SPU_AOT !== "1" ? "local-aot/lbp2-spu/manifest.json" : undefined,
   inputTrace, captureRgba: true, keepRuntime: false,
@@ -174,14 +186,23 @@ await connection.evaluate(`(() => {
 const startedAt = Date.now();
 // Kick the run off without blocking on it, so the boot can be watched while it happens: a first
 // boot on a device downloads the ahead-of-time bundles and compiles them before a frame appears.
-await connection.evaluate(`(() => {
+// The saved result outlives the page, so a run must be able to tell its own result from the one the
+// previous run left behind: without this the reader takes the stale file on its first poll and
+// reports the previous run's outcome as this one's.
+const runId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+await connection.evaluate(`(async () => {
   window.__rpcs3DeviceState = { phase: "running" };
+  try {
+    const root = await navigator.storage.getDirectory();
+    await root.removeEntry("device-run.json");
+  } catch (error) { /* nothing saved yet */ }
   const save = async (payload) => {
     try {
+      const stamped = JSON.stringify({ ...JSON.parse(payload), runId: ${JSON.stringify(runId)} });
       const root = await navigator.storage.getDirectory();
       const handle = await root.getFileHandle("device-run.json", { create: true });
       const writable = await handle.createWritable();
-      await writable.write(payload);
+      await writable.write(stamped);
       await writable.close();
     } catch (error) { /* the reader falls back to the live page */ }
   };
@@ -193,7 +214,8 @@ await connection.evaluate(`(() => {
       return value;
     })
     .catch(async (error) => {
-      const message = String((error && error.message) || error).slice(0, 600);
+      // A failure carries the events that led to it, and the ones that say why are the last
+      const message = String((error && error.message) || error).slice(0, 8000);
       window.__rpcs3DeviceState = { phase: "failed", error: message };
       await save(JSON.stringify({ ok: false, detail: "RUN FAILED " + message }));
       throw error;
@@ -218,8 +240,10 @@ for (let tick = 0; tick * 10_000 < timeoutMs; tick++) {
       return JSON.stringify({ phase: window.__rpcs3DeviceState?.phase ?? "gone", saved });
     })()`, true);
     const parsedState = JSON.parse(state);
-    process.stderr.write(`[${new Date().toISOString().slice(11, 19)}] ${parsedState.phase} saved=${parsedState.saved.length}\n`);
-    if (parsedState.saved) { result = parsedState.saved; break; }
+    const savedRunId = parsedState.saved ? JSON.parse(parsedState.saved).runId : undefined;
+    const mine = savedRunId === runId;
+    process.stderr.write(`[${new Date().toISOString().slice(11, 19)}] ${parsedState.phase} saved=${parsedState.saved.length}${parsedState.saved && !mine ? " (an earlier run's, ignored)" : ""}\n`);
+    if (parsedState.saved && mine) { result = parsedState.saved; break; }
   } catch (error) {
     process.stderr.write(`[${new Date().toISOString().slice(11, 19)}] connection lost: ${String(error.message).slice(0, 80)}\n`);
     try { connection?.close(); } catch (_) {}

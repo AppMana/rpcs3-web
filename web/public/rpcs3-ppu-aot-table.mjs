@@ -133,9 +133,42 @@ export async function loadPpuAotBundle({ module, mainInstance, mainMemory, manif
   };
 
   log(`PPU AOT bundle: layout ${parts.length} parts at table ${tableBase}+${load.tableSize}`);
-  // This worker's own table first: the linker's element segments place the blocks, and the block
-  // tables (relocated to absolute indices) give RPCS3 its (guest address, index) pairs.
   const populateStartedAt = performance.now();
+  // A bundle that carries its blocks in the manifest is registered without instantiating anything
+  // here: this thread runs no PPU thread, and instantiating every part costs a function reference
+  // per table entry, which a phone does not have room for. Workers still populate their own tables
+  // when a PPU thread first runs on them.
+  const prebuilt = descriptors.every((part) => typeof part.blocks === "string");
+  if (prebuilt) {
+    const pairs = [];
+    for (let position = 0; position < descriptors.length; position += 1) {
+      const relative = new Uint32Array(Uint8Array.from(atob(descriptors[position].blocks), (c) => c.charCodeAt(0)).buffer);
+      const elemBase = load.parts[position].elemBase;
+      for (let entry = 0; entry < relative.length; entry += 2) {
+        pairs.push(relative[entry], elemBase + relative[entry + 1]);
+      }
+    }
+    if (!pairs.length) throw new Error("PPU AOT bundle has no blocks");
+    const pairBytes = module._malloc(pairs.length * 4) >>> 0;
+    new Uint32Array(mainMemory.buffer, pairBytes, pairs.length).set(pairs);
+    module.ccall("rpcs3_web_ppu_aot_register_many", null, ["number", "number"], [pairBytes, pairs.length / 2]);
+    module._free(pairBytes);
+    const registerMs = performance.now() - populateStartedAt;
+    log(`PPU AOT bundle: registered ${pairs.length / 2} blocks from the manifest in ${Math.round(registerMs)} ms`);
+    const { broadcastAotLoad } = await import("./rpcs3-aot-workers.mjs");
+    const ready = await broadcastAotLoad({ module, key: "rpcs3PpuAot", load, readyTimeoutMs });
+    log(`PPU AOT bundle: ${ready.workersReady} workers acknowledged, ${ready.errors.length} errors`);
+    if (ready.errors.length) throw new Error(`PPU AOT worker population failed: ${ready.errors[0]}`);
+    return {
+      parts: parts.length, blocks: pairs.length / 2, tableBase, tableSize: load.tableSize,
+      bindings: load.bindings, compileMs, populateMs: registerMs, prebuilt: true,
+      idleWorkersReady: ready.idleWorkersReady, idleWorkers: ready.idleWorkers,
+      workersReady: ready.workersReady, workersSent: ready.workersSent,
+      skippedRelocatable: manifest.parts.length - descriptors.length,
+      totalMs: performance.now() - startedAt,
+    };
+  }
+  // Older bundles carry no block lists, so this thread instantiates to read them out.
   const placed = module.rpcs3PopulatePpuAot(load);
   const pairs = [];
   // Read through the live memory: growth during population would leave a cached view stale.

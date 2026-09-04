@@ -37,15 +37,68 @@ async function mapConcurrent(items, limit, worker) {
 }
 
 const startedAt = Date.now();
-// Absolute (EBOOT) parts link into one module so cross-part block calls resolve directly and each worker
-// instantiates one module; relocatable (PRX) parts keep one module per PRX until seg0 dispatch exists.
+// Relocatable (PRX) parts keep one module per PRX until seg0 dispatch exists. The absolute (EBOOT)
+// parts used to link into a single module so cross-part block calls could resolve directly, but a
+// title's EBOOT reaches a size no browser will compile (LittleBigPlanet 2's is 156 MB, and Mobile
+// Safari does not finish compiling it), so they are split into groups. --eboot-parts=N sets how
+// many; the manifest records the guest imports each group ends up with, which is what tells you
+// whether a split cut a direct call.
+const ebootGroupsOption = options.find((option) => option.startsWith("--eboot-parts="));
+const ebootGroups = Math.max(1, Number(ebootGroupsOption?.slice("--eboot-parts=".length)) || 1);
 const groups = new Map();
+const ebootSources = [];
 for (const source of sources) {
   const module = source.slice(0, source.indexOf("-"));
-  const key = module.startsWith("EBOOT") ? "EBOOT" : module;
-  if (!groups.has(key)) groups.set(key, []);
-  groups.get(key).push(source);
+  if (module.startsWith("EBOOT")) { ebootSources.push(source); continue; }
+  if (!groups.has(module)) groups.set(module, []);
+  groups.get(module).push(source);
 }
+if (ebootSources.length) {
+  const perGroup = Math.ceil(ebootSources.length / ebootGroups);
+  for (let index = 0, group = 0; index < ebootSources.length; index += perGroup, group += 1) {
+    const name = ebootGroups === 1 ? "EBOOT" : `EBOOT-${String(group).padStart(2, "0")}`;
+    groups.set(name, ebootSources.slice(index, index + perGroup));
+  }
+}
+// The (guest address, table index) pairs a part contributes. The runtime used to get these by
+// instantiating every part on its module thread, which costs a function reference per table entry
+// and is what a phone runs out of room for; extracting them here lets that thread register the
+// blocks without instantiating anything, and leaves instantiation to the workers that run PPU
+// threads, which already do it lazily. Indices are relative to the part's element base, which only
+// the runtime knows.
+async function extractBlocks(compiled) {
+  const memory = new WebAssembly.Memory({ initial: 512, maximum: 32768, shared: true });
+  const table = new WebAssembly.Table({ initial: 1 << 16, element: "anyfunc" });
+  const memoryBase = 1 << 16;
+  const env = {
+    memory,
+    __indirect_function_table: table,
+    __memory_base: new WebAssembly.Global({ value: "i32", mutable: false }, memoryBase),
+    __table_base: new WebAssembly.Global({ value: "i32", mutable: false }, 0),
+    __stack_pointer: new WebAssembly.Global({ value: "i32", mutable: true }, 1 << 24),
+  };
+  for (const imported of WebAssembly.Module.imports(compiled)) {
+    if (imported.module !== "env" || imported.name in env) continue;
+    if (imported.kind === "function") env[imported.name] = () => 0;
+    else if (imported.kind === "global") env[imported.name] = new WebAssembly.Global({ value: "i32", mutable: false }, 0);
+  }
+  const instance = new WebAssembly.Instance(compiled, { env });
+  if (typeof instance.exports.__wasm_apply_data_relocs === "function") instance.exports.__wasm_apply_data_relocs();
+  const heap = new Uint32Array(memory.buffer);
+  const blocks = [];
+  for (const [name, value] of Object.entries(instance.exports)) {
+    if (!name.startsWith("__ppu_blocks_") || !(value instanceof WebAssembly.Global)) continue;
+    const indexOf = instance.exports[`__ppu_block_index_${name.slice("__ppu_blocks_".length)}`];
+    if (typeof indexOf !== "function") throw new Error(`${name} has no index function`);
+    const address = (memoryBase + (value.value >>> 0)) >>> 0;
+    const count = heap[address >>> 2];
+    for (let entry = 0; entry < count; entry += 1) {
+      blocks.push(heap[(address >>> 2) + 1 + entry] >>> 0, indexOf(entry) >>> 0);
+    }
+  }
+  return blocks;
+}
+
 async function describe(wasmPath, group, members) {
   const bytes = readFileSync(wasmPath);
   const compiled = await WebAssembly.compile(bytes);
@@ -54,13 +107,14 @@ async function describe(wasmPath, group, members) {
   return {
     url: basename(wasmPath),
     module: group,
-    relocatable: group !== "EBOOT",
+    relocatable: !group.startsWith("EBOOT"),
     parts: members.length,
     bytes: bytes.byteLength,
     irBytes: members.reduce((sum, member) => sum + statSync(join(inputDirectory, member)).size, 0),
     blockTables,
     guestImports,
     sha256: createHash("sha256").update(bytes).digest("hex"),
+    blocks: Buffer.from(new Uint32Array(await extractBlocks(compiled)).buffer).toString("base64"),
   };
 }
 const parts = [];

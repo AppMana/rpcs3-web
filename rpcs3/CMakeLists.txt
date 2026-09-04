@@ -185,10 +185,10 @@ if(RPCS3_WEB)
 			"-sEXPORT_NAME=createRPCS3SpuLlvm"
 			"-sENVIRONMENT=worker"
 			# A shared memory reserves its maximum when it is created, not when it grows, so each
-			# compiler worker costs its maximum in address space for as long as it exists. Two of
-			# them at the runtime's own 2 GiB maximum overruns what Mobile Safari will hand out,
-			# and the WebAssembly.Memory constructor throws before LLVM ever starts.
-			"-sMAXIMUM_MEMORY=805306368"
+			# compiler worker costs its maximum in address space for as long as it exists, and a
+			# device hands out only a few gigabytes in total. The pool reports the heap a worker
+			# actually reaches (peakHeapBytes); this is that measurement with one doubling of room.
+			"-sMAXIMUM_MEMORY=536870912"
 			"-sINITIAL_MEMORY=268435456"
 			"-sALLOW_MEMORY_GROWTH=1"
 			"-sSTACK_SIZE=16777216"

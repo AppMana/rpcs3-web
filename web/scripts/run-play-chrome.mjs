@@ -90,6 +90,14 @@ try {
     if (status.state === "failed") break;
   }
 
+  // The page records every pad state against the flip it belongs to, so a session played here is a
+  // trace: this is how a run of the actual game — not its intro — gets replayed under a profiler.
+  const inputTrace = await page.evaluate(() => window.__rpcs3Playable?.exportInputTrace()).catch(() => null);
+  if (inputTrace?.entries?.length) {
+    await writeFile("play-chrome-trace.json", `${JSON.stringify(inputTrace)}\n`);
+    process.stdout.write(`\ninput trace: ${inputTrace.entries.length} entries through flip ${inputTrace.flipCounter}\n`);
+  }
+
   // RPCS3's own log says what the emulator thought was wrong, which a page-level error never does
   const emulatorLog = await page.evaluate(async () => {
     try {

@@ -1,4 +1,5 @@
 import { readGamepad, samePadState } from "./rpcs3-gamepad.mjs";
+import { supportsSuspending } from "./rpcs3-suspending.mjs";
 
 const Digital1 = Object.freeze({ select: 0x01, start: 0x08, up: 0x10, right: 0x20, down: 0x40, left: 0x80 });
 const Digital2 = Object.freeze({ l2: 0x01, r2: 0x02, l1: 0x04, r1: 0x08, triangle: 0x10, circle: 0x20, cross: 0x40, square: 0x80 });
@@ -15,9 +16,8 @@ const search = new URLSearchParams(location.search);
 const bootPath = search.get("boot");
 const keys = new Set();
 const touches = new Map();
-// The RSX thread renders into an OffscreenCanvas and hands back one ImageBitmap per flip; this
-// canvas only displays it.
-const directView = canvas.getContext("bitmaprenderer");
+let directView;
+let suspending = false;
 let lastPadState;
 let worker;
 let stopped = false;
@@ -99,13 +99,24 @@ async function start() {
   if (worker) return;
   stopped = false;
   presentedFrames = 0;
-  const directCanvas = new OffscreenCanvas(canvas.width, canvas.height);
+  // With a suspending core the RSX thread yields between flips, so it can render into the displayed
+  // canvas itself and the frame never crosses back to this page. Without one it renders into a
+  // canvas of its own and hands each frame over as an ImageBitmap, which this page displays.
+  suspending = await supportsSuspending();
+  const directCanvas = suspending
+    ? canvas.transferControlToOffscreen()
+    : new OffscreenCanvas(canvas.width, canvas.height);
+  if (!suspending) directView = canvas.getContext("bitmaprenderer");
   worker = new Worker("./runtime-smoke-worker.mjs", { type: "module" });
   worker.addEventListener("message", (event) => {
     if (stopped) return;
     if (event.data?.type === "runtime-present") {
       presentedFrames += 1;
-      directView.transferFromImageBitmap(event.data.bitmap);
+      directView?.transferFromImageBitmap(event.data.bitmap);
+      return;
+    }
+    if (event.data?.type === "runtime-presented") {
+      presentedFrames += 1;
       return;
     }
     if (event.data?.type !== "runtime-result" && event.data?.type !== "runtime-frame") return;
@@ -133,6 +144,9 @@ async function start() {
     ...(bootPath ? { path: bootPath } : { fixture: "fixtures/gs_gcm_tetris.elf" }),
     directRenderer: true,
     gpuCanvas: directCanvas,
+    // The core has to match the canvas: only a suspending one lets the RSX thread yield, which is
+    // what a transferred canvas needs before it will present.
+    coreUrl: suspending ? "./core/jspi/rpcs3-web.mjs" : undefined,
     // The flip packet is what marks a frame; discardPackets drops the per-draw payloads with it
     returnPackets: true,
     discardPackets: true,

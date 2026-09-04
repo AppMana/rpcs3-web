@@ -247,6 +247,9 @@ Module["rpcs3PrepareGpu"] = (canvas, flagAddress) => new Promise((resolve, rejec
       reject(new Error(data.rpcs3GpuError));
     } else if (data.rpcs3Present && Module["rpcs3OnPresent"]) {
       Module["rpcs3OnPresent"](data);
+    } else if (data.rpcs3Presented !== undefined && Module["rpcs3OnPresented"]) {
+      // A transferred canvas presents itself; this only reports that a frame went out
+      Module["rpcs3OnPresented"](data.rpcs3Presented);
     }
   };
   worker.addEventListener("message", onMessage);

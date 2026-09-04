@@ -33,10 +33,11 @@ const context = await chromium.launchPersistentContext(profilePath, {
 
 try {
   const page = context.pages()[0] ?? await context.newPage();
+  const verbose = env.RPCS3_VERBOSE === "1";
   page.on("console", (message) => {
-    if (message.type() === "error") process.stderr.write(`[error] ${message.text()}\n`);
+    if (verbose || message.type() === "error") process.stderr.write(`[${message.type()}] ${message.text()}\n`);
   });
-  page.on("pageerror", (error) => process.stderr.write(`[pageerror] ${error.message}\n`));
+  page.on("pageerror", (error) => process.stderr.write(`[pageerror] ${error.message}\n${error.stack ?? ""}\n`));
 
   // The page boots as soon as it loads, and the RSX worker asks for its own adapter, so the GPU
   // process has to be up before that: probe from a page that is not the one under test.

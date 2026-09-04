@@ -544,7 +544,7 @@ scope.addEventListener("message", async (event) => {
       spuDispatcher?.release();
       spuDispatcher = undefined;
       const stopStartedAt = performance.now();
-      module?.ccall("rpcs3_web_stop", null, [], []);
+      await module?.ccall("rpcs3_web_stop", null, [], []);
       // Emu.Kill is asynchronous. Wait (without blocking this event-loop
       // thread) for RPCS3's threads to exit cooperatively: they record their
       // stack high-water marks on the way out, and a clean exit is what lets
@@ -689,12 +689,15 @@ scope.addEventListener("message", async (event) => {
       module.ccall("rpcs3_web_set_direct_renderer", null, ["number"], [1]);
       const flagAddress = module.ccall("rpcs3_web_rsx_spawn_flag_address", "number", [], []) >>> 0;
       module.rpcs3OnPresent = (data) => scope.postMessage({ type: "runtime-present", frame: data.frame, bitmap: data.rpcs3Present }, [data.rpcs3Present]);
+      module.rpcs3OnPresented = (frame) => scope.postMessage({ type: "runtime-presented", frame });
       if (!module.__rpcs3GpuWorker) {
         directGpu = await module.rpcs3PrepareGpu(event.data.gpuCanvas, flagAddress);
         recordLog(`direct WebGPU device ready on a pool worker: ${JSON.stringify(directGpu)}`);
       }
     }
-    initialized = module.ccall("rpcs3_web_init", "number", [], []);
+    // A suspending core's file-touching entry points return a promise, because the file system they
+    // reach suspends the calling stack rather than blocking it.
+    initialized = await module.ccall("rpcs3_web_init", "number", [], []);
     sparseVmProbe = module.ccall("rpcs3_web_sparse_vm_probe", "number", [], []);
     module.ccall("rpcs3_webgpu_set_capture_level", null, ["number"], [Number(event.data.packetCaptureLevel ?? 4)]);
     if (clockScale) module.ccall("rpcs3_web_set_clock_scale", null, ["number"], [clockScale]);
@@ -776,7 +779,7 @@ scope.addEventListener("message", async (event) => {
     if (spuAotWasm) module.ccall("rpcs3_web_set_spu_aot_handoff", null, ["number"], [1]);
     if (event.data.path) fixtureBytes = Number(module.FS.stat(path).size);
     applyPadState(event.data.pad);
-    bootResult = module.ccall("rpcs3_web_boot", "number", ["string"], [path]);
+    bootResult = await module.ccall("rpcs3_web_boot", "number", ["string"], [path]);
     if (aotWasm) {
       ppuDispatcher = createPpuDispatcher({
         module,

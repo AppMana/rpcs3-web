@@ -291,15 +291,25 @@ EM_JS(u32, rpcs3_web_direct_canvas_size, (), {
 	return canvas ? (((canvas.width & 0xffff) << 16) | (canvas.height & 0xffff)) >>> 0 : 0;
 });
 
-// Hands the frame rendered into the canvas to the page. transferToImageBitmap is synchronous
-// and resets the canvas, so the next wgpuSurfaceGetCurrentTexture starts a new frame without
-// this thread returning to its event loop.
+#ifdef RPCS3_WEB_JSPI
+// A canvas whose control the page transferred presents what was drawn into it when this worker's
+// event loop turns, so the frame is released by suspending here rather than by copying it out.
+EM_ASYNC_JS(void, rpcs3_web_direct_present, (u32 frame), {
+	if (!self.__rpcs3GpuCanvas) return;
+	self.postMessage({ rpcs3Presented: frame });
+	await new Promise((resolve) => setTimeout(resolve, 0));
+});
+#else
+// Without a suspending stack this thread never returns to its event loop, so the canvas would never
+// present. transferToImageBitmap is synchronous and resets the canvas, which releases the frame and
+// starts the next one in place; the page displays it through a bitmaprenderer context.
 EM_JS(void, rpcs3_web_direct_present, (u32 frame), {
 	const canvas = self.__rpcs3GpuCanvas;
 	if (!canvas) return;
 	const bitmap = canvas.transferToImageBitmap();
 	self.postMessage({ rpcs3Present: bitmap, frame: frame }, [bitmap]);
 });
+#endif
 
 // RSX program pair to WGSL through the browser-side translator the worker imported
 // (rpcs3-webgpu-renderer.mjs translateRsxProgram). Returns a malloc'd string:

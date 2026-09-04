@@ -100,6 +100,18 @@ if(RPCS3_WEB)
 	# store of a wall-clock seconds value lands at wasm address 0 during LBP2 (harmless: static
 	# data starts at GLOBAL_BASE), and the probe aborts the runtime at the next thread exit.
 	target_link_options(rpcs3_web_runtime PRIVATE "-sASSERTIONS=1" "-sSTACK_OVERFLOW_CHECK=0")
+	if(RPCS3_WEB_JSPI)
+		# Emscripten calls a pthread entry point through a promising dyncall under this setting, so a
+		# guest thread's stack can suspend at an EM_ASYNC_JS call and resume where it left off.
+		# Proxied work runs off the thread mailbox, and WASMFS's OPFS backend suspends inside it, so
+		# that entry point has to be able to suspend too or the stack it runs on cannot.
+		# An export that can reach a suspending import has to be able to suspend itself. Proxied work
+		# runs off the thread mailbox, and every entry point below reaches the file system, which
+		# suspends under this setting. Such an export returns a promise, so its callers await it.
+		target_link_options(rpcs3_web_runtime PRIVATE "-sJSPI"
+			"-sJSPI_EXPORTS=_emscripten_check_mailbox,rpcs3_web_init,rpcs3_web_boot,rpcs3_web_stop"
+			"-g1" "--profiling-funcs")
+	endif()
 	if(RPCS3_WEB_PROFILE)
 		target_link_options(rpcs3_web_runtime PRIVATE
 			"-g1"

@@ -64,6 +64,7 @@ option(BUILD_RPCS3_TESTS "Build RPCS3 unit tests." OFF)
 option(RUN_RPCS3_TESTS "Run RPCS3 unit tests. Requires BUILD_RPCS3_TESTS" OFF)
 option(USE_GAMEMODE "Choose whether to enable GameMode features or not." ON)
 option(RPCS3_WEB "Build the full RPCS3 emulation core with browser host backends." OFF)
+option(RPCS3_WEB_JSPI "Let browser guest threads suspend, through JavaScript Promise Integration." OFF)
 option(RPCS3_WEB_PROBE "Build the standalone browser capability probe." OFF)
 option(RPCS3_PORTABLE_SPU_INTERPRETER "Use the portable SPU interpreter dispatch path for native differential validation." OFF)
 
@@ -82,6 +83,17 @@ if(RPCS3_WEB)
     endif()
 
     add_compile_definitions(RPCS3_WEB=1)
+    # A guest thread runs on its worker's only JS stack, so it can never await. JSPI lets that stack
+    # suspend, which is what a canvas needs before it will present a frame from a worker.
+    #
+    # A stack carrying JavaScript frames cannot be suspended, and Emscripten's default exceptions and
+    # longjmp reach their handlers through JS trampolines, which puts such a frame in the middle of
+    # ordinary emulator call chains. The suspending build therefore handles both in WebAssembly.
+    if(RPCS3_WEB_JSPI)
+        add_compile_definitions(RPCS3_WEB_JSPI=1)
+        add_compile_options(-fwasm-exceptions)
+        add_link_options(-fwasm-exceptions -sSUPPORT_LONGJMP=wasm)
+    endif()
     set(WITH_LLVM OFF CACHE BOOL "LLVM JIT is unavailable in the browser" FORCE)
     set(BUILD_LLVM OFF CACHE BOOL "LLVM JIT is unavailable in the browser" FORCE)
     set(USE_VULKAN OFF CACHE BOOL "Use the WebGPU RSX backend" FORCE)

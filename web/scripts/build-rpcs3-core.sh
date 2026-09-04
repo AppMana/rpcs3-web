@@ -31,10 +31,20 @@ fi
 # RPCS3_WEB_PROFILE=1 builds the symbolized profiling variant into a separate
 # build tree and stages it under web/public/core/profile/. The default build is
 # the stripped runtime that the iPad and the acceptance lanes use.
+# RPCS3_WEB_JSPI=1 builds the variant whose guest threads can suspend, staged under
+# web/public/core/jspi/. The page probes for JavaScript Promise Integration and loads it when the
+# browser has it, falling back to the core beside it.
+jspi_flag=OFF
 if [[ "${RPCS3_WEB_PROFILE:-0}" == "1" ]]; then
   build_dir="${repo_root}/build-rpcs3-web-profile"
   stage_dir="${repo_root}/web/public/core/profile"
   profile_flag=ON
+  targets=(rpcs3_web_runtime)
+elif [[ "${RPCS3_WEB_JSPI:-0}" == "1" ]]; then
+  build_dir="${repo_root}/build-rpcs3-web-jspi"
+  stage_dir="${repo_root}/web/public/core/jspi"
+  profile_flag=OFF
+  jspi_flag=ON
   targets=(rpcs3_web_runtime)
 else
   build_dir="${repo_root}/build-rpcs3-web"
@@ -73,12 +83,14 @@ fi
 if [[ ! -f "${build_dir}/build.ninja" \
    || "$(cache_value RPCS3_WEB_LLVM_DIR)" != "${llvm_dir}" \
    || "$(cache_value RPCS3_WEB_FAST_LINK)" != "${fast_link}" \
-   || "$(cache_value RPCS3_WEB_PROFILE)" != "${profile_flag}" ]]; then
+   || "$(cache_value RPCS3_WEB_PROFILE)" != "${profile_flag}" \
+   || "$(cache_value RPCS3_WEB_JSPI)" != "${jspi_flag}" ]]; then
   # No C++ modules here: the Ninja generator's module dependency scan (emscan-deps) fails on the
   # emdawnwebgpu port headers and would only add a pass over every source
   emcmake cmake -S "${repo_root}" -B "${build_dir}" -G Ninja \
     -DRPCS3_WEB=ON \
     -DRPCS3_WEB_PROFILE="${profile_flag}" \
+    -DRPCS3_WEB_JSPI="${jspi_flag}" \
     -DRPCS3_WEB_LLVM_DIR="${llvm_dir}" \
     -DRPCS3_WEB_FAST_LINK="${fast_link}" \
     -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
@@ -96,7 +108,7 @@ stage() {
 }
 stage rpcs3-web.mjs
 stage rpcs3-web.wasm
-if [[ "${profile_flag}" == "OFF" ]]; then
+if [[ "${profile_flag}" == "OFF" && "${jspi_flag}" == "OFF" ]]; then
   stage rpcs3-web-units.mjs
   stage rpcs3-web-units.wasm
 fi

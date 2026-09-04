@@ -96,6 +96,10 @@ ctest --test-dir build-web-native --output-on-failure -R webgpu
 
 ### Ahead-of-time bundles
 
+`scripts/build-partial-ppu-bundle.mjs` makes a bundle that registers every Nth block of a module it
+already has, which is what puts a bundle block and a runtime-tier block on the same hot path; the
+browser test for the two together needs one.
+
 `npm run ppu:aot:bundle` and `npm run spu:aot:bundle` turn directories of LLVM IR dumped by native
 RPCS3 into the wasm side modules the runtime loads before boot. They are inputs to commercial runs
 rather than part of a normal build, and are rebuilt only when new programs are dumped.

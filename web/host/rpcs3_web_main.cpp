@@ -131,6 +131,7 @@ extern u32 web_hot_table_limit();
 extern u32 web_hot_table_base();
 extern void ppu_web_jit_set_enabled(bool enabled);
 extern void ppu_web_jit_set_threshold(u32 misses);
+extern void ppu_web_jit_set_capacity(u32 entries);
 extern s32 ppu_web_jit_poll();
 extern u32 ppu_web_jit_slot_addr(u32 i);
 extern u32 ppu_web_jit_slot_size(u32 i);
@@ -1221,6 +1222,14 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_llvm_set_threshold(u32 misses)
 	{
 		ppu_web_jit_set_threshold(misses);
+	}
+
+	// Function table entries the tier may claim above the bundles. Every worker running a PPU thread
+	// reserves the whole span, so it is a per-worker cost; a run that fills it leaves the rest
+	// interpreted. Applied before boot.
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_llvm_set_capacity(u32 entries)
+	{
+		ppu_web_jit_set_capacity(entries);
 	}
 
 	EMSCRIPTEN_KEEPALIVE s32 rpcs3_web_ppu_llvm_poll()

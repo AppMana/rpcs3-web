@@ -314,6 +314,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       ppuProfile: options.ppuProfile === true,
       ppuJit: options.ppuJit === true,
       ppuJitThreshold: options.ppuJitThreshold,
+      ppuJitCapacity: options.ppuJitCapacity,
       spuBlockSize: options.spuBlockSize,
       spuLlvmWorkers: options.spuLlvmWorkers,
       spuHotThreshold: options.spuHotThreshold,

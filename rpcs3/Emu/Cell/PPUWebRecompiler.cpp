@@ -32,12 +32,19 @@ namespace
 // A PPU block reaches another through the function table, so an index a worker's table does not
 // hold yet would trap inside compiled code. Every worker that runs a PPU thread therefore reserves
 // this whole span up front and fills it with a stub that returns to the interpreter, and the tier
-// registers nothing outside it.
-constexpr u32 web_hot_table_capacity = 65536;
+// registers nothing outside it. The span is a per-worker cost, so how many entries it is worth is a
+// property of the run rather than of the port; a run that fills it leaves the rest interpreted.
+atomic_t<u32> g_web_hot_table_capacity{65536};
+
+extern void web_hot_table_set_capacity(u32 entries)
+{
+	g_web_hot_table_capacity = entries ? entries : 65536;
+}
 
 extern u32 web_hot_table_limit()
 {
-	return g_web_hot_table_base.load() + web_hot_table_capacity;
+	const u32 base = g_web_hot_table_base.load();
+	return base ? base + g_web_hot_table_capacity : 0;
 }
 
 extern void web_hot_table_set_base(u32 base)
@@ -67,7 +74,7 @@ EM_JS(u32, rpcs3_web_ppu_hot_sync, (), {
 	return rpcs3PpuHotSyncImpl() >>> 0;
 });
 
-extern void ppu_web_aot_register(const u32* pairs, u32 count);
+extern void ppu_web_jit_publish(u32 addr, u32 table_index);
 extern void ppu_web_jit_mark_entry(u32 addr);
 extern u32 g_ppu_web_jit_threshold;
 extern atomic_t<u64> g_ppu_web_aot_dispatch_count;
@@ -131,17 +138,29 @@ namespace
 	std::mutex g_ppu_web_jit_queue_mutex;
 	std::deque<u32> g_ppu_web_jit_queue;
 
+	// A guest reaches the threshold far faster than the compiler workers drain the queue, so an
+	// unbounded queue grows without ever being served. A block dropped here is still interpreted and
+	// still hot, so it is offered again; the bound keeps the backlog to work the workers can reach.
+	constexpr u32 web_jit_queue_limit = 256;
+	atomic_t<u32> g_ppu_web_jit_dropped{0};
+
 	std::string g_ppu_web_jit_error;
 }
 
 static void ppu_web_jit_start();
 
 // Guest thread: the block at this address passed the miss threshold and is not compiled yet
-extern void ppu_web_jit_enqueue(u32 addr)
+extern bool ppu_web_jit_enqueue(u32 addr)
 {
 	std::lock_guard lock(g_ppu_web_jit_queue_mutex);
+	if (g_ppu_web_jit_queue.size() >= web_jit_queue_limit)
+	{
+		g_ppu_web_jit_dropped++;
+		return false;
+	}
 	g_ppu_web_jit_queue.push_back(addr);
 	g_ppu_web_jit_queued++;
+	return true;
 }
 
 extern u32 ppu_web_jit_enabled()
@@ -250,13 +269,23 @@ extern void ppu_web_jit_slot_finish(u32 i, u8* bytes, u32 size, u32 memory_size,
 // Registers a compiled side module as the block's dispatch entry; returns its function table index
 static u32 ppu_web_jit_register(const ppu_web_jit_request& slot)
 {
+	// Nothing may be registered outside the span the workers reserve, and there is no span until the
+	// host has installed its base
+	if (!web_hot_table_limit())
+	{
+		g_ppu_web_jit_refused++;
+		return 0;
+	}
+
 	std::vector<u8> module(slot.result, slot.result + slot.result_size);
 	u32 memory_base = 0;
+
+	uptr allocation = 0;
 
 	if (slot.memory_size)
 	{
 		const u32 align = std::max<u32>(16, 1u << std::min<u32>(slot.memory_align, 16)); // dylink.0 carries log2
-		const auto allocation = reinterpret_cast<uptr>(std::malloc(slot.memory_size + align));
+		allocation = reinterpret_cast<uptr>(std::malloc(slot.memory_size + align));
 		memory_base = static_cast<u32>((allocation + align - 1) & ~uptr{align - 1});
 		std::memset(reinterpret_cast<void*>(static_cast<uptr>(memory_base)), 0, slot.memory_size);
 	}
@@ -271,7 +300,9 @@ static u32 ppu_web_jit_register(const ppu_web_jit_request& slot)
 
 		if (index >= web_hot_table_limit())
 		{
+			// The span is full: this block stays on the interpreter, and so does every later one
 			g_ppu_web_jit_refused++;
+			std::free(reinterpret_cast<void*>(static_cast<uptr>(allocation)));
 			return 0;
 		}
 
@@ -282,8 +313,7 @@ static u32 ppu_web_jit_register(const ppu_web_jit_request& slot)
 	g_ppu_web_jit_compiled++;
 	g_ppu_web_jit_bytes += slot.result_size;
 
-	const u32 pair[2] = { slot.addr, index };
-	ppu_web_aot_register(pair, 1);
+	ppu_web_jit_publish(slot.addr, index);
 	return index;
 }
 
@@ -484,6 +514,13 @@ extern void ppu_web_jit_set_enabled(bool enabled)
 	ppu_web_jit_start();
 }
 
+extern void web_hot_table_set_capacity(u32 entries);
+
+extern void ppu_web_jit_set_capacity(u32 entries)
+{
+	web_hot_table_set_capacity(entries);
+}
+
 extern void ppu_web_jit_set_threshold(u32 misses)
 {
 	g_ppu_web_jit_threshold = misses ? misses : 64;
@@ -501,12 +538,12 @@ extern std::string ppu_web_jit_report()
 	return fmt::format(
 		"{\"enabled\":%u,\"threshold\":%u,\"compilable\":%u,\"requested\":%u,\"pending\":%s,\"registered\":%u,\"failed\":%u,\"refused\":%u,"
 		"\"bytes\":%u,\"compileMs\":%u,\"tableBase\":%u,\"dispatches\":%u,\"blocksUsed\":%u,"
-		"\"unplaced\":%u,\"syncs\":%u}",
+		"\"unplaced\":%u,\"syncs\":%u,\"capacity\":%u,\"dropped\":%u}",
 		+g_ppu_web_jit_enabled, g_ppu_web_jit_threshold, ::size32(g_ppu_web_jit_funcs), +g_ppu_web_jit_queued, queued,
 		::size32(g_ppu_web_jit_entries), +g_ppu_web_jit_failed, +g_ppu_web_jit_refused, +g_ppu_web_jit_bytes,
 		static_cast<u32>(g_ppu_web_jit_compile_us / 1000), web_hot_table_base(),
 		static_cast<u32>(g_ppu_web_aot_dispatch_count.load()), static_cast<u32>(ppu_web_blocks_used()),
-		+g_ppu_web_jit_unplaced, +g_ppu_web_jit_syncs);
+		+g_ppu_web_jit_unplaced, +g_ppu_web_jit_syncs, +g_web_hot_table_capacity, +g_ppu_web_jit_dropped);
 }
 
 #endif // RPCS3_WEB

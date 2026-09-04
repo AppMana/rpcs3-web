@@ -17,7 +17,7 @@
 //   RPCS3_PACKET_CAPTURE_LEVEL=0..5   RPCS3_POOL_SIZE=12   RPCS3_CORE=release|profile|jspi
 //   RPCS3_PACKET_FIXTURE=/path/frame.wgpf.gz   RPCS3_CAPTURE_RGBA=1   RPCS3_CAPTURE_SHADERS=1
 //   RPCS3_CPU_PROFILE=/path/run.cpuprofile   RPCS3_CPU_INTERVAL_US=10000   RPCS3_TRACE=/path/trace.json
-//   RPCS3_PPU_JIT=1   RPCS3_PPU_JIT_THRESHOLD=64
+//   RPCS3_PPU_JIT=1   RPCS3_PPU_JIT_THRESHOLD=64   RPCS3_PPU_JIT_CAPACITY=65536
 //   RPCS3_WATCH_ADDRESS / RPCS3_TRACE_PC / RPCS3_TRACE_DELAY_PC / RPCS3_TRACE_DELAY_MS / RPCS3_DEBUG_ADDRESSES=a,b
 //   RPCS3_INPUT_TRACE=/path/trace.json   frame-indexed pad states recorded on play.html
 import { readFileSync } from "node:fs";
@@ -77,6 +77,7 @@ const runOptions = {
   ppuProfile: env.RPCS3_PPU_PROFILE === "1",
   ppuJit: env.RPCS3_PPU_JIT === "1",
   ppuJitThreshold: Number(env.RPCS3_PPU_JIT_THRESHOLD) || undefined,
+  ppuJitCapacity: Number(env.RPCS3_PPU_JIT_CAPACITY) || undefined,
   spuBlockSize: env.RPCS3_SPU_BLOCK_SIZE || undefined,
   spuLlvmWorkers: Number(env.RPCS3_SPU_LLVM_WORKERS) || undefined,
   spuHotThreshold: Number(env.RPCS3_SPU_HOT_THRESHOLD) || undefined,

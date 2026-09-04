@@ -725,8 +725,15 @@ void PPUTranslator::WasmCallThroughTable(Value* target, Value* seg0)
 	m_ir->CreateCondBr(m_ir->CreateIsNull(page), fallback, have_page, m_md_unlikely);
 
 	m_ir->SetInsertPoint(have_page);
-	const auto leaf_slot = m_ir->CreateGEP(GetType<u32>(), m_ir->CreateIntToPtr(page, GetType<u8*>()), m_ir->CreateLShr(m_ir->CreateAnd(addr, 0xffff), 2));
-	const auto index = m_ir->CreateLoad(GetType<u32>(), leaf_slot);
+	const auto page_ptr = m_ir->CreateIntToPtr(page, GetType<u8*>());
+	const auto word = m_ir->CreateLShr(m_ir->CreateAnd(addr, 0xffff), 2);
+	const auto leaf_slot = m_ir->CreateGEP(GetType<u32>(), page_ptr, word);
+	const auto bundled = m_ir->CreateLoad(GetType<u32>(), leaf_slot);
+	// The runtime tier's slots follow the bundle's in the page (ppu_web_dispatch_page); a slot with
+	// the top bit set is that tier's miss count rather than a table index.
+	const auto tier_slot = m_ir->CreateGEP(GetType<u32>(), m_ir->CreatePtrAdd(page_ptr, m_ir->getInt32(0x10000)), word);
+	const auto tier = m_ir->CreateLoad(GetType<u32>(), tier_slot);
+	const auto index = m_ir->CreateSelect(m_ir->CreateIsNull(bundled), tier, bundled);
 	const auto callable = m_ir->CreateICmpULT(m_ir->CreateSub(index, m_ir->getInt32(1)), m_ir->getInt32(0x7fff'ffff));
 	m_ir->CreateCondBr(callable, call, fallback, m_md_likely);
 

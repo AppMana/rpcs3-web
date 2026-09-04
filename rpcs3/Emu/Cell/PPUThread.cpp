@@ -533,10 +533,19 @@ namespace
 	{
 		// Wasm function table index of the compiled block that starts at each guest word (0 = none).
 		// First member: compiled blocks resolve cross-module targets by reading it at offset 0 of the page.
+		// Only an ahead-of-time bundle is published here. A bundle built before the runtime tier existed
+		// reads this word and calls whatever it finds, so nothing that is not a table index may reach it.
 		std::atomic<u32> aot[0x10000 / sizeof(u32)]{};
+		// The runtime tier's state for the same guest word: a table index, or the count of interpreter
+		// entries it has seen before compiling one. Blocks the tier's own compiler builds read it at a
+		// fixed offset from the page (PPUTranslator::WasmCallThroughTable); an older block does not know
+		// it exists and reaches a tier block through the interpreter instead.
+		std::atomic<u32> jit[0x10000 / sizeof(u32)]{};
 		std::atomic<ppu_intrp_func_t> hooks[0x10000 / sizeof(u32)]{};
 		std::atomic<u64> decoded[0x10000 / sizeof(u32)]{};
 	};
+
+	static_assert(offsetof(ppu_web_dispatch_page, jit) == 0x10000, "compiled blocks read the tier's slots at this offset from the page");
 
 	std::array<std::atomic<ppu_web_dispatch_page*>, 0x10000> s_ppu_web_dispatch_pages{};
 	std::mutex s_ppu_web_dispatch_mutex;
@@ -596,6 +605,7 @@ static inline void ppu_write(u32 addr, ppu_intrp_func_t function)
 		{
 			// An explicit hook takes the address away from compiled code
 			page->aot[index].store(0, std::memory_order_release);
+			page->jit[index].store(0, std::memory_order_release);
 		}
 		page->hooks[index].store(function, std::memory_order_release);
 	}
@@ -688,10 +698,9 @@ static inline u32 ppu_web_aot_lookup(u32 addr)
 	return page->aot[index].load(std::memory_order_acquire);
 }
 
-// A dispatch slot with this bit set is not a table index: it counts the times the interpreter
-// entered a block the analyser found and no tier has compiled yet, and carries the queued marker
-// once the JIT tier has taken it. Table indices are far below the bit, so the dispatch path reads
-// one word for both.
+// A tier slot with this bit set is not a table index: it counts the times the interpreter entered a
+// block the analyser found and the tier has not compiled yet, and carries the queued marker once the
+// tier has taken it. Table indices are far below the bit, so one slot carries both.
 static constexpr u32 ppu_web_jit_tag = 0x8000'0000;
 static constexpr u32 ppu_web_jit_queued = 0x4000'0000;
 
@@ -701,7 +710,7 @@ u32 g_ppu_web_jit_threshold = 64;
 atomic_t<u32> g_ppu_web_jit_unplaced{0};
 atomic_t<u32> g_ppu_web_jit_syncs{0};
 
-extern void ppu_web_jit_enqueue(u32 addr);
+extern bool ppu_web_jit_enqueue(u32 addr);
 extern u32 ppu_web_jit_enabled();
 
 // The block starts the analyser found, marked so the interpreter can count its entries
@@ -710,45 +719,58 @@ extern void ppu_web_jit_mark_entry(u32 addr)
 	const auto page = ppu_web_dispatch_page_for(addr, true);
 	const u32 index = (addr & 0xffff) / sizeof(u32);
 
-	if (page->hooks[index].load(std::memory_order_acquire))
+	if (page->hooks[index].load(std::memory_order_acquire) || page->aot[index].load(std::memory_order_acquire))
 	{
+		// A hook owns the address, or a bundle already carries the block
 		return;
 	}
 
 	u32 expected = 0;
-	page->aot[index].compare_exchange_strong(expected, ppu_web_jit_tag, std::memory_order_release, std::memory_order_relaxed);
+	page->jit[index].compare_exchange_strong(expected, ppu_web_jit_tag, std::memory_order_release, std::memory_order_relaxed);
+}
+
+// The tier's answer for a block; a hooked address, and one a bundle already carries, keep theirs
+extern void ppu_web_jit_publish(u32 addr, u32 table_index)
+{
+	const auto page = ppu_web_dispatch_page_for(addr, true);
+	const u32 index = (addr & 0xffff) / sizeof(u32);
+
+	if (page->hooks[index].load(std::memory_order_acquire) || page->aot[index].load(std::memory_order_acquire))
+	{
+		return;
+	}
+
+	page->jit[index].store(table_index, std::memory_order_release);
 }
 
 // Interpreter: an uncompiled block start was entered
-static NEVER_INLINE void ppu_web_jit_note(u32 addr, u32 slot)
+static NEVER_INLINE void ppu_web_jit_note(ppu_web_dispatch_page* page, u32 index, u32 addr, u32 slot)
 {
 	if (slot == (ppu_web_jit_tag | ppu_web_jit_queued))
 	{
 		return;
 	}
 
-	const auto page = ppu_web_dispatch_page_for(addr, false);
-
-	if (!page)
-	{
-		return;
-	}
-
-	const u32 index = (addr & 0xffff) / sizeof(u32);
 	const u32 count = (slot & ~(ppu_web_jit_tag | ppu_web_jit_queued)) + 1;
 
 	if (count >= g_ppu_web_jit_threshold)
 	{
 		u32 expected = slot;
-		if (page->aot[index].compare_exchange_strong(expected, ppu_web_jit_tag | ppu_web_jit_queued, std::memory_order_release, std::memory_order_relaxed))
+		if (page->jit[index].compare_exchange_strong(expected, ppu_web_jit_tag | ppu_web_jit_queued, std::memory_order_release, std::memory_order_relaxed))
 		{
-			ppu_web_jit_enqueue(addr);
+			// A refused block starts its count again rather than resting one short of the threshold:
+			// it stays eligible while it is hot, without offering itself on every entry to a queue
+			// that is full.
+			if (!ppu_web_jit_enqueue(addr))
+			{
+				page->jit[index].store(ppu_web_jit_tag, std::memory_order_relaxed);
+			}
 		}
 
 		return;
 	}
 
-	page->aot[index].store(ppu_web_jit_tag | count, std::memory_order_relaxed);
+	page->jit[index].store(ppu_web_jit_tag | count, std::memory_order_relaxed);
 }
 
 // (guest address, table index) pairs; hooked addresses stay with the hook
@@ -776,8 +798,7 @@ extern void* ppu_web_aot_exec_base()
 
 extern u32 ppu_web_aot_registered(u32 addr)
 {
-	const u32 slot = ppu_web_aot_lookup(addr);
-	return slot & ppu_web_jit_tag ? 0 : slot;
+	return ppu_web_aot_lookup(addr);
 }
 #else
 static inline ppu_intrp_func_t ppu_read(u32 addr)
@@ -3151,7 +3172,11 @@ void ppu_thread::exec_task()
 	// Compiled blocks are only callable once this worker's function table holds them (see
 	// rpcs3_web_pre.js): the bundle is placed as a whole, the runtime tier's entries one at a time
 	const bool web_aot_ready = rpcs3_web_ppu_aot_worker_ready() != 0 || web_jit_base != 0;
-	u32 web_jit_placed = 0;
+	// The tier's region has to exist on this worker before any compiled block runs here, not when the
+	// interpreter first meets one of its indices: a bundle block reaches another through the table
+	// too, so it can branch into an address the tier registered while this thread was inside compiled
+	// code, and a table this worker never grew faults there instead of falling back.
+	u32 web_jit_placed = web_jit_base ? rpcs3_web_ppu_hot_sync() : 0;
 	g_ppu_web_last_pc = cia;
 #endif
 
@@ -3211,25 +3236,40 @@ void ppu_thread::exec_task()
 					read32(gpr[25] + 0x18), read32(gpr[25] + 0x38));
 			}
 		}
-		if (const u32 aot_index = web_aot_ready ? ppu_web_aot_lookup(web_instruction_pc) : 0)
+		if (const auto web_page = web_aot_ready ? ppu_web_dispatch_page_for(web_instruction_pc, false) : nullptr)
 		{
-			if (aot_index & ppu_web_jit_tag) [[unlikely]]
-			{
-				ppu_web_jit_note(web_instruction_pc, aot_index);
-			}
-			else
-			{
-				// An index the runtime tier handed out is callable here only once this worker placed
-				// its module; the registry is in index order, so one number decides that. Without the
-				// tier there is no region above the bundle and every index is placed.
-				bool placed = !web_jit_base || aot_index < web_jit_base || aot_index <= web_jit_placed;
+			const u32 web_slot = (web_instruction_pc & 0xffff) / sizeof(u32);
 
-				if (!placed) [[unlikely]]
+			if (!web_page->hooks[web_slot].load(std::memory_order_acquire))
+			{
+				// The bundle first: its blocks are placed on this worker as a whole, so an index here is
+				// always callable
+				u32 aot_index = web_page->aot[web_slot].load(std::memory_order_acquire);
+				bool placed = aot_index != 0;
+
+				if (!placed && web_jit_base)
 				{
-					g_ppu_web_jit_syncs.raw()++;
-					web_jit_placed = rpcs3_web_ppu_hot_sync();
-					placed = aot_index <= web_jit_placed;
-					if (!placed) g_ppu_web_jit_unplaced.raw()++;
+					const u32 tier = web_page->jit[web_slot].load(std::memory_order_acquire);
+
+					if (tier & ppu_web_jit_tag)
+					{
+						ppu_web_jit_note(web_page, web_slot, web_instruction_pc, tier);
+					}
+					else if (tier)
+					{
+						// A tier index is callable here only once this worker placed its module; the
+						// registry is in index order, so one number decides that
+						aot_index = tier;
+						placed = tier <= web_jit_placed;
+
+						if (!placed) [[unlikely]]
+						{
+							g_ppu_web_jit_syncs.raw()++;
+							web_jit_placed = rpcs3_web_ppu_hot_sync();
+							placed = tier <= web_jit_placed;
+							if (!placed) g_ppu_web_jit_unplaced.raw()++;
+						}
+					}
 				}
 
 				if (placed)

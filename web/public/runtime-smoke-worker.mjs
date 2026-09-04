@@ -792,6 +792,9 @@ scope.addEventListener("message", async (event) => {
         if (Number(event.data.ppuJitThreshold) > 0) {
           module.ccall("rpcs3_web_ppu_llvm_set_threshold", null, ["number"], [Number(event.data.ppuJitThreshold)]);
         }
+        if (Number(event.data.ppuJitCapacity) > 0) {
+          module.ccall("rpcs3_web_ppu_llvm_set_capacity", null, ["number"], [Number(event.data.ppuJitCapacity)]);
+        }
         module.ccall("rpcs3_web_ppu_llvm_set_enabled", null, ["number"], [1]);
       }
       if (spuDecoder === "llvm" || ppuJit) {

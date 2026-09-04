@@ -185,7 +185,7 @@ struct BlitOut { @builtin(position) position: vec4f, @location(0) uv: vec2f };
 	}
 
 	// vk::apply_swizzle_remap(native map, guest remap) as an RGBA swizzle string
-	std::string compose_swizzle(const std::array<char, 4>& native, u32 remap)
+	std::array<char, 4> compose_swizzle(const std::array<char, 4>& native, u32 remap)
 	{
 		const u32 sources = remap & 0xffff;
 		const u32 control = remap >> 8;
@@ -197,7 +197,7 @@ struct BlitOut { @builtin(position) position: vec4f, @location(0) uv: vec2f };
 			else if (mode == 1) argb[channel] = '1';
 			else argb[channel] = native[(sources >> (channel * 2)) & 3];
 		}
-		return std::string{ argb[1], argb[2], argb[3], argb[0] };
+		return std::array<char, 4>{ argb[1], argb[2], argb[3], argb[0] };
 	}
 
 	WGPUCompareFunction compare_function(u32 rsx_func)
@@ -502,7 +502,7 @@ void WebGPUDirectGSRender::end_pass()
 		wgpuRenderPassEncoderEnd(m_pass);
 		wgpuRenderPassEncoderRelease(m_pass);
 		m_pass = nullptr;
-		m_pass_key.clear();
+		m_pass_key = {};
 	}
 }
 
@@ -853,9 +853,9 @@ WebGPUDirectGSRender::targets WebGPUDirectGSRender::bound_targets()
 		if (!bound.second || bound.first != m_framebuffer_layout.color_addresses[index]) continue;
 		if (auto surface = surface_by_id(bound.second->id))
 		{
+			result.key.colors[result.colors.size()] = bound.second->id;
+			result.formats.colors[result.colors.size()] = surface->format;
 			result.colors.push_back(surface);
-			result.key += fmt::format("c%u|", bound.second->id);
-			result.format_key += fmt::format("%s|", format_name(surface->format));
 		}
 	}
 	if (const auto& bound = m_rtts.m_bound_depth_stencil; bound.second && bound.first == m_framebuffer_layout.zeta_address)
@@ -863,8 +863,8 @@ WebGPUDirectGSRender::targets WebGPUDirectGSRender::bound_targets()
 		if (auto surface = surface_by_id(bound.second->id))
 		{
 			result.depth = surface;
-			result.key += fmt::format("d%u", bound.second->id);
-			result.format_key += format_name(surface->format);
+			result.key.depth = bound.second->id;
+			result.formats.depth = surface->format;
 		}
 	}
 	return result;
@@ -873,8 +873,7 @@ WebGPUDirectGSRender::targets WebGPUDirectGSRender::bound_targets()
 // ---------------------------------------------------------------------------------------------
 // Programs, pipelines, samplers, textures
 
-WebGPUDirectGSRender::gpu_program& WebGPUDirectGSRender::get_program(const std::string& key, const std::array<u8, 16>& dimensions,
-	u32 color_target_count, u32 alpha_func, const std::string& swizzles)
+WebGPUDirectGSRender::gpu_program& WebGPUDirectGSRender::get_program(const program_key& key, const std::array<sampled_texture, 16>& textures)
 {
 	if (const auto found = m_programs.find(key); found != m_programs.end())
 	{
@@ -883,7 +882,19 @@ WebGPUDirectGSRender::gpu_program& WebGPUDirectGSRender::get_program(const std::
 
 	gpu_program program{};
 	std::array<u32, 16> dims{};
-	for (u32 slot = 0; slot < 16; slot++) dims[slot] = dimensions[slot];
+	for (u32 slot = 0; slot < 16; slot++) dims[slot] = key.dimensions[slot];
+
+	// The translator takes the non-default swizzles as "slot=rgba;" pairs
+	std::string swizzles;
+	for (u32 slot = 0; slot < 16; slot++)
+	{
+		if (!(current_fp_metadata.referenced_textures_mask & (1u << slot))) continue;
+		const auto& swizzle = textures[slot].swizzle;
+		if (swizzle == std::array<char, 4>{ 'r', 'g', 'b', 'a' }) continue;
+		fmt::append(swizzles, "%u=%c%c%c%c;", slot, swizzle[0], swizzle[1], swizzle[2], swizzle[3]);
+	}
+	const u32 color_target_count = key.target_count;
+	const u32 alpha_func = key.alpha_func;
 	char* translated = rpcs3_web_direct_translate(
 		reinterpret_cast<const u8*>(current_vertex_program.data.data()), static_cast<u32>(current_vertex_program.data.size() * sizeof(u32)),
 		current_vertex_program.entry, current_vertex_program.ctrl, rsx::method_registers.vertex_attrib_output_mask(),
@@ -981,7 +992,7 @@ WebGPUDirectGSRender::gpu_program& WebGPUDirectGSRender::get_program(const std::
 	return m_programs.emplace(key, program).first->second;
 }
 
-WGPURenderPipeline WebGPUDirectGSRender::get_pipeline(const std::string& key, const gpu_program& program, const targets& targets,
+WGPURenderPipeline WebGPUDirectGSRender::get_pipeline(const pipeline_key& key, const gpu_program& program, const targets& targets,
 	WGPUPrimitiveTopology topology, WGPUIndexFormat strip_index_format, const rsx::webgpu::resolved_state_packet& state)
 {
 	if (const auto found = m_pipelines.find(key); found != m_pipelines.end())
@@ -1113,7 +1124,7 @@ WGPUSampler WebGPUDirectGSRender::null_sampler()
 
 WGPURenderPipeline WebGPUDirectGSRender::get_clear_pipeline(const targets& targets, u32 write_mask, bool depth_write)
 {
-	const std::string key = fmt::format("%s|%u|%d", targets.format_key, write_mask, depth_write);
+	const clear_pipeline_key key{ targets.formats, write_mask, depth_write ? 1u : 0u };
 	if (const auto found = m_clear_pipelines.find(key); found != m_clear_pipelines.end()) return found->second;
 
 	const usz count = std::max<usz>(1, targets.colors.size());
@@ -1634,13 +1645,11 @@ void WebGPUDirectGSRender::end()
 	std::array<sampled_texture, 16> textures{};
 	std::array<u8, 16> dimensions{};
 	dimensions.fill(0xff);
-	std::string swizzles;
 	for (u32 slot = 0; slot < 16; slot++)
 	{
 		if (!(current_fp_metadata.referenced_textures_mask & (1u << slot))) continue;
 		textures[slot] = resolve_texture(rsx::method_registers.fragment_textures[slot], slot);
 		dimensions[slot] = textures[slot].dimension;
-		if (textures[slot].swizzle != "rgba") swizzles += fmt::format("%u=%s;", slot, textures[slot].swizzle);
 	}
 
 	rsx::webgpu::resolved_state_packet state{};
@@ -1652,12 +1661,21 @@ void WebGPUDirectGSRender::end()
 	// supplies through the fragment uniform (fragment_program_utils::get_fragment_program_ucode_hash)
 	const u64 vp_hash = program_hash_util::vertex_program_utils::get_vertex_program_ucode_hash(current_vertex_program);
 	const u64 fp_hash = program_hash_util::fragment_program_utils::get_fragment_program_ucode_hash(current_fragment_program);
-	const std::string program_key = fmt::format("%llx:%u:%x:%x:%llx:%x:%s:%u:%x", vp_hash, current_vertex_program.entry, current_vertex_program.ctrl,
-		rsx::method_registers.vertex_attrib_output_mask(), fp_hash, rsx::method_registers.shader_control(),
-		fmt::format("%s|%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d", swizzles, dimensions[0], dimensions[1], dimensions[2], dimensions[3], dimensions[4], dimensions[5], dimensions[6], dimensions[7],
-			dimensions[8], dimensions[9], dimensions[10], dimensions[11], dimensions[12], dimensions[13], dimensions[14], dimensions[15]),
-		target_count, alpha_func);
-	gpu_program& program = get_program(program_key, dimensions, target_count, alpha_func, swizzles);
+	program_key program_id{};
+	program_id.vertex_hash = vp_hash;
+	program_id.fragment_hash = fp_hash;
+	program_id.vertex_entry = current_vertex_program.entry;
+	program_id.vertex_ctrl = current_vertex_program.ctrl;
+	program_id.output_mask = rsx::method_registers.vertex_attrib_output_mask();
+	program_id.shader_control = rsx::method_registers.shader_control();
+	program_id.target_count = target_count;
+	program_id.alpha_func = alpha_func;
+	program_id.dimensions = dimensions;
+	for (u32 slot = 0; slot < 16; slot++)
+	{
+		if (current_fp_metadata.referenced_textures_mask & (1u << slot)) program_id.swizzles[slot] = textures[slot].swizzle;
+	}
+	gpu_program& program = get_program(program_id, textures);
 	if (!program.valid)
 	{
 		m_stats.draws_skipped++;
@@ -1787,11 +1805,19 @@ void WebGPUDirectGSRender::end()
 		group_descriptor.entries = entries.data();
 		WGPUBindGroup group = wgpuDeviceCreateBindGroup(m_device, &group_descriptor);
 
-		const std::string pipeline_key = fmt::format("%s|%s|%d|%d|%x|%x|%x|%x|%x|%x|%x|%x|%x|%x|%x|%x|%x|%x|%x", program_key, targets.format_key, static_cast<u32>(topology), static_cast<u32>(strip_index_format),
-			state.front_face_mode, state.cull_face_enabled ? state.cull_face_mode : 0, state.depth_test_enabled, state.depth_write_enabled, state.depth_func,
-			state.blend_enabled_mask, state.blend_sfactor_rgb, state.blend_dfactor_rgb, state.blend_equation_rgb, state.blend_sfactor_a, state.blend_dfactor_a, state.blend_equation_a,
-			state.color_write_mask[0] | (state.color_write_mask[1] << 4) | (state.color_write_mask[2] << 8) | (state.color_write_mask[3] << 12), 0, 0);
-		WGPURenderPipeline pipeline = get_pipeline(pipeline_key, program, targets, topology, strip_index_format, state);
+		pipeline_key pipeline_id{};
+		pipeline_id.program = &program;
+		pipeline_id.formats = targets.formats;
+		pipeline_id.topology = static_cast<u32>(topology);
+		pipeline_id.index_format = static_cast<u32>(strip_index_format);
+		pipeline_id.front_face = state.front_face_mode;
+		pipeline_id.cull_face = state.cull_face_enabled ? state.cull_face_mode : 0;
+		pipeline_id.depth_state = state.depth_test_enabled | (state.depth_write_enabled << 1) | (state.depth_func << 2);
+		pipeline_id.blend_mask = state.blend_enabled_mask;
+		pipeline_id.blend_rgb = state.blend_sfactor_rgb | (state.blend_dfactor_rgb << 8) | (state.blend_equation_rgb << 16);
+		pipeline_id.blend_alpha = state.blend_sfactor_a | (state.blend_dfactor_a << 8) | (state.blend_equation_a << 16);
+		pipeline_id.color_write = state.color_write_mask[0] | (state.color_write_mask[1] << 4) | (state.color_write_mask[2] << 8) | (state.color_write_mask[3] << 12);
+		WGPURenderPipeline pipeline = get_pipeline(pipeline_id, program, targets, topology, strip_index_format, state);
 
 		if (m_pass_key != targets.key) begin_pass(targets);
 		(void)get_scissor(m_scissor, true);

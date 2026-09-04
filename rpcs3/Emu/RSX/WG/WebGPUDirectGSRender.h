@@ -94,12 +94,90 @@ public:
 		std::vector<std::byte> staging;  // this frame's contents, written to the buffer at submit
 	};
 
+	// Cache keys are plain data hashed by their bytes: a draw looks up a program and a pipeline, and
+	// building a formatted string for each of those lookups costs more than the lookup. Every key is
+	// value-initialized so its padding hashes and compares as zero.
+	struct target_key
+	{
+		std::array<u32, 4> colors{};  // surface ids, 0 where unbound
+		u32 depth = 0;
+		bool operator==(const target_key&) const = default;
+	};
+
+	struct format_key
+	{
+		std::array<WGPUTextureFormat, 4> colors{ WGPUTextureFormat_Undefined, WGPUTextureFormat_Undefined,
+			WGPUTextureFormat_Undefined, WGPUTextureFormat_Undefined };
+		WGPUTextureFormat depth = WGPUTextureFormat_Undefined;
+		bool operator==(const format_key&) const = default;
+	};
+
+	struct program_key
+	{
+		u64 vertex_hash = 0;
+		u64 fragment_hash = 0;
+		u32 vertex_entry = 0;
+		u32 vertex_ctrl = 0;
+		u32 output_mask = 0;
+		u32 shader_control = 0;
+		u32 target_count = 0;
+		u32 alpha_func = 0;
+		std::array<u8, 16> dimensions{};
+		std::array<std::array<char, 4>, 16> swizzles{};
+		bool operator==(const program_key&) const = default;
+	};
+
+	struct pipeline_key
+	{
+		const gpu_program* program = nullptr;
+		format_key formats{};
+		u32 topology = 0;
+		u32 index_format = 0;
+		u32 front_face = 0;
+		u32 cull_face = 0;
+		u32 depth_state = 0;
+		u32 blend_mask = 0;
+		u32 blend_rgb = 0;
+		u32 blend_alpha = 0;
+		u32 color_write = 0;
+		bool operator==(const pipeline_key&) const = default;
+	};
+
+	struct clear_pipeline_key
+	{
+		format_key formats{};
+		u32 write_mask = 0;
+		u32 depth_write = 0;
+		bool operator==(const clear_pipeline_key&) const = default;
+	};
+
+	// FNV-1a over the key's bytes; every key is a trivially copyable aggregate
+	template <typename Key>
+	struct byte_hash
+	{
+		usz operator()(const Key& key) const noexcept
+		{
+			const auto* bytes = reinterpret_cast<const u8*>(&key);
+			u64 hash = 0xcbf29ce484222325ull;
+			for (usz i = 0; i < sizeof(Key); i++) hash = (hash ^ bytes[i]) * 0x100000001b3ull;
+			return static_cast<usz>(hash);
+		}
+	};
+
 	struct targets
 	{
 		std::vector<gpu_surface*> colors;
 		gpu_surface* depth = nullptr;
-		std::string key;
-		std::string format_key;
+		target_key key;
+		format_key formats;
+	};
+
+	struct sampled_texture
+	{
+		WGPUTextureView view = nullptr;
+		WGPUSampler sampler = nullptr;
+		std::array<char, 4> swizzle{ 'r', 'g', 'b', 'a' };
+		u8 dimension = 1;
 	};
 
 private:
@@ -131,8 +209,8 @@ private:
 	void flush_ring(ring_buffer& ring);
 
 	// Programs, pipelines, samplers, textures
-	gpu_program& get_program(const std::string& key, const std::array<u8, 16>& dimensions, u32 color_target_count, u32 alpha_func, const std::string& swizzles);
-	WGPURenderPipeline get_pipeline(const std::string& key, const gpu_program& program, const targets& targets, WGPUPrimitiveTopology topology,
+	gpu_program& get_program(const program_key& key, const std::array<sampled_texture, 16>& textures);
+	WGPURenderPipeline get_pipeline(const pipeline_key& key, const gpu_program& program, const targets& targets, WGPUPrimitiveTopology topology,
 		WGPUIndexFormat strip_index_format, const rsx::webgpu::resolved_state_packet& state);
 	WGPUSampler get_sampler(u32 address_modes, u32 filter_modes, u32 mip_count);
 	WGPUTextureView null_texture_view(u8 dimension);
@@ -140,13 +218,6 @@ private:
 	WGPURenderPipeline get_clear_pipeline(const targets& targets, u32 write_mask, bool depth_write);
 	WGPURenderPipeline get_blit_pipeline(WGPUTextureFormat format, bool depth);
 
-	struct sampled_texture
-	{
-		WGPUTextureView view = nullptr;
-		WGPUSampler sampler = nullptr;
-		std::string swizzle = "rgba";
-		u8 dimension = 1;
-	};
 	// Resolves a fragment texture: a surface of the store (whole match), else an upload
 	sampled_texture resolve_texture(const rsx::fragment_texture& texture, u32 slot);
 	gpu_texture* upload_texture(const rsx::fragment_texture& texture, const rsx::webgpu::texture_packet_record& record, u32 address, u32 size);
@@ -179,15 +250,15 @@ private:
 
 	WGPUCommandEncoder m_encoder = nullptr;
 	WGPURenderPassEncoder m_pass = nullptr;
-	std::string m_pass_key;
+	target_key m_pass_key;
 	ring_buffer m_uniform_ring;
 	ring_buffer m_stream_ring;
 	ring_buffer m_index_ring;
 	u64 m_frame_serial = 0;
 	std::vector<std::byte> m_draw_persistent, m_draw_transient, m_draw_vertex_state, m_draw_fragment_state;
 
-	std::unordered_map<std::string, gpu_program> m_programs;
-	std::unordered_map<std::string, WGPURenderPipeline> m_pipelines;
+	std::unordered_map<program_key, gpu_program, byte_hash<program_key>> m_programs;
+	std::unordered_map<pipeline_key, WGPURenderPipeline, byte_hash<pipeline_key>> m_pipelines;
 	std::unordered_map<u64, WGPUSampler> m_samplers;
 	std::unordered_map<u64, gpu_texture> m_textures;
 	std::vector<std::byte> m_guest_staging;   // contiguous copy of a texture's guest bytes (16-byte aligned inside)
@@ -195,7 +266,7 @@ private:
 	u64 m_texture_bytes = 0;
 	std::array<WGPUTextureView, 4> m_null_views{};
 	WGPUSampler m_null_sampler = nullptr;
-	std::unordered_map<std::string, WGPURenderPipeline> m_clear_pipelines;
+	std::unordered_map<clear_pipeline_key, WGPURenderPipeline, byte_hash<clear_pipeline_key>> m_clear_pipelines;
 	WGPUBindGroupLayout m_clear_layout = nullptr;
 	std::unordered_map<u32, WGPURenderPipeline> m_blit_pipelines;
 	WGPUBindGroupLayout m_blit_layout = nullptr;

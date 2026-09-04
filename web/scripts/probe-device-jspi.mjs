@@ -166,6 +166,35 @@ const jspiProbe = `(async () => {
   return JSON.stringify(out);
 })()`;
 
+// The request shape wasmfs_create_fetch_backend uses: a HEAD to size the file, then ranged reads.
+// A repeated range that reports transferSize 0 was served from the browser's cache.
+const rangeCacheProbe = `(async () => {
+  const out = {};
+  try {
+    const index = await (await fetch("/library/index.json")).json();
+    const file = index.files.find((entry) => entry.size > 2000000) ?? index.files[0];
+    out.name = file.name;
+    const url = "/library/files/" + encodeURIComponent(file.name);
+    const head = await fetch(url, { method: "HEAD", headers: { Range: "bytes=0-" } });
+    out.acceptRanges = head.headers.get("accept-ranges");
+    out.cacheControl = head.headers.get("cache-control");
+    const read = async () => {
+      const response = await fetch(url, { headers: { Range: "bytes=0-1048575" } });
+      return { status: response.status, bytes: (await response.arrayBuffer()).byteLength };
+    };
+    out.first = await read();
+    out.second = await read();
+    const entries = performance.getEntriesByType("resource")
+      .filter((entry) => entry.name.includes(encodeURIComponent(file.name)))
+      .map((entry) => entry.transferSize);
+    out.transferSizes = entries;
+    const secondTransfer = entries.at(-1) ?? 0;
+    out.cached = out.second.bytes > 0 && secondTransfer < out.second.bytes / 10;
+    out.revalidates = out.cached && secondTransfer > 0;
+  } catch (error) { out.error = String(error && error.message ? error.message : error).slice(0, 200); }
+  return JSON.stringify(out);
+})()`;
+
 const initial = await findPage((page) => page.title !== "ServiceWorker" && !page.url.startsWith("safari-web-extension:"));
 let connection = await new Connection(initial.page.webSocketDebuggerUrl).open();
 await connection.evaluate(`location.assign(${JSON.stringify(`${origin}?jspi-probe=${Date.now()}`)})`);
@@ -176,6 +205,7 @@ const landed = await findPage((page) => page.url.startsWith(origin));
 connection = await new Connection(landed.page.webSocketDebuggerUrl).open();
 console.log(`device: ${landed.device.deviceName} (iPadOS ${landed.device.deviceOSVersion})`);
 console.log(`jspi:      ${await connection.evaluate(jspiProbe, true)}`);
+console.log(`ranges:    ${await connection.evaluate(rangeCacheProbe, true)}`);
 
 // The yielding worker sits at x=0 and the non-yielding control at x=200, so one screenshot shows both
 const yielding = JSON.parse(await connection.evaluate(probe(true, 0), true));

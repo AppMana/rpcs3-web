@@ -92,6 +92,7 @@ extern u32 spu_web_hot_index(u32 i);
 extern const u8* spu_web_hot_bytes(u32 i);
 extern u32 spu_web_hot_size(u32 i);
 extern u64 ppu_web_blocks_used();
+extern u32 ppu_web_copy_used(u32* out, u32 max);
 extern void ppu_web_set_block_base(u32 base);
 extern atomic_t<u32> g_spu_web_hot_threshold;
 extern void spu_web_hot_info(u32 i, u32* out);
@@ -966,6 +967,12 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_blocks_used()
 	{
 		return static_cast<u32>(ppu_web_blocks_used());
+	}
+
+	// The guest addresses this run entered, as a bitmap over 4-byte slots (build-ppu-aot-profile.mjs)
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_used_blocks(u32* out, u32 max)
+	{
+		return ppu_web_copy_used(out, max);
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_set_block_base(u32 base)

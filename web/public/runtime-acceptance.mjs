@@ -233,12 +233,15 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
           clearTimeout(timeout);
           // Recorded SPU AOT misses (SPU cache format) travel separately: they can be megabytes
           const spuMissBase64 = options.spuFallbackHistogram ? (await requestWorker(worker, "spu-misses", "spu-misses"))?.base64 : undefined;
+          // The entered guest addresses travel the same way, for the same reason: they are far larger
+          // than a frame record and are wanted once, after the run has produced its frames
+          const ppuProfileBase64 = options.ppuProfile ? (await requestWorker(worker, "ppu-profile", "ppu-profile"))?.base64 : undefined;
           let spuWasmSelftest;
           if (options.spuWasmSelftestBase64) {
             worker.postMessage({ type: "spu-wasm-selftest", base64: options.spuWasmSelftestBase64 });
             spuWasmSelftest = (await requestWorker(worker, "spu-wasm-selftest-noop", "spu-wasm-selftest", 120_000))?.report;
           }
-          const result = { ...firstResult, ...frames.at(-1), gpu, renderError, packetFixture, events, spuMissBase64, spuWasmSelftest, frames: requestedFrames > 1 || untilDraw ? frames : undefined };
+          const result = { ...firstResult, ...frames.at(-1), gpu, renderError, packetFixture, events, spuMissBase64, ppuProfileBase64, spuWasmSelftest, frames: requestedFrames > 1 || untilDraw ? frames : undefined };
           document.querySelector("#result").textContent = JSON.stringify(result, null, 2);
           // The worker waits up to 5 s for RPCS3's threads to exit and then
           // reports; allow that report to arrive before giving up on it.
@@ -308,6 +311,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       spuTraceRange: Array.isArray(options.spuTraceRange) ? options.spuTraceRange : undefined,
       spuFallbackHistogram: options.spuFallbackHistogram === true,
       spuDecoder: options.spuDecoder,
+      ppuProfile: options.ppuProfile === true,
       spuBlockSize: options.spuBlockSize,
       spuLlvmWorkers: options.spuLlvmWorkers,
       spuHotThreshold: options.spuHotThreshold,

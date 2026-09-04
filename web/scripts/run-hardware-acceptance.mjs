@@ -73,6 +73,7 @@ const runOptions = {
   spuAotBundle: process.env.RPCS3_SPU_AOT_BUNDLE || undefined,
   spuFallbackHistogram: env.RPCS3_SPU_FALLBACK_HIST === "1",
   spuDecoder: env.RPCS3_SPU_DECODER || undefined,
+  ppuProfile: env.RPCS3_PPU_PROFILE === "1",
   spuBlockSize: env.RPCS3_SPU_BLOCK_SIZE || undefined,
   spuLlvmWorkers: Number(env.RPCS3_SPU_LLVM_WORKERS) || undefined,
   spuHotThreshold: Number(env.RPCS3_SPU_HOT_THRESHOLD) || undefined,
@@ -377,6 +378,12 @@ try {
     // Recorded SPU AOT misses in SPU cache format: append to the title's native cache and rerun the IR dump
     await writeFile(outputPath.replace(/\.json$/, "") + ".spu-misses.dat", Buffer.from(result.spuMissBase64, "base64"));
     delete result.spuMissBase64;
+  }
+  if (result.ppuProfileBase64) {
+    // Guest addresses this run entered, little-endian u32s, for building a profile-guided PPU bundle
+    await writeFile(outputPath.replace(/\.json$/, "") + ".ppu-used.bin", Buffer.from(result.ppuProfileBase64, "base64"));
+    delete result.ppuProfileBase64;
+    delete resultWithoutFixture.ppuProfileBase64;
   }
   for (const image of result.gpu?.frameImages ?? []) {
     const data = String(image.png).replace(/^data:image\/png;base64,/, "");

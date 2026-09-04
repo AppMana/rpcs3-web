@@ -61,6 +61,10 @@ ctest --test-dir build-web-native --output-on-failure -R webgpu
 
 `npm run ppu:aot:bundle` and `npm run spu:aot:bundle` turn directories of LLVM IR dumped by native RPCS3 into the Wasm side modules the runtime loads before boot. They are inputs to commercial runs rather than part of a normal build, and they are rebuilt only when new programs are dumped.
 
+Dump a title's PPU IR by running it under native RPCS3 with `RPCS3_PPU_WASM_AOT_IR=1` and `RPCS3_PPU_WASM_AOT_DIR` set to an output directory; the analyser finishes within seconds of boot, so the run can be stopped once the parts stop appearing. `--eboot-parts=N` splits a title's program into N modules, which is what keeps each one inside the size a browser will compile.
+
+A bundle holds every block the analyser proved reachable, and every worker running a PPU thread has to hold all of them in its function table. To build one from what a session actually runs instead, capture a profile with `RPCS3_PPU_PROFILE=1` (the runner writes the entered guest addresses beside its report as `.ppu-used.bin`), then `node scripts/filter-ppu-ir-by-profile.mjs IR_DIR OUT_DIR PROFILE.bin` before bundling. A block the profile missed is simply not registered, so it runs interpreted.
+
 ## Validation
 
 ```sh

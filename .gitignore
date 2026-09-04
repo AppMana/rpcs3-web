@@ -148,5 +148,6 @@ CMakeUserPresets.json
 # claude
 CLAUDE.md
 
-# Title-specific PPU AOT bundles built from commercial code
+# Title-specific PPU AOT bundles built from commercial code, and the IR dumps they are built from
 web/public/local-aot/
+web/local-aot-ir-*/

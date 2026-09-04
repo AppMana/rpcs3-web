@@ -36,6 +36,7 @@ let moduleCreateMs = 0;
 let recordInputs = false;
 const inputTrace = [];
 let spuFallbackHistogram = false;
+let ppuProfile = false;
 let diagnostics = false;
 let presentLatestOnly = false;
 let consumedFlips = 0;
@@ -122,6 +123,26 @@ async function captureDispatch(expectedVerdict = "", timeoutMs = 30_000) {
     logs: logs.slice(-300),
     detail: terminal || `dispatch protocol did not finish within ${timeoutMs} ms`,
   });
+}
+
+// The guest addresses this run entered, as little-endian u32s. The page asks for these once the run
+// has produced its frames, the way it asks for the recorded SPU misses, so a profile large enough to
+// matter never rides along in a per-frame record.
+function ppuUsedBase64() {
+  const max = 1 << 19;
+  const pointer = module._malloc(max * 4) >>> 0;
+  try {
+    const count = Math.min(module.ccall("rpcs3_web_ppu_used_blocks", "number", ["number", "number"], [pointer, max]) >>> 0, max);
+    const bytes = new Uint8Array(module.HEAPU8.buffer, pointer, count * 4);
+    let binary = "";
+    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(offset, offset + 0x8000));
+    }
+    recordLog(`PPU profile: ${count} entered blocks`);
+    return btoa(binary);
+  } finally {
+    module._free(pointer);
+  }
 }
 
 function detail(error) {
@@ -501,6 +522,12 @@ scope.addEventListener("message", async (event) => {
     return;
   }
 
+  if (event.data?.type === "ppu-profile") {
+    // The guest addresses this run entered, for building a bundle of only the blocks a run reaches
+    scope.postMessage({ type: "ppu-profile", base64: ppuProfile && module ? ppuUsedBase64() : "" });
+    return;
+  }
+
   if (event.data?.type === "spu-misses") {
     // Recorded SPU AOT misses (SPU cache format) for the native compile pass
     scope.postMessage({ type: "spu-misses", base64: spuFallbackHistogram && module ? spuMissBase64() : "" });
@@ -691,6 +718,7 @@ scope.addEventListener("message", async (event) => {
       module.ccall("rpcs3_web_set_spu_fallback_histogram", null, ["number"], [1]);
       spuFallbackHistogram = true;
     }
+    ppuProfile = event.data.ppuProfile === true;
     if (Array.isArray(event.data.spuTraceRange)) {
       module.ccall("rpcs3_web_set_spu_trace_range", null, ["number", "number"], [Number(event.data.spuTraceRange[0]) >>> 0, Number(event.data.spuTraceRange[1]) >>> 0]);
     }

@@ -619,7 +619,35 @@ extern u64 ppu_web_blocks_used()
 	return used;
 }
 
-static inline void ppu_web_note_block(u32 index)
+// Guest addresses entered, one bit per instruction slot over the first 32 MB, which covers a
+// title's code segments. Reported by rpcs3_web_ppu_used_blocks so a bundle can be built from a
+// profile instead of from everything the analyser found.
+static constexpr u32 ppu_web_used_span = 32u << 20;
+static std::array<atomic_t<u64>, ppu_web_used_span / 4 / 64> g_ppu_web_address_used{};
+
+// The entered addresses themselves, which are a small fraction of the span the bitmap covers
+extern u32 ppu_web_copy_used(u32* out, u32 max)
+{
+	u32 count = 0;
+
+	for (u32 word = 0; word < g_ppu_web_address_used.size(); word++)
+	{
+		u64 bits = g_ppu_web_address_used[word].load();
+
+		while (bits)
+		{
+			const u32 bit = std::countr_zero(bits);
+			bits &= bits - 1;
+
+			if (count < max) out[count] = ((word * 64) + bit) * 4;
+			count++;
+		}
+	}
+
+	return count;
+}
+
+static inline void ppu_web_note_block(u32 index, u32 address)
 {
 	const u32 slot = index - g_ppu_web_block_base.load();
 
@@ -627,6 +655,13 @@ static inline void ppu_web_note_block(u32 index)
 	{
 		auto& word = g_ppu_web_block_used[slot / 64];
 		const u64 bit = 1ull << (slot % 64);
+		if (!(word.load() & bit)) word |= bit;
+	}
+
+	if (address < ppu_web_used_span)
+	{
+		auto& word = g_ppu_web_address_used[(address / 4) / 64];
+		const u64 bit = 1ull << ((address / 4) % 64);
 		if (!(word.load() & bit)) word |= bit;
 	}
 }
@@ -3106,7 +3141,7 @@ void ppu_thread::exec_task()
 		{
 			// Run the compiled block on this thread; it tail-calls through the table and returns with cia set at a boundary
 			g_ppu_web_aot_dispatch_count++;
-			ppu_web_note_block(aot_index);
+			ppu_web_note_block(aot_index, web_instruction_pc);
 			reinterpret_cast<ppu_web_aot_func_t>(static_cast<uptr>(aot_index))(ppu_web_aot_exec_base(), this, 0, nullptr, gpr[0], gpr[1], gpr[2]);
 			continue;
 		}

@@ -7,28 +7,32 @@ import path from "node:path";
 const IDLE_FRAMES = ["(idle)", "(program)", "(garbage collector)", "emscripten_futex_wait", "_do_futex_wait"];
 const TRAMPOLINE_FRAMES = ["wasm-to-js", "js-to-wasm::i", "js-to-wasm::v"];
 
-// A run reaches the part worth measuring some way into itself — a title's boot and its intro are
-// not its gameplay — so every reader takes the same window: the last `lastSeconds` of the profile,
-// or all of it. timeDeltas[i] is the microseconds before sample i.
-function windowed(profile, lastSeconds) {
+// A run reaches the part worth measuring some way into itself — a title's boot and its intro are not
+// its gameplay — so every reader takes the same window: the `lastSeconds` before the end, less any
+// `trailingSeconds` that belong to a different scene. timeDeltas[i] is the microseconds before
+// sample i.
+function windowed(profile, lastSeconds, trailingSeconds = 0) {
   const samples = profile.samples || [];
   if (!lastSeconds) return samples;
   const deltas = profile.timeDeltas || [];
-  const cutoff = profile.endTime - lastSeconds * 1_000_000;
+  const opens = profile.endTime - lastSeconds * 1_000_000;
+  const closes = profile.endTime - trailingSeconds * 1_000_000;
   let time = profile.startTime;
   let first = samples.length;
+  let end = samples.length;
   for (let index = 0; index < samples.length; index++) {
     time += deltas[index] ?? 0;
-    if (time >= cutoff) { first = index; break; }
+    if (first === samples.length && time >= opens) first = index;
+    if (time > closes) { end = index; break; }
   }
-  return samples.slice(first);
+  return samples.slice(first, end);
 }
 
-export function workSampleCount(profile, lastSeconds = 0) {
+export function workSampleCount(profile, lastSeconds = 0, trailingSeconds = 0) {
   const waitNodes = new Set(profile.nodes
     .filter(({ callFrame }) => IDLE_FRAMES.includes(callFrame.functionName))
     .map(({ id }) => id));
-  return windowed(profile, lastSeconds).reduce((count, id) => count + !waitNodes.has(id), 0);
+  return windowed(profile, lastSeconds, trailingSeconds).reduce((count, id) => count + !waitNodes.has(id), 0);
 }
 
 // The busiest target lands at `outputPath`; the rest follow it as .1, .2 and so on, with a sidecar
@@ -181,7 +185,7 @@ export function createWorkerProfiler(session, samplingIntervalUs) {
 
 // Self time names the cost; the callers name the code to change. Walks the sample tree upwards from
 // every node whose function is `name` and reports the callers by the samples they account for.
-export function callersOf(profile, name, limit = 8, { depth = 1, lastSeconds = 0 } = {}) {
+export function callersOf(profile, name, limit = 8, { depth = 1, lastSeconds = 0, trailingSeconds = 0 } = {}) {
   const byId = new Map(profile.nodes.map((node) => [node.id, node]));
   const parents = new Map();
   for (const node of profile.nodes) {
@@ -189,7 +193,7 @@ export function callersOf(profile, name, limit = 8, { depth = 1, lastSeconds = 0
   }
   const counts = new Map();
   let total = 0;
-  for (const id of windowed(profile, lastSeconds)) {
+  for (const id of windowed(profile, lastSeconds, trailingSeconds)) {
     if (byId.get(id)?.callFrame.functionName !== name) continue;
     // Every wasm call into a JS import goes through a trampoline frame; the code that wanted the
     // import is above it. A thin wrapper is not an answer either, so `depth` frames are reported.
@@ -216,11 +220,11 @@ export function callersOf(profile, name, limit = 8, { depth = 1, lastSeconds = 0
 // unmerged, an interpreter helper called from four opcodes reads as four small entries. Waiting is
 // excluded unless asked for, and percentages are over what is included — a worker that spends its
 // life in a futex would otherwise report nothing but the futex.
-export function selfTime(profile, limit = 25, { includeWaits = false, lastSeconds = 0 } = {}) {
+export function selfTime(profile, limit = 25, { includeWaits = false, lastSeconds = 0, trailingSeconds = 0 } = {}) {
   const byId = new Map(profile.nodes.map((node) => [node.id, node]));
   const merged = new Map();
   let total = 0;
-  for (const id of windowed(profile, lastSeconds)) {
+  for (const id of windowed(profile, lastSeconds, trailingSeconds)) {
     const node = byId.get(id);
     if (!node) continue;
     const { functionName, url } = node.callFrame;

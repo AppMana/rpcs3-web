@@ -6,7 +6,9 @@ and the browser-side plumbing that replaces what wasm cannot provide.
 
 Commercial titles boot and render, on desktop Chromium and on an iPad. Compiled PPU and SPU blocks
 run on the guest threads through the wasm function table, with the interpreter as the fallback for
-any block that is not compiled.
+any block that is not compiled. Both PPU and SPU blocks can also be compiled while the guest runs,
+by RPCS3's own recompilers hosted in compiler workers, so a block no bundle carries does not stay
+interpreted for the rest of the run.
 
 `docs/port.md` describes the architecture, the seams, how to test, how to deploy to a device, and
 what that device can and cannot do. This file covers building and running.
@@ -103,6 +105,10 @@ Dump a title's PPU IR by running it under native RPCS3 with `RPCS3_PPU_WASM_AOT_
 the run can be stopped once the parts stop appearing. `--eboot-parts=N` splits a title's program into
 N modules, which is what keeps each one inside the size a browser will compile — a single large
 module will not compile on a device at all.
+
+`RPCS3_PPU_JIT=1` turns on the runtime PPU tier, which needs no bundle at all and can also stand
+beside one: the bundle is the warm start and the tier compiles what the bundle lacks.
+`RPCS3_PPU_JIT_THRESHOLD` is how many times the interpreter must enter a block first (default 64).
 
 A bundle holds every block the analyser proved reachable, and **every worker running a PPU thread
 holds all of them in its function table**, so the bundle is a per-worker cost. To build one from what

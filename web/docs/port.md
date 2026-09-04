@@ -35,7 +35,8 @@ The JSPI work exists to relax the first constraint. See "Suspending" below.
 | `web/public/play-runtime.mjs`, `play.html` | The interactive page: display, input, HUD. |
 | `web/public/rpcs3-gamepad.mjs` | Gamepad API to PS3 pad words. |
 | `web/public/rpcs3-*-aot-table.mjs`, `rpcs3-aot-workers.mjs` | Loading compiled PPU/SPU side modules and placing them in each worker's function table. |
-| `web/public/rpcs3-spu-llvm*.mjs` | The SPU LLVM tier's compiler workers. |
+| `web/public/rpcs3-spu-llvm*.mjs` | The LLVM tiers' compiler workers and the pool that feeds them. |
+| `rpcs3/Emu/Cell/PPUWebRecompiler.cpp` | The runtime PPU tier: what may be compiled, the registry, the shared table region. |
 | `web/public/rpcs3-webgpu-renderer.mjs` | RSX program to WGSL translation, imported by the RSX worker. |
 | `rpcs3/Emu/RSX/WG/` | The WebGPU backend: `WebGPUDirectGSRender` (renders on the RSX thread), `WebGPURenderTargets.h` (RPCS3's surface store driving it). |
 | `rpcs3/Input/pad_thread.cpp` | `web_pad_handler`, a real `PadHandlerBase` fed by `web_pad::set_state`. |
@@ -68,8 +69,11 @@ JavaScript never drives input timing — it only keeps the snapshot fresh.
 
 **Execution.** PPU and SPU blocks are compiled to wasm side modules and placed in each worker's
 function table; dispatch is a table call, and an address with no compiled block falls back to the
-interpreter. The SPU LLVM tier runs RPCS3's LLVM SPU recompiler with LLVM's wasm backend and
-`wasm-ld` inside compiler workers.
+interpreter. The LLVM tiers run RPCS3's own recompilers — `PPUTranslator` and the LLVM SPU
+recompiler — with LLVM's wasm backend and `wasm-ld` inside compiler workers, which share one
+compiler module because LLVM and lld are 48 MB of wasm per worker. A PPU block is compiled when the
+interpreter has entered it often enough; what counts as a block is the analyser's answer, never a
+policy of the port's own.
 
 **Clock.** `utils::get_tsc()` reads `emscripten_get_now()` directly rather than going through
 `steady_clock` and the WASI clock shim.

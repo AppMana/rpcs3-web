@@ -1676,6 +1676,8 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 	// Compiled programs come from the offline bundle (placed on this worker) and from the recompilers'
 	// registry (present once the host installed its table base); either makes the dispatch path live
 	const bool aot_ready = rpcs3_web_spu_aot_worker_ready() != 0 || spu_web_hot_table_base() != 0;
+	// The highest function table index this worker holds; the registry is in index order, so a
+	// published index at or below it is placed here
 	u32 hot_placed = rpcs3_web_spu_hot_sync();
 #endif
 
@@ -1715,15 +1717,15 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 					{
 						// A program one of the recompilers built: this worker must have placed its
 						// registry entry, and the registry only ever grows
-						if (index - hot_base >= hot_placed)
+						if (index > hot_placed)
 						{
 							hot_placed = rpcs3_web_spu_hot_sync();
 						}
-						if (index - hot_base >= hot_placed)
+						if (index > hot_placed)
 						{
 							if (g_spu_web_hot_skipped++ < 16)
 							{
-								spu_log.error("SPU hot program at 0x%05x (table %u, base %u, placed %u, registry %u) not placed on this worker; skipped", spu.pc, index, hot_base, hot_placed, spu_web_hot_count());
+								spu_log.error("SPU hot program at 0x%05x (table %u, base %u, placed up to %u, registry %u) not placed on this worker; skipped", spu.pc, index, hot_base, hot_placed, spu_web_hot_count());
 							}
 							skipped++;
 							continue;

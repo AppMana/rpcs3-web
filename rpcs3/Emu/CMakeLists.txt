@@ -429,7 +429,9 @@ target_sources(rpcs3_emu PRIVATE
 
 if(RPCS3_WEB)
 	# SPUCommonRecompiler.cpp contributes only its analysis half on the web (see the RPCS3_WEB guards there)
-	target_sources(rpcs3_emu PRIVATE Cell/SPUWebRuntime.cpp Cell/SPUWebNoLlvm.cpp Cell/SPUCommonRecompiler.cpp Cell/SPUWasmRecompiler.cpp)
+	# PPUWebRecompiler.cpp is the runtime PPU tier's registry and thread; the translation itself runs
+	# in the compiler module (web/host/rpcs3_ppu_llvm_main.cpp), so the runtime never links LLVM
+	target_sources(rpcs3_emu PRIVATE Cell/SPUWebRuntime.cpp Cell/SPUWebNoLlvm.cpp Cell/SPUCommonRecompiler.cpp Cell/SPUWasmRecompiler.cpp Cell/PPUWebRecompiler.cpp)
 else()
 	target_sources(rpcs3_emu PRIVATE
 		Cell/PPUTranslator.cpp

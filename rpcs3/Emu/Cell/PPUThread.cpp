@@ -163,6 +163,8 @@ extern const ppu_decoder<ppu_iname> g_ppu_iname{};
 // atomic operation on every guest instruction.
 atomic_t<u64> g_ppu_web_instruction_count{0};
 extern "C" int rpcs3_web_ppu_aot_worker_ready();
+extern "C" u32 rpcs3_web_ppu_hot_sync();
+extern u32 web_hot_table_base();
 atomic_t<u32> g_ppu_web_last_pc{0};
 atomic_t<u32> g_ppu_web_trace_pc{0};
 atomic_t<u32> g_ppu_web_trace_hits{0};
@@ -188,6 +190,9 @@ bool serialize<ppu_thread::cr_bits>(utils::serial& ar, typename ppu_thread::cr_b
 }
 
 extern void ppu_initialize();
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+extern void ppu_web_jit_register_module(const ppu_module<lv2_obj>& info);
+#endif
 extern void ppu_finalize(const ppu_module<lv2_obj>& info, bool force_mem_release = false);
 extern bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only = false, u64 file_size = 0);
 static void ppu_initialize2(class jit_compiler& jit, const ppu_module<lv2_obj>& module_part, const std::string& cache_path, const std::string& obj_name);
@@ -683,6 +688,69 @@ static inline u32 ppu_web_aot_lookup(u32 addr)
 	return page->aot[index].load(std::memory_order_acquire);
 }
 
+// A dispatch slot with this bit set is not a table index: it counts the times the interpreter
+// entered a block the analyser found and no tier has compiled yet, and carries the queued marker
+// once the JIT tier has taken it. Table indices are far below the bit, so the dispatch path reads
+// one word for both.
+static constexpr u32 ppu_web_jit_tag = 0x8000'0000;
+static constexpr u32 ppu_web_jit_queued = 0x4000'0000;
+
+u32 g_ppu_web_jit_threshold = 64;
+
+// A block this worker's table does not hold yet stays on the interpreter, which is silent otherwise
+atomic_t<u32> g_ppu_web_jit_unplaced{0};
+atomic_t<u32> g_ppu_web_jit_syncs{0};
+
+extern void ppu_web_jit_enqueue(u32 addr);
+extern u32 ppu_web_jit_enabled();
+
+// The block starts the analyser found, marked so the interpreter can count its entries
+extern void ppu_web_jit_mark_entry(u32 addr)
+{
+	const auto page = ppu_web_dispatch_page_for(addr, true);
+	const u32 index = (addr & 0xffff) / sizeof(u32);
+
+	if (page->hooks[index].load(std::memory_order_acquire))
+	{
+		return;
+	}
+
+	u32 expected = 0;
+	page->aot[index].compare_exchange_strong(expected, ppu_web_jit_tag, std::memory_order_release, std::memory_order_relaxed);
+}
+
+// Interpreter: an uncompiled block start was entered
+static NEVER_INLINE void ppu_web_jit_note(u32 addr, u32 slot)
+{
+	if (slot == (ppu_web_jit_tag | ppu_web_jit_queued))
+	{
+		return;
+	}
+
+	const auto page = ppu_web_dispatch_page_for(addr, false);
+
+	if (!page)
+	{
+		return;
+	}
+
+	const u32 index = (addr & 0xffff) / sizeof(u32);
+	const u32 count = (slot & ~(ppu_web_jit_tag | ppu_web_jit_queued)) + 1;
+
+	if (count >= g_ppu_web_jit_threshold)
+	{
+		u32 expected = slot;
+		if (page->aot[index].compare_exchange_strong(expected, ppu_web_jit_tag | ppu_web_jit_queued, std::memory_order_release, std::memory_order_relaxed))
+		{
+			ppu_web_jit_enqueue(addr);
+		}
+
+		return;
+	}
+
+	page->aot[index].store(ppu_web_jit_tag | count, std::memory_order_relaxed);
+}
+
 // (guest address, table index) pairs; hooked addresses stay with the hook
 extern void ppu_web_aot_register(const u32* pairs, u32 count)
 {
@@ -708,7 +776,8 @@ extern void* ppu_web_aot_exec_base()
 
 extern u32 ppu_web_aot_registered(u32 addr)
 {
-	return ppu_web_aot_lookup(addr);
+	const u32 slot = ppu_web_aot_lookup(addr);
+	return slot & ppu_web_jit_tag ? 0 : slot;
 }
 #else
 static inline ppu_intrp_func_t ppu_read(u32 addr)
@@ -3076,8 +3145,13 @@ void ppu_thread::exec_task()
 #ifdef RPCS3_WEB
 	u32 web_progress_batch = 0;
 	bool web_reported_zero_pc = false;
-	// Compiled blocks are only callable once this worker's function table holds them (see rpcs3_web_pre.js)
-	const bool web_aot_ready = rpcs3_web_ppu_aot_worker_ready() != 0;
+	// The first function table index the runtime tier may use; the host installs it before any guest
+	// code runs and the registry only grows from there
+	const u32 web_jit_base = ppu_web_jit_enabled() ? web_hot_table_base() : 0;
+	// Compiled blocks are only callable once this worker's function table holds them (see
+	// rpcs3_web_pre.js): the bundle is placed as a whole, the runtime tier's entries one at a time
+	const bool web_aot_ready = rpcs3_web_ppu_aot_worker_ready() != 0 || web_jit_base != 0;
+	u32 web_jit_placed = 0;
 	g_ppu_web_last_pc = cia;
 #endif
 
@@ -3139,11 +3213,34 @@ void ppu_thread::exec_task()
 		}
 		if (const u32 aot_index = web_aot_ready ? ppu_web_aot_lookup(web_instruction_pc) : 0)
 		{
-			// Run the compiled block on this thread; it tail-calls through the table and returns with cia set at a boundary
-			g_ppu_web_aot_dispatch_count++;
-			ppu_web_note_block(aot_index, web_instruction_pc);
-			reinterpret_cast<ppu_web_aot_func_t>(static_cast<uptr>(aot_index))(ppu_web_aot_exec_base(), this, 0, nullptr, gpr[0], gpr[1], gpr[2]);
-			continue;
+			if (aot_index & ppu_web_jit_tag) [[unlikely]]
+			{
+				ppu_web_jit_note(web_instruction_pc, aot_index);
+			}
+			else
+			{
+				// An index the runtime tier handed out is callable here only once this worker placed
+				// its module; the registry is in index order, so one number decides that. Without the
+				// tier there is no region above the bundle and every index is placed.
+				bool placed = !web_jit_base || aot_index < web_jit_base || aot_index <= web_jit_placed;
+
+				if (!placed) [[unlikely]]
+				{
+					g_ppu_web_jit_syncs.raw()++;
+					web_jit_placed = rpcs3_web_ppu_hot_sync();
+					placed = aot_index <= web_jit_placed;
+					if (!placed) g_ppu_web_jit_unplaced.raw()++;
+				}
+
+				if (placed)
+				{
+					// Run the compiled block on this thread; it tail-calls through the table and returns with cia set at a boundary
+					g_ppu_web_aot_dispatch_count++;
+					ppu_web_note_block(aot_index, web_instruction_pc);
+					reinterpret_cast<ppu_web_aot_func_t>(static_cast<uptr>(aot_index))(ppu_web_aot_exec_base(), this, 0, nullptr, gpr[0], gpr[1], gpr[2]);
+					continue;
+				}
+			}
 		}
 		const u32 opcode = *op;
 		const auto fn = ppu_read(cia, opcode);
@@ -5333,6 +5430,11 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 				ppu_write(func.addr, &ppu_check_toc);
 			}
 		}
+
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+		// The runtime tier compiles what the analyser just described, nothing else
+		ppu_web_jit_register_module(info);
+#endif
 
 		return false;
 	}

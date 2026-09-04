@@ -193,13 +193,15 @@ function rpcs3InstantiateSpuSide(module, elemBase, memoryBase, importsTable, tab
   if (!name) throw new Error("SPU side module exports no program");
   return instance.exports[name.name];
 }
-// Called from the SPU thread (C++) on this worker; returns the number of registry entries placed here
+// Called from the SPU thread (C++) on this worker; returns the highest function table index this
+// worker holds. The registry is in index order, so a published index at or below it is placed here.
 function rpcs3SpuHotSyncImpl() {
   const count = wasmExports["rpcs3_web_spu_hot_count"]() >>> 0;
   let placed = self.__rpcs3SpuHotPlaced >>> 0;
-  if (placed >= count) return placed;
+  if (placed >= count) return self.__rpcs3SpuHotMaxIndex >>> 0;
   const table = wasmExports["__indirect_function_table"];
   const info = self.__rpcs3SpuHotInfo ??= wasmExports["malloc"](32) >>> 0;
+  let maxIndex = self.__rpcs3SpuHotMaxIndex >>> 0;
   for (; placed < count; placed++) {
     wasmExports["rpcs3_web_spu_hot_info"](placed, info);
     const [kind, index, pointer, size, elemBase, tableSize, memoryBase, importsTable] = new Uint32Array(wasmMemory.buffer, info, 8);
@@ -208,18 +210,109 @@ function rpcs3SpuHotSyncImpl() {
     const need = kind === 1 ? Math.max(index + 1, elemBase + tableSize) : index + 1;
     if (table.length < need) table.grow(need - table.length);
     table.set(index, kind === 1 ? rpcs3InstantiateSpuSide(module, elemBase, memoryBase, importsTable, table) : rpcs3InstantiateSpuHot(module));
+    if (index > maxIndex) maxIndex = index;
     if ((self.__rpcs3SpuHotLogged = (self.__rpcs3SpuHotLogged | 0) + 1) <= 40) console.log(`[rpcs3 spu hot] worker placed entry ${placed} at table index ${index} (table length ${table.length}, ${size} bytes)`);
   }
   self.__rpcs3SpuHotPlaced = placed;
-  return placed;
+  self.__rpcs3SpuHotMaxIndex = maxIndex;
+  return maxIndex;
 }
-Module["rpcs3InstallSpuHotLoad"] = (load) => {
+Module["rpcs3SpuHotStats"] = () => ({ placedHere: self.__rpcs3SpuHotPlaced >>> 0, count: wasmExports["rpcs3_web_spu_hot_count"]() >>> 0 });
+
+// PPU blocks compiled while the guest runs (rpcs3/Emu/Cell/PPUWebRecompiler.cpp). Same placement as
+// an LLVM-tier SPU program: a dylink side module whose element segment sits at elemBase and whose
+// data sits at the memoryBase the registry reserved, bound to the runtime's direct dispatch exports.
+const rpcs3PpuHotBindings = Object.freeze({
+  __check: "rpcs3_web_ppu_direct_check", __error: "rpcs3_web_ppu_direct_error",
+  __syscall: "rpcs3_web_ppu_direct_syscall", __lv1call: "rpcs3_web_ppu_direct_lv1call",
+  __get_tb: "rpcs3_web_ppu_direct_get_tb", __lwarx: "rpcs3_web_ppu_direct_lwarx",
+  __ldarx: "rpcs3_web_ppu_direct_ldarx", __stwcx: "rpcs3_web_ppu_direct_stwcx",
+  __stdcx: "rpcs3_web_ppu_direct_stdcx",
+  fma: "rpcs3_web_libcall_fma", fmaf: "rpcs3_web_libcall_fmaf",
+  fmod: "rpcs3_web_libcall_fmod", fmodf: "rpcs3_web_libcall_fmodf",
+  memcpy: "rpcs3_web_libcall_memcpy", memmove: "rpcs3_web_libcall_memmove",
+  memset: "rpcs3_web_libcall_memset", memcmp: "rpcs3_web_libcall_memcmp",
+});
+function rpcs3InstantiatePpuSide(module, elemBase, memoryBase, importsTable, table) {
+  const env = {
+    memory: wasmMemory,
+    __memory_base: new WebAssembly.Global({ value: "i32", mutable: false }, memoryBase),
+    __table_base: new WebAssembly.Global({ value: "i32", mutable: false }, elemBase),
+  };
+  if (importsTable) env.__indirect_function_table = table;
+  for (const imported of WebAssembly.Module.imports(module)) {
+    if (imported.module !== "env" || imported.name in env) continue;
+    if (imported.kind === "global" && imported.name === "__stack_pointer") {
+      if (!(wasmExports["__stack_pointer"] instanceof WebAssembly.Global)) throw new Error("the runtime does not export __stack_pointer");
+      env.__stack_pointer = wasmExports["__stack_pointer"];
+      continue;
+    }
+    if (imported.kind !== "function") throw new Error(`unsupported PPU side-module import ${imported.kind} ${imported.name}`);
+    const target = rpcs3PpuHotBindings[imported.name] ?? (imported.name.startsWith("rpcs3_web_vm_") ? imported.name : undefined);
+    if (!target || typeof wasmExports[target] !== "function") throw new Error(`no runtime binding for PPU side-module import ${imported.name}`);
+    env[imported.name] = wasmExports[target];
+  }
+  const instance = new WebAssembly.Instance(module, { env });
+  for (const init of ["__wasm_init_memory", "__wasm_apply_data_relocs", "__wasm_call_ctors"]) {
+    if (typeof instance.exports[init] === "function") instance.exports[init]();
+  }
+  const name = WebAssembly.Module.exports(module).find((e) => e.kind === "function" && /^__0x[0-9a-f]+$/i.test(e.name));
+  if (!name) throw new Error("PPU side module exports no block");
+  return instance.exports[name.name];
+}
+// A compiled block reaches another through the function table, so a slot the runtime tier may
+// publish while this worker is inside compiled code has to be callable already: the whole region is
+// reserved here and every free slot answers with the stub that hands the block back to the
+// interpreter, which then places what the registry has grown by.
+function rpcs3ReserveHotRegion(table) {
+  if (self.__rpcs3HotRegionReserved) return;
+  self.__rpcs3HotRegionReserved = true;
+  const base = wasmExports["rpcs3_web_hot_table_base"]() >>> 0;
+  const limit = wasmExports["rpcs3_web_hot_table_limit"]() >>> 0;
+  if (!base) { self.__rpcs3HotRegionReserved = false; return; }
+  if (table.length < limit) table.grow(limit - table.length);
+  const unplaced = wasmExports["rpcs3_web_ppu_direct_unplaced"];
+  for (let index = base; index < limit; index++) {
+    if (table.get(index) === null) table.set(index, unplaced);
+  }
+}
+// Called from the PPU thread (C++) on this worker; returns the highest function table index it holds
+function rpcs3PpuHotSyncImpl() {
+  const count = wasmExports["rpcs3_web_ppu_hot_count"]() >>> 0;
   const table = wasmExports["__indirect_function_table"];
-  const base = load ? load.tableBase + load.tableSize : table.length;
-  Module["ccall"]("rpcs3_web_spu_set_hot_table_base", null, ["number"], [base]);
+  rpcs3ReserveHotRegion(table);
+  let placed = self.__rpcs3PpuHotPlaced >>> 0;
+  if (placed >= count) return self.__rpcs3PpuHotMaxIndex >>> 0;
+  const info = self.__rpcs3PpuHotInfo ??= wasmExports["malloc"](32) >>> 0;
+  let maxIndex = self.__rpcs3PpuHotMaxIndex >>> 0;
+  for (; placed < count; placed++) {
+    wasmExports["rpcs3_web_ppu_hot_info"](placed, info);
+    const [index, pointer, size, elemBase, tableSize, memoryBase, importsTable] = new Uint32Array(wasmMemory.buffer, info, 7);
+    const bytes = new Uint8Array(wasmMemory.buffer, pointer, size).slice();
+    const module = new WebAssembly.Module(bytes);
+    const need = Math.max(index + 1, elemBase + tableSize);
+    if (table.length < need) table.grow(need - table.length);
+    table.set(index, rpcs3InstantiatePpuSide(module, elemBase, memoryBase, importsTable, table));
+    if (index > maxIndex) maxIndex = index;
+    if ((self.__rpcs3PpuHotLogged = (self.__rpcs3PpuHotLogged | 0) + 1) <= 40) console.log(`[rpcs3 ppu jit] worker placed entry ${placed} at table index ${index} (table length ${table.length}, ${size} bytes)`);
+  }
+  self.__rpcs3PpuHotPlaced = placed;
+  self.__rpcs3PpuHotMaxIndex = maxIndex;
+  return maxIndex;
+}
+Module["rpcs3PpuHotStats"] = () => ({ placedHere: self.__rpcs3PpuHotPlaced >>> 0, count: wasmExports["rpcs3_web_ppu_hot_count"]() >>> 0 });
+
+// One region above every bundle for both runtime tiers, so a PPU block and an SPU program never
+// claim the same function table index
+Module["rpcs3InstallHotTable"] = (ppuLoad, spuLoad) => {
+  const table = wasmExports["__indirect_function_table"];
+  let base = table.length;
+  for (const load of [ppuLoad, spuLoad]) {
+    if (load) base = Math.max(base, (load.tableBase >>> 0) + (load.tableSize >>> 0));
+  }
+  Module["ccall"]("rpcs3_web_set_hot_table_base", null, ["number"], [base]);
   return { base };
 };
-Module["rpcs3SpuHotStats"] = () => ({ placedHere: self.__rpcs3SpuHotPlaced >>> 0, count: wasmExports["rpcs3_web_spu_hot_count"]() >>> 0 });
 
 Module["rpcs3PrepareGpu"] = (canvas, flagAddress) => new Promise((resolve, reject) => {
   const PThread = Module["PThread"];

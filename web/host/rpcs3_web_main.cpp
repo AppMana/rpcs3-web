@@ -1,3 +1,5 @@
+#include <cmath>
+#include <cstring>
 #include "Emu/System.h"
 #include "Emu/IdManager.h"
 #include "Emu/VFS.h"
@@ -123,6 +125,21 @@ extern u64 spu_web_aot_fallback_count();
 [[noreturn]] extern void spu_web_escape_now(spu_thread* spu);
 
 extern void ppu_web_aot_register(const u32* pairs, u32 count);
+// PPU runtime tier (rpcs3/Emu/Cell/PPUWebRecompiler.cpp)
+extern void web_hot_table_set_base(u32 base);
+extern u32 web_hot_table_limit();
+extern u32 web_hot_table_base();
+extern void ppu_web_jit_set_enabled(bool enabled);
+extern void ppu_web_jit_set_threshold(u32 misses);
+extern s32 ppu_web_jit_poll();
+extern u32 ppu_web_jit_slot_addr(u32 i);
+extern u32 ppu_web_jit_slot_size(u32 i);
+extern const u8* ppu_web_jit_slot_code(u32 i);
+extern u32 ppu_web_jit_slot_attr(u32 i);
+extern void ppu_web_jit_slot_finish(u32 i, u8* bytes, u32 size, u32 memory_size, u32 memory_align, u32 table_size, u32 imports_table);
+extern u32 ppu_web_jit_count();
+extern void ppu_web_jit_info(u32 i, u32* out);
+extern std::string ppu_web_jit_report();
 extern void* ppu_web_aot_exec_base();
 extern u32 ppu_web_aot_registered(u32 addr);
 extern atomic_t<u64> g_ppu_web_aot_dispatch_count;
@@ -1124,6 +1141,135 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_set_hot_table_base(u32 base)
 	{
 		spu_web_set_hot_table_base(base);
+	}
+
+	// The function table region both runtime tiers allocate their indices from
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_hot_table_base(u32 base)
+	{
+		spu_web_set_hot_table_base(base);
+	}
+
+	// One past the last index the runtime tiers may use; a worker reserves this whole span before it
+	// runs a PPU thread, because compiled blocks reach each other through the table
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_hot_table_limit()
+	{
+		return web_hot_table_limit();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_hot_table_base()
+	{
+		return web_hot_table_base();
+	}
+
+	// Placed in every reserved slot no compiled block occupies: the caller stored the target address
+	// in cia, so returning hands the block back to the interpreter (PPUTranslator::WasmCallThroughTable)
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_direct_unplaced(void*, void*, u64, void*, u64, u64, u64)
+	{
+	}
+
+	// Library calls the WebAssembly backend emits for intrinsics it cannot lower to an instruction.
+	// The offline bundles link Emscripten's own archives for these; a side module built in the browser
+	// imports them instead, so it shares the runtime's copy rather than carrying one per block.
+	EMSCRIPTEN_KEEPALIVE double rpcs3_web_libcall_fma(double a, double b, double c)
+	{
+		return std::fma(a, b, c);
+	}
+
+	EMSCRIPTEN_KEEPALIVE float rpcs3_web_libcall_fmaf(float a, float b, float c)
+	{
+		return std::fmaf(a, b, c);
+	}
+
+	EMSCRIPTEN_KEEPALIVE double rpcs3_web_libcall_fmod(double a, double b)
+	{
+		return std::fmod(a, b);
+	}
+
+	EMSCRIPTEN_KEEPALIVE float rpcs3_web_libcall_fmodf(float a, float b)
+	{
+		return std::fmodf(a, b);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void* rpcs3_web_libcall_memcpy(void* dst, const void* src, usz size)
+	{
+		return std::memcpy(dst, src, size);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void* rpcs3_web_libcall_memmove(void* dst, const void* src, usz size)
+	{
+		return std::memmove(dst, src, size);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void* rpcs3_web_libcall_memset(void* dst, int value, usz size)
+	{
+		return std::memset(dst, value, size);
+	}
+
+	EMSCRIPTEN_KEEPALIVE int rpcs3_web_libcall_memcmp(const void* a, const void* b, usz size)
+	{
+		return std::memcmp(a, b, size);
+	}
+
+	// PPU runtime tier: RPCS3's PPUTranslator running in the compiler workers
+	// (web/host/rpcs3_ppu_llvm_main.cpp, driven by web/public/rpcs3-spu-llvm.mjs)
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_llvm_set_enabled(s32 enabled)
+	{
+		ppu_web_jit_set_enabled(enabled != 0);
+	}
+
+	// Interpreter entries into an uncompiled block before the tier is asked for it (default 64)
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_llvm_set_threshold(u32 misses)
+	{
+		ppu_web_jit_set_threshold(misses);
+	}
+
+	EMSCRIPTEN_KEEPALIVE s32 rpcs3_web_ppu_llvm_poll()
+	{
+		return ppu_web_jit_poll();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_llvm_slot_addr(u32 i)
+	{
+		return ppu_web_jit_slot_addr(i);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_llvm_slot_size(u32 i)
+	{
+		return ppu_web_jit_slot_size(i);
+	}
+
+	EMSCRIPTEN_KEEPALIVE const u8* rpcs3_web_ppu_llvm_slot_code(u32 i)
+	{
+		return ppu_web_jit_slot_code(i);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_llvm_slot_attr(u32 i)
+	{
+		return ppu_web_jit_slot_attr(i);
+	}
+
+	// The compiler worker's answer: side module bytes from malloc (the waiting PPU JIT thread
+	// registers and frees them), or null with size 0 on failure
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_llvm_slot_finish(u32 i, u8* bytes, u32 size, u32 memory_size, u32 memory_align, u32 table_size, u32 imports_table)
+	{
+		ppu_web_jit_slot_finish(i, bytes, size, memory_size, memory_align, table_size, imports_table);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_hot_count()
+	{
+		return ppu_web_jit_count();
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_hot_info(u32 i, u32* out)
+	{
+		ppu_web_jit_info(i, out);
+	}
+
+	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_ppu_jit_report()
+	{
+		static std::string report;
+		report = ppu_web_jit_report();
+		return report.c_str();
 	}
 
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_hot_count()

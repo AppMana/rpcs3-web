@@ -2077,7 +2077,6 @@ namespace
 	std::deque<spu_web_hot_entry> g_spu_web_hot_entries; // stable addresses
 	atomic_t<u32> g_spu_web_hot_count{0};                 // entries published (release)
 	atomic_t<u32> g_spu_web_hot_compiled{0}, g_spu_web_hot_refused{0}, g_spu_web_hot_bytes{0};
-	u32 g_spu_web_hot_next_index = 0;                     // first free table index beyond the bundle layout
 	atomic_t<u32> g_spu_web_hot_base{0};                  // first hot table index (dispatch hot path reads it)
 	constexpr u32 spu_web_hot_limit = 65536;              // programs per run
 	// Per hot table slot (index - base): 1 for an LLVM-tier side module, so dispatches count per tier
@@ -2093,10 +2092,15 @@ namespace
 	std::array<spu_web_tier_counts, 8> g_spu_web_tier_counts{};
 }
 
+// The region above the bundles is shared with the PPU runtime tier (PPUWebRecompiler.cpp)
+extern void web_hot_table_set_base(u32 base);
+extern u32 web_hot_table_base();
+extern u32 web_hot_table_reserve(u32 count);
+
 extern void spu_web_set_hot_table_base(u32 base)
 {
 	std::lock_guard lock(g_spu_web_hot_mutex);
-	g_spu_web_hot_next_index = base;
+	web_hot_table_set_base(base);
 	g_spu_web_hot_base = base;
 }
 
@@ -2279,9 +2283,10 @@ extern u32 spu_web_llvm_register(const u8* bytes, u32 size, u32 entry, u32 memor
 	u32 index;
 	{
 		std::lock_guard lock(g_spu_web_hot_mutex);
-		const u32 elem_base = g_spu_web_hot_next_index;
-		g_spu_web_hot_next_index += table_size;
-		index = g_spu_web_hot_next_index++;
+		// Reserved under this lock so the registry stays in index order, which is what lets a worker
+		// decide from the highest index it placed whether a published entry is placed here
+		const u32 elem_base = web_hot_table_reserve(table_size + 1);
+		index = elem_base + table_size;
 		g_spu_web_hot_entries.push_back({ entry, index, std::move(module), 1, elem_base, table_size, memory_base, imports_table });
 		if (const u32 slot = index - g_spu_web_hot_base.load(); slot < spu_web_hot_limit * 2) g_spu_web_hot_kinds[slot].store(1);
 		g_spu_web_hot_count.store(::size32(g_spu_web_hot_entries));
@@ -2329,7 +2334,7 @@ static u32 spu_web_hot_register_module(u32 entry, std::vector<u8> module)
 	u32 index;
 	{
 		std::lock_guard lock(g_spu_web_hot_mutex);
-		index = g_spu_web_hot_next_index++;
+		index = web_hot_table_reserve(1);
 		g_spu_web_hot_entries.push_back({ entry, index, std::move(module) });
 		g_spu_web_hot_count.store(::size32(g_spu_web_hot_entries));
 	}
@@ -2390,7 +2395,7 @@ spu_function_t spu_wasm_recompiler::compile(spu_program&& _func)
 // Dispatch miss in spu_web_interpreter_loop: the sequence of spu_recompiler_base::dispatch
 extern bool spu_web_try_compile(spu_thread& spu)
 {
-	if (!spu.jit || !g_spu_web_hot_next_index || spu._ref<u32>(spu.pc) == 0u)
+	if (!spu.jit || !web_hot_table_base() || spu._ref<u32>(spu.pc) == 0u)
 	{
 		return false;
 	}

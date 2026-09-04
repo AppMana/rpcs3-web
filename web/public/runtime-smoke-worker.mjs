@@ -30,6 +30,7 @@ let ppuDispatcher;
 let ppuAotTable = null;
 let spuAotTable = null;
 let spuLlvmPool = null;
+let ppuJit = false;
 let spuDispatcher;
 let padState = { digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 };
 let moduleCreateMs = 0;
@@ -122,6 +123,8 @@ async function captureDispatch(expectedVerdict = "", timeoutMs = 30_000) {
       module.ccall("rpcs3_web_spu_aot_abi", "number", ["number"], [field]) >>> 0),
     spuHotReport: JSON.parse(module.ccall("rpcs3_web_spu_hot_report", "string", [], [])),
     spuLlvm: spuLlvmPool ? spuLlvmPool.stats() : undefined,
+    ppuJitReport: ppuJit ? JSON.parse(module.ccall("rpcs3_web_ppu_jit_report", "string", [], [])) : undefined,
+    ppuAotDispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])),
     elapsedMs: performance.now() - bootStartedAt,
     logs: logs.slice(-300),
     detail: terminal || `dispatch protocol did not finish within ${timeoutMs} ms`,
@@ -265,6 +268,8 @@ async function progress(includeThreads = false) {
     ppuLastPc: module.ccall("rpcs3_web_ppu_last_pc", "number", [], []) >>> 0,
     ppuLastFunction: module.ccall("rpcs3_web_ppu_last_function", "string", [], []),
     ppuAotEntryReady: module.ccall("rpcs3_web_ppu_aot_entry_ready", "number", [], []),
+    ppuAotDispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])),
+    ppuJitReport: ppuJit ? JSON.parse(module.ccall("rpcs3_web_ppu_jit_report", "string", [], [])) : undefined,
     spuInstructions: Number(module.ccall("rpcs3_web_spu_instruction_count", "bigint", [], [])),
     spuLastPcs: Array.from({ length: 6 }, (_, index) =>
       module.ccall("rpcs3_web_spu_last_pc", "number", ["number"], [index]) >>> 0),
@@ -464,6 +469,9 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     spuHot: module.rpcs3SpuHotStats ? module.rpcs3SpuHotStats() : undefined,
     spuHotReport: module ? JSON.parse(module.ccall("rpcs3_web_spu_hot_report", "string", [], [])) : undefined,
     spuLlvm: spuLlvmPool ? spuLlvmPool.stats() : undefined,
+    ppuJitReport: ppuJit ? JSON.parse(module.ccall("rpcs3_web_ppu_jit_report", "string", [], [])) : undefined,
+    ppuHot: ppuJit && module.rpcs3PpuHotStats ? module.rpcs3PpuHotStats() : undefined,
+    ppuAotDispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])),
     spuMissCount: spuFallbackHistogram ? module.ccall("rpcs3_web_spu_miss_count", "number", [], []) >>> 0 : 0,
     stackReport: stackReport(),
     ppuInstructions: Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], [])),
@@ -769,24 +777,36 @@ scope.addEventListener("message", async (event) => {
       });
     }
     if (!reuse) {
-      // Runtime SPU->wasm recompiler: compiled programs are hot-loaded into every worker's table
-      module.rpcs3InstallSpuHotLoad(spuAotTable);
+      // Everything either runtime tier compiles goes into the function table above the bundles
+      module.rpcs3InstallHotTable(ppuAotTable, spuAotTable);
       // The binding map (one entry per patchpoint import) is not report material
       if (spuAotTable) spuAotTable = { ...spuAotTable, bindings: undefined };
       if (Number(event.data.spuHotThreshold) > 0) {
         module.ccall("rpcs3_web_spu_set_hot_threshold", null, ["number"], [Number(event.data.spuHotThreshold)]);
       }
-      if (spuDecoder === "llvm") {
-        // RPCS3's SPU LLVM thread compiles in these compiler workers (see rpcs3-spu-llvm.mjs)
-        const { createSpuLlvmPool } = await import("./rpcs3-spu-llvm.mjs");
-        spuLlvmPool = await createSpuLlvmPool({
+      // The PPU tier compiles blocks the bundle does not carry, so a block the analyser found never
+      // falls back to the interpreter for the whole run. Enabled before boot, because ppu_initialize
+      // is where the analyser hands it the blocks it may compile.
+      ppuJit = event.data.ppuJit === true;
+      if (ppuJit) {
+        if (Number(event.data.ppuJitThreshold) > 0) {
+          module.ccall("rpcs3_web_ppu_llvm_set_threshold", null, ["number"], [Number(event.data.ppuJitThreshold)]);
+        }
+        module.ccall("rpcs3_web_ppu_llvm_set_enabled", null, ["number"], [1]);
+      }
+      if (spuDecoder === "llvm" || ppuJit) {
+        // RPCS3's own recompilers run in these compiler workers (see rpcs3-spu-llvm.mjs)
+        const { createLlvmCompilerPool } = await import("./rpcs3-spu-llvm.mjs");
+        spuLlvmPool = await createLlvmCompilerPool({
           module,
           memory: mainMemory ?? module.wasmMemory,
           workers: Number(event.data.spuLlvmWorkers) > 0 ? Number(event.data.spuLlvmWorkers) : 2,
           moduleUrl: new URL("./core/rpcs3-spu-llvm.mjs", scope.location.href).href,
           log: (line) => { recordLog(line); console.log(line); },
+          spu: spuDecoder === "llvm",
+          ppu: ppuJit,
         });
-        module.ccall("rpcs3_web_spu_llvm_set_enabled", null, ["number"], [1]);
+        if (spuDecoder === "llvm") module.ccall("rpcs3_web_spu_llvm_set_enabled", null, ["number"], [1]);
       }
     }
     if (aotWasm) module.ccall("rpcs3_web_set_ppu_aot_handoff", null, ["number"], [1]);

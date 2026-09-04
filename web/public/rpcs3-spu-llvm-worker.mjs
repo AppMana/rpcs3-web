@@ -1,6 +1,7 @@
-// Compiler worker of the browser SPU LLVM tier. Hosts core/rpcs3-spu-llvm.wasm (RPCS3's LLVM SPU
-// recompiler in wasm-IR mode, LLVM's WebAssembly backend, wasm-ld) and turns local-store snapshots
-// into dylink side modules; rpcs3-spu-llvm.mjs on the runtime's module thread feeds it.
+// Compiler worker of the browser LLVM tiers. Hosts core/rpcs3-spu-llvm.wasm (RPCS3's LLVM SPU
+// recompiler in wasm-IR mode, RPCS3's PPUTranslator in its wasm mode, LLVM's WebAssembly backend,
+// wasm-ld) and turns local-store snapshots and PPU blocks into dylink side modules;
+// rpcs3-spu-llvm.mjs on the runtime's module thread feeds it.
 let module = null;
 let lsPointer = 0;
 const lines = [];
@@ -20,6 +21,9 @@ self.onmessage = async (event) => {
       if (!module.ccall("rpcs3_spu_llvm_init", "number", [], [])) {
         throw new Error(`${module.ccall("rpcs3_spu_llvm_error", "string", [], [])}\n${lines.join("\n")}`);
       }
+      if (!module.ccall("rpcs3_ppu_llvm_init", "number", [], [])) {
+        throw new Error(`${module.ccall("rpcs3_ppu_llvm_error", "string", [], [])}\n${lines.join("\n")}`);
+      }
       lsPointer = module._malloc(262144) >>> 0;
       self.postMessage({ type: "ready" });
     } catch (error) {
@@ -30,6 +34,30 @@ self.onmessage = async (event) => {
   // Views are taken fresh from the memory: the module grows its heap while compiling, and a cached
   // HEAPU8 would then point at a detached buffer
   const heap = () => new Uint8Array(module.wasmMemory.buffer);
+  if (data.type === "compile-ppu") {
+    const startedAt = performance.now();
+    let pointer = 0;
+    try {
+      const code = new Uint8Array(data.code);
+      pointer = module._malloc(code.length) >>> 0;
+      heap().set(code, pointer);
+      const size = module.ccall("rpcs3_ppu_llvm_compile", "number", ["number", "number", "number", "number"], [data.addr, code.length, pointer, data.attr >>> 0]) >>> 0;
+      const ms = performance.now() - startedAt;
+      if (!size) {
+        self.postMessage({ type: "failed", id: data.id, addr: data.addr, ms, error: `${module.ccall("rpcs3_ppu_llvm_error", "string", [], [])}\n${lines.slice(-20).join("\n")}` });
+        return;
+      }
+      const output = module.ccall("rpcs3_ppu_llvm_output", "number", [], []) >>> 0;
+      const bytes = heap().slice(output, output + size);
+      const heapBytes = module.wasmMemory.buffer.byteLength;
+      self.postMessage({ type: "compiled", id: data.id, addr: data.addr, bytes, words: code.length / 4, ms, heapBytes }, [bytes.buffer]);
+    } catch (error) {
+      self.postMessage({ type: "failed", id: data.id, addr: data.addr, ms: performance.now() - startedAt, error: `${String(error?.stack ?? error)}\n${lines.slice(-20).join("\n")}` });
+    } finally {
+      if (pointer) module._free(pointer);
+    }
+    return;
+  }
   if (data.type === "compile" || data.type === "compile-ir") {
     const startedAt = performance.now();
     try {

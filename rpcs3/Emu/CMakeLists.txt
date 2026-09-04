@@ -110,6 +110,7 @@ target_sources(rpcs3_emu PRIVATE
 if(RPCS3_WEB)
 	target_sources(rpcs3_emu PRIVATE
 		../util/vm_web.cpp
+		../util/sched_web.cpp
 		../rpcs3_version.cpp
 		../Input/mouse_gyro_handler.cpp
 		../Input/pad_thread.cpp

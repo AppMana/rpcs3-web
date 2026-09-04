@@ -210,7 +210,7 @@ RPCS3_FRAMES=600 npm run hardware:run -- "/opfs/games/<title>.iso" out.json
 
 The runner writes `out.json` plus sidecars beside it. Useful variables: `RPCS3_SPU_DECODER`,
 `RPCS3_CLOCK_SCALE`, `RPCS3_RENDER_EVERY`, `RPCS3_READBACK`, `RPCS3_INPUT_TRACE`, `RPCS3_PPU_PROFILE`,
-`RPCS3_CORE=profile` for the symbolized build.
+`RPCS3_CORE=profile` for the symbolized build and `RPCS3_CORE=jspi` for the suspending one.
 
 ## Deploying to an iPad
 

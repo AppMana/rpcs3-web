@@ -14,7 +14,7 @@
 //   RPCS3_FRAMES=1 (max 3600)   RPCS3_UNTIL_DRAW=1   RPCS3_RENDER_EVERY=1
 //   RPCS3_TIMEOUT_MS=120000   RPCS3_WIDTH=1280 RPCS3_HEIGHT=720   RPCS3_READBACK=0|1
 //   RPCS3_CLOCK_SCALE=<percent>   RPCS3_ACCURATE_SPU_DMA=1   RPCS3_RENDERER=webgpu|null
-//   RPCS3_PACKET_CAPTURE_LEVEL=0..5   RPCS3_POOL_SIZE=12   RPCS3_CORE=release|profile
+//   RPCS3_PACKET_CAPTURE_LEVEL=0..5   RPCS3_POOL_SIZE=12   RPCS3_CORE=release|profile|jspi
 //   RPCS3_PACKET_FIXTURE=/path/frame.wgpf.gz   RPCS3_CAPTURE_RGBA=1   RPCS3_CAPTURE_SHADERS=1
 //   RPCS3_CPU_PROFILE=/path/run.cpuprofile   RPCS3_CPU_INTERVAL_US=10000   RPCS3_TRACE=/path/trace.json
 //   RPCS3_PPU_JIT=1   RPCS3_PPU_JIT_THRESHOLD=64
@@ -53,7 +53,7 @@ const readback = env.RPCS3_READBACK ? env.RPCS3_READBACK === "1" : Boolean(packe
 const cpuProfilePath = env.RPCS3_CPU_PROFILE ? path.resolve(env.RPCS3_CPU_PROFILE) : undefined;
 const cpuSamplingIntervalUs = Math.max(1_000, Math.min(100_000, Number(env.RPCS3_CPU_INTERVAL_US) || 10_000));
 const tracePath = env.RPCS3_TRACE ? path.resolve(env.RPCS3_TRACE) : undefined;
-const coreVariant = env.RPCS3_CORE === "profile" ? "profile" : "release";
+const coreVariant = ["profile", "jspi"].includes(env.RPCS3_CORE) ? env.RPCS3_CORE : "release";
 const inputTrace = env.RPCS3_INPUT_TRACE ? JSON.parse(await readFile(path.resolve(env.RPCS3_INPUT_TRACE), "utf8")).entries : undefined;
 const runOptions = {
   frames,
@@ -93,7 +93,8 @@ const runOptions = {
   accurateSpuDma: env.RPCS3_ACCURATE_SPU_DMA ? env.RPCS3_ACCURATE_SPU_DMA === "1" : undefined,
   packetCaptureLevel: env.RPCS3_PACKET_CAPTURE_LEVEL ? Number(env.RPCS3_PACKET_CAPTURE_LEVEL) : undefined,
   pthreadPoolSize: env.RPCS3_POOL_SIZE ? Number(env.RPCS3_POOL_SIZE) : undefined,
-  coreUrl: coreVariant === "profile" ? "./core/profile/rpcs3-web.mjs" : undefined,
+  coreUrl: coreVariant === "release" ? undefined : `./core/${coreVariant}/rpcs3-web.mjs`,
+  suspending: coreVariant === "jspi",
   tracePc: env.RPCS3_TRACE_PC ? Number(env.RPCS3_TRACE_PC) : undefined,
   traceDelayPc: env.RPCS3_TRACE_DELAY_PC ? Number(env.RPCS3_TRACE_DELAY_PC) : undefined,
   traceDelayMs: env.RPCS3_TRACE_DELAY_MS ? Number(env.RPCS3_TRACE_DELAY_MS) : undefined,

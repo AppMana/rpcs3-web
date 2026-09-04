@@ -141,8 +141,8 @@ RPCS3_FRAMES=600 npm run hardware:run -- "/opfs/games/<title>.iso" out.json
 ```
 
 The runner writes `out.json` plus sidecars beside it. Useful variables: `RPCS3_SPU_DECODER`
-(`static`, `asmjit`, `llvm`), `RPCS3_SPU_LLVM_WORKERS`, `RPCS3_CLOCK_SCALE`, `RPCS3_RENDER_EVERY`,
-`RPCS3_INPUT_TRACE`, `RPCS3_PPU_PROFILE`, `RPCS3_CORE=profile`.
+(`static`, `asmjit`, `llvm`), `RPCS3_SPU_LLVM_WORKERS`, `RPCS3_PPU_JIT`, `RPCS3_CLOCK_SCALE`,
+`RPCS3_RENDER_EVERY`, `RPCS3_INPUT_TRACE`, `RPCS3_PPU_PROFILE`, `RPCS3_CORE=profile|jspi`.
 
 `play.html` is the interactive page. It takes the title and its bundles as query parameters:
 

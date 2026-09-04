@@ -330,6 +330,9 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       progressIntervalMs: options.progressIntervalMs,
       pthreadPoolSize: options.pthreadPoolSize,
       coreUrl: options.coreUrl,
+      // A suspending core's file-touching entry points return promises, so the module thread awaits
+      // them and boots on a thread of its own (runtime-smoke-worker.mjs)
+      suspending: options.suspending === true,
       inputTrace: Array.isArray(options.inputTrace) ? options.inputTrace : undefined,
       recordInputs: options.recordInputs === true,
       // RPCS3's WebGPU RSX backend always produces packets; page-side WebGPU

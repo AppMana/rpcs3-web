@@ -41,6 +41,9 @@ let diagnostics = false;
 let presentLatestOnly = false;
 let consumedFlips = 0;
 let directGpu;
+// A core whose guest threads can suspend: its file-touching entry points return promises, and the
+// boot has to run off this thread so this one can keep servicing them.
+let suspendingCore = false;
 let presentedSkips = 0;
 let frameCounterAddress = 0;
 
@@ -69,7 +72,7 @@ async function captureDispatch(expectedVerdict = "", timeoutMs = 30_000) {
       aotSnapshot = snapshot;
     }
     if (spuDispatcher) spuDispatcher.runBatch(256);
-    runHostTasks();
+    await runHostTasks();
     if (!ppuDispatcher || aotSnapshot?.context) refreshDispatchLines();
     terminal = dispatchLines.findLast((line) => / (PASS|FAIL) /.test(line)) ?? "";
     if (terminal) break;
@@ -228,15 +231,24 @@ function stackReport() {
     .sort((a, b) => b.usedBytes - a.usedBytes);
 }
 
-// RPCS3 queues work for its main thread; this worker is that thread.
+// RPCS3 queues work for its main thread; this worker is that thread. On a suspending core that
+// queue carries file access, which suspends, so draining it returns a promise the caller awaits.
 function runHostTasks() {
   if (!module) return 0;
-  return module.ccall("rpcs3_web_run_host_tasks", "number", [], []) >>> 0;
+  return module.ccall("rpcs3_web_run_host_tasks", "number", [], []);
 }
 
-function progress(includeThreads = false) {
-  if (!module) return;
-  runHostTasks();
+let progressInFlight = false;
+
+async function progress(includeThreads = false) {
+  if (!module || progressInFlight) return;
+  progressInFlight = true;
+  try {
+    await runHostTasks();
+  } catch {
+    progressInFlight = false;
+    return;
+  }
   scope.postMessage({
     type: "runtime-progress",
     bootResult,
@@ -267,6 +279,7 @@ function progress(includeThreads = false) {
     threads: includeThreads ? module.ccall("rpcs3_web_thread_snapshot", "string", [], []) : "",
     elapsedMs: bootStartedAt ? performance.now() - bootStartedAt : 0,
   });
+  progressInFlight = false;
 }
 
 scope.addEventListener("error", (event) => {
@@ -395,7 +408,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     // Wait for the RSX thread's flip notification (bounded so pad messages
     // and status changes are still observed). This is not guest pacing.
     await waitForFlip(Math.min(250, packetDeadline - performance.now()));
-    runHostTasks();
+    await runHostTasks();
     status = module.ccall("rpcs3_web_status", "number", [], []);
   }
   if (untilDraw && flipPacketCount === 1 && drawPacketCount === 0 && bootResult === 0 && status !== 0 && performance.now() < packetDeadline) {
@@ -446,7 +459,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     captureMs,
     workingSet: workingSet(),
     liveThreadNames: module.ccall("rpcs3_web_live_thread_names", "string", [], []).split("\n").filter(Boolean),
-    threads: module.ccall("rpcs3_web_thread_snapshot", "string", [], []),
+    threads: diagnostics ? module.ccall("rpcs3_web_thread_snapshot", "string", [], []) : "",
     spuFallbackReport: spuFallbackHistogram ? module.ccall("rpcs3_web_spu_aot_fallback_report", "string", ["number"], [48]) : undefined,
     spuHot: module.rpcs3SpuHotStats ? module.rpcs3SpuHotStats() : undefined,
     spuHotReport: module ? JSON.parse(module.ccall("rpcs3_web_spu_hot_report", "string", [], [])) : undefined,
@@ -551,7 +564,7 @@ scope.addEventListener("message", async (event) => {
       // the browser release the workers and the shared heap.
       let stoppedCleanly = false;
       while (module && performance.now() - stopStartedAt < 5_000) {
-        runHostTasks();
+        await runHostTasks();
         if (module.ccall("rpcs3_web_is_stopped", "number", [], []) === 1
           && (module.ccall("rpcs3_web_live_thread_count", "number", [], []) >>> 0) === 0) {
           stoppedCleanly = true;
@@ -623,6 +636,7 @@ scope.addEventListener("message", async (event) => {
     // coreUrl/wasmUrl/fixtureUrl let the iPad harness inject Blob URLs and let
     // desktop profiling select the symbolized profile build.
     const coreUrl = new URL(event.data.coreUrl ?? "./core/rpcs3-web.mjs", scope.location.href).href;
+    suspendingCore = event.data.suspending === true;
     const resolveCoreFile = (name) => {
       if (event.data.wasmUrl && name.endsWith(".wasm")) return event.data.wasmUrl;
       try { return new URL(name, coreUrl).href; } catch { return name; }
@@ -777,9 +791,22 @@ scope.addEventListener("message", async (event) => {
     }
     if (aotWasm) module.ccall("rpcs3_web_set_ppu_aot_handoff", null, ["number"], [1]);
     if (spuAotWasm) module.ccall("rpcs3_web_set_spu_aot_handoff", null, ["number"], [1]);
-    if (event.data.path) fixtureBytes = Number(module.FS.stat(path).size);
+    if (event.data.path) {
+      try { fixtureBytes = Number(module.FS.stat(path).size); } catch { fixtureBytes = 0; }
+    }
     applyPadState(event.data.pad);
-    bootResult = await module.ccall("rpcs3_web_boot", "number", ["string"], [path]);
+    if (suspendingCore) {
+      // Booting reads the disc image and waits on the threads it starts, and both of those need
+      // this thread's event loop, so the boot runs on its own thread and this one keeps turning.
+      bootResult = module.ccall("rpcs3_web_boot_begin", "number", ["string"], [path]);
+      while (bootResult === 0 && !module.ccall("rpcs3_web_boot_finished", "number", [], [])) {
+        await runHostTasks();
+        await new Promise((resolve) => setTimeout(resolve, 4));
+      }
+      if (bootResult === 0) bootResult = module.ccall("rpcs3_web_boot_result", "number", [], []);
+    } else {
+      bootResult = module.ccall("rpcs3_web_boot", "number", ["string"], [path]);
+    }
     if (aotWasm) {
       ppuDispatcher = createPpuDispatcher({
         module,
@@ -797,7 +824,7 @@ scope.addEventListener("message", async (event) => {
         aotModules: [spuAotWasm],
       });
     }
-    progress(true);
+    progress();
     progressTimer = setInterval(progress, progressIntervalMs);
     if (event.data.completion === "dispatch") {
       await captureDispatch(String(event.data.expectedVerdict ?? ""), Number(event.data.dispatchTimeoutMs) || 30_000);

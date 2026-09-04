@@ -131,6 +131,7 @@ CMakeLists.txt.user
 /web/device-tetris-evidence-*/
 /web/device-guided-evidence*/
 /web/device-game-evidence*/
+/web/*.png
 /web/public/core/
 /web/public/fixtures/
 /web/public/local-fixtures/

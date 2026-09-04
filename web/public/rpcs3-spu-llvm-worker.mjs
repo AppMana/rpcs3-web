@@ -48,7 +48,9 @@ self.onmessage = async (event) => {
       const pointer = module.ccall("rpcs3_spu_llvm_output", "number", [], []) >>> 0;
       const bytes = heap().slice(pointer, pointer + size);
       const words = module.ccall("rpcs3_spu_llvm_program_words", "number", [], []) >>> 0;
-      self.postMessage({ type: "compiled", id: data.id, pc: data.pc, bytes, words, ms }, [bytes.buffer]);
+      // What this worker's heap has actually grown to, which is what its reservation has to cover
+      const heapBytes = module.wasmMemory.buffer.byteLength;
+      self.postMessage({ type: "compiled", id: data.id, pc: data.pc, bytes, words, ms, heapBytes }, [bytes.buffer]);
     } catch (error) {
       self.postMessage({ type: "failed", id: data.id, pc: data.pc, ms: performance.now() - startedAt, error: `${String(error?.stack ?? error)}\n${lines.slice(-20).join("\n")}` });
     }

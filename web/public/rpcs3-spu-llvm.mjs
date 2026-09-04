@@ -10,7 +10,7 @@ export async function createSpuLlvmPool({ module, memory, workers = 2, moduleUrl
   const sharedMemory = memory ?? module.wasmMemory;
   if (!(sharedMemory instanceof WebAssembly.Memory)) throw new Error("the runtime did not expose its shared memory");
   const heap = () => new Uint8Array(sharedMemory.buffer);
-  const state = { workers: 0, requested: 0, sent: 0, compiled: 0, failed: 0, stuck: 0, bytes: 0, words: 0, compileMs: 0, maxCompileMs: 0, queue: [], errors: [] };
+  const state = { workers: 0, requested: 0, sent: 0, compiled: 0, failed: 0, stuck: 0, bytes: 0, words: 0, compileMs: 0, maxCompileMs: 0, peakHeapBytes: 0, queue: [], errors: [] };
   const idle = [];
   const pool = [];
   const inFlight = new Map(); // worker -> { job, timer }
@@ -40,6 +40,8 @@ export async function createSpuLlvmPool({ module, memory, workers = 2, moduleUrl
       state.compiled += 1;
       state.bytes += reply.bytes.length;
       state.words += reply.words >>> 0;
+      // What a compiler worker's heap actually reaches, which is what its reservation has to cover
+      state.peakHeapBytes = Math.max(state.peakHeapBytes, reply.heapBytes >>> 0);
       if (state.compiled <= 8) log(`SPU LLVM tier: compiled 0x${(job.pc >>> 0).toString(16)} (${reply.bytes.length} bytes, ${reply.words} words, ${Math.round(reply.ms)} ms)`);
     } catch (error) {
       fail(job, error);

@@ -13,7 +13,6 @@ const baseURL = env.RPCS3_WEB_URL || "http://127.0.0.1:4175";
 // The same profile the other runners use: it is where the origin-private file system holding
 // firmware and disc images lives.
 const profilePath = env.RPCS3_CHROME_PROFILE || path.join(homedir(), ".cache", "rpcs3-web-chrome-profile");
-const headed = env.RPCS3_HEADED === "1";
 
 const query = new URLSearchParams();
 if (env.RPCS3_BOOT) query.set("boot", env.RPCS3_BOOT);
@@ -26,7 +25,7 @@ if (env.RPCS3_CLOCK_SCALE) query.set("clockScale", env.RPCS3_CLOCK_SCALE);
 // Same flags and rejection rule as the other hardware runners.
 const context = await chromium.launchPersistentContext(profilePath, {
   executablePath: env.RPCS3_CHROME_PATH || "/usr/bin/google-chrome",
-  headless: !headed,
+  headless: false,
   args: ["--no-sandbox", "--enable-unsafe-webgpu", "--enable-webgpu-developer-features",
     "--ignore-gpu-blocklist", "--enable-features=Vulkan", "--use-angle=vulkan"],
 });
@@ -66,6 +65,7 @@ try {
     process.stdout.write(`${JSON.stringify(status)}\n`);
     if (status.state === "failed") break;
   }
+  await page.locator("#gpu-output").screenshot({ path: "play-chrome-screen.png" });
   process.stdout.write(`\nfinal: ${JSON.stringify(last)}\n`);
   process.exitCode = last && last.state === "running" ? 0 : 1;
 } finally {

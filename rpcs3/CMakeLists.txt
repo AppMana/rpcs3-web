@@ -109,7 +109,7 @@ if(RPCS3_WEB)
 		# runs off the thread mailbox, and every entry point below reaches the file system, which
 		# suspends under this setting. Such an export returns a promise, so its callers await it.
 		target_link_options(rpcs3_web_runtime PRIVATE "-sJSPI"
-			"-sJSPI_EXPORTS=_emscripten_check_mailbox,rpcs3_web_init,rpcs3_web_boot,rpcs3_web_stop"
+			"-sJSPI_EXPORTS=_emscripten_check_mailbox,emscripten_proxy_execute_queue,rpcs3_web_init,rpcs3_web_boot,rpcs3_web_stop,rpcs3_web_run_host_tasks"
 			"-g1" "--profiling-funcs")
 	endif()
 	if(RPCS3_WEB_PROFILE)

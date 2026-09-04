@@ -109,12 +109,25 @@ against a device before assuming a path is available there.
 
 ### Build
 
-Emscripten exposes JSPI as `-sJSPI` and Asyncify as `-sASYNCIFY`, set in
-`rpcs3/CMakeLists.txt` beside the other link options for `rpcs3_web_runtime`. The two produce
-different artifacts, so they are staged separately under `web/public/core/` and selected at load
-time by the probe result. Suspending call paths must be declared to the linker; a function that
-suspends without being declared fails at runtime, not at build time, which is why the browser tests
-below exercise each suspending seam directly.
+`RPCS3_WEB_JSPI=1 npm run build:runtime` builds the suspending runtime into its own tree and stages
+it under `web/public/core/jspi/`. The page probes and loads it in place of the core beside it.
+
+Four rules govern that build, and none of them are enforced at build time:
+
+- An export that can reach a suspending import must itself be able to suspend, listed in
+  `JSPI_EXPORTS`. All file access suspends, so this covers the entry points that touch the file
+  system and `_emscripten_check_mailbox`, since proxied work runs off the thread mailbox and
+  WASMFS's OPFS backend suspends inside it.
+- Such an export returns a promise, so its JavaScript callers await it.
+- A stack carrying JavaScript frames cannot suspend. Emscripten's default exceptions and longjmp
+  reach their handlers through JS trampolines that sit inside ordinary emulator call chains, so this
+  build uses `-fwasm-exceptions` and `-sSUPPORT_LONGJMP=wasm`.
+- A call that suspends must not also block the thread whose event loop the suspension needs.
+  Booting both reads the disc image and waits on the threads it starts, so it runs on its own
+  thread, not the module thread.
+
+Build with `--profiling-funcs` when diagnosing a suspend failure; without it the stack is only
+function indices.
 
 ### Seams that suspend
 

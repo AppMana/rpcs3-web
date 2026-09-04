@@ -83,6 +83,9 @@ function updateStatus(frame) {
     ppuAotBlocks: frame.ppuAotTable?.blocks,
     ppuAotDispatches: frame.ppuAotTable?.dispatches,
     spuAotPrograms: frame.spuAotTable?.programs,
+    // What the backend did with the draws it was given: a draw it skipped or could not translate is
+    // geometry that is simply absent from the frame
+    backend: frame.directStats,
   };
   statusElement.textContent = `${currentStatus.state} · ${currentStatus.fps.toFixed(1)} fps`;
   detailElement.textContent = `${draws.toLocaleString()} draws · ${(frame.ppuInstructions ?? 0).toLocaleString()} PPU`
@@ -103,6 +106,12 @@ async function start() {
   // canvas itself and the frame never crosses back to this page. Without one it renders into a
   // canvas of its own and hands each frame over as an ImageBitmap, which this page displays.
   suspending = await supportsSuspending();
+  // Render at the size the canvas is actually displayed at. A backing store smaller than the display
+  // is upscaled, and a thin outline that falls between samples disappears rather than blurring.
+  const bounds = canvas.getBoundingClientRect();
+  const scale = Math.min(devicePixelRatio || 1, 1920 / Math.max(1, bounds.width), 1080 / Math.max(1, bounds.height));
+  canvas.width = Math.max(768, Math.round(bounds.width * scale));
+  canvas.height = Math.max(432, Math.round(bounds.height * scale));
   const directCanvas = suspending
     ? canvas.transferControlToOffscreen()
     : new OffscreenCanvas(canvas.width, canvas.height);
@@ -147,6 +156,7 @@ async function start() {
     // The core has to match the canvas: only a suspending one lets the RSX thread yield, which is
     // what a transferred canvas needs before it will present.
     coreUrl: suspending ? "./core/jspi/rpcs3-web.mjs" : undefined,
+    suspending,
     // The flip packet is what marks a frame; discardPackets drops the per-draw payloads with it
     returnPackets: true,
     discardPackets: true,

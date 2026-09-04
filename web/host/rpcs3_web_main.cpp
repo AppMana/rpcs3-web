@@ -686,6 +686,47 @@ extern "C"
 		return static_cast<u32>(result);
 	}
 
+	// Booting reads the disc image and waits on the threads it starts. Both of those need the
+	// module thread's event loop -- one to resume a suspended read, the other to service the
+	// thread creation Emscripten proxies there -- so booting on that thread deadlocks against
+	// itself. On its own thread the event loop stays free and the host polls for the result.
+	enum class boot_state : u32 { idle = 0, running = 1, finished = 2 };
+	static atomic_t<u32> s_boot_state{static_cast<u32>(boot_state::idle)};
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_boot_begin(const char* path)
+	{
+		if (!path || !*path || !s_initialized)
+		{
+			return static_cast<u32>(game_boot_result::invalid_file_or_folder);
+		}
+		if (s_boot_state.load() == static_cast<u32>(boot_state::running))
+		{
+			return static_cast<u32>(game_boot_result::still_running);
+		}
+
+		s_boot_state = static_cast<u32>(boot_state::running);
+		std::thread([boot_path = std::string(path)]()
+		{
+			Emu.SetForceBoot(true);
+			const game_boot_result result = Emu.BootGame(boot_path, {}, true, cfg_mode::default_config);
+			s_last_boot_result = static_cast<u32>(result);
+			notify_host_event("rpcs3-boot-result", static_cast<u32>(result));
+			s_boot_state = static_cast<u32>(boot_state::finished);
+		}).detach();
+
+		return static_cast<u32>(game_boot_result::no_errors);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_boot_finished()
+	{
+		return s_boot_state.load() == static_cast<u32>(boot_state::finished);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_boot_result()
+	{
+		return s_last_boot_result;
+	}
+
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_hold_ppu_at_entry(s32 enabled)
 	{
 		Emu.SetHoldAtEntry(enabled != 0);

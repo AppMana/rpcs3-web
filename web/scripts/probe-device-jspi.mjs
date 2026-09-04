@@ -151,6 +151,8 @@ const jspiProbe = `(async () => {
   const out = {
     hasSuspending: typeof WebAssembly.Suspending === "function",
     hasPromising: typeof WebAssembly.promising === "function",
+    // A memory section whose limits flag marks the index type as i64
+    memory64: WebAssembly.validate(new Uint8Array([0,97,115,109,1,0,0,0,5,3,1,4,1])),
   };
   if (out.hasSuspending && out.hasPromising) {
     try {

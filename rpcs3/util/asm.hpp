@@ -17,6 +17,10 @@
 #endif
 #endif
 
+#ifdef ARCH_WASM32
+#include <emscripten/threading.h>
+#endif
+
 namespace utils
 {
 	// Try to prefetch to Level 2 cache since it's not split to data/code on most processors
@@ -352,6 +356,28 @@ namespace utils
 		{
 			std::this_thread::yield();
 		}
+#elif defined(ARCH_WASM32)
+		// wasm's own form of UMWAIT and WFE: block on the address until the value changes or the
+		// timeout expires. A worker may block; the main runtime thread traps on memory.atomic.wait,
+		// and only a four-byte atomic maps onto wait32, so both fall back to the spin. The waiting
+		// thread here polls guest memory that another guest thread writes without notifying, so the
+		// wait runs to its timeout and the caller's loop re-reads — the same contract the caller
+		// already has, without a core spinning through it.
+		using wait_type = std::remove_cvref_t<decltype(var.raw())>;
+
+		if constexpr (sizeof(wait_type) == 4)
+		{
+			if (timeout_us && !emscripten_is_main_runtime_thread())
+			{
+				__builtin_wasm_memory_atomic_wait32(
+					static_cast<int32_t*>(const_cast<void*>(addr)),
+					std::bit_cast<int32_t>(old_value),
+					static_cast<int64_t>(timeout_us) * 1000);
+				return;
+			}
+		}
+
+		std::this_thread::yield();
 #else
 		(void)addr;
 		(void)old_value;

@@ -1670,6 +1670,9 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
 	const u32 stats_slot = index % g_spu_web_stats.size();
 	auto& stats = g_spu_web_stats[stats_slot];
+	// The host installs the registry's table base once, before any guest code runs, and the registry
+	// only grows from there, so the dispatch path reads both of these outside its hot path
+	const u32 hot_base = spu_web_hot_table_base();
 	// Compiled programs come from the offline bundle (placed on this worker) and from the recompilers'
 	// registry (present once the host installed its table base); either makes the dispatch path live
 	const bool aot_ready = rpcs3_web_spu_aot_worker_ready() != 0 || spu_web_hot_table_base() != 0;
@@ -1692,12 +1695,6 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 		// previous instruction branched to it
 		if (aot_ready && at_branch_target)
 		{
-			// Hot-compiled modules not yet placed in this worker's table (registry order)
-			if (spu_web_hot_count() != hot_placed) [[unlikely]]
-			{
-				hot_placed = rpcs3_web_spu_hot_sync();
-			}
-
 			if (const auto list = g_spu_web_aot_lists[(spu.pc & 0x3fffc) / 4].load())
 			{
 				// A program whose local-store verification fails increments block_failure and returns
@@ -1714,9 +1711,10 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 				for (u32 i = 0; i < list->count && !ran; i++)
 				{
 					const u32 index = list->indices[i];
-					if (const u32 hot_base = spu_web_hot_table_base(); index >= hot_base) [[unlikely]]
+					if (index >= hot_base) [[unlikely]]
 					{
-						// A hot-compiled program: this worker must have placed its registry entry
+						// A program one of the recompilers built: this worker must have placed its
+						// registry entry, and the registry only ever grows
 						if (index - hot_base >= hot_placed)
 						{
 							hot_placed = rpcs3_web_spu_hot_sync();
@@ -1733,7 +1731,7 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 					}
 					reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(index))(&spu, spu._ptr<u8>(0), 0);
 					ran = spu.block_failure == failures + (i - skipped);
-					if (ran && index >= spu_web_hot_table_base()) spu_web_note_hot_dispatch(index, stats_slot);
+					if (ran && index >= hot_base) spu_web_note_hot_dispatch(index, stats_slot);
 				}
 
 				spu.allow_interrupts_in_cpu_work = true;

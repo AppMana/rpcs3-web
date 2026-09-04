@@ -53,7 +53,7 @@ describe("library server", () => {
     expect(response.headers.get("accept-ranges")).toBe("bytes");
     expect(response.headers.get("content-length")).toBe(String(payload.length));
     expect(response.headers.get("x-content-sha256")).toBe(payloadSha256);
-    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
     expect(response.headers.get("cross-origin-resource-policy")).toBe("same-origin");
   });
 

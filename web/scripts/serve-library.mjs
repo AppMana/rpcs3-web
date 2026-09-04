@@ -209,6 +209,7 @@ export async function createLibraryServer(options = {}) {
     }
     const headers = {
       ...baseHeaders,
+      "Cache-Control": "public, max-age=31536000, immutable",
       "Accept-Ranges": "bytes",
       "Content-Type": "application/octet-stream",
       ETag: entry.etag,

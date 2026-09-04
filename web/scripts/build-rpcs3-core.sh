@@ -53,10 +53,13 @@ else
   targets=(rpcs3_web_runtime rpcs3_web_unit_tests)
 fi
 
-# The browser SPU LLVM tier builds when an Emscripten LLVM+lld tree is available
-# (RPCS3_WEB_LLVM_DIR, default ~/llvm-wasm/build-wasm; see PLAN.md for the build recipe).
+# The browser LLVM tiers' compiler module builds when an Emscripten LLVM+lld tree is available
+# (RPCS3_WEB_LLVM_DIR, default ~/llvm-wasm/build-wasm; see PLAN.md for the build recipe). It is not
+# part of the suspending build: it runs in its own worker and never suspends, and the LLVM archives
+# are built with Emscripten's own longjmp, which that build's -sSUPPORT_LONGJMP=wasm cannot resolve.
+# The page loads the one module beside the core in either case.
 llvm_dir="${RPCS3_WEB_LLVM_DIR:-${HOME}/llvm-wasm/build-wasm}"
-if [[ -f "${llvm_dir}/lib/cmake/llvm/LLVMConfig.cmake" && "${profile_flag}" == "OFF" ]]; then
+if [[ -f "${llvm_dir}/lib/cmake/llvm/LLVMConfig.cmake" && "${profile_flag}" == "OFF" && "${jspi_flag}" == "OFF" ]]; then
   targets+=(rpcs3_web_spu_llvm)
 else
   llvm_dir=""

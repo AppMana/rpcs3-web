@@ -1,6 +1,4 @@
-import { decodeDrawPacket } from "./rpcs3-webgpu-packet.mjs";
 import { readGamepad, samePadState } from "./rpcs3-gamepad.mjs";
-import { prepareWebGPU, releaseWebGPU, renderPacketsToWebGPU, stopWebGPUPresentation } from "./rpcs3-webgpu-renderer.mjs";
 
 const Digital1 = Object.freeze({ select: 0x01, start: 0x08, up: 0x10, right: 0x20, down: 0x40, left: 0x80 });
 const Digital2 = Object.freeze({ l2: 0x01, r2: 0x02, l1: 0x04, r1: 0x08, triangle: 0x10, circle: 0x20, cross: 0x40, square: 0x80 });
@@ -17,15 +15,17 @@ const search = new URLSearchParams(location.search);
 const bootPath = search.get("boot");
 const keys = new Set();
 const touches = new Map();
+// The RSX thread renders into an OffscreenCanvas and hands back one ImageBitmap per flip; this
+// canvas only displays it.
+const directView = canvas.getContext("bitmaprenderer");
 let lastPadState;
 let worker;
-let gpu;
 let stopped = false;
-let renderBusy = false;
 let frameCount = 0;
+let presentedFrames = 0;
 let frameWindowStart = performance.now();
 let frameWindowCount = 0;
-let currentStatus = { state: "booting", frames: 0, fps: 0, activeCenterX: undefined };
+let currentStatus = { state: "booting", frames: 0, fps: 0 };
 
 function controlState() {
   const controls = new Set([...keys].map((code) => keyControls.get(code)).filter(Boolean));
@@ -37,7 +37,8 @@ function controlState() {
     digital2 |= Digital2[control] ?? 0;
   });
   // A connected controller adds to the keys and touch buttons rather than replacing them, and it is
-  // the only thing here that can move a stick.
+  // the only thing here that can move a stick. A controller that has gone to sleep simply stops
+  // being reported, which lands here as the neutral state rather than as a stuck button or stick.
   const gamepad = readGamepad();
   if (!gamepad) return { digital1, digital2, leftX: 128, leftY: 128, rightX: 128, rightY: 128 };
   return {
@@ -57,13 +58,7 @@ function sendPad(state = controlState()) {
   });
 }
 
-function activeCenter(drawDiagnostics) {
-  if (!Array.isArray(drawDiagnostics) || drawDiagnostics.length < 9) return undefined;
-  const activeBlocks = drawDiagnostics.slice(-4);
-  return activeBlocks.reduce((sum, draw) => sum + (draw.clipBounds.min[0] + draw.clipBounds.max[0]) / 2, 0) / activeBlocks.length;
-}
-
-function updateStatus(frame, rendered) {
+function updateStatus(frame) {
   frameCount += 1;
   frameWindowCount += 1;
   const now = performance.now();
@@ -73,71 +68,60 @@ function updateStatus(frame, rendered) {
     frameWindowStart = now;
     frameWindowCount = 0;
   }
-  const gameReady = rendered.draws >= 9;
+  const draws = frame.directStats?.draws ?? 0;
   currentStatus = {
-    state: gameReady ? "running" : "starting",
+    state: draws > 0 ? "running" : "starting",
     frames: frameCount,
+    presented: presentedFrames,
     fps: currentStatus.fps,
-    draws: rendered.draws,
-    vertices: rendered.vertices,
-    activeCenterX: activeCenter(rendered.drawDiagnostics),
+    draws,
     ppuInstructions: frame.ppuInstructions,
+    spuInstructions: frame.spuInstructions,
     droppedPackets: frame.droppedPackets,
-    adapter: rendered.adapter,
-    renderMs: rendered.timings.totalMs,
-    pipelineCache: rendered.pipelineCache,
+    // Whether a title's compiled blocks are in play, which is the difference between a title
+    // running and a title crawling through the interpreter
+    ppuAotBlocks: frame.ppuAotTable?.blocks,
+    ppuAotDispatches: frame.ppuAotTable?.dispatches,
+    spuAotPrograms: frame.spuAotTable?.programs,
   };
   statusElement.textContent = `${currentStatus.state} · ${currentStatus.fps.toFixed(1)} fps`;
-  detailElement.textContent = `${rendered.draws} draws · ${rendered.vertices} vertices · ${frame.ppuInstructions.toLocaleString()} PPU instructions · ${frame.droppedPackets} dropped`;
+  detailElement.textContent = `${draws.toLocaleString()} draws · ${(frame.ppuInstructions ?? 0).toLocaleString()} PPU`
+    + `${currentStatus.ppuAotBlocks ? ` · ${currentStatus.ppuAotDispatches?.toLocaleString() ?? 0} compiled dispatches` : " · interpreted"}`;
 }
 
-async function renderFrame(message) {
-  if (stopped || renderBusy) return;
-  renderBusy = true;
-  try {
-    const packets = message.packetBuffers.map((buffer) => decodeDrawPacket(new Uint8Array(buffer)));
-    const rendered = await renderPacketsToWebGPU(gpu, packets, {
-      readback: false,
-      vertexDiagnostics: true,
-      // The guest and RSX threads continue immediately; this only keeps the
-      // latest GPU frame available to the browser compositor between flips.
-      replayPresentation: true,
-    });
-    updateStatus(message, rendered);
-    worker.postMessage({ type: "next-frame" });
-  } catch (error) {
-    currentStatus = { ...currentStatus, state: "failed", detail: String(error) };
-    statusElement.textContent = "failed";
-    detailElement.textContent = error instanceof Error ? error.message : String(error);
-  } finally {
-    renderBusy = false;
-  }
+function fail(detail) {
+  currentStatus = { ...currentStatus, state: "failed", detail };
+  statusElement.textContent = "failed";
+  detailElement.textContent = detail;
 }
 
 async function start() {
   if (worker) return;
   stopped = false;
-  gpu = await prepareWebGPU(canvas);
+  presentedFrames = 0;
+  const directCanvas = new OffscreenCanvas(canvas.width, canvas.height);
   worker = new Worker("./runtime-smoke-worker.mjs", { type: "module" });
   worker.addEventListener("message", (event) => {
-    if (event.data?.type === "runtime-result" || event.data?.type === "runtime-frame") {
-      if (!event.data.ok) {
-        currentStatus = { ...currentStatus, state: "failed", detail: event.data.detail };
-        statusElement.textContent = "failed";
-        detailElement.textContent = event.data.detail;
-        return;
-      }
-      void renderFrame(event.data);
+    if (stopped) return;
+    if (event.data?.type === "runtime-present") {
+      presentedFrames += 1;
+      directView.transferFromImageBitmap(event.data.bitmap);
+      return;
     }
+    if (event.data?.type !== "runtime-result" && event.data?.type !== "runtime-frame") return;
+    // A frame that took too long is not a failed session: a title can go a long time between flips
+    // while it loads. Only a runtime that has actually stopped ends the run.
+    if (!event.data.ok && (event.data.bootResult !== 0 || event.data.status === 0)) {
+      fail(event.data.detail);
+      return;
+    }
+    updateStatus(event.data);
+    worker.postMessage({ type: "next-frame", discardPackets: true });
   });
-  worker.addEventListener("error", (event) => {
-    currentStatus = { ...currentStatus, state: "failed", detail: event.message };
-    statusElement.textContent = "failed";
-    detailElement.textContent = event.message;
-  });
+  worker.addEventListener("error", (event) => fail(event.message));
   // ?trace=<url> replays a recorded input trace; inputs are always recorded
   // so a session can be exported with __rpcs3Playable.exportInputTrace().
-  const traceUrl = new URL(location.href).searchParams.get("trace");
+  const traceUrl = search.get("trace");
   let inputTrace;
   if (traceUrl) {
     const response = await fetch(traceUrl);
@@ -147,28 +131,30 @@ async function start() {
   worker.postMessage({
     type: "boot",
     ...(bootPath ? { path: bootPath } : { fixture: "fixtures/gs_gcm_tetris.elf" }),
+    directRenderer: true,
+    gpuCanvas: directCanvas,
+    // The flip packet is what marks a frame; discardPackets drops the per-draw payloads with it
     returnPackets: true,
+    discardPackets: true,
     presentLatestOnly: true,
+    // A session is open-ended, so a frame waits as long as the runtime will allow
+    packetTimeoutMs: 300_000,
     recordInputs: true,
     inputTrace,
     pad: controlState(),
-    // A title needs its compiled blocks to be playable rather than merely to boot, and which bundle
-    // belongs to which disc image is the caller's to say: ?ppuAot=local-aot/<title>/manifest.json
+    // Which bundle belongs to which disc image is the caller's to say
     ppuAotBundle: search.get("ppuAot") ?? undefined,
     spuAotBundle: search.get("spuAot") ?? undefined,
     spuDecoder: search.get("spuDecoder") ?? undefined,
     spuLlvmWorkers: Number(search.get("spuLlvmWorkers")) || undefined,
     clockScale: Number(search.get("clockScale")) || undefined,
-  });
+  }, [directCanvas]);
 }
 
 function stop() {
   stopped = true;
-  stopWebGPUPresentation();
   worker?.postMessage({ type: "shutdown" });
   worker = undefined;
-  releaseWebGPU(gpu);
-  gpu = undefined;
   currentStatus = { ...currentStatus, state: "stopped" };
 }
 
@@ -183,19 +169,26 @@ for (const type of ["keydown", "keyup"]) {
 }
 addEventListener("blur", () => { keys.clear(); touches.clear(); sendPad(); });
 
-// The Gamepad API has no events for button or stick state, so a controller has to be read. Once a
-// frame is the rate the guest samples the pad at anyway, and posting only on a change keeps a held
-// button or a resting stick off the worker's message queue.
-function pollGamepad() {
+// The Gamepad API has no events for button or stick state and cannot be reached from a worker, so
+// the page has to read the controller. RPCS3 keeps its own cadence -- pad_thread calls
+// web_pad_handler::process() every g_cfg.io.pad_sleep microseconds and reads the last state set --
+// so this only has to keep that snapshot fresh. It is deliberately not tied to the frame: a title
+// running at 30 fps would otherwise sample the stick 30 times a second. Posting only on a change
+// keeps a held button or a resting stick off the worker's queue.
+const padPollIntervalMs = 8;
+setInterval(() => {
+  const gamepad = readGamepad();
+  // A real controller is the better input, so the on-screen pad gets out of the picture. A pad that
+  // has gone to sleep brings it back, and waking the pad takes it away again.
+  document.body.classList.toggle("has-gamepad", Boolean(gamepad));
   const state = controlState();
   if (!samePadState(state, lastPadState)) sendPad(state);
-  requestAnimationFrame(pollGamepad);
-}
-requestAnimationFrame(pollGamepad);
+}, padPollIntervalMs);
 
-// Safari does not report a controller until it has been used, so the name is only known on connect
+// Safari does not report a controller until a button on it has been pressed, so this is also how a
+// player finds out the pad was seen at all
 addEventListener("gamepadconnected", (event) => {
-  detailElement.textContent = `controller: ${event.gamepad.id} (${event.gamepad.mapping || "non-standard"} mapping)`;
+  detailElement.textContent = `controller: ${event.gamepad.id} · ${event.gamepad.mapping || "non-standard"} mapping`;
 });
 
 document.querySelectorAll("[data-control]").forEach((button) => {
@@ -240,8 +233,4 @@ window.__rpcs3Playable = {
   exportInputTrace,
 };
 
-void start().catch((error) => {
-  currentStatus = { state: "failed", detail: String(error), frames: 0, fps: 0 };
-  statusElement.textContent = "failed";
-  detailElement.textContent = error instanceof Error ? error.message : String(error);
-});
+void start().catch((error) => fail(error instanceof Error ? error.message : String(error)));

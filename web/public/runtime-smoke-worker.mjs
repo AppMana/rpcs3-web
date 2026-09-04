@@ -108,7 +108,7 @@ async function captureDispatch(expectedVerdict = "", timeoutMs = 30_000) {
     sparseVmProbe,
     ppuAot: ppuDispatcher?.snapshot() ?? null,
     ppuAotTable: ppuAotTable
-      ? { ...ppuAotTable, dispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])) }
+      ? { ...ppuAotTable, dispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])), blocksUsed: Number(module.ccall("rpcs3_web_ppu_blocks_used", "number", [], [])) }
       : null,
     spuAotTable: spuAotTable
       ? { ...spuAotTable, dispatches: Number(module.ccall("rpcs3_web_spu_aot_dispatches", "number", [], [])), fallbacks: Number(module.ccall("rpcs3_web_spu_aot_fallbacks", "number", [], [])) }
@@ -224,7 +224,7 @@ function progress(includeThreads = false) {
     stackReport: includeThreads ? stackReport() : undefined,
     ppuInstructions: Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], [])),
     ppuAotTable: ppuAotTable
-      ? { ...ppuAotTable, dispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])) }
+      ? { ...ppuAotTable, dispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])), blocksUsed: Number(module.ccall("rpcs3_web_ppu_blocks_used", "number", [], [])) }
       : null,
     spuAotTable: spuAotTable
       ? { ...spuAotTable, dispatches: Number(module.ccall("rpcs3_web_spu_aot_dispatches", "number", [], [])), fallbacks: Number(module.ccall("rpcs3_web_spu_aot_fallbacks", "number", [], [])) }
@@ -434,7 +434,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     stackReport: stackReport(),
     ppuInstructions: Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], [])),
     ppuAotTable: ppuAotTable
-      ? { ...ppuAotTable, dispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])) }
+      ? { ...ppuAotTable, dispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])), blocksUsed: Number(module.ccall("rpcs3_web_ppu_blocks_used", "number", [], [])) }
       : null,
     spuAotTable: spuAotTable
       ? { ...spuAotTable, dispatches: Number(module.ccall("rpcs3_web_spu_aot_dispatches", "number", [], [])), fallbacks: Number(module.ccall("rpcs3_web_spu_aot_fallbacks", "number", [], [])) }

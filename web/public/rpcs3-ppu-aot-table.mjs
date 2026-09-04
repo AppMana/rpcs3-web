@@ -153,6 +153,7 @@ export async function loadPpuAotBundle({ module, mainInstance, mainMemory, manif
     new Uint32Array(mainMemory.buffer, pairBytes, pairs.length).set(pairs);
     module.ccall("rpcs3_web_ppu_aot_register_many", null, ["number", "number"], [pairBytes, pairs.length / 2]);
     module._free(pairBytes);
+    module.ccall("rpcs3_web_ppu_set_block_base", null, ["number"], [tableBase]);
     const registerMs = performance.now() - populateStartedAt;
     log(`PPU AOT bundle: registered ${pairs.length / 2} blocks from the manifest in ${Math.round(registerMs)} ms`);
     const { broadcastAotLoad } = await import("./rpcs3-aot-workers.mjs");

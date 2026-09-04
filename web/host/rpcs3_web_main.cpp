@@ -91,6 +91,8 @@ extern u32 spu_web_hot_count();
 extern u32 spu_web_hot_index(u32 i);
 extern const u8* spu_web_hot_bytes(u32 i);
 extern u32 spu_web_hot_size(u32 i);
+extern u64 ppu_web_blocks_used();
+extern void ppu_web_set_block_base(u32 base);
 extern atomic_t<u32> g_spu_web_hot_threshold;
 extern void spu_web_hot_info(u32 i, u32* out);
 extern void spu_web_llvm_set_enabled(bool enabled);
@@ -958,6 +960,17 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_aot_register_many(u32 pairs, u32 count)
 	{
 		ppu_web_aot_register(reinterpret_cast<const u32*>(static_cast<uptr>(pairs)), count);
+	}
+
+	// How many distinct compiled blocks this run has entered (diagnostic)
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_blocks_used()
+	{
+		return static_cast<u32>(ppu_web_blocks_used());
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_set_block_base(u32 base)
+	{
+		ppu_web_set_block_base(base);
 	}
 
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_aot_exec_base()

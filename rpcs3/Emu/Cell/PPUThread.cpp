@@ -601,6 +601,36 @@ using ppu_web_aot_func_t = void (*)(void* exec, ppu_thread* thread, u64 seg0, vo
 
 atomic_t<u64> g_ppu_web_aot_dispatch_count{0};
 
+// Diagnostic: which compiled blocks a run actually enters. A title's bundle holds every block the
+// analyser found, and every worker running a PPU thread has to hold all of them in its function
+// table, so knowing how many are ever entered says what a bundle built from a profile would cost.
+static std::array<atomic_t<u64>, (1u << 20) / 64> g_ppu_web_block_used{};
+static atomic_t<u32> g_ppu_web_block_base{0};
+
+extern void ppu_web_set_block_base(u32 base)
+{
+	g_ppu_web_block_base = base;
+}
+
+extern u64 ppu_web_blocks_used()
+{
+	u64 used = 0;
+	for (const auto& word : g_ppu_web_block_used) used += std::popcount(word.load());
+	return used;
+}
+
+static inline void ppu_web_note_block(u32 index)
+{
+	const u32 slot = index - g_ppu_web_block_base.load();
+
+	if (slot < (1u << 20))
+	{
+		auto& word = g_ppu_web_block_used[slot / 64];
+		const u64 bit = 1ull << (slot % 64);
+		if (!(word.load() & bit)) word |= bit;
+	}
+}
+
 static inline u32 ppu_web_aot_lookup(u32 addr)
 {
 	const auto page = ppu_web_dispatch_page_for(addr, false);
@@ -3076,6 +3106,7 @@ void ppu_thread::exec_task()
 		{
 			// Run the compiled block on this thread; it tail-calls through the table and returns with cia set at a boundary
 			g_ppu_web_aot_dispatch_count++;
+			ppu_web_note_block(aot_index);
 			reinterpret_cast<ppu_web_aot_func_t>(static_cast<uptr>(aot_index))(ppu_web_aot_exec_base(), this, 0, nullptr, gpr[0], gpr[1], gpr[2]);
 			continue;
 		}

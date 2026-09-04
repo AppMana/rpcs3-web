@@ -5,6 +5,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const IDLE_FRAMES = ["(idle)", "(program)", "(garbage collector)", "emscripten_futex_wait", "_do_futex_wait"];
+const TRAMPOLINE_FRAMES = ["wasm-to-js", "js-to-wasm::i", "js-to-wasm::v"];
 
 export function workSampleCount(profile) {
   const waitNodes = new Set(profile.nodes
@@ -161,25 +162,60 @@ export function createWorkerProfiler(session, samplingIntervalUs) {
   };
 }
 
-// Flattens a profile into self-time per function, which is what says where the frame went.
-export function selfTime(profile, limit = 25) {
+// Self time names the cost; the callers name the code to change. Walks the sample tree upwards from
+// every node whose function is `name` and reports the callers by the samples they account for.
+export function callersOf(profile, name, limit = 8, { depth = 1 } = {}) {
   const byId = new Map(profile.nodes.map((node) => [node.id, node]));
-  const counts = new Map();
-  for (const id of profile.samples || []) {
-    counts.set(id, (counts.get(id) ?? 0) + 1);
+  const parents = new Map();
+  for (const node of profile.nodes) {
+    for (const child of node.children || []) parents.set(child, node.id);
   }
-  const total = (profile.samples || []).length || 1;
-  const rows = [];
-  for (const [id, count] of counts) {
+  const counts = new Map();
+  let total = 0;
+  for (const id of profile.samples || []) {
+    if (byId.get(id)?.callFrame.functionName !== name) continue;
+    // Every wasm call into a JS import goes through a trampoline frame; the code that wanted the
+    // import is above it. A thin wrapper is not an answer either, so `depth` frames are reported.
+    const chain = [];
+    let parent = byId.get(parents.get(id));
+    while (parent && chain.length < depth) {
+      if (!TRAMPOLINE_FRAMES.includes(parent.callFrame.functionName)) {
+        chain.push(parent.callFrame.functionName || "(anonymous)");
+      }
+      parent = byId.get(parents.get(parent.id));
+    }
+    const caller = chain.length ? chain.join(" <- ") : "(root)";
+    counts.set(caller, (counts.get(caller) ?? 0) + 1);
+    total++;
+  }
+  return [...counts]
+    .map(([caller, samples]) => ({ caller, samples, percent: (samples / (total || 1)) * 100 }))
+    .sort((left, right) => right.samples - left.samples)
+    .slice(0, limit);
+}
+
+// Flattens a profile into self-time per function, which is what says where the frame went. One
+// function reached down several call paths gets a node per path, so the rows are merged by name:
+// unmerged, an interpreter helper called from four opcodes reads as four small entries. Waiting is
+// excluded unless asked for, and percentages are over what is included — a worker that spends its
+// life in a futex would otherwise report nothing but the futex.
+export function selfTime(profile, limit = 25, { includeWaits = false } = {}) {
+  const byId = new Map(profile.nodes.map((node) => [node.id, node]));
+  const merged = new Map();
+  let total = 0;
+  for (const id of profile.samples || []) {
     const node = byId.get(id);
     if (!node) continue;
     const { functionName, url } = node.callFrame;
-    rows.push({
-      name: functionName || "(anonymous)",
-      where: (url || "").split("/").pop(),
-      samples: count,
-      percent: (count / total) * 100,
-    });
+    const name = functionName || "(anonymous)";
+    if (!includeWaits && IDLE_FRAMES.includes(name)) continue;
+    const row = merged.get(name) ?? { name, where: (url || "").split("/").pop(), samples: 0 };
+    row.samples++;
+    merged.set(name, row);
+    total++;
   }
-  return rows.sort((left, right) => right.samples - left.samples).slice(0, limit);
+  return [...merged.values()]
+    .map((row) => ({ ...row, percent: (row.samples / (total || 1)) * 100 }))
+    .sort((left, right) => right.samples - left.samples)
+    .slice(0, limit);
 }

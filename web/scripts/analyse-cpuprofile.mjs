@@ -4,9 +4,11 @@
 // Self time is per function; the tree is also walked so a caller that spends its time in children
 // (an interpreter loop dispatching, a compiled block calling a host helper) is still attributable.
 import { readFile } from "node:fs/promises";
-import { selfTime, workSampleCount } from "./worker-profiler.mjs";
+import { callersOf, selfTime, workSampleCount } from "./worker-profiler.mjs";
 
 const base = process.argv[2] || "play-chrome.cpuprofile";
+// A second argument asks who calls that function, pooled the same way.
+const callee = process.argv[3];
 const targets = JSON.parse(await readFile(`${base}.targets.json`, "utf8"));
 
 const rows = [];
@@ -31,10 +33,25 @@ for (const { profile } of rows) {
   }
 }
 
-console.log(`pooled across workers (${pooledSamples} samples)`);
+console.log(`pooled across workers (${pooledSamples} work samples)`);
 for (const [name, samples] of [...pooled].sort((a, b) => b[1] - a[1]).slice(0, 25)) {
   const percent = (samples / pooledSamples) * 100;
   console.log(`  ${percent.toFixed(1).padStart(5)}%  ${samples.toString().padStart(6)}  ${name}`);
+}
+
+if (callee) {
+  const callers = new Map();
+  let calleeSamples = 0;
+  for (const { profile } of rows) {
+    for (const row of callersOf(profile, callee, 10_000, { depth: 3 })) {
+      callers.set(row.caller, (callers.get(row.caller) ?? 0) + row.samples);
+      calleeSamples += row.samples;
+    }
+  }
+  console.log(`\ncallers of ${callee} (${calleeSamples} samples)`);
+  for (const [caller, samples] of [...callers].sort((a, b) => b[1] - a[1]).slice(0, 15)) {
+    console.log(`  ${((samples / calleeSamples) * 100).toFixed(1).padStart(5)}%  ${samples.toString().padStart(6)}  ${caller}`);
+  }
 }
 
 console.log(`\nbusiest workers`);

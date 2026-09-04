@@ -1,4 +1,5 @@
 import { decodeDrawPacket } from "./rpcs3-webgpu-packet.mjs";
+import { readGamepad, samePadState } from "./rpcs3-gamepad.mjs";
 import { prepareWebGPU, releaseWebGPU, renderPacketsToWebGPU, stopWebGPUPresentation } from "./rpcs3-webgpu-renderer.mjs";
 
 const Digital1 = Object.freeze({ select: 0x01, start: 0x08, up: 0x10, right: 0x20, down: 0x40, left: 0x80 });
@@ -12,9 +13,11 @@ const keyControls = new Map([
 const canvas = document.querySelector("#gpu-output");
 const statusElement = document.querySelector("#status");
 const detailElement = document.querySelector("#detail");
-const bootPath = new URLSearchParams(location.search).get("boot");
+const search = new URLSearchParams(location.search);
+const bootPath = search.get("boot");
 const keys = new Set();
 const touches = new Map();
+let lastPadState;
 let worker;
 let gpu;
 let stopped = false;
@@ -33,11 +36,20 @@ function controlState() {
     digital1 |= Digital1[control] ?? 0;
     digital2 |= Digital2[control] ?? 0;
   });
-  return { digital1, digital2, leftX: 128, leftY: 128, rightX: 128, rightY: 128 };
+  // A connected controller adds to the keys and touch buttons rather than replacing them, and it is
+  // the only thing here that can move a stick.
+  const gamepad = readGamepad();
+  if (!gamepad) return { digital1, digital2, leftX: 128, leftY: 128, rightX: 128, rightY: 128 };
+  return {
+    digital1: digital1 | gamepad.digital1,
+    digital2: digital2 | gamepad.digital2,
+    leftX: gamepad.leftX, leftY: gamepad.leftY, rightX: gamepad.rightX, rightY: gamepad.rightY,
+  };
 }
 
-function sendPad() {
-  worker?.postMessage({ type: "pad", state: controlState() });
+function sendPad(state = controlState()) {
+  lastPadState = state;
+  worker?.postMessage({ type: "pad", state });
   document.querySelectorAll("[data-control]").forEach((button) => {
     const pressed = [...touches.values()].includes(button.dataset.control) ||
       [...keys].some((code) => keyControls.get(code) === button.dataset.control);
@@ -140,6 +152,13 @@ async function start() {
     recordInputs: true,
     inputTrace,
     pad: controlState(),
+    // A title needs its compiled blocks to be playable rather than merely to boot, and which bundle
+    // belongs to which disc image is the caller's to say: ?ppuAot=local-aot/<title>/manifest.json
+    ppuAotBundle: search.get("ppuAot") ?? undefined,
+    spuAotBundle: search.get("spuAot") ?? undefined,
+    spuDecoder: search.get("spuDecoder") ?? undefined,
+    spuLlvmWorkers: Number(search.get("spuLlvmWorkers")) || undefined,
+    clockScale: Number(search.get("clockScale")) || undefined,
   });
 }
 
@@ -163,6 +182,21 @@ for (const type of ["keydown", "keyup"]) {
   });
 }
 addEventListener("blur", () => { keys.clear(); touches.clear(); sendPad(); });
+
+// The Gamepad API has no events for button or stick state, so a controller has to be read. Once a
+// frame is the rate the guest samples the pad at anyway, and posting only on a change keeps a held
+// button or a resting stick off the worker's message queue.
+function pollGamepad() {
+  const state = controlState();
+  if (!samePadState(state, lastPadState)) sendPad(state);
+  requestAnimationFrame(pollGamepad);
+}
+requestAnimationFrame(pollGamepad);
+
+// Safari does not report a controller until it has been used, so the name is only known on connect
+addEventListener("gamepadconnected", (event) => {
+  detailElement.textContent = `controller: ${event.gamepad.id} (${event.gamepad.mapping || "non-standard"} mapping)`;
+});
 
 document.querySelectorAll("[data-control]").forEach((button) => {
   button.addEventListener("pointerdown", (event) => {

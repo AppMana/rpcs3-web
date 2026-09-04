@@ -6,7 +6,7 @@ port replaces only what wasm cannot provide, at named seams.
 
 This document covers the shape of the port, where its seams are, how to test it, how to get it onto
 an iPad, and what that device can and cannot do. It is the companion to `web/README.md`, which
-covers building.
+covers building, and to `performance.md`, which covers measuring.
 
 ## The two threads that matter
 
@@ -74,6 +74,39 @@ recompiler — with LLVM's wasm backend and `wasm-ld` inside compiler workers, w
 compiler module because LLVM and lld are 48 MB of wasm per worker. A PPU block is compiled when the
 interpreter has entered it often enough; what counts as a block is the analyser's answer, never a
 policy of the port's own.
+
+## Tiers, and how a compiled block is reached
+
+Both guests climb the same ladder, and the tiers share one function-table region so a PPU block and
+an SPU program can never claim the same index:
+
+| | PPU | SPU |
+| --- | --- | --- |
+| interpret | `ppu_web_interpreter` | `spu_web_interpreter_loop` |
+| hand-written → wasm | *(none)* | `SPUWasmRecompiler.cpp`, the fast tier at dispatch misses |
+| RPCS3 recompiler → LLVM → wasm | `PPUWebRecompiler` → `rpcs3_ppu_llvm_main` in a compiler worker | RPCS3's LLVM SPU recompiler → `rpcs3_spu_llvm_main` |
+| prebuilt bundle | `local-aot/<title>/manifest.json` | `local-aot/<title>-spu/manifest.json` |
+
+`spu_decoder_type::llvm` turns on **both** SPU compiled tiers: `asmjit` and `llvm` each add the
+hand-written SPU→wasm recompiler at dispatch misses, and `llvm` adds RPCS3's own LLVM SPU recompiler
+in the compiler workers on top of it (`spu_thread::init_spu_decoder`). A run with any of these
+missing is a run of the interpreter, and it is an order of magnitude slower; the interactive page
+therefore enables all of them, and which bundle belongs to which disc image comes from
+`public/local-aot/index.json` rather than from the caller.
+
+**How a block reaches the next block matters as much as how it is compiled.** Desktop RPCS3 keeps a
+direct-mapped dispatch table and has compiled blocks *tail-jump* through it, so a running guest never
+returns to a dispatch loop: `spu_runtime::g_dispatcher` is indexed by the block's first instruction
+word, and its trampoline is six instructions ending in `jmp [g_dispatcher + idx*8]`.
+
+The PPU tier does the same thing in wasm. A compiled block's branch epilogue (`PPUTranslator.cpp`)
+loads a two-level dispatch page, takes the bundle's slot or the runtime tier's slot beside it, and
+ends in a `musttail` indirect call — a wasm `return_call_indirect` — falling back to a plain return
+into the interpreter when the slot is empty. Blocks chain; the interpreter loop is not on the path.
+
+The SPU path does not yet: it returns to `spu_web_interpreter_loop` after every block and re-derives
+the next dispatch from scratch. That difference is the single largest cost in a profiled commercial
+title — see `performance.md`.
 
 **Clock.** `utils::get_tsc()` reads `emscripten_get_now()` directly rather than going through
 `steady_clock` and the WASI clock shim.
@@ -290,7 +323,13 @@ JSPI change is benchmarked against the same build without it, on the same hardwa
 input trace.
 
 Compare like with like. A title's frame time depends on what is on screen, and the same run reaches
-the same scene at a different flip each time, so compare **microseconds per draw over frames
-carrying a comparable draw count**, never wall time or a fixed frame index. Record the adapter, the
-clock scale, and whether compiled blocks were active; a run with a bundle and a run without are not
-comparable numbers.
+the same scene at a different flip each time, so compare **CPU milliseconds per frame at a matched
+draws per frame**, never wall time or a fixed frame index. Record the adapter, the clock scale, and
+which tiers were active; a run with a bundle and a run without are not comparable numbers.
+
+The desktop emulator on the same machine is the reference for what a cost *should* be, and it is
+what says whether something is expensive because of wasm or expensive everywhere.
+
+`performance.md` carries the method for both sides — the exact commands, the profile-core caveat that
+`wasm-opt` inlines the dispatch loops away in the shipping cores, how to reach a title's gameplay
+rather than profiling its intro, and the measured browser-against-native table.

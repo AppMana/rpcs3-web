@@ -11,7 +11,8 @@ by RPCS3's own recompilers hosted in compiler workers, so a block no bundle carr
 interpreted for the rest of the run.
 
 `docs/port.md` describes the architecture, the seams, how to test, how to deploy to a device, and
-what that device can and cannot do. This file covers building and running.
+what that device can and cannot do. `docs/performance.md` describes how the port is measured, against
+itself and against the desktop emulator on the same machine. This file covers building and running.
 
 ## Memory model
 

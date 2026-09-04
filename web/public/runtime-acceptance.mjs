@@ -50,7 +50,9 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
     const untilDraw = options.untilDraw === true;
     const requestedFrames = dispatchCompletion
       ? 1
-      : Number.isInteger(options.frames) ? Math.max(1, Math.min(3600, options.frames)) : (untilDraw ? 3600 : 1);
+      // A commercial title reaches gameplay thousands of flips in, so a performance run needs a
+      // budget past that; a fixture still asks for the one frame it wants.
+      : Number.isInteger(options.frames) ? Math.max(1, Math.min(20_000, options.frames)) : (untilDraw ? 3600 : 1);
     const renderEvery = Number.isInteger(options.renderEvery) ? Math.max(1, options.renderEvery) : 1;
     // Frames that are neither rendered nor final are discarded in the worker
     // (no packet copy, no transfer); RSX still executes them.

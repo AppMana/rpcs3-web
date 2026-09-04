@@ -39,9 +39,11 @@ const profilePath = env.RPCS3_CHROME_PROFILE || path.join(homedir(), ".cache", "
 const baseURL = env.RPCS3_WEB_URL || "http://127.0.0.1:4175";
 const headed = env.RPCS3_HEADED === "1";
 const untilDraw = env.RPCS3_UNTIL_DRAW === "1";
-// Until-draw runs keep going up to the page's 3600-frame cap unless a
-// smaller frame budget is given explicitly.
-const frames = Math.max(1, Math.min(3600, Number(env.RPCS3_FRAMES) || (untilDraw ? 3600 : 1)));
+// Until-draw runs keep going up to the cap unless a smaller frame budget is given explicitly. A
+// commercial title spends thousands of flips on its logos, boot and intro before it reaches
+// gameplay — LittleBigPlanet 2's first heavy frame is around flip 3500 — so a performance run needs
+// a budget well past that to have a gameplay window at all.
+const frames = Math.max(1, Math.min(20_000, Number(env.RPCS3_FRAMES) || (untilDraw ? 3600 : 1)));
 const renderEvery = Math.max(1, Number(env.RPCS3_RENDER_EVERY) || 1);
 const timeoutMs = Math.max(5_000, Number(env.RPCS3_TIMEOUT_MS) || 120_000);
 const width = Number(env.RPCS3_WIDTH) || 1280;

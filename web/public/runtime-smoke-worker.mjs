@@ -196,7 +196,11 @@ function vmPpuLocks() {
 // Working-set telemetry. These are the numbers that decide the Mobile Safari
 // worker pool, stack size, and initial memory; they are recorded, never used
 // as a correctness oracle.
-function workingSet() {
+// The two malloc figures come from mallinfo(), which walks every chunk of the arena: on a heap that
+// has grown to a gigabyte one call costs tens of milliseconds on the thread the runtime's own event
+// loop runs on. They are asked for where a run ends, not on every progress tick and every captured
+// frame.
+function workingSet({ arena = false } = {}) {
   if (!module) return undefined;
   const u64 = (name) => Number(module.ccall(name, "bigint", [], []));
   const u32 = (name) => module.ccall(name, "number", [], []) >>> 0;
@@ -204,8 +208,8 @@ function workingSet() {
   const poolIdle = module.PThread?.unusedWorkers?.length ?? 0;
   return {
     heapBytes: module.HEAPU8?.byteLength ?? 0,
-    mallocBytes: u64("rpcs3_web_malloc_bytes"),
-    mallocArenaBytes: u64("rpcs3_web_malloc_arena_bytes"),
+    mallocBytes: arena ? u64("rpcs3_web_malloc_bytes") : undefined,
+    mallocArenaBytes: arena ? u64("rpcs3_web_malloc_arena_bytes") : undefined,
     vmMappedPages: u32("rpcs3_web_vm_mapped_pages"),
     vmBackingBytes: u64("rpcs3_web_vm_backing_bytes"),
     liveThreads: u32("rpcs3_web_live_thread_count"),
@@ -581,7 +585,7 @@ scope.addEventListener("message", async (event) => {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       const shutdownStackReport = stackReport();
-      const shutdownWorkingSet = workingSet();
+      const shutdownWorkingSet = workingSet({ arena: true });
       const liveThreadNames = module ? module.ccall("rpcs3_web_live_thread_names", "string", [], []).split("\n").filter(Boolean) : [];
       const keepRuntime = event.data.keepRuntime === true && stoppedCleanly;
       if (!keepRuntime) module?.PThread?.terminateAllThreads();

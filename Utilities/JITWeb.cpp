@@ -94,7 +94,10 @@ std::vector<u8> jit_compiler::emit_wasm(llvm::Module& module, std::string& error
 
 	std::string lld_out, lld_err;
 	raw_string_ostream out(lld_out), err(lld_err);
-	const char* args[] = {"wasm-ld", "--shared", "--import-memory", "--shared-memory", "--max-memory=2147483648", "--allow-undefined", "--export-all", object_path.c_str(), "-o", output_path.c_str()};
+	// Compiler-rt's builtins are embedded in this module (rpcs3/CMakeLists.txt) so what the backend
+	// lowers to a library call resolves here, as it does for the offline bundles. What the runtime
+	// already exports stays an import instead, so a block shares that copy rather than carrying one.
+	const char* args[] = {"wasm-ld", "--shared", "--import-memory", "--shared-memory", "--max-memory=2147483648", "--allow-undefined", "--export-all", object_path.c_str(), "/lib/libclang_rt.builtins.a", "-o", output_path.c_str()};
 	const lld::Result result = lld::lldMain(args, out, err, {{lld::Wasm, &lld::wasm::link}});
 	sys::fs::remove(object_path);
 

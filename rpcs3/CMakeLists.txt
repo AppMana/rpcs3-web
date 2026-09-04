@@ -143,6 +143,17 @@ if(RPCS3_WEB)
 		set_source_files_properties(${CMAKE_SOURCE_DIR}/rpcs3/Emu/Cell/PPUTranslator.cpp PROPERTIES
 			COMPILE_FLAGS -fno-rtti
 			SKIP_PRECOMPILE_HEADERS ON)
+		# Compiler-rt's builtins, embedded so wasm-ld can resolve what the WebAssembly backend lowers
+		# to a library call inside the browser, exactly as the offline bundles resolve it
+		# (web/scripts/compile-ppu-ir-to-wasm.mjs links the same archive).
+		find_file(RPCS3_WEB_BUILTINS_ARCHIVE
+			NAMES libclang_rt.builtins-mt.a libclang_rt.builtins.a
+			PATHS "$ENV{EMSDK}/upstream/emscripten/cache/sysroot/lib/wasm32-emscripten"
+				"$ENV{HOME}/.cache/emsdk-6.0.8/upstream/emscripten/cache/sysroot/lib/wasm32-emscripten"
+			NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+		if(NOT RPCS3_WEB_BUILTINS_ARCHIVE)
+			message(FATAL_ERROR "compiler-rt builtins for wasm32-emscripten were not found; set EMSDK")
+		endif()
 		target_compile_definitions(rpcs3_web_spu_llvm PRIVATE LLVM_AVAILABLE)
 		target_include_directories(rpcs3_web_spu_llvm SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${LLD_INCLUDE_DIRS})
 		target_compile_options(rpcs3_web_spu_llvm PRIVATE "--use-port=emdawnwebgpu" -msimd128 -msse4.1)
@@ -190,6 +201,7 @@ if(RPCS3_WEB)
 			"-sEXPORTED_FUNCTIONS=['_main','_malloc','_free']"
 			"-sASSERTIONS=1"
 			"-sSTACK_OVERFLOW_CHECK=0"
+			"--embed-file" "${RPCS3_WEB_BUILTINS_ARCHIVE}@/lib/libclang_rt.builtins.a"
 			"-sWASM_BIGINT=1")
 	endif()
 

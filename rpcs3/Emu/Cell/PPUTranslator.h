@@ -74,6 +74,9 @@ class PPUTranslator final : public cpu_translator
 	llvm::Value** const m_fc = m_locals + 131; // FPSCR bits (used partially)
 
 	llvm::Value* nan_vec4;
+
+	// Everything the constructors share once the context is bound
+	void prepare();
 	bool m_may_be_mmio = false;
 	bool m_wasm_aot = false;
 
@@ -347,7 +350,12 @@ public:
 	// Handle compilation errors
 	void CompilationError(std::string_view error);
 
+#ifdef RPCS3_WEB
+	// Browser compiler: the target machine stands in for the execution engine (Utilities/JIT.h)
+	PPUTranslator(llvm::LLVMContext& context, llvm::Module* _module, const ppu_module<lv2_obj>& info, llvm::TargetMachine& target, bool wasm_aot);
+#else
 	PPUTranslator(llvm::LLVMContext& context, llvm::Module* _module, const ppu_module<lv2_obj>& info, llvm::ExecutionEngine& engine, bool wasm_aot = false);
+#endif
 	~PPUTranslator();
 
 	// Get thread context struct type

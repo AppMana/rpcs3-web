@@ -28,6 +28,18 @@ const ppu_decoder<PPUTranslator> s_ppu_decoder;
 extern const ppu_decoder<ppu_itype> g_ppu_itype;
 extern const ppu_decoder<ppu_iname> g_ppu_iname;
 
+#ifdef RPCS3_WEB
+PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_module<lv2_obj>& info, llvm::TargetMachine& target, bool wasm_aot)
+	: cpu_translator(_module, false)
+	, m_info(info)
+	, m_pure_attr()
+	, m_wasm_aot(wasm_aot)
+{
+	// Bind context
+	cpu_translator::initialize(context, target);
+	prepare();
+}
+#else
 PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_module<lv2_obj>& info, ExecutionEngine& engine, bool wasm_aot)
 	: cpu_translator(_module, false)
 	, m_info(info)
@@ -36,6 +48,13 @@ PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_mo
 {
 	// Bind context
 	cpu_translator::initialize(context, engine);
+	prepare();
+}
+#endif
+
+// Everything the constructors share once the context is bound
+void PPUTranslator::prepare()
+{
 	if (m_wasm_aot)
 	{
 		m_use_ssse3 = false;
@@ -689,6 +708,8 @@ void PPUTranslator::WasmCallThroughTable(Value* target, Value* seg0)
 {
 	// Exec base (arg 0) is the directory of 64 KiB guest pages; a page's first member is the u32 wasm table index per guest word.
 	// Unregistered blocks store cia and return, and the owning PPU thread continues in the interpreter.
+	// A slot is callable only when it is a table index: zero means no compiled block, and the top bit
+	// marks a block the runtime tier has found but not compiled (rpcs3/Emu/Cell/PPUThread.cpp).
 	const auto type = m_function->getFunctionType();
 	const auto addr = Trunc(target, GetType<u32>());
 	const auto r0 = GetGpr(0);
@@ -706,9 +727,13 @@ void PPUTranslator::WasmCallThroughTable(Value* target, Value* seg0)
 	m_ir->SetInsertPoint(have_page);
 	const auto leaf_slot = m_ir->CreateGEP(GetType<u32>(), m_ir->CreateIntToPtr(page, GetType<u8*>()), m_ir->CreateLShr(m_ir->CreateAnd(addr, 0xffff), 2));
 	const auto index = m_ir->CreateLoad(GetType<u32>(), leaf_slot);
-	m_ir->CreateCondBr(m_ir->CreateIsNull(index), fallback, call, m_md_unlikely);
+	const auto callable = m_ir->CreateICmpULT(m_ir->CreateSub(index, m_ir->getInt32(1)), m_ir->getInt32(0x7fff'ffff));
+	m_ir->CreateCondBr(callable, call, fallback, m_md_likely);
 
 	m_ir->SetInsertPoint(call);
+	// The target's own address, so a slot the calling worker's table does not hold yet lands on a
+	// stub that returns and the interpreter resumes at the block the branch went to
+	m_ir->CreateStore(addr, m_ir->CreateStructGEP(m_thread_type, m_thread, static_cast<uint>(&m_cia - m_locals)));
 	const auto c = m_ir->CreateCall(FunctionCallee(type, m_ir->CreateIntToPtr(index, GetType<u8*>())), {m_exec, m_thread, seg0, m_base, r0, r1, r2});
 	c->setTailCallKind(llvm::CallInst::TCK_MustTail);
 	c->setCallingConv(CallingConv::C);

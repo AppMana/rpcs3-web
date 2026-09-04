@@ -131,11 +131,18 @@ if(RPCS3_WEB)
 	if(RPCS3_WEB_LLVM_DIR)
 		find_package(LLVM REQUIRED CONFIG PATHS "${RPCS3_WEB_LLVM_DIR}/lib/cmake/llvm" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
 		find_package(LLD REQUIRED CONFIG PATHS "${RPCS3_WEB_LLVM_DIR}/lib/cmake/lld" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+		# One compiler module hosts both runtime tiers: LLVM and lld are 48 MB of wasm that every
+		# compiler worker instantiates, and a second module of them is not affordable on a phone.
 		add_executable(rpcs3_web_spu_llvm
 			${CMAKE_SOURCE_DIR}/web/host/rpcs3_spu_llvm_main.cpp
+			${CMAKE_SOURCE_DIR}/web/host/rpcs3_ppu_llvm_main.cpp
 			${CMAKE_SOURCE_DIR}/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
+			${CMAKE_SOURCE_DIR}/rpcs3/Emu/Cell/PPUTranslator.cpp
 			${CMAKE_SOURCE_DIR}/rpcs3/Emu/CPU/CPUTranslator.cpp
 			${CMAKE_SOURCE_DIR}/Utilities/JITWeb.cpp)
+		set_source_files_properties(${CMAKE_SOURCE_DIR}/rpcs3/Emu/Cell/PPUTranslator.cpp PROPERTIES
+			COMPILE_FLAGS -fno-rtti
+			SKIP_PRECOMPILE_HEADERS ON)
 		target_compile_definitions(rpcs3_web_spu_llvm PRIVATE LLVM_AVAILABLE)
 		target_include_directories(rpcs3_web_spu_llvm SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${LLD_INCLUDE_DIRS})
 		target_compile_options(rpcs3_web_spu_llvm PRIVATE "--use-port=emdawnwebgpu" -msimd128 -msse4.1)

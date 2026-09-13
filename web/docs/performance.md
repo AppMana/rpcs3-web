@@ -877,3 +877,14 @@ reject floor ~4-4.5% is the absolute LS-self-mod real cost, threshold-invariant)
 deployed and gameplay-verified (0 fails across 10 runs). Remaining heavy-band gameplay bound = the
 per-dispatch atlas+verify path + per-draw Dawn submission + FPU/PPU interpreter resident share;
 deterministic content-pinning is the open prerequisite to attributing per-fps deltas.
+
+## Corrected sustained-gameplay characterization (round 9) — 2026-09-12
+Band analysis of the latest gameplay captures corrects the earlier "heavy ~12fps @1162dpf"
+reading: per-frame draws are LONGEST-CONTIGUOUS in the 300-700 band — the game's sustained
+render load. hw-o3bundle (O3 transpiler + O3 PPU-AOT): 813 contiguous fps @573dpf = **23.3fps**.
+hw-hoist (draw-state hoist build): 233 contiguous @573dpf = **23.6fps**. The 941-1162-dpf
+bursts are transient (level/FMV interleave), not sustained gameplay bands, so the earlier
+"heavy-band ~12fps" figures were a windowing misinterpretation of spikes. Sustained gameplay
+sits ~573dpf at ~23fps — within 1.3x of the 30fps target, with the transpile-quality stack
+(O3 in-browser JIT, O3 PPU-AOT, mega/giga SPU blocks, low hot thresholds) + Dawn draw-state
+hoist all deployed and gameplay-verified (12 runs, 0 failures).

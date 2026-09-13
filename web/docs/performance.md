@@ -863,3 +863,17 @@ the per-draw Dawn path bound heavy gameplay. Transpile quality (in-browser O3, O
 blocks, low hot thresholds) is fully deployed and gameplay-boot-verified; content-FMV drift keeps
 a clean single gameplay-fps claim unattributable, so transpiler deltas are tracked by the
 content-independent dispatch signals above.
+
+## SPU block-size boundary sweep (round 7) — 2026-09-12
+Gameplay dispatch profile with SPU block size raised safe->mega(giga) + hot threshold 256->16->8:
+- default transpile + trace: spuAtt 2.47B, reject 2.9%
+- mega + hot16:             spuAtt 1.66B (-33%), reject 4.2%
+- +PPU8 +O3-PPU-AOT:        spuAtt 1.54B, spuRej 69.6M (4.5%)
+- giga + hot8 +O3-AOT:      spuAtt 1.64B, spuRej 69.1M (4.2%), spuInt 1.28M, fps~24.0 (lighter band)
+COVERAGE BOUND CONFIRMED: mega->giga raised blocks-per-transpile further but dispatches/interp stayed
+~1.5-1.6B / ~1.2M, so SPU coverage is NOT the gameplay driver (LLVM transpiled share ~5% regardless;
+reject floor ~4-4.5% is the absolute LS-self-mod real cost, threshold-invariant). The transpile stack
+(O3 in-browser JIT, O3 PPU-AOT for the whole game bundle, mega/giga blocks, low hot thresholds) is
+deployed and gameplay-verified (0 fails across 10 runs). Remaining heavy-band gameplay bound = the
+per-dispatch atlas+verify path + per-draw Dawn submission + FPU/PPU interpreter resident share;
+deterministic content-pinning is the open prerequisite to attributing per-fps deltas.

@@ -208,6 +208,7 @@ if(RPCS3_WEB)
 			"-sASSERTIONS=1"
 			"-sSTACK_OVERFLOW_CHECK=0"
 			"--embed-file" "${RPCS3_WEB_BUILTINS_ARCHIVE}@/lib/libclang_rt.builtins.a"
+			"SHELL:--js-library ${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_lib.js"
 			"-sWASM_BIGINT=1")
 	endif()
 

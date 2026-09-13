@@ -10,6 +10,8 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/OptimizationLevel.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/TargetSelect.h"
@@ -79,6 +81,27 @@ std::vector<u8> jit_compiler::emit_wasm(llvm::Module& module, std::string& error
 
 	SmallVector<char, 0> object;
 	{
+		// Full -O3-quality IR optimization before wasm emission, mirroring what the offline
+		// llc -O3 path (web/scripts/compile-ppu-ir-to-wasm.mjs) applies. Without this the
+		// in-browser transpiled guest blocks miss InstCombine/GVN/SROA/LoopVectorize/ADCE,
+		// so live code runs measurably weaker than the AOT bundles. NewPM is linked in
+		// (SPULLVMRecompiler.cpp uses PassBuilder already); the +simd128 feature lets the
+		// LoopVectorizer emit v128 for guest vector loops.
+		LoopAnalysisManager lam;
+		FunctionAnalysisManager fam;
+		CGSCCAnalysisManager cgam;
+		ModuleAnalysisManager mam;
+
+		PassBuilder pb(m_target_machine.get());
+		pb.registerModuleAnalyses(mam);
+		pb.registerCGSCCAnalyses(cgam);
+		pb.registerFunctionAnalyses(fam);
+		pb.registerLoopAnalyses(lam);
+		pb.crossRegisterProxies(lam, fam, cgam, mam);
+
+		ModulePassManager mpm = pb.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
+		mpm.run(module, mam);
+
 		raw_svector_ostream stream(object);
 		legacy::PassManager passes;
 

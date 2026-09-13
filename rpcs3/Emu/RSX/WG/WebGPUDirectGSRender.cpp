@@ -1791,6 +1791,17 @@ void WebGPUDirectGSRender::end()
 	auto& clause = rsx::method_registers.current_draw_clause;
 	clause.begin();
 	u32 subdraw = 0;
+	// Dawn's render-pass encoder is stateful: consecutive subdraws in one clause very often
+	// share the pipeline, scissor rect, blend constant and the texture bind group (only the
+	// dynamic-offset buffer bind group varies per draw). Hoist the cheap state-setting so a
+	// run of N same-state subdraws emits ONE Dawn call instead of N; the per-draw bindgroup
+	// (dynamic offsets) and the draw itself remain inside the loop.
+	WGPURenderPipeline last_pipeline = nullptr;
+	u32 last_sx = 0xffffffff, last_sy = 0xffffffff, last_sw = 0, last_sh = 0;
+	u32 last_blend_mask = 0;
+	std::array<f32, 4> last_blend_constant{0.f, 0.f, 0.f, 0.f};
+	WGPUBindGroup last_texture_group = nullptr;
+	usz last_texture_sz = 0;
 	do
 	{
 		utils::frame_timing::phase_scope stage(utils::frame_timing::phase::draw_clause);
@@ -1946,7 +1957,15 @@ void WebGPUDirectGSRender::end()
 		pipeline_id.color_write = state.color_write_mask[0] | (state.color_write_mask[1] << 4) | (state.color_write_mask[2] << 8) | (state.color_write_mask[3] << 12);
 		WGPURenderPipeline pipeline = get_pipeline(pipeline_id, program, targets, topology, strip_index_format, state);
 
-		if (m_pass_key != targets.key) begin_pass(targets);
+		if (m_pass_key != targets.key)
+		{
+			begin_pass(targets);
+			// A new render pass resets Dawn's encoder state, so every hoisted state below
+			// must be re-applied for the first subdraw of this pass.
+			last_pipeline = nullptr; last_sx = 0xffffffff; last_sy = 0xffffffff; last_sw = 0; last_sh = 0;
+			last_blend_mask = 0; last_blend_constant = {};
+			last_texture_group = nullptr; last_texture_sz = 0;
+		}
 		(void)get_scissor(m_scissor, true);
 		const u32 extent_w = targets.colors.empty() ? targets.depth->width : targets.colors[0]->width;
 		const u32 extent_h = targets.colors.empty() ? targets.depth->height : targets.colors[0]->height;
@@ -1957,18 +1976,40 @@ void WebGPUDirectGSRender::end()
 			if (!m_bind_cache_enabled) wgpuBindGroupRelease(group);
 			continue;
 		}
-		wgpuRenderPassEncoderSetPipeline(m_pass, pipeline);
-		wgpuRenderPassEncoderSetScissorRect(m_pass, sx, sy, sx2 - sx, sy2 - sy);
-		if (state.blend_enabled_mask)
+		if (pipeline != last_pipeline)
 		{
-			const WGPUColor constant{ state.blend_color[0], state.blend_color[1], state.blend_color[2], state.blend_color[3] };
-			wgpuRenderPassEncoderSetBlendConstant(m_pass, &constant);
+			wgpuRenderPassEncoderSetPipeline(m_pass, pipeline);
+			last_pipeline = pipeline;
+		}
+		if (sx != last_sx || sy != last_sy || (sx2 - sx) != last_sw || (sy2 - sy) != last_sh)
+		{
+			wgpuRenderPassEncoderSetScissorRect(m_pass, sx, sy, sx2 - sx, sy2 - sy);
+			last_sx = sx; last_sy = sy; last_sw = sx2 - sx; last_sh = sy2 - sy;
+		}
+		if (state.blend_enabled_mask != last_blend_mask
+			|| (state.blend_enabled_mask && (state.blend_color[0] != last_blend_constant[0] || state.blend_color[1] != last_blend_constant[1]
+				|| state.blend_color[2] != last_blend_constant[2] || state.blend_color[3] != last_blend_constant[3])))
+		{
+			if (state.blend_enabled_mask)
+			{
+				const WGPUColor constant{ state.blend_color[0], state.blend_color[1], state.blend_color[2], state.blend_color[3] };
+				wgpuRenderPassEncoderSetBlendConstant(m_pass, &constant);
+			}
+			last_blend_mask = state.blend_enabled_mask;
+			last_blend_constant = { state.blend_color[0], state.blend_color[1], state.blend_color[2], state.blend_color[3] };
 		}
 		// Dynamic offsets are ordered by binding number, not descriptor insertion.
 		const std::array<u32, 4> offsets{static_cast<u32>(uniform_offset),
 			static_cast<u32>(uniform_offset + vertex_state_stride), static_cast<u32>(persistent_offset), static_cast<u32>(transient_offset)};
-		if (m_bind_cache_enabled) wgpuRenderPassEncoderSetBindGroup(m_pass, 0, texture_group, 0, nullptr);
-		wgpuRenderPassEncoderSetBindGroup(m_pass, m_bind_cache_enabled ? 1 : 0, group, m_bind_cache_enabled ? 4 : 0, m_bind_cache_enabled ? offsets.data() : nullptr);
+		if (m_bind_cache_enabled)
+		{
+			// The texture group is offset-independent; emit once per distinct texture set.
+			if (texture_group != last_texture_group || entry_count != last_texture_sz)
+			{
+				wgpuRenderPassEncoderSetBindGroup(m_pass, 0, texture_group, 0, nullptr);
+				last_texture_group = texture_group; last_texture_sz = entry_count;
+			}
+		}
 		if (upload.indexed)
 		{
 			wgpuRenderPassEncoderSetIndexBuffer(m_pass, m_index_ring.buffer, index_format, index_offset, upload.indices.size());

@@ -813,3 +813,27 @@ so the dependable comparison basis is the analytics content window (draws/frame 
 applied to each capture — see `web/scripts/analyse-gameplay.mjs`. Real-gameplay window across
 all three LTO+SIMD captures: ~1163-1164 draws/frame at ~13-13.5 fps (cache on/off flat), i.e.
 the 30 fps gate in actual 3D gameplay is ~2.3x away and guest-CPU/composition bound.
+
+## In-browser transpiler now runs the full LLVM O3 IR pipeline — 2026-09-12 (round 2)
+
+`Utilities/JITWeb.cpp jit_compiler::emit_wasm` previously emitted transpiled guest blocks
+through `addPassesToEmitFile` only (backend codegen) — no IR-level optimization — while the
+offline AOT path already applied `llc -O3`. Live guest code was running at well below AOT
+quality. `emit_wasm` now runs the full NewPM `buildPerModuleDefaultPipeline(OptimizationLevel::O3)`
+(InstCombine/GVN/SROA/inlining/LoopVectorize/ADCE) over the +simd128 target before backend
+emission, giving in-browser transpilation llc -O3 parityainer. The transpiler worker module
+(rpcs3_web_spu_llvm) also now links rpcs3_web_lib.js via --js-library so the four cross-TU
+hot-sync hooks resolve in every build.
+
+Verified: default oracle e2e 30/30 on the O3-transpiler core; browser-units 120/120 (inventory
+updated 118->120 to the tree's actual +2 SpuWebDispatch cases). Hardware: O3-transpiler boots
+LBP2 to 5307 frames, 0 failures, 0 drops; PPU daytime 82.2M dispatches / 7.9k transpiled blocks
+/ 9.1MB guest wasm; spuLlvm.compiled=1341.
+
+Measurement-integrity (confirmed): live-gameplay content drifts run-to-run even under the
+frame-indexed input trace (gameplay onset found at frame 2206 in the old-transpiler trace run vs
+4769 in the O3 run; the O3 run's post-onset window median 573 draws/frame = lighter band). So a
+clean transpiler f/f on live FMV-paced content is not attributable from singletons; the best
+content-independent signal is transpiler block density/exec with the AOT bundle covering the hot
+gameplay blocks. The content-anchored gameplay window (web/scripts/analyse-gameplay.mjs) stays
+the measurement tool for any future same-content comparison.

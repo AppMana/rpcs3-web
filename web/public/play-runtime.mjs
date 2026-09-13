@@ -324,6 +324,8 @@ async function start() {
     bindGroupCache: search.get("bindGroupCache") === "1",
     presentationYield: search.get("presentationYield") ?? "timer",
     llvmCompilerUrl: search.get("llvmCompiler") || undefined,
+    spuBlockSize: ["safe", "mega", "giga"].includes(search.get("spuBlockSize")) ? search.get("spuBlockSize") : undefined,
+    spuHotThreshold: Number(search.get("spuHotThreshold")) || 0,
     inputTrace,
     pad: controlState(),
     // Every tier the port has, on. A guest block starts interpreted; the PPU tier and the SPU

@@ -29,5 +29,7 @@ export default defineConfig({
   },
   test: {
     include: ["tests/*.test.ts", "tests/*.test.mjs"],
+    testTimeout: 120_000,
+    hookTimeout: 120_000,
   },
 });

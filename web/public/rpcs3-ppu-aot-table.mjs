@@ -1,3 +1,4 @@
+import { dylinkInfo } from "./wasm-dylink.mjs";
 // Loads a title's compiled PPU blocks into RPCS3's function tables so the PPU
 // pthreads call them directly (see web/host/rpcs3_web_pre.js for the per-worker
 // side). One layout is computed here: each part gets a contiguous range of table
@@ -18,40 +19,6 @@ const bindings = Object.freeze({
   __stwcx: "rpcs3_web_ppu_direct_stwcx",
   __stdcx: "rpcs3_web_ppu_direct_stdcx",
 });
-
-function readLeb(bytes, offset) {
-  let result = 0;
-  let shift = 0;
-  for (;;) {
-    const byte = bytes[offset++];
-    result |= (byte & 0x7f) << shift;
-    if ((byte & 0x80) === 0) return [result >>> 0, offset];
-    shift += 7;
-  }
-}
-
-// wasm-ld --shared records the memory and table space a module needs in dylink.0.
-function dylinkInfo(module) {
-  const sections = WebAssembly.Module.customSections(module, "dylink.0");
-  const info = { memorySize: 0, memoryAlign: 0, tableSize: 0, tableAlign: 0 };
-  if (!sections.length) return info;
-  const bytes = new Uint8Array(sections[0]);
-  let offset = 0;
-  while (offset < bytes.length) {
-    const type = bytes[offset++];
-    let size;
-    [size, offset] = readLeb(bytes, offset);
-    if (type === 1) {
-      let cursor = offset;
-      [info.memorySize, cursor] = readLeb(bytes, cursor);
-      [info.memoryAlign, cursor] = readLeb(bytes, cursor);
-      [info.tableSize, cursor] = readLeb(bytes, cursor);
-      [info.tableAlign, cursor] = readLeb(bytes, cursor);
-    }
-    offset += size;
-  }
-  return info;
-}
 
 async function mapConcurrent(items, limit, worker) {
   const results = new Array(items.length);
@@ -91,6 +58,12 @@ export async function loadPpuAotBundle({ module, mainInstance, mainMemory, manif
     const wasm = compiled[index];
     const info = dylinkInfo(wasm);
     for (const imported of WebAssembly.Module.imports(wasm)) {
+      if (imported.module === "GOT.mem" && imported.kind === "global" && imported.name === "__rpcs3_guest_pages") {
+        if (typeof module._rpcs3_web_vm_page_table_address !== "function") {
+          throw new Error("PPU bundle requires direct guest-page reads unsupported by this runtime");
+        }
+        continue;
+      }
       if (imported.module !== "env") throw new Error(`unsupported PPU AOT import module ${imported.module}.${imported.name}`);
       if (imported.kind !== "function") continue;
       if (imported.name.startsWith("rpcs3_web_vm_")) {
@@ -132,6 +105,14 @@ export async function loadPpuAotBundle({ module, mainInstance, mainMemory, manif
     bindings: { ...bindings, ...Object.fromEntries(vmBindings) },
   };
 
+  // Each side module owns one contiguous element segment. Publish these immutable spans
+  // before guest execution, so portable PPU branches can retain same-instance tail calls.
+  if (module._rpcs3_web_ppu_register_instance_span) {
+    for (const [index, part] of parts.entries()) if (part.tableSize && descriptors[index].localTableOnly === true) {
+      module.ccall("rpcs3_web_ppu_register_instance_span", null, ["number", "number"],
+        [part.elemBase, part.elemBase + part.tableSize]);
+    }
+  }
   log(`PPU AOT bundle: layout ${parts.length} parts at table ${tableBase}+${load.tableSize}`);
   const populateStartedAt = performance.now();
   // A bundle that carries its blocks in the manifest is registered without instantiating anything
@@ -149,6 +130,10 @@ export async function loadPpuAotBundle({ module, mainInstance, mainMemory, manif
       }
     }
     if (!pairs.length) throw new Error("PPU AOT bundle has no blocks");
+    // Registration without instantiation still owns these indices. Otherwise a
+    // later SPU bundle starts at the same table.length and a worker changing
+    // roles overwrites one layout with the other while retaining both ready flags.
+    if (table.length < cursor) table.grow(cursor - table.length);
     const pairBytes = module._malloc(pairs.length * 4) >>> 0;
     new Uint32Array(mainMemory.buffer, pairBytes, pairs.length).set(pairs);
     module.ccall("rpcs3_web_ppu_aot_register_many", null, ["number", "number"], [pairBytes, pairs.length / 2]);

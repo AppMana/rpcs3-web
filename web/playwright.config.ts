@@ -6,6 +6,7 @@ export default defineConfig({
   // config runs both correctness tests (software adapters allowed) and strict
   // hardware gates (software adapters rejected).
   testIgnore: [
+    "runtime-direct-session.spec.ts",
     "ppu-aot-table-gpu.spec.ts",
     "frame-oracle.spec.ts",
     "gpu.spec.ts",
@@ -18,10 +19,11 @@ export default defineConfig({
     "runtime-scissor.spec.ts",
     "runtime-sustained.spec.ts",
     "input-trace.spec.ts",
+    "fragment-output-routing.spec.ts",
   ],
   timeout: 30_000,
   use: {
-    baseURL: `http://127.0.0.1:4173${process.env.BASE_PATH ?? "/"}`,
+    baseURL: process.env.RPCS3_TEST_ORIGIN ?? `http://127.0.0.1:4173${process.env.BASE_PATH ?? "/"}`,
     trace: "retain-on-failure",
   },
   webServer: [

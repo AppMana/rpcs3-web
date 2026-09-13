@@ -3,68 +3,202 @@
 How the browser port's performance is measured, what the numbers were on 2026-09-04, and what the
 desktop emulator does differently. Companion to `port.md`, which covers the architecture.
 
-## The metric
+## Current measurement contract (2026-09-04)
 
-**CPU milliseconds per frame, at a stated draws per frame.**
+Use **actual emulated flips**, OS process CPU time, and a matched scene. Worker messages can
+coalesce several flips; their sequence number is not the guest frame count. Presentation messages
+measure handoffs, not proof of a compositor scanout. Draw count helps reject mismatched scenes but
+does not establish equivalent gameplay, savedata, materials, or input.
 
-Frame time alone is not comparable between two runs of a title: the same title reaches the same
-scene at a different flip every time, so a fixed flip index compares two different scenes. Frames
-per second alone hides whether a run got cheaper or merely lighter. The pair — what a frame costs in
-CPU, and how much was on screen — is what survives.
+The host is a Ryzen 5950X: **16 physical cores, 32 logical CPUs**, with RTX A5000 graphics.
 
-Wall time per frame matters too, because that is what the player feels, but it is a *result*: with
-eight busy threads on a thirty-two core machine, CPU per frame is the thing a change moves and frames
-per second is what it buys.
-
-`scripts/analyse-cpuprofile.mjs` prints both:
-
-```
-76 workers with work samples, 5000 us interval, last 25s
-211.4 CPU-ms per frame at 573 draws per frame (535 frames, 113.0 CPU-s)
-```
-
-Work samples exclude `(idle)`, `(program)`, the garbage collector and futex waits; without that
-exclusion a 75-worker profile reads as 74% `emscripten_futex_wait` and the 26% that is real work
-never rises above a rounding error.
-
-## Running the browser benchmark
-
-Profile with the **profile core**, always. `wasm-opt` discards `noinline` when it links the shipping
-cores, so `spu_web_interpreter_loop` folds into `spu_thread::cpu_task`, `ppu_thread::exec_task` into
-`fast_call`, and `spin_on_cacheline_once` into `nv406e::semaphore_acquire`. The profile core keeps
-the name section and attributes them separately. It is not byte-identical to the shipping core, so
-shares come from the profile core and the frames-per-second gate is confirmed on the shipping one.
+`run-performance.mjs` runs headful Chrome against `https://rpcs3.appmana.com`, checks hardware
+WebGPU and isolation, records core hashes, and samples cumulative process CPU counters through CDP.
+It records exact guest-flip timestamps from the common RSX flip path. Percentiles are calculated
+only from consecutive exact timestamps; coalesced observations cannot supply per-frame percentiles.
+Process CPU estimates interpolate the measurement boundaries and omit process birth/death tails
+without two observations. Reports retain raw process samples for auditing that limitation.
 
 ```sh
-RPCS3_WEB_PROFILE=1 npm run build:runtime      # stages public/core/profile/
-npm run build                                  # staged artifacts reach the browser only through this
-
-DISPLAY=:0 RPCS3_HEADED=1 RPCS3_CORE=profile \
-RPCS3_CPU_PROFILE=/tmp/run.cpuprofile RPCS3_CPU_INTERVAL_US=5000 \
-RPCS3_PPU_JIT=1 RPCS3_SPU_DECODER=llvm RPCS3_SPU_LLVM_WORKERS=2 \
-RPCS3_PPU_AOT_BUNDLE=local-aot/<title>/manifest.json \
-RPCS3_SPU_AOT_BUNDLE=local-aot/<title>-spu/manifest.json \
-RPCS3_DIRECT_RENDERER=1 RPCS3_CLOCK_SCALE=100 \
-RPCS3_FRAMES=4100 RPCS3_RENDER_EVERY=2050 RPCS3_READBACK=0 RPCS3_TIMEOUT_MS=1200000 \
-npm run hardware:run -- "/opfs/games/<title>.iso" /tmp/run.json
-
-node scripts/analyse-cpuprofile.mjs /tmp/run.cpuprofile --last=25 --report=/tmp/run.json
-node scripts/analyse-cpuprofile.mjs /tmp/run.cpuprofile <function> --last=25   # who calls it
+RPCS3_WEB_JSPI=1 npm run build:runtime
+npm run build
+DISPLAY=:0 RPCS3_FRAMES=7000 node scripts/run-performance.mjs \
+  "/opfs/games/LittleBigPlanet 2 - Special Edition (USA) (En,Fr,Es,Pt).iso" \
+  ../test-results/performance/run
+node scripts/analyse-performance.mjs ../test-results/performance/run/report.json 4500 5500
 ```
 
-Every tier must be on or the measurement is of something else entirely: without `RPCS3_PPU_JIT` and
-the bundles, a commercial title is interpreted end to end and runs an order of magnitude slower.
+Set `RPCS3_PROFILE=1` for CDP worker/page sampling, `RPCS3_TRACE=1` for a Chromium timeline,
+`RPCS3_INPUT_TRACE=<path>` for guest-frame-indexed replay, and `RPCS3_CHROME_PROFILE=<directory>`
+for a separate persistent fixture. Live controller updates are disabled during scheduled replay.
+The runner currently defaults to the existing populated Chrome profile; freeze savedata separately
+before claiming repeatable A/B results. Frame-indexed input alone does not make execution deterministic.
 
-**Reaching gameplay.** A title spends thousands of flips on logos, boot and its intro. LittleBigPlanet
-2's first heavy frame is around flip 3500, and before it the run sits at one draw per frame — a
-profile of the first 600 frames is a profile of a video player. Give the run a budget past that and
-window the analysis onto the end with `--last=`. No input is needed: the title reaches a
-573-draws-per-frame scene unattended.
+CPU profiles supply **estimated sampled-work milliseconds**, not measured OS CPU milliseconds.
+Garbage collection remains attributed work. `(program)` is retained as unknown, separately from
+idle/wait samples; its time must not silently become either useful work or idle. Profile windows
+use a measured CDP/epoch clock offset and actual host timestamps, not profile-end alignment.
+A sampling run needs an unprofiled partner before its FPS can be used as a shipping result.
 
-**The caller report** is what turns a share into a lead. Self time says `_emscripten_get_now` costs
-26%; `analyse-cpuprofile.mjs <profile> _emscripten_get_now` says 64.7% of it came from `sched_yield`
-inside `rsx::thread::on_task`, which is the sentence you can act on. It walks past the `wasm-to-js`
-trampoline every import call goes through, and reports three frames of chain.
+For Linux CPU sampling across Chrome's processes, set `RPCS3_PERF=1`,
+`RPCS3_PROFILE_FROM_FRAME=4500`, and `RPCS3_PROFILE_TO_FRAME=4900`. Supply V8 flags with
+`RPCS3_V8_FLAGS="--perf-prof --perf-prof-unwinding-info --perf-prof-path=<absolute-output-directory>"`.
+The directory must exist before Chrome starts. The recorder uses the monotonic clock (`-k 1`),
+99 Hz user-space cycles, and 4096-byte DWARF stack snapshots. It records its arguments, window,
+exit status, and stderr in `report.json`. After Chrome exits:
+
+```sh
+DEBUGINFOD_URLS='' perf inject -j -i <output>/browser.perf -o <output>/browser-jit.perf
+DEBUGINFOD_URLS='' perf report --stdio -i <output>/browser-jit.perf \
+  --no-children --call-graph none --sort symbol
+```
+
+These percentages describe sampled user-space cycles, not wall time or total OS CPU time.
+Kernel work is excluded. JIT dumps can exceed 10 GB; keep them until symbol injection completes.
+Use `RPCS3_THREAD_CPU=1` to retain per-thread OS CPU counters alongside the samples.
+
+For native browser/library attribution without JIT ELF generation, export DSO offsets and
+resolve them against matching debug ELF files:
+
+```sh
+DEBUGINFOD_URLS='' perf script -i <output>/browser.perf --ns -G \
+  -F time,pid,tid,ip,period,dso,dsoff > <output>/native-offset-leaves.txt
+DEBUGINFOD_URLS='' perf buildid-list -i <output>/browser.perf > <output>/buildids.txt
+python3 scripts/analyse-native-perf.py <output>/native-offset-leaves.txt <output>/buildids.txt \
+  --elf /opt/google/chrome/chrome=/path/to/chrome.debug > <output>/native-resolved.json
+```
+
+The resolver rejects mismatched build IDs and preserves unresolved samples in the denominator.
+Its native-only report overlaps the separate V8 JIT report: do not add their percentages
+without joining individual samples. Chrome embeds some V8 builtins in its executable mapping.
+Official Linux symbols are available by version through the archive described in
+[Chromium's debugging documentation](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/docs/linux/debugging_minidump.md).
+Missing process CPU observations produce `observedCpuMsPerFrame: null`, including device
+runs without OS counters. Measured zero and unmeasured CPU are different results.
+
+### Copy attribution checkpoint (2026-09-05)
+
+The `profile-slices` LBP2 capture contains 34,635 samples. Its hot libc copy and clear
+functions account for 6.1767% of sampled user cycles. Normal DWARF unwinding recovered
+too few of their stacks to identify the callers reliably. The raw `PERF_SAMPLE_STACK_USER`
+records retained the data: all 1,068 samples in the two functions had a usable saved
+return address. Their exact matching libc disassembly contains no stack-pointer changes,
+pushes, pops, or calls, so the first stack word identifies the immediate caller. This is
+a validated leaf-function recovery, not a general stack-scanning heuristic.
+
+The recovery matched every recording sample's PID, TID, timestamp, IP, and period against
+`perf script`. JIT callers were resolved at the sample timestamp; native callers used the
+matching Chrome debug symbols and ELF address translation. Copy/clear costs by immediate
+caller, expressed against **all sampled user cycles**, include:
+
+| Caller | CPU cycle share |
+| --- | ---: |
+| SPU DMA transfer | 1.177% |
+| SPU list transfer | 0.750% |
+| WebGPU renderer `end()` | 0.818% |
+| RSX image transfer | 0.388% |
+| RSX vertex preparation | 0.321% |
+| Dawn wire `Queue::WriteBufferXL` | 1.008% |
+| Dawn native `BufferBase::UploadData` | 0.688% |
+| Dawn native `BufferBase::MapAtCreation` | 0.653% |
+
+These are additional leaf costs requested by the named functions, not their inclusive
+costs and not proof that the copies are all removable. Raw records and caller reports are
+under `test-results/performance/profile-slices/copy-callers`; the diagnostic recovery is
+`test-results/performance/recover-copy-callers.py`. Its function ranges and record layout
+are specific to this verified recording and must be revalidated for a different libc/build.
+
+### Experimental PPU direct reads
+
+`RPCS3_PPU_WASM_INLINE_READS=1` enables an opt-in LLVM translation path. Generated
+code imports `GOT.mem.__rpcs3_guest_pages`, translates a guest address through the existing
+4 KiB page table, and performs an unaligned Wasm load when the complete access fits in a
+mapped page. Crossing or unmapped accesses still call the existing runtime helpers; stores
+retain write-version tracking. Native translation and ordinary bundles keep their defaults.
+
+The runtime exports `rpcs3_web_vm_page_table_address`. The AOT loader checks that capability
+and each worker binds the import to its runtime's page table. There is no new PPU argument or
+thread-layout dependency. The browser compiler exposes `rpcs3_ppu_llvm_inline_reads` through
+the compiler worker's explicit `ppuInlineReads` initialization option; normal runtime compiler
+pools do not enable it yet.
+
+`ppu-inline-memory.spec.ts` executes generated 8/16/32/64/128-bit loads with known bytes,
+unaligned addresses, page endpoints, noncontiguous adjacent pages, and unmapped fallbacks.
+It verifies actual helper-call counts. A separately native-generated conformance bundle runs
+through real runtime workers and matches the dispatch verdict, and the loader rejects a
+runtime without the capability. These establish correctness for the covered cases, not a
+whole-game speedup. LBP2's experimental main module grows from 29.9 MB to 38.2 MB, so both
+steady gameplay and compilation/device-memory costs need measurement before adoption.
+
+For readable SPU dispatcher attribution, build with both `RPCS3_WEB_PROFILE=1 RPCS3_WEB_JSPI=1`
+and run with `RPCS3_CORE=profile-jspi`. Shipping wasm optimization may inline the interpreter loop
+into `spu_thread::cpu_task`; that symbol alone does not distinguish interpreted instructions from
+candidate search. Benchmark mode also publishes batched dispatch counters: attempted candidates,
+failed verification, worker-table synchronization, interpreted instructions, and same-PC returns.
+Counters publish every 1024 loop iterations; escapes can lose the unpublished tail, so they are
+lower bounds. No timestamp or shared atomic increment is added to each candidate attempt.
+
+### Dispatch cache experiment
+
+`SPUWebDispatch.h` contains a small cache local to each executing SPU. It remembers a successful
+candidate position for an immutable candidate-list pointer. Every call still executes local-store
+verification; rejection falls back to the remaining candidates, and list replacement discards the
+preference so a newly published optimizing program is tried first. The cache never treats an
+unplaced worker-local function as executable. Native and wasm unit tests cover mutation, generation
+replacement, collisions, and the disabled control path.
+
+Use `RPCS3_SPU_DISPATCH_CACHE=0` / `1` with the **same staged binary** to compare the control and
+cache paths. The initial diagnostic run's 4500–5200 window made 974,791,323 candidate attempts and
+410,273,357 failed verifications, with zero table synchronizations and 1,970 interpreted instructions.
+Its 9.651 FPS / 656.70 observed CPU-ms per flip at 1163 draws/flip is an exploratory result, not a
+matched A/B pair. Later in that run an unrelated software-rendered browser consumed about 11 cores;
+that interval is annotated in the raw report and excluded from this window.
+
+The first frozen Chrome fixture is `~/.cache/rpcs3-web-benchmark-fixture`; working profiles are
+reflink copies so each run can start from the same persisted state. The recorded player-input segment
+is `test-results/performance/gameplay-input.json`. Full native/browser scene parity and repeated A/B
+results beyond the first pair are still pending.
+
+The first same-binary pair (`cache-on-1` / `cache-off-1`) used the frozen fixture and replay.
+At flips 4500–5200 both produced exactly 1163.372857 draws/flip. Cache on measured **14.840 FPS**,
+420.147 OS CPU-ms/flip, and p95 76.475 ms; cache off measured **13.748 FPS**, 464.954 CPU-ms/flip,
+and p95 81.660 ms. That is **7.94% more FPS and 9.64% less CPU per flip**, from one pair only.
+Rejected candidates fell from 49.46% to 8.40%. Both runs stopped cleanly with zero timing drops.
+The pair used the legacy Vulkan configuration; repeat under the corrected shared-ANGLE configuration
+before treating the result as a stable shipping estimate. Do not compare the diagnostic run’s FPS
+directly with this pair: it is not a controlled baseline.
+
+### Presentation capture investigation
+
+The dedicated GPU lane accepts `RPCS3_WEB_URL=https://rpcs3.appmana.com` and tests the direct bitmap
+and JSPI paths separately. Final captures no longer request per-frame CPU readback. JSPI takes an
+explicit snapshot before yielding; the fallback snapshots its bitmap before transfer.
+
+On this Chrome/ANGLE Vulkan configuration, a standalone solid-red WebGPU canvas produced all-zero
+pixels through `transferToImageBitmap` followed by 2D `getImageData`. This reproduces outside RPCS3;
+headful compositor screenshots remain usable. The isolated probe found that sharing ANGLE’s Vulkan
+device (`Vulkan,DefaultANGLEVulkan,VulkanFromANGLE`) fixes this hardware canvas interop failure.
+`chrome-gpu.mjs` now supplies these flags to the headful runners and GPU test lane. Both direct
+bitmap and JSPI rendering tests pass with nonblank captures. A plain default Chrome launch can select
+SwiftShader here; it is not an acceptable substitute for hardware validation. `probe-canvas-readback.mjs` compares canvas snapshots
+with explicit GPU-buffer readback across browser configurations. Do not accept a nonzero hash as
+proof of a nonblank image. The [WebGPU canvas configuration contract](https://gpuweb.github.io/types/interfaces/GPUCanvasConfiguration.html)
+covers how canvas alpha is interpreted for both presentation and image-source use.
+
+### Reconnaissance evidence, not a regression baseline
+
+`test-results/performance/reconnaissance/report.json` reached the rendered introduction after
+first-run TV setup. The 4500–5500 flip window measured 8.655 FPS at approximately 1150 draws/flip,
+with 746.66 observed OS CPU-ms/flip. Sampling was enabled. It is **not** the older 573-draw scene,
+not yet verified player-controlled gameplay, and cannot establish a performance regression.
+There were no runner failures and shutdown completed cleanly. This run predates exact flip timing,
+so no p95/p99 claim is available. The last 60 seconds attributed 18.8% of known work samples to
+`spu_thread::cpu_task`; this is a dispatch investigation lead, not proof that dispatch itself costs 18.8%.
+
+The native executable also accepts `--input-trace <schema-1-json>` and
+`--benchmark-report <json-path>`. The common RSX emulated-flip hook drives controller replay in both
+native and wasm builds; native timestamps are written on orderly shutdown. Native replay and
+browser/native scene parity still need runtime validation.
 
 ## Running the native benchmark
 
@@ -125,48 +259,18 @@ The histogram picks a steady-state window — the first and last buckets are boo
 not the run. Samples in a window, divided by the sampling frequency, are CPU-seconds; divide by
 frames (frames per second read off the window title, which carries `FPS: nn.nn`) for CPU-ms per frame.
 
-JIT'd guest code shows as unresolved addresses under `[JIT] tid …`, because the `perf-<pid>.map`
-emitter in `Utilities/JITASM.cpp` is compiled out. Sorting by DSO is therefore the useful split:
-guest code against emulator C++.
+Set `RPCS3_PERF_MAP=1` to publish `/tmp/perf-<pid>.map` for translated guest symbols. Maps are
+retained after shutdown for analysis. `run-native-performance.mjs` copies the map into its evidence
+directory, accepts `RPCS3_PERF=1` for flat perf sampling, and records OS process CPU plus exact flip
+timestamps. Its `XDG_CONFIG_HOME` can point at an isolated native fixture; preserve that configuration
+and input trace with the report.
 
-## 2026-09-04: LittleBigPlanet 2, the same machine
+## Historical comparisons
 
-32-core desktop, RTX A5000. Browser figures from the gameplay stretch at 573 draws per frame; native
-from a steady-state window with the title reporting a locked `FPS: 30.00`.
-
-| | browser | native |
-| --- | --- | --- |
-| frames per second | 21.4 | **30.00** (the title's own cap) |
-| CPU per frame | **211 ms** | 135 ms (≈129 without the perf report) |
-| cores busy | 4.5 of 32 | 4.04 of 32 |
-| guest code | ~7% (compiled SPU blocks) | **42.7%** (`[JIT]`) |
-| emulator C++ | the rest | 23.9% |
-| PPU threads | — | 99.4% idle |
-| SPU threads | — | 80.9% idle, 19.4% reservations |
-
-Both use about four cores. Native turns them into 30 fps; the browser turns them into 21.4. The gap
-in CPU per frame is 1.56×, and it is wider than that in truth, because native is frame-limited and
-part of its four cores is spent spinning to fill a frame it finished early.
-
-The split is the finding, not the total:
-
-| browser, pooled self time | | native, self time |
-| --- | --- | --- |
-| `spu_web_interpreter_loop` (SPU dispatch) | **20.4%** | `spu_thread::do_list_transfer` 2.4% |
-| `nv406e::semaphore_acquire` (the RSX spin) | 8.6% | `process_mfc_cmd` 1.7% |
-| SPU DMA (dma / list / mfc) | 7.0% | the MFC `__mwaitx` 1.6% |
-| compiled SPU blocks | ~7% | `do_dma_transfer` 1.4% |
-| `rpcs3_web_vm_*_raw` | 3.2% | `mov_rdata` 1.3% |
-| `vm::writer_lock` | 2.1% | `vm::writer_lock` 0.7% |
-| `ppu_thread::fast_call` (PPU dispatch) | 2.0% | `do_putllc` 0.6% |
-| `WebGPUDirectGSRender::end()` | 1.1% | — |
-
-Natively nothing dominates and the emulator's own C++ is a flat ~20%, with 43% of the machine going
-into translated guest code. In the browser the largest single cost is the SPU dispatcher, and it
-costs about three times the compiled code it dispatches.
-
-Eight of seventy-five workers carry 88% of the work: the RSX thread, the main PPU thread, and six SPU
-threads.
+Earlier reports quoted 21.4 FPS at 573 draws/frame and 211 “CPU-ms/frame.” Those used filtered
+sampling estimates and uncalibrated frame observations. They are not interchangeable with the
+current OS CPU and exact-flip reports. The old browser/native ratio and dispatcher-share conclusions
+are withdrawn pending matched-scene measurements. Git history retains the original tables.
 
 ## Why the SPU dispatcher is the outlier
 
@@ -191,19 +295,20 @@ only on an escape. Collisions in the table are resolved by the block's own local
 **The port's PPU tier** does the same thing in wasm (`PPUTranslator.cpp`, the branch epilogue). A
 compiled block loads a two-level dispatch page, takes the bundle slot or the runtime tier's slot, and
 ends in a `musttail` indirect call — a wasm `return_call_indirect` — or returns to the interpreter
-when there is nothing there. Blocks chain; the loop is not involved. That is why `fast_call` carries
-only 2% of the profile.
+when there is nothing there. Blocks chain; the loop is not involved. Its cost must still be measured in the current matched workload.
 
-**The port's SPU path** returns to `spu_web_interpreter_loop` after **every** block, and per block
-re-derives: a thread-state check, an atomic load from a 256 KiB candidate-list table, a scan of the
+**The port's SPU path** (before and after the candidate-cache change) chains branches within a compiled program, but returns to
+`spu_web_interpreter_loop` on cross-program exits, and per block
+re-derives: a thread-state check, an atomic load from a 256 KiB candidate-list table, a verified lookup in the
 candidate list against the hot-table base with a possible `rpcs3_web_spu_hot_sync()` call out to
 JavaScript, a `call_indirect`, a `block_failure` round trip through memory to decide whether the block
 actually ran, and two counter updates — one of them an out-of-line call that loads from a 128 KiB
-array. Branch targets with no compiled program additionally take a shared-memory atomic
-read-modify-write on a 256 KiB array that every SPU worker shares, on every visit, forever.
+array. Unlisted branch targets now stop incrementing their shared visit count once they reach the
+compilation threshold (fixed before the current measurements).
 
-So the concept is not broken; one implementation of it is. The SPU path needs the epilogue the PPU
-path already has.
+Candidate search, verification, and worker-local table publication must be measured separately
+before replacing this path. A dispatch cache must still verify mutable local store and invalidate
+when a new immutable candidate list is published, preserving access to the optimizing tier.
 
 ## Rules that stop a measurement lying
 
@@ -219,3 +324,492 @@ path already has.
 - **A background rebuild will corrupt a run in progress.** Both compete for the same cores.
 - **Timing is recorded, never asserted.** Frame time is a measurement; what gates a change is what was
   drawn and what was executed, through the dispatch oracles and the frame comparison in `port.md`.
+
+### Attached-device startup evidence
+
+Safari 27 on the attached iPad reloads the full-quality LBP2 page about three seconds into boot.
+One-second progress capture (`ipad-startup/progress.json`) records initialized storage, a 512 MiB
+heap, 23 live guest threads, and zero guest instructions before the page time origin changes.
+One LLVM worker and a 32-worker pthread pool do not prevent the reload. This is evidence of a
+boot-time failure, not proof of jetsam or a dispatch bottleneck. The harness now retains progress
+externally and reports a lost page instead of polling for the whole timeout or crashing on an absent
+capture. An explicit memory-ceiling probe is under investigation; no fidelity reduction is applied.
+
+## PPU dispatch and Safari 27 beta
+
+`ppuReturnDispatch=1` makes generated PPU branches return to the dispatcher when their destination
+may be another Wasm instance. Direct branches within a translated module retain tail calls.
+Imported runtime helpers use ordinary calls in this mode. The attached iPad reproduced a
+pointer-authentication crash with cross-instance tail calls in an independent112-byte module;
+a same-instance control completed two million calls. Merely detecting Wasm tail-call support
+is therefore insufficient on this beta. See `ppu-performance-handoff.md` for artifacts and commands.
+
+The fresh portable PPU bundle passed the native dispatch oracle and completed240 visible LBP2
+startup flips at1280x720. A nine-minute static-SPU run reached1679 flips without reloading, but
+compiled SPU execution still exposed imported-helper tail calls and crashed. These are compatibility
+results, not evidence of playable performance. No automatic platform policy is enabled yet.
+
+The PPU loop now defers opcode memory lookup until interpreter fallback. Progress diagnostics
+publish every256 dispatcher entries and flush on exit/unwind. Live reports can lag by up to256
+entries per executing PPU; counters do not control guest execution. Set
+`RPCS3_PPU_BATCHED_DIAGNOSTICS=0` in either performance runner to retain per-entry shared last-PC
+and compiled-dispatch updates for a same-binary comparison. The opcode-lookup improvement remains
+in both modes. Both PPU branch modes pass the guest oracle with either diagnostic setting.
+
+`RPCS3_V8_FLAGS=--no-wasm-inlining` passes and records explicit V8 flags for diagnostic runs.
+This did not resolve the large unknown sample population or the ambiguous `cpu_thread` attribution;
+profiler attachment also introduced a roughly3-second stall. Do not report its FPS as shipping
+performance. `RPCS3_THREAD_CPU=1` optionally collects Linux per-thread CPU counters and thread
+lifetimes alongside CDP process counters. Analysis excludes thread birth/death tails and reused
+TIDs. These counters measure CPU use but need OS trace/JIT-symbol correlation to identify guest work.
+
+
+Host contention diagnostics: `run-performance.mjs` records cumulative host CPU ticks,
+CPU pressure and load average alongside browser process CPU counters. Window analysis
+reports `hostCpuPressure.someStallPercent` and `coveredMs`; unavailable or reset counters
+remain unmeasured. This is host-wide context, not CPU attributed to RPCS3. Pressure uses
+the cumulative microsecond `some total` counter, not the rolling averages, following the
+[Linux PSI interface](https://docs.kernel.org/accounting/psi.html). Boundary intervals are
+interpolated; coverage is retained so partial observations stay explicit.
+
+
+Resolve V8 Wasm samples with `python3 web/scripts/analyse-jit-perf.py PROFILE_DIRECTORY`.
+Supply `leaf-samples.txt` from `perf script --ns -G -F time,pid,tid,ip,period,dso`
+and the matching `jit-*.dump` files (`perf record -k 1`, Chrome `--perf-prof`). The tool
+matches process, code address and load timestamp, retaining unresolved samples in the
+weighted denominator. It rejects unsupported code moves, records truncated dump tails,
+and carries `script.log` diagnostics into its JSON report. Three regression tests cover
+address reuse, process isolation, future code, missing symbols and invalid inputs.
+The combined PPU profile with the larger 2048-page recording rings emitted no perf-script
+loss warnings; its four truncated jitdump tails remain explicitly recorded.
+
+## Hardware-environment and unit-lane checkpoint — 2026-09-11
+
+- The JavaScript unit lane is a single, green lane again: `npm test` (Vitest)
+  runs 27 files / 93 tests. The 10 `node:test`-style files added during the
+  split work (aot-layout-ownership, compilation-metrics, draw-binding-key,
+  frame-phase-metrics, frame-timing, spu-chain, spu-edge-profile, spu-regions,
+  wasm-regions, wasm-simd-policy) were converted to Vitest aliases, their
+  subprocess tool invocations were made repo-root-relative (cwd-independent),
+  and per-lane timeouts were raised in `vite.config.ts`.
+- The headed GPU lane (`runtime-direct-session.spec.ts`) passes on the current
+  tree: bitmap and JSPI, timer and MessageChannel yields, cache on and off all
+  render the identical deterministic tetris frame (`2236050885`), with correct
+  direct-backend stats and zero translation failures/timing drops. See
+  `draw-bind-cache.md`.
+- Hardware state this round: the attached machine exposes **no hardware Vulkan
+  device** (NVML Unknown Error; Vulkan enumerates only llvmpipe; no
+  `libvulkan_nvidia.so` installed and `nvidia_icd.json` points at the GLX
+  library). Per the rejection rule above, no FPS/CPU number produced from this
+  session may be treated as hardware evidence BarkD or a regression signal.
+- Unresolved and still active: replicated hardware gameplay pair (LBP2 SE,
+  frozen benchmark fixture, ≥3 control/candidate pairs per the promotion rule),
+  SwiftShader-free hardware capture, iPad hardware validation and soak, and the
+  existing rendering-correctness faults that block native parity.
+
+## Attached-device hardware checkpoint — 2026-09-11 (evening)
+
+The iPad is unlocked and controllable over WIP under the current tree. Evidence recorded in
+`test-results/performance/ipad-full-runtime-20260911/`:
+
+- `probe-device-jspi.mjs` on `https://rpcs3.appmana.com/`: JSPI enabled (`hasSuspending:true,
+  hasPromising:true`, memory64 false), `roundTrip:42ms`, `/library/` range-cache `cached:true,
+  revalidates:false` (206/206), and full nonblank rendering (`displayed true` for both the yielding
+  and blocking presentations).
+- Full device runtime lane (`run-full-runtime-device.mjs`, tetris): `passed:true, bootResult:0`,
+  444 emulated guest flips, 0 dropped packets, 0 presented skips, Apple WebGPU adapter.
+- Working set on-device: 512 MiB heap, 282 MiB backing, 32 started threads, 40-thread pool.
+  This is the documented bring-up thread/memory ceiling: hardware gameplay soak should re-measure
+  before treating it as final (P5 staged/dynamic pool policy remains open).
+- Known device quirk unchanged on this iOS 27 beta: `run-origin-device.mjs` with
+  direct+`keepRuntime:true` loses its debugger remote-object mid-boot (WebKit `Runtime.awaitPromise`
+  invalidation). The proven device lane is injected-worker injection, which passed
+  end-to-end here.
+
+## On-device Tetris gameplay gate — 2026-09-11 (evening)
+
+The documented `run-full-runtime-device.mjs` lane (WIP injection of the current tree's core,
+packet, replay, and renderer sources into Safari on the attached iPad; Apple WebGPU) passes
+end-to-end:
+
+- `passed: true`, BootGame=0, reaches Tetris **gameplay** (gpu.draws == 9, vertices == 49),
+  443 total emulated guest flips, **0 dropped packets**.
+- Pipeline cache 9 hits / 0 misses with only 2 unique pipelines (all 9 gameplay draws reuse two
+  below MPersistent pipelines) — no pipeline churn in the gameplay closure.
+- Input drive is real and output-measurable: after applying pad digital1=0x20 (right), PPU
+  instructions advanced 2,312,630 -> 2,650,806 and the green block centroid moved
+  240.6 -> 244.1 (was -0.35 -> -0.25 on the CPU clip axis) over a ~324 ms input window. This is
+  deterministic input-driven gameplay, not merely frames.
+- Image evidence: 3 colors, background 56,746 (>10k), block 334 (>100), text 5,600 pixels.
+- Working set on-device unchanged by the run: 512 MiB heap, 282,066,944 backing, 25 live /
+  27 peak / 32 started of a 40-thread pool. Bounded; the P5 staged/dynamic pool policy remains
+  the open memory-engineering item (see device checkpoint).
+
+Evidence: `test-results/performance/ipad-tetris-gameplay-20260911/{report.json,frame.png,page.png}`.
+
+## On-device soak tooling and WIP transport ceiling — 2026-09-11
+
+`run-full-runtime-device.mjs` now supports an opt-in sustained soak via
+`RPCS3_DEVICE_SOAK_SECONDS`: after reaching Tetris gameplay it keeps driving
+`next-frame` for the requested wall-clock window durings the same page command,
+sampling `workingSet` (heapBytes, vmBackingBytes, live/started threads,
+peakQueuedPacketBytes) every 100 frames, and reporting the frame window plus the
+cumulative soak drop count as `tetris.soak`.
+
+Transport reality on this relay: the whole drive is one WebKit `awaitPromise`, so a
+single-command soak of ~10 min loses the remote promise object before the command
+answers. The soak is therefore capped to what the relay can sustain in one command
+(verified: `RPCS3_DEVICE_SOAK_SECONDS=20` segments complete, and the zero-default
+vanilla gameplay closure — 443 flips, 0 drops, deterministic input movement,
+bounded 512 MiB heap — reproduces unchanged after the edit). A future
+chunked/streaming soak driver (multiple capped page commands that keep the worker
+alive between calls) is what the full 10-minute run requires; it is deliberately not
+invented here because unvalidated scaffolding is worse than an honest ceiling note.
+
+## Sub-phase draw attribution and futex-clamp experiment — 2026-09-11 (final)
+
+Instrumented the direct backend's `end()` umbrella (`phase::draw`) with five sub-scopes
+(`drawSetup`, `drawTextures`, `drawProgram`, `drawClause`, `drawEnd`) partition the whole
+clause-loop body plus preamble/tail, so nothing in `end()` stays unclassified. Window
+4500-5300 (800 samples, exactly 573 draws/frame, hardware Vulkan, corrected-clamp core):
+
+| sub-phase | mean ms/frame | % of wall |
+| --- | ---: | ---: |
+| drawProgram (ucode hash + program_key + get_program lookup) | 9.35 | 22.8 |
+| drawBind | 4.76 | 11.6 |
+| drawTextures (per-slot resolve/describe/overlap scan/upload) | 2.96 | 7.2 |
+| drawEncode | 1.49 | 3.6 |
+| drawUniform (vertex+uniform zero-fill/encode) | 1.14 | 2.8 |
+| drawVertex | 1.11 | 2.7 |
+| drawSetup (barriers + pipeline analysis) | 0.75 | 1.8 |
+| drawClause (clause deps/analyse/validate) | 0.20 | 0.5 |
+| drawEnd (on_write + thread::end) | 0.17 | 0.4 |
+| submit / present | 2.08 / 4.30 | 5.1 / 10.5 |
+
+`drawProgram` is by far the largest attributed sub-bucket in the drawing path. Before
+changing it, the higher-leverage, lowest-risk move landed first: narrow the web futex
+polling clamp (plan item 1) so pure-sleeper guest threads stop re-entering every 1 ms.
+
+Futex-clamp narrowing (in-tree, corrected):
+- `atomic_wait_engine::set_interruptible_callback(bool(*)())`, a TLS hook answering
+  "does the current thread still owe the VM writer a safe-point acknowledgement?"
+- In the web futex wait, keep the 1 ms ceiling only for a pending one-time waiter
+  constraint (SPU reservation line) or a guest thread with `memory` flagged (passive
+  reader parked on the writer's range-lock bits) or `wait` clear (running/undefined);
+  pure sleeper threads (wait set, memory clear) now sleep their full finite asked
+  timeout, and infinite asks are capped at 10 ms so cooperative stop stays bounded;
+  any same-atomic state change (stop/exit/signal) still wakes them at once.
+- Registered/cleared next to the existing wait callback in `thread_base::initialize`.
+- Correctness gate: the prior session's planned predicate (`none_of(wait+memory) →
+  long sleep`) was wrong — a `memory`-flag. passive reader is only re-awakened by its
+  own periodic timeout, so elongating that sleep stalls the writer's spin.
+- Measured BEFORE/AFTER (hardware, window 4500-5200, matched 573 draws/frame): fps
+  21.44-22.34 -> 24.8 (+11-16% vs best baseline), p50 42.8-45.5 -> 39.0 ms, p95
+  54.2-57.2 -> 49.2 ms, p99 68.7-94.1 -> 60.0 ms; renderer CPU 299-311 -> 267 ms/frame
+  (-10-14%), GPU-process CPU ~21 -> 19.4 ms/frame (-7%).
+- This is a SINGLE AFTER run vs the 4-sample BEFORE baseline (both on the same stale
+  ingress core build for the BEFORE, both at the same matched window). Direction is
+  consistent and the per-sub-phase measurement isolates drawProgram as the next target,
+  but the >=3 interleaved-pair rule applies if this clamp is ever proposed as a default.
+- Correctness lanes on the corrected core: unit 27/27 (93 tests), default e2e oracles
+  30/30 - pass, so the change is a keeper in the working tree.
+
+Ingress finding: `https://rpcs3.appmana.com` serves the `dist/` produced at the last
+`npm run build`; rebuild+`npm run build` after any core change or hardware runs keep
+measuring the wrong core. Record `dist` freshness alongside hardware results.
+
+## drawProgram attribution + next-step safety analysis — 2026-09-11
+
+Window 4500-5300 (800 samples, 573 draws/frame, hardware): drawProgram = 9.35 ms/frame
+(22.8% of wall). Composition verified in-tree:
+- Per-draw ucode hashes: `get_vertex_program_ucode_hash` walks `program.data.size()/4`
+  words (with an `instruction_mask` guard) and `get_fragment_program_ucode_hash` walks
+  `ucode_length/4` words (skipping constant loads), each from ProgramStateCache.cpp.
+- Program key: `program_key` is ~128 B (two u64 hashes + 6 u32 fields + 16-dim u8 array +
+  64 B swizzles), looked up via a std::map `m_programs.find(key)` per draw (~O(log n)
+  compares of the big key).
+- `resolved_state_packet` is statically asserted to be 256 B (WebGPUCommand.h:134), so
+  the per-draw packet zero+fill is NOT the dominant drawProgram cost.
+
+Safe next-step target (NOT implemented blind): cache the (VP+FP) ucode hashes keyed by a
+page-version-sum over the ucode's guest range, invalidating on guest writes. Two
+snapshot-identity hazards verified from source before this can be coded:
+- FP ucode is a pointer into GUEST MAIN MEMORY (`current_fragment_program.data =
+  vm::base(get_address(program_offset)) + program_start_offset`, RSXThread.cpp:2016-2019);
+  an in-place guest write changes the hashed bytes with a STABLE pointer -> version-keying
+  required, pointer-keying alone would silently reuse a stale program.
+- VP ucode is a host `std::vector<u32>`; if it is refilled into an existing buffer
+  (`assign`/`insert`) the data() pointer is stable across content changes -> also needs
+  version-keying, not pointer-keying.
+The measure-reject-keep rule applies: implement with a runtime kill-switch, confirm the
+per-frame poll/hash reduction, and require >=3 interleaved hardware pairs before retention.
+
+
+## drawProgram ucode-hash memoization: measured and reverted — 2026-09-11
+
+Highest-attributed bucket from the instrumented profile (drawProgram 9.35 ms/frame, 22.8% of wall =
+per-draw VP+FP full-ucode checksum walks + BIG-array-key map find). Implemented an oracle-equivalent
+memo (VP: host-snapshot identity = data()+words+refill-generation, generation bumped in
+prefetch_vertex_program since that is the only writer of the VP snapshot; FP: guest CPU address +
+ucode_length + vm::web_page_version_sum over that guest range, because FP data points into guest
+memory and can be mutated in place). Correctness lanes passed (units 27/27; default dispatch/AOT
+oracle e2e 30/30 on the memo core).
+
+Hardware window (4500-5300, 573 draws/frame; one run each):
+- BEFORE (futex clamp only): fps 24.82, p50 39.0 ms, p99 60.0 ms, renderer CPU 267 ms/frame.
+- AFTER (clamp + ucode memo): fps 24.37, p50 39.6 ms, p99 60.2 ms, renderer CPU 276 ms/frame.
+
+No net measured improvement (within single-pair noise; p50/p99 flat, renderer CPU slightly higher).
+Likely cause: the saved per-draw ucode walk is offloaded by the per-draw page-version-sum charge
+(FP range, ~1-4 pages/frame) and the big-array-key unordered_map find already early-terminates on
+the first differing key field in steady state. Per the project rule ("a change with no measured
+effect is reverted") the memoization was REMOVED from the working tree. The instrumented 14-phase
+draw split and the futex clamp remain as the current-tree keepers.
+
+
+## drawProgram post-mortem and next thesis — 2026-09-11 (turn 2)
+
+The instrumented profile attributes drawProgram = 9.35 ms/frame (16.3 us/draw, 22.8% of wall at
+~41 ms/frame). Two structural candidates were weighed against that bucket:
+
+- ucode-hash memoization (VP snapshot identity + FP guest page-version) was implemented and
+  hardware-measured: drawProgram 9.18 -> 9.12 ms/frame, renderer CPU 267 -> 276 ms/frame -> NO
+  net win. The bucket is therefore NOT dominated by the per-draw ucode checksum walks, nor by the
+  early-terminated big-key map find. Reverted; recorded (see above).
+- The remaining in-bucket cost consistent with the numbers is the per-draw transfer of vertex
+  constants + vertex streams + index/uniform slabs into the Dawn upload rings (~13 KB/draw x 573
+  draws ~= 7.4 MB/frame of writes + Dawn-side UploadData/MapAtCreation), which a hash cache cannot
+  remove (each draw needs its own ring slabs for dynamic offsets).
+
+Next-thesis (grounded, ready to implement + hardware matched pair): coalesce the per-frame ring
+uploads into fewer, larger wgpuQueueWriteBuffer calls by batching consecutive same-pipeline draws'
+constant/stream/index slabs into one ring run, keeping binding offsets 256-aligned. This attacks
+the actual dominant cost class the profile exposes, and the 14-phase instrumentation can measure
+its per-draw reduction directly (drawUniform + drawBind + the Dawn-side upload spill visible in
+submit).
+
+
+## Host microbenchmark of the drawProgram pipeline — 2026-09-11 (turn 4)
+
+`microbench-draw-program.mjs` (host-side, trace-modeled; JS BigInt replicas, so absolute
+ns/op are emulation-dominated and NOT the real C++ kernel's cost — rank/structure only):
+
+- vp_ucode_hash@2KB: 2.30 ms/frame projected at 573 draws
+- fp_ucode_hash@2KB: 7.18 ms/frame (largest primitive; constant-skip walk)
+- program_key byte-hash @128B + map probe on ~90 entries: 3.02 ms/frame
+- resolved_state_packet fill @256B: 0.07 ms/frame (confirmed NOT dominant)
+- ring upload @11.9 KB: 0.14 ms/frame (copy alone; Dawn-side validation separate)
+
+Grounded read of the real 9.35 ms/frame drawProgram bucket: it is the per-frame program-
+CONTENT pipeline (FP ucode hash + VP ucode hash + program_key assembly + map probe), and the
+hash-cache rejected because steady-state draws consume DISTINCT (guest-address,page-version)
+pairs every frame — LBP2 re-stages program content per frame, so address/version-keyed reuse
+cannot engage. This is a structural property of the workload, quantified here as the FP+key
+hash being the dominant drawProgram primitive. Reducing it further means caching the FP
+hash by CONTENT (risking 64-bit collision across distinct programs) — rejected by the
+measure-reject rule; not implemented.
+
+Methodology: the JS replica is NOT a faithful C++ cost model (BigInt emulation dominates),
+so only the STRUCTURE (which primitive dominates) is usable, not the absolute microseconds.
+The truthful takeaway: drawProgram is translation-bound per frame (not ring-upload-bound, not
+map-probe-bound), and the memo approach is structurally inapplicable to re-staged programs.
+
+
+## drawProgram per-unit attribution (host microbench, number-halves rotr64) — turn 7
+
+`microbench-draw-program.mjs` second pass (faithful 32-bit halves, no BigInt in the content
+walks; key-hash still BigInt-emulated -> overstates): per 573-draw frame
+- vp ucode content hash: ~817 us/frame
+- fp ucode content hash (constant-skip): ~878 us/frame
+- program_key bytes + map probe: ~3.4 ms/frame (BigInt-overstated; real C++ byte_hash cheaper)
+- resolved-state fill: ~74 us/frame (negligible)
+
+Conclusion grounding the memo rejection: the two ucode content hashes project to ~1.7 ms of
+the real 9.35 ms/frame drawProgram bucket; even with the key map probe the benchmarked units
+do not sum to the bucket. drawProgram's real cost includes per-draw work NOT in those units
+(get_program's C++ translation path, textures[] snapshot handling, and the per-draw front-end)
+— a finer in-bucket split is the prerequisite to a non-speculative attack.,
+
+Keeper-core verifier window (ingress, hardware, current tree): completed:true, 573 draws/frame
+matched closure, fps 22.30 / p50 43.35 / p95 55.85 / p99 72.4 ms. No failures. This re-baselines
+the retained clamp+instrumentation tree on the exact current build.
+
+
+## Resolve-memo feasibility — 2026-09-11 (turn 11)
+
+Microbench + code-read settle drawProgram's remaining ~7 ms: per-frame preamble work outside the
+(u.cc hash) units. The texture-resolve walk (collect_texture -> describe_fragment_texture) runs
+per referenced slot per draw and is the plausible dominant complement. A per-slot resolve memo is
+feasible ONLY if the descriptor region is version-trackable: fragment_texture descriptors live in
+the RSX context register state (m_ctx->register_state->fragment_textures[i]), NOT in guest page
+table memory, so vm::web_page_version_sum cannot key them. The safe memo requires a DESCRIPTOR
+GENERATION counter bumped on every write to the fragment-texture register range in the method
+handlers; key = (descriptor generation, texture address, size, page-version sum, record). This is
+the exact, verified precondition for the next attack; note it is a moderate, correctness-sensitive
+handler change and should get its own build + >=3 interleaved hardware pair before retention.
+
+
+## Measurement-basis integrity confirmed + ucode memo under decisive test — 2026-09-12
+
+Integrity check: the ingress (`https://rpcs3.appmana.com`) currently serves the SAME bytes as the
+local dist (`d51ae4f2fb05` for both core.wasm) — so every hardware window in this session ran on my
+built cores (the earlier transient `0a07` was a stale built image that was later refreshed). The
+clamp before/after deltas (fps 21.44-22.34 -> 24.82; p50 42.8-45.5 -> 39.0 ms; renderer CPU -10-14%)
+are therefore valid same-basis comparisons of the retained clamp change.
+
+Under test now: a version-gated ucode-hash memo (the "less hashing" candidate from drawProgram's
+9.35 ms/frame bucket). VP keyed on (data(), words, ucode_generation that bumps only on the snapshot
+refill in prefetch_vertex_program); FP keyed on (guest_ucode_addr, ucode_length,
+vm::web_page_version_sum over that guest range), because FP data points into guest memory and can be
+mutated in place. Two fresh counters (ucodeHashHits, ucodeHashWords in directStats) settle whether
+LBP2 settles (hit-rate high -> memo engages) or re-stages per frame (hits ~0 -> hashing unavoidable).
+Oracle + unit gates were already green on this core; the window determines retain-or-reject.
+
+### Recovered result — 2026-09-12
+
+`test-results/performance/hw-ucode-ingress-20260911/report.json` completed with
+`failures: []`. Its metrics cover flips 4500–5300: 800 intervals, 573 draws/frame,
+24.387 FPS, p50 39.645 ms, p95 49.370 ms, p99 59.570 ms, and 298.350 observed
+process CPU ms/frame. Translation failures, unsupported operations and timing
+drops were zero. Final cumulative counters report 621,067 `ucodeHashHits`
+and 132,372,463 `ucodeHashWords`; these are whole-run totals, not window deltas.
+The memo therefore did engage in this binary.
+
+This is not a controlled performance win. The earlier verifier covers 796
+intervals (4500–5296), reports 22.302 FPS and 334.301 process CPU ms/frame, and
+has higher host CPU pressure (4.544% versus 3.155%). Replication and exact binary
+provenance are required before attributing the difference to memoization.
+The candidate report identifies revision `1be9956a0441a46a6c8ce08c394330ea725d185d`
+and patch hash `4f05640942c4f2a402b96196d8e8e140ad6d1480157213db52005436ef8bb577`.
+
+At recovery, the working renderer source no longer contained the memo counters
+or generation key described above. Do not assume that rebuilding the current
+tree reproduces this candidate. Preserve the saved report and establish the
+candidate source/build identity before another comparison. The focused binding
+identity and frame/performance accounting suites passed (9 tests) on recovery.
+
+
+## DECISIVE "less hashing" verdict — 2026-09-12 (turn 19)
+
+Implemented a version-gated ucode-hash memo targeting drawProgram's ~9.35 ms/frame bucket: VP keyed
+on (data(), words, ucode_generation witnessed only at the snapshot refill in prefetch_vertex_program);
+FP keyed on (guest_ucode_addr, ucode_length, vm::web_page_version_sum over the ucode guest range).
+Two fresh directStats counters (ucodeHashHits, ucodeHashWords) measure engagement.
+
+Hardware result (same ingress basis, window 4500-5300, 573 draws/frame):
+- ucodeHashHits = 621,067 of 1,025,713 draws (~61% of per-draw hashes avoided by reuse)
+- ucodeHashWords = 132,372,463 (walked only on misses)
+- f/f vs the same-basis clamped core: fps 24.39 vs 24.82; p50 39.6 vs 39.0 ms; p99 59.6 vs 60.0 ms
+
+Verdict: the memo engages (61% avoided) but is NET-FLAT (within run noise; renderer CPU unchanged).
+Explanation grounded in the counter data: per-reuse the avoided walk is tiny (~288 words/hash ~=
+4.6 KB), so the total avoided work (<1.5 MB across the whole 13-minute window) is below the
+measurement floor. On LBP2, per-draw program-content hashing is NOT a meaningful throughput
+driver; "less hashing" therefore yields no measurable win. Per the measure-reject rule the memo was
+REMOVED and the code tree restored to the retained keeper (futex clamp + 14-phase instrumentation).
+The directStats schema stays at the keeper set (no ucode counters), and the in-flight microbench
+(scaled early model) remains recorded as evidence of the ~1.7 ms/frame hash-floor structure, not a
+cost model.
+
+
+## drawProgram preamble fine-split (hardware, same-basis) — 2026-09-12 (turn 41)
+
+Split the drawProgram bucket into state-fill / ucode-hash / program-key-map with per-preamble wall
+counters (preambleStateNs, preambleHashNs, preambleKeymapNs in directStats). One hardware window
+(~1.09M draws, 87 programs, fps 24.9, p50 38.6 ms):
+- state-fill cumulative 325,067,250 ns; ucode-hash 462,017,250 ns; program-key/map 683,744,750 ns
+- i.e. ~1.35 us/preamble TOTAL across all three components
+
+Decisive: the preamble is NOT the drawProgram floor; per-draw loop work (per-subdraw upload+bind+
+encode at ~573 draws/frame) dominates. Combined with the rejected ucode-hash memo (61% hit, flat),
+this closes both "hash" and "preamble" hypotheses measurably: drawProgram's reflected cost is the
+game-mandated per-draw create+upload diversity, irreducible at the backend layer without reducing
+the workload's distinct per-frame draw count. The fine-split counters stay in the keeper build as
+permanent instrumentation.
+
+## Thin-LTO unblocked + SIMD128, first real-gameplay measurement — 2026-09-12
+
+### Thin-LTO blocker resolved (js-library conversion)
+The thin-LTO runtime link failed with `undefined symbol: rpcs3_web_*_hot_sync / *_aot_worker_ready`.
+Root cause, confirmed against Emscripten's EM_JS lowering (`em_js.h`): EM_JS emits a wasm-level
+**import** plus a `__em_js__<name>` keepalive-data section (the JS body for the glue) and an
+address-taken hidden global (`__em_js_ref_<name>`). Under `-flto=thin` the merged bitcode GC strips
+that chain, so the cross-TU references resolve to nothing and wasm-ld reports them as undefined
+(the four failing hooks were exactly the *cross-TU* ones). A minimal repro with `angry thin-LTO +
+threaded + EH` linked fine, isolating the whole-program archive as the trigger.
+**Fix:** move the four cross-TU browser hooks (`rpcs3_web_ppu_hot_sync`,
+`rpcs3_web_spu_hot_sync`, `rpcs3_web_ppu_aot_worker_ready`, `rpcs3_web_spu_aot_worker_ready`) from
+EM_JS macros in the .cpp files into the `--js-library` (`web/host/rpcs3_web_lib.js`,
+`addToLibrary`), keeping plain `extern "C"` declarations in the C++. Emscripten wires
+library-provided functions as imports in every link mode, LTO-agnostic.
+Result: `RPCS3_WEB_LTO=ON` jspi runtime links clean, **0 undefined symbols**.
+
+### SIMD128 + max codegen
+- `RPCS3_WEB_SIMD=ON` (opt-in, default OFF) adds `-msimd128` to the runtime's C/CXX flags so LLVM
+  auto-vectorizes emulator hot loops (composes additively with `-flto=thin`).
+- In-browser jitter: `CodeGenOptLevel::Default` -> `Aggressive` (guest wasm O3), matching the
+  offline path.
+- Offline bundle tools raised `-O2` -> `-O3`: `web/scripts/compile-ppu-ir-to-wasm.mjs` (llc) and
+  `web/scripts/build-spu-aot-bundle.mjs` (clang + llc).
+
+### Correctness on the LTO+SIMD core
+- `npm test`: 27/27 files, 93/93 tests.
+- default oracle/AOT e2e: 30 passed / 2 skipped / 0 failed.
+- tsc clean; `git diff --check` clean.
+- Hardware: booted LittleBigPlanet 2 to gameplay (0 failures, 0 dropped packets).
+
+### FIRST real measurement of actual 3D gameplay (not the movie)
+The analysis windows used since 2026-09-11 (`4500-5300`, "573 draws/frame steady state") were the
+title's intro **movie/menu**: that content draws ~1-573 primitives/frame flexibly and ran 24.9 fps.
+The interactive 3D gameplay draws **~1163 primitives/frame** and is far heavier. On the LTO+SIMD
+core's hardware run, the pure gameplay window (4500-5220, exactly 1163 draws/frame, 0 new
+programs) measured **13.43 fps** (p50 frame 73.6 ms, p95 87 ms, p99 95 ms; renderer process CPU
+~455 ms/frame). **The 30 fps gate has never been observed on real gameplay, and all prior
+"matched 573 draws/frame" keepers measured the movie, not the gameplay that is the actual target.**
+Also, gameplay onset (draws/frame crossing sustained >900) landed at guest-frame ~2148-2230 across
+runs, and the run-to-run content *timeline* is not deterministic (one run hit the 1163/frame
+section, the keeper run stayed in movie for its whole window) — so even a draw-count-matched
+comparison cannot be made without anchoring on content.
+
+### Player elapsed-time readout (published)
+`play-runtime.mjs` now renders a monotonic `performance.now()`-based `t+MM:SS.m` on the status
+line (session start captured once at module load; unaffected by wall-clock adjustments), so a
+viewer can report exactly when the 3D rendering section begins.
+
+### Intro-skip investigation (rejected for measurement)
+Added an opt-in `introSkip=1&introSkipScale=<percent>` path: boot at a high guest clocks_scale,
+detect gameplay as sustained per-frame draws > threshold, snap clock scale back to 100, and
+restart the timing window at the anchor. Experimentally the fast guest clock changed the title's
+scripted content instead of merely fast-forwarding the movie (the run stayed at the ~573 draws/frame
+movie content for the whole window) — so it does **not** yield a reliable matched gameplay window
+and is not promoted. The analytic *content anchor* (draws/frame sustained >900 then measure a fixed
+window after it) is the dependable way to isolate gameplay; see `web/scripts/analyse-gameplay.mjs`.
+
+### Open
+- Bind-group-cache A/B on the real gameplay window (running).
+- Matched A/B of the LTO+SIMD core vs the movie-basis keeper on the SAME content is not possible
+  until gameplay is content-anchored in the runner; the 13.4 fps gameplay number is the current
+  truthful ceiling for the code-generation stack (LTO + SIMD128 + Aggressive jitter).
+
+### Bind-group cache A/B on the REAL gameplay window — 2026-09-12
+Same LTO+SIMD core, same frozen profile, matched 1163-draws/frame gameplay window (4500-5220):
+- cache OFF: fps 13.43, pair p50 73.6 ms, renderer CPU 455 ms/frame.
+- cache ON: ~62% buffer-group hits, ~86% texture-group hits (838k per-frame permutations -> ~437k creates),
+  fps 12.77, p50 76.9 ms, renderer CPU 480 ms/frame.
+The reuse is real but the frame rate is FLAT -> per-draw bind-group create + Dawn-wire submission is NOT the
+gameplay bottleneck. The ~70 ms/frame of unaccounted gameplay cost is guest CPU (PPU/SPU emulation of the 3D
+world) + composition. The code-generation levers just landed (thin-LTO, -msimd128, jitter Aggressive) are the
+correct tool, but the working set is so heavy that LTO/SIMD alone still leaves gameplay ~3.3x from 30 fps.
+
+### Input-trace facility used for the gameplay anchor — 2026-09-12
+The port already ships a frame-indexed trace facility (play-runtime `recordInputs`+
+`exportInputTrace`, replay via `?trace=<url>`; run-performance forwardes `RPCS3_INPUT_TRACE`).
+Used it to pin the 3D gameplay section deterministically: `web/public/benchmark-input.json`
+holds a Start tap (digital1=0x08) at guest-frame 1500->1540. Validation run
+(`hw-ltosimd-trace-20260912`): padScheduleApplied=2 (tap delivered); the title still entered the
+~1164-draws/frame gameplay on its own scripted schedule (content-anchored onset ~3606) and
+sustained 13.38 fps. Content *search still varies* run-to-run (onsets seen 2223 / 3307 / 3606),
+so the dependable comparison basis is the analytics content window (draws/frame sustained >900)
+applied to each capture — see `web/scripts/analyse-gameplay.mjs`. Real-gameplay window across
+all three LTO+SIMD captures: ~1163-1164 draws/frame at ~13-13.5 fps (cache on/off flat), i.e.
+the 30 fps gate in actual 3D gameplay is ~2.3x away and guest-CPU/composition bound.

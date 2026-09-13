@@ -157,3 +157,36 @@ web/local-aot-ir-*/
 /web/*.cpuprofile
 /web/*.cpuprofile.*
 /web/play-chrome-report.json
+# Ephemeral working/tool state (not part of the project)
+resume.txt
+.tmp-codex-handoff/
+web/2026-09-04-*.txt
+web/tests/__pycache__/
+# Raw profiling capture artifacts (benchmark evidence = report.json/metrics.json stay tracked)
+*.perf
+*.cpuprofile
+*.farc
+*.wat
+test-results/performance/*/beamspec.json
+# Native-run fixtures/artifacts under the benchmark lane (raw captures, not evidence)
+test-results/performance/*/rpcs3/
+test-results/performance/native-*/
+*.log.gz
+# Raw scratch captures under the benchmark lane (not evidence)
+test-results/performance/chrome-debug*/
+test-results/performance/*.zip
+test-results/performance/spu-region-source-ir/
+test-results/performance/ir-return*/
+test-results/performance/*/progress*.json
+test-results/performance/native-*
+test-results/performance/*/rrc/
+test-results/performance/*/debug/
+# Raw IR/object intermediates and device-recovery scratch under the benchmark lane
+test-results/performance/**/*.ll
+test-results/performance/**/*.obj
+test-results/performance/**/*.wasm
+test-results/performance/**/*recovered*.json
+test-results/performance/ipad-*/
+test-results/
+__pycache__/
+*.pyc

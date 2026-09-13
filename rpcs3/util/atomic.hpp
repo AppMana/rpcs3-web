@@ -267,6 +267,11 @@ public:
 
 	static void set_wait_callback(bool(*cb)(const void* data, u64 attempts, u64 stamp0));
 	static void set_one_time_use_wait_callback(bool (*cb)(u64 progress));
+	// Web only: answers "does the current thread still owe the VM writer a
+	// safe-point acknowledgement?" A false answer lets a pure guest sleep wait
+	// its full asked timeout (INFINITY for infinite waits) instead of polling
+	// at 1 kHz. Null (or unregistered) means "do not know" -> keep polling.
+	static void set_interruptible_callback(bool (*cb)());
 };
 
 template <uint Max, typename... T>

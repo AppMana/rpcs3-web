@@ -22,9 +22,10 @@ test("original RPCS3 unit sources pass in Wasm", async ({ page }) => {
   expect(result.error).toBeUndefined();
   expect(result.ok).toBe(true);
   expect(result.report?.target).toBe("wasm32-emscripten");
-  expect(result.report?.total).toBe(114);
-  expect(result.report?.passed).toBe(114);
+  expect(result.report?.total).toBe(118);
+  expect(result.report?.passed).toBe(118);
   expect(result.report?.failed).toBe(0);
   expect(result.report?.skipped).toBe(0);
-  expect(result.report?.tests).toHaveLength(114);
+  expect(result.report?.tests).toHaveLength(118);
+  expect(result.report?.tests.filter((test) => test.suite === "SpuWebDispatch")).toHaveLength(4);
 });

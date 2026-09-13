@@ -15,6 +15,7 @@
 #include "Emu/RSX/GSRender.h"
 #include "WebGPURenderTargets.h"
 #include "WebGPUCommand.h"
+#include "WebGPUDrawBindingKey.h"
 
 #include <webgpu/webgpu.h>
 
@@ -72,7 +73,7 @@ public:
 		WGPUPipelineLayout pipeline_layout = nullptr;
 		std::vector<u32> texture_slots;
 		std::array<u8, 16> texture_dimensions{};
-		u32 constant_count = 0;
+		std::vector<u32> constant_offsets;
 		bool valid = false;
 	};
 
@@ -121,6 +122,7 @@ public:
 		u32 output_mask = 0;
 		u32 shader_control = 0;
 		u32 target_count = 0;
+		u32 color_output_map = 0;
 		u32 alpha_func = 0;
 		std::array<u8, 16> dimensions{};
 		std::array<std::array<char, 4>, 16> swizzles{};
@@ -167,6 +169,7 @@ public:
 	struct targets
 	{
 		std::vector<gpu_surface*> colors;
+		u32 color_output_map = 0;
 		gpu_surface* depth = nullptr;
 		target_key key;
 		format_key formats;
@@ -233,6 +236,13 @@ private:
 	u32 m_surface_height = 0;
 	u64 m_presented = 0;
 	bool m_ready = false;
+	bool m_bind_cache_enabled = false;
+	using draw_bind_key = rsx::webgpu::draw_binding_key;
+	using draw_bind_hash = rsx::webgpu::draw_binding_hash;
+	std::unordered_map<draw_bind_key, WGPUBindGroup, draw_bind_hash> m_draw_bind_groups;
+	void clear_draw_bind_groups();
+	WGPUBindGroup cached_draw_bind_group(const draw_bind_key& key, const WGPUBindGroupDescriptor& descriptor, bool texture);
+	WGPUBindGroupLayout m_draw_buffer_layout = nullptr;
 
 	rsx::vertex_input_layout m_vertex_layout;
 	areau m_scissor{};
@@ -255,7 +265,6 @@ private:
 	ring_buffer m_stream_ring;
 	ring_buffer m_index_ring;
 	u64 m_frame_serial = 0;
-	std::vector<std::byte> m_draw_persistent, m_draw_transient, m_draw_vertex_state, m_draw_fragment_state;
 
 	std::unordered_map<program_key, gpu_program, byte_hash<program_key>> m_programs;
 	std::unordered_map<pipeline_key, WGPURenderPipeline, byte_hash<pipeline_key>> m_pipelines;
@@ -277,10 +286,15 @@ private:
 public:
 	struct stats
 	{
+		u64 texture_bind_group_hits = 0;
+		u64 texture_bind_group_creates = 0;
+		u64 bind_group_hits = 0;
+		u64 bind_group_creates = 0;
 		u64 draws = 0;
 		u64 draws_skipped = 0;
 		u64 clears = 0;
 		u64 programs = 0;
+		u64 remapped_color_programs = 0;
 		u64 pipelines = 0;
 		u64 texture_uploads = 0;
 		u64 texture_invalidations = 0;
@@ -288,7 +302,11 @@ public:
 		u64 surface_hits = 0;
 		u64 surface_ops = 0;
 		u64 translation_failures = 0;
+		u32 unnormalized_texture_slots = 0;
 		u64 unsupported = 0;
+		u64 preamble_state_ns = 0;
+		u64 preamble_hash_ns = 0;
+		u64 preamble_keymap_ns = 0;
 	};
 	stats m_stats;
 };

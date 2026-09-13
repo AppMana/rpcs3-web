@@ -19,21 +19,30 @@ async function runFixture(page: import("@playwright/test").Page, fixture: string
   }, [fixture, options] as const);
 }
 
-test("matches the native oracle with compiled PPU blocks dispatched on the PPU threads", async ({ page }, testInfo) => {
-  test.setTimeout(180_000);
-  await page.goto("/runtime.html");
-  const result = await runFixture(page, "fixtures/web_dispatch_conformance.self", {
-    completion: "dispatch",
-    renderer: "null",
-    ppuAotBundle: "fixtures/web_dispatch_conformance-aot.manifest.json",
-    expectedVerdict: "76ec98ba0e352b1c",
-    dispatchTimeoutMs: 60_000,
-  });
-  await testInfo.attach("ppu-aot-table-conformance.json", { body: JSON.stringify(result, null, 2), contentType: "application/json" });
-  expect(result.ok, JSON.stringify(result, null, 2)).toBe(true);
-  expect(result.verdict).toBe("76ec98ba0e352b1c");
-  const table = result.ppuAotTable as { blocks: number; dispatches: number; idleWorkersReady: number; idleWorkers: number };
-  expect(table.blocks).toBeGreaterThan(0);
-  expect(table.dispatches).toBeGreaterThan(0);
-  expect(table.idleWorkersReady, JSON.stringify(table)).toBe(table.idleWorkers);
-});
+for (const ppuBatchedDiagnostics of [false, true]) {
+  for (const [mode, bundle] of [
+    ["tail calls", "fixtures/web_dispatch_conformance-aot.manifest.json"],
+    ["return to dispatcher", "fixtures/web_dispatch_conformance-return.manifest.json"],
+  ] as const) {
+    test(`matches the native oracle with compiled PPU blocks using ${mode}, batched diagnostics=${ppuBatchedDiagnostics}`, async ({ page }, testInfo) => {
+      test.setTimeout(180_000);
+      await page.goto("/runtime.html");
+      const result = await runFixture(page, "fixtures/web_dispatch_conformance.self", {
+        completion: "dispatch",
+        renderer: "null",
+        coreUrl: process.env.RPCS3_TEST_CORE_URL,
+        ppuAotBundle: bundle,
+        ppuBatchedDiagnostics,
+        expectedVerdict: "76ec98ba0e352b1c",
+        dispatchTimeoutMs: 60_000,
+      });
+      await testInfo.attach("ppu-aot-table-conformance.json", { body: JSON.stringify(result, null, 2), contentType: "application/json" });
+      expect(result.ok, JSON.stringify(result, null, 2)).toBe(true);
+      expect(result.verdict).toBe("76ec98ba0e352b1c");
+      const table = result.ppuAotTable as { blocks: number; dispatches: number; idleWorkersReady: number; idleWorkers: number };
+      expect(table.blocks).toBeGreaterThan(0);
+      expect(table.dispatches).toBeGreaterThan(0);
+      expect(table.idleWorkersReady, JSON.stringify(table)).toBe(table.idleWorkers);
+    });
+  }
+}

@@ -1,3 +1,4 @@
+import { createWorkerProfiler, writeCpuProfiles } from "./worker-profiler.mjs";
 // Hardware (physical-adapter) acceptance runner. Drives the same page API
 // (`__rpcs3Runtime.run`) as the Playwright lanes and the hosted-origin iPad
 // runner, from a persistent Chrome profile whose origin-private storage holds
@@ -25,6 +26,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
+import { hardwareChromeArgs } from "./chrome-gpu.mjs";
 import { chromium } from "playwright";
 import { PNG } from "pngjs";
 
@@ -36,8 +38,8 @@ if (!target) {
 const outputPath = process.argv[3] ? path.resolve(process.argv[3]) : undefined;
 const env = process.env;
 const profilePath = env.RPCS3_CHROME_PROFILE || path.join(homedir(), ".cache", "rpcs3-web-chrome-profile");
-const baseURL = env.RPCS3_WEB_URL || "http://127.0.0.1:4175";
-const headed = env.RPCS3_HEADED === "1";
+const baseURL = env.RPCS3_WEB_URL || "https://rpcs3.appmana.com";
+const headed = env.RPCS3_HEADED !== "0";
 const untilDraw = env.RPCS3_UNTIL_DRAW === "1";
 // Until-draw runs keep going up to the cap unless a smaller frame budget is given explicitly. A
 // commercial title spends thousands of flips on its logos, boot and intro before it reaches
@@ -55,7 +57,7 @@ const readback = env.RPCS3_READBACK ? env.RPCS3_READBACK === "1" : Boolean(packe
 const cpuProfilePath = env.RPCS3_CPU_PROFILE ? path.resolve(env.RPCS3_CPU_PROFILE) : undefined;
 const cpuSamplingIntervalUs = Math.max(1_000, Math.min(100_000, Number(env.RPCS3_CPU_INTERVAL_US) || 10_000));
 const tracePath = env.RPCS3_TRACE ? path.resolve(env.RPCS3_TRACE) : undefined;
-const coreVariant = ["profile", "jspi"].includes(env.RPCS3_CORE) ? env.RPCS3_CORE : "release";
+const coreVariant = ["release", "profile", "jspi", "profile-jspi"].includes(env.RPCS3_CORE) ? env.RPCS3_CORE : "auto";
 const inputTrace = env.RPCS3_INPUT_TRACE ? JSON.parse(await readFile(path.resolve(env.RPCS3_INPUT_TRACE), "utf8")).entries : undefined;
 const runOptions = {
   frames,
@@ -64,7 +66,7 @@ const runOptions = {
   timeoutMs,
   render: env.RPCS3_RENDERER !== "null",
   renderer: env.RPCS3_RENDERER === "null" ? "null" : "webgpu",
-  directRenderer: env.RPCS3_DIRECT_RENDERER === "1",
+  directRenderer: env.RPCS3_DIRECT_RENDERER === undefined ? undefined : env.RPCS3_DIRECT_RENDERER === "1",
   captureEvery: env.RPCS3_CAPTURE_EVERY ? Number(env.RPCS3_CAPTURE_EVERY) : undefined,
   width,
   height,
@@ -77,7 +79,7 @@ const runOptions = {
   spuFallbackHistogram: env.RPCS3_SPU_FALLBACK_HIST === "1",
   spuDecoder: env.RPCS3_SPU_DECODER || undefined,
   ppuProfile: env.RPCS3_PPU_PROFILE === "1",
-  ppuJit: env.RPCS3_PPU_JIT === "1",
+  ppuJit: env.RPCS3_PPU_JIT === undefined ? undefined : env.RPCS3_PPU_JIT === "1",
   ppuJitThreshold: Number(env.RPCS3_PPU_JIT_THRESHOLD) || undefined,
   ppuJitCapacity: Number(env.RPCS3_PPU_JIT_CAPACITY) || undefined,
   spuBlockSize: env.RPCS3_SPU_BLOCK_SIZE || undefined,
@@ -96,8 +98,8 @@ const runOptions = {
   accurateSpuDma: env.RPCS3_ACCURATE_SPU_DMA ? env.RPCS3_ACCURATE_SPU_DMA === "1" : undefined,
   packetCaptureLevel: env.RPCS3_PACKET_CAPTURE_LEVEL ? Number(env.RPCS3_PACKET_CAPTURE_LEVEL) : undefined,
   pthreadPoolSize: env.RPCS3_POOL_SIZE ? Number(env.RPCS3_POOL_SIZE) : undefined,
-  coreUrl: coreVariant === "release" ? undefined : `./core/${coreVariant}/rpcs3-web.mjs`,
-  suspending: coreVariant === "jspi",
+  coreUrl: env.RPCS3_CORE_URL || (coreVariant === "auto" ? undefined : `./core/${coreVariant === "release" ? "" : coreVariant + "/"}rpcs3-web.mjs`),
+  suspending: coreVariant === "auto" ? undefined : coreVariant.endsWith("jspi"),
   tracePc: env.RPCS3_TRACE_PC ? Number(env.RPCS3_TRACE_PC) : undefined,
   traceDelayPc: env.RPCS3_TRACE_DELAY_PC ? Number(env.RPCS3_TRACE_DELAY_PC) : undefined,
   traceDelayMs: env.RPCS3_TRACE_DELAY_MS ? Number(env.RPCS3_TRACE_DELAY_MS) : undefined,
@@ -106,14 +108,7 @@ const runOptions = {
   progressIntervalMs: 1_000,
 };
 // Same flags and rejection rule as playwright.gpu.config.ts / the GPU specs.
-const chromeArgs = [
-  "--no-sandbox",
-  "--enable-unsafe-webgpu",
-  "--enable-webgpu-developer-features",
-  "--ignore-gpu-blocklist",
-  "--enable-features=Vulkan",
-  "--use-angle=vulkan",
-];
+const chromeArgs = hardwareChromeArgs();
 const softwareAdapterPattern = /SwiftShader|llvmpipe|software|CPU/i;
 
 const context = await chromium.launchPersistentContext(profilePath, {
@@ -124,158 +119,6 @@ const context = await chromium.launchPersistentContext(profilePath, {
 let workerProfiler;
 let traceSession;
 let traceComplete;
-
-function workSampleCount(profile) {
-  const waitNodes = new Set(profile.nodes
-    .filter(({ callFrame }) => ["(idle)", "emscripten_futex_wait"].includes(callFrame.functionName))
-    .map(({ id }) => id));
-  return (profile.samples || []).reduce((count, id) => count + !waitNodes.has(id), 0);
-}
-
-async function writeCpuProfiles(targets) {
-  if (!cpuProfilePath) return;
-  const ranked = targets
-    .filter(({ profile }) => profile)
-    .sort((left, right) => workSampleCount(right.profile) - workSampleCount(left.profile));
-  await mkdir(path.dirname(cpuProfilePath), { recursive: true });
-  const profilePaths = new Map();
-  await Promise.all(ranked.map(async (target, index) => {
-    const profilePath = index === 0 ? cpuProfilePath : `${cpuProfilePath}.${index}`;
-    profilePaths.set(target, profilePath);
-    await writeFile(profilePath, `${JSON.stringify(target.profile)}\n`);
-  }));
-  await writeFile(`${cpuProfilePath}.targets.json`, `${JSON.stringify({
-    samplingIntervalUs: cpuSamplingIntervalUs,
-    selected: ranked[0]?.targetInfo,
-    targets: targets.map((target) => ({
-      targetInfo: target.targetInfo,
-      profilePath: profilePaths.get(target),
-      samples: target.profile?.samples?.length || 0,
-      workSamples: target.profile ? workSampleCount(target.profile) : 0,
-      started: Boolean(target.started),
-      recursiveAttachError: target.recursiveAttachError,
-      error: target.error,
-    })),
-  }, null, 2)}\n`);
-}
-
-function createWorkerProfiler(session, samplingIntervalUs) {
-  let commandId = 0;
-  const pending = new Map();
-  const targets = new Map();
-  const parents = new Map();
-  const starts = [];
-
-  const send = async (sessionId, method, params = {}) => {
-    const id = ++commandId;
-    const key = `${sessionId}:${id}`;
-    const response = new Promise((resolve, reject) => pending.set(key, { resolve, reject }));
-    response.catch(() => {});
-    const message = JSON.stringify({ id, method, params });
-    try {
-      const parentSessionId = parents.get(sessionId);
-      if (parentSessionId) {
-        await send(parentSessionId, "Target.sendMessageToTarget", { sessionId, message });
-      } else {
-        await session.send("Target.sendMessageToTarget", { sessionId, message });
-      }
-    } catch (error) {
-      pending.delete(key);
-      throw error;
-    }
-    return response;
-  };
-
-  const handleDetached = (sessionId) => {
-    const target = targets.get(sessionId);
-    if (target && !target.profile) target.error ??= "target detached before profile collection";
-    for (const [key, waiter] of pending) {
-      if (!key.startsWith(`${sessionId}:`)) continue;
-      pending.delete(key);
-      waiter.reject(new Error("target detached"));
-    }
-  };
-
-  const handleAttached = (sessionId, targetInfo, parentSessionId) => {
-    if (targetInfo.type !== "worker" || targets.has(sessionId)) return;
-    parents.set(sessionId, parentSessionId);
-    const target = { sessionId, targetInfo };
-    targets.set(sessionId, target);
-    starts.push((async () => {
-      try {
-        await send(sessionId, "Target.setAutoAttach", {
-          autoAttach: true,
-          waitForDebuggerOnStart: false,
-          flatten: false,
-        });
-      } catch (error) {
-        target.recursiveAttachError = error instanceof Error ? error.message : String(error);
-      }
-      try {
-        await send(sessionId, "Profiler.enable");
-        await send(sessionId, "Profiler.setSamplingInterval", { interval: samplingIntervalUs });
-        await send(sessionId, "Profiler.start");
-        target.started = true;
-      } catch (error) {
-        target.error = error instanceof Error ? error.message : String(error);
-      }
-    })());
-  };
-
-  const handleMessage = (sessionId, message) => {
-    const payload = JSON.parse(message);
-    if (payload.id) {
-      const waiter = pending.get(`${sessionId}:${payload.id}`);
-      if (!waiter) return;
-      pending.delete(`${sessionId}:${payload.id}`);
-      if (payload.error) waiter.reject(new Error(`${payload.error.code}: ${payload.error.message}`));
-      else waiter.resolve(payload.result || {});
-      return;
-    }
-    if (payload.method === "Target.receivedMessageFromTarget") {
-      handleMessage(payload.params.sessionId, payload.params.message);
-    } else if (payload.method === "Target.attachedToTarget") {
-      handleAttached(payload.params.sessionId, payload.params.targetInfo, sessionId);
-    } else if (payload.method === "Target.detachedFromTarget") {
-      handleDetached(payload.params.sessionId);
-    }
-  };
-  session.on("Target.receivedMessageFromTarget", ({ sessionId, message }) => {
-    handleMessage(sessionId, message);
-  });
-  session.on("Target.detachedFromTarget", ({ sessionId }) => handleDetached(sessionId));
-  session.on("Target.attachedToTarget", ({ sessionId, targetInfo }) => {
-    handleAttached(sessionId, targetInfo, undefined);
-  });
-
-  return {
-    async start() {
-      await session.send("Target.setAutoAttach", {
-        autoAttach: true,
-        waitForDebuggerOnStart: false,
-        flatten: false,
-      });
-    },
-    async stop() {
-      await Promise.allSettled(starts);
-      await Promise.all([...targets.values()].map(async (target) => {
-        if (!target.started) return;
-        try {
-          const { profile } = await send(target.sessionId, "Profiler.stop");
-          target.profile = profile;
-        } catch (error) {
-          target.error = error instanceof Error ? error.message : String(error);
-        }
-      }));
-      await session.send("Target.setAutoAttach", {
-        autoAttach: false,
-        waitForDebuggerOnStart: false,
-        flatten: false,
-      });
-      return [...targets.values()];
-    },
-  };
-}
 
 async function stopTrace() {
   if (!traceSession || !traceComplete) return;
@@ -318,7 +161,7 @@ try {
       if (!workerProfiler) return;
       const profiler = workerProfiler;
       workerProfiler = undefined;
-      await writeCpuProfiles(await profiler.stop());
+      await writeCpuProfiles(await profiler.stop(), cpuProfilePath, cpuSamplingIntervalUs);
     });
   }
   if (tracePath) {
@@ -367,18 +210,23 @@ try {
   const result = await page.evaluate(async ({ target, options }) => {
     const runtime = window.__rpcs3Runtime;
     if (!runtime) throw new Error("runtime acceptance API is unavailable");
-    return runtime.run(target, options);
+    try { return await runtime.run(target, options); }
+    catch (error) {
+      // Serialize partial evidence here: Playwright does not transport custom
+      // Error properties when page.evaluate rejects across the process boundary.
+      return { ...error.partial, ok: false, detail: String(error), stack: error.stack };
+    }
   }, { target, options: runOptions });
   const elapsedMs = Date.now() - startedAt;
   if (workerProfiler) {
-    await writeCpuProfiles(await workerProfiler.stop());
+    await writeCpuProfiles(await workerProfiler.stop(), cpuProfilePath, cpuSamplingIntervalUs);
     workerProfiler = undefined;
   }
   await stopTrace();
 
   const frameList = result.frames ?? [result];
   const completed = Boolean(result.ok) && !result.renderError
-    && (untilDraw ? frameList.some((frame) => (frame.drawPacketCount ?? 0) > 0) : frameList.length >= frames);
+    && (untilDraw ? frameList.some((frame) => (frame.drawPacketCount ?? 0) > 0) : (result.emuFlipId ?? result.workingSet?.flipCounter ?? frameList.length) >= frames);
   const { packetFixture, ...resultWithoutFixture } = result;
   const rgbaBase64 = result.gpu?.rgbaBase64;
   if (result.spuMissBase64) {
@@ -475,7 +323,7 @@ try {
   if (!completed) process.exitCode = 1;
 } finally {
   if (workerProfiler) {
-    try { await writeCpuProfiles(await workerProfiler.stop()); } catch {}
+    try { await writeCpuProfiles(await workerProfiler.stop(), cpuProfilePath, cpuSamplingIntervalUs); } catch {}
   }
   try { await stopTrace(); } catch {}
   await context.close();

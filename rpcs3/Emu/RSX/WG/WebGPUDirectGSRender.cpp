@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Utilities/FrameTiming.h"
 #include "WebGPUDirectGSRender.h"
 #include "WebGPUHost.h"
 #include "WebGPUDrawCommon.h"
@@ -285,6 +286,8 @@ struct BlitOut { @builtin(position) position: vec4f, @location(0) uv: vec2f };
 
 }
 
+EM_JS(u32, rpcs3_web_direct_bind_cache, (), { return self.__rpcs3BindGroupCache === true ? 1 : 0; });
+
 // The hosting worker's JS keeps the presentation canvas (rpcs3_web_pre.js rpcs3PrepareGpu).
 EM_JS(u32, rpcs3_web_direct_canvas_size, (), {
 	const canvas = self.__rpcs3GpuCanvas;
@@ -296,8 +299,14 @@ EM_JS(u32, rpcs3_web_direct_canvas_size, (), {
 // event loop turns, so the frame is released by suspending here rather than by copying it out.
 EM_ASYNC_JS(void, rpcs3_web_direct_present, (u32 frame), {
 	if (!self.__rpcs3GpuCanvas) return;
+	const capture = self.__rpcs3GpuCapture;
+	if (capture && (frame === capture.frame || (capture.every && (frame + 1) % capture.every === 0))) {
+		// Snapshot before yielding: the presentation texture may be discarded afterwards.
+		const bitmap = await createImageBitmap(self.__rpcs3GpuCanvas);
+		self.postMessage({ rpcs3Capture: bitmap, frame }, [bitmap]);
+	}
 	self.postMessage({ rpcs3Presented: frame });
-	await new Promise((resolve) => setTimeout(resolve, 0));
+	await self.__rpcs3YieldPresentation();
 });
 #else
 // Without a suspending stack this thread never returns to its event loop, so the canvas would never
@@ -315,7 +324,7 @@ EM_JS(void, rpcs3_web_direct_present, (u32 frame), {
 // (rpcs3-webgpu-renderer.mjs translateRsxProgram). Returns a malloc'd string:
 // "slots=..;dims=..;constants=N;inputs=..\n<WGSL>" or "error\n<message>".
 EM_JS(char*, rpcs3_web_direct_translate, (const u8* vp, u32 vp_len, u32 vp_entry, u32 vp_ctrl, u32 vp_mask,
-	const u8* fp, u32 fp_len, u32 fp_ctrl, const u32* tex_dims, const char* swizzles, u32 target_count, u32 alpha_func), {
+	const u8* fp, u32 fp_len, u32 fp_ctrl, const u32* tex_dims, const char* swizzles, u32 target_count, u32 alpha_func, u32 color_output_map), {
 	const translator = self.__rpcs3Translator;
 	if (!translator) return stringToNewUTF8("error\nthe RSX worker has no WGSL translator");
 	try {
@@ -331,12 +340,14 @@ EM_JS(char*, rpcs3_web_direct_translate, (const u8* vp, u32 vp_len, u32 vp_entry
 			textureSwizzles[slot] = swizzle;
 		}
 		const result = translator.translateRsxProgram({
+			drawBufferGroup: self.__rpcs3BindGroupCache ? 1 : 0,
 			vertexProgram: new Uint8Array(wasmMemory.buffer, vp, vp_len).slice(),
 			vertexProgramEntry: vp_entry,
 			vertexProgramControl: vp_ctrl,
 			vertexProgramOutputMask: vp_mask,
 			fragmentProgram: new Uint8Array(wasmMemory.buffer, fp, fp_len).slice(),
 			fragmentProgramControl: fp_ctrl,
+			colorOutputIndices: Array.from({ length: target_count }, (_, i) => (color_output_map >>> (i * 2)) & 3),
 			textures: textures,
 			colorTargetCount: target_count,
 			alphaFunc: alpha_func === 0xff ? undefined : alpha_func,
@@ -434,6 +445,7 @@ void WebGPUDirectGSRender::on_init_thread()
 		rsx_log.error("WebGPU direct: no device on the RSX thread's worker (instance=%d device=%d)", !!m_instance, !!m_device);
 		return;
 	}
+	m_bind_cache_enabled = rpcs3_web_direct_bind_cache() != 0;
 	m_queue = wgpuDeviceGetQueue(m_device);
 	m_ready = configure_surface();
 	rsx_log.success("WebGPU direct: device ready on the RSX thread (surface %s)", m_ready ? "configured" : "missing");
@@ -441,6 +453,7 @@ void WebGPUDirectGSRender::on_init_thread()
 
 void WebGPUDirectGSRender::on_exit()
 {
+	clear_draw_bind_groups();
 	end_pass();
 	if (m_encoder) { wgpuCommandEncoderRelease(m_encoder); m_encoder = nullptr; }
 	m_rtts.destroy();
@@ -516,8 +529,28 @@ void WebGPUDirectGSRender::end_pass()
 	}
 }
 
+WGPUBindGroup WebGPUDirectGSRender::cached_draw_bind_group(const draw_bind_key& key, const WGPUBindGroupDescriptor& descriptor, bool texture)
+{
+	if (auto found = m_draw_bind_groups.find(key); found != m_draw_bind_groups.end())
+	{
+		(texture ? m_stats.texture_bind_group_hits : m_stats.bind_group_hits)++;
+		return found->second;
+	}
+	const auto group = wgpuDeviceCreateBindGroup(m_device, &descriptor);
+	m_draw_bind_groups.emplace(key, group);
+	(texture ? m_stats.texture_bind_group_creates : m_stats.bind_group_creates)++;
+	return group;
+}
+
+void WebGPUDirectGSRender::clear_draw_bind_groups()
+{
+	for (auto& [key, group] : m_draw_bind_groups) wgpuBindGroupRelease(group);
+	m_draw_bind_groups.clear();
+}
+
 void WebGPUDirectGSRender::submit()
 {
+	utils::frame_timing::phase_scope timing(utils::frame_timing::phase::submit);
 	end_pass();
 	flush_ring(m_uniform_ring);
 	flush_ring(m_stream_ring);
@@ -530,9 +563,21 @@ void WebGPUDirectGSRender::submit()
 		wgpuCommandEncoderRelease(m_encoder);
 		m_encoder = nullptr;
 	}
+	clear_draw_bind_groups();
 	for (auto view : m_retired_views) wgpuTextureViewRelease(view);
-	for (auto texture : m_retired_textures) wgpuTextureRelease(texture);
-	for (auto buffer : m_retired_buffers) wgpuBufferRelease(buffer);
+	// Releasing an Emscripten handle only drops a JS reference. Explicit destruction
+	// lets WebGPU reclaim the allocation after already-submitted work completes,
+	// rather than waiting for JS garbage collection to notice the wrapper.
+	for (auto texture : m_retired_textures)
+	{
+		wgpuTextureDestroy(texture);
+		wgpuTextureRelease(texture);
+	}
+	for (auto buffer : m_retired_buffers)
+	{
+		wgpuBufferDestroy(buffer);
+		wgpuBufferRelease(buffer);
+	}
 	m_retired_views.clear();
 	m_retired_textures.clear();
 	m_retired_buffers.clear();
@@ -856,8 +901,10 @@ void WebGPUDirectGSRender::apply_surface_ops()
 WebGPUDirectGSRender::targets WebGPUDirectGSRender::bound_targets()
 {
 	targets result;
+	u32 output_index = 0;
 	for (u8 index : rsx::utility::get_rtt_indexes(m_framebuffer_layout.target))
 	{
+		const u32 shader_output = output_index++;
 		if (!m_framebuffer_layout.color_write_enabled[index]) continue;
 		const auto& bound = m_rtts.m_bound_render_targets[index];
 		if (!bound.second || bound.first != m_framebuffer_layout.color_addresses[index]) continue;
@@ -865,6 +912,7 @@ WebGPUDirectGSRender::targets WebGPUDirectGSRender::bound_targets()
 		{
 			result.key.colors[result.colors.size()] = bound.second->id;
 			result.formats.colors[result.colors.size()] = surface->format;
+			result.color_output_map |= shader_output << (result.colors.size() * 2);
 			result.colors.push_back(surface);
 		}
 	}
@@ -909,7 +957,7 @@ WebGPUDirectGSRender::gpu_program& WebGPUDirectGSRender::get_program(const progr
 		reinterpret_cast<const u8*>(current_vertex_program.data.data()), static_cast<u32>(current_vertex_program.data.size() * sizeof(u32)),
 		current_vertex_program.entry, current_vertex_program.ctrl, rsx::method_registers.vertex_attrib_output_mask(),
 		static_cast<const u8*>(current_fragment_program.get_data()), current_fragment_program.ucode_length, rsx::method_registers.shader_control(),
-		dims.data(), swizzles.c_str(), color_target_count, alpha_func);
+		dims.data(), swizzles.c_str(), color_target_count, alpha_func, key.color_output_map);
 	std::string text = translated ? translated : "error\ntranslator returned null";
 	std::free(translated);
 
@@ -951,7 +999,15 @@ WebGPUDirectGSRender::gpu_program& WebGPUDirectGSRender::get_program(const progr
 	{
 		program.texture_dimensions[program.texture_slots[i]] = static_cast<u8>(slot_dims[i]);
 	}
-	program.constant_count = static_cast<u32>(std::stoul(field("constants").empty() ? "0" : field("constants")));
+	if (std::stoul(field("constants").empty() ? "0" : field("constants")))
+	{
+		// Inline values change per draw, but their positions are shader metadata.
+		// The program hash ignores the values while retaining instruction layout.
+		program.constant_offsets = rsx::webgpu::fragment_inline_constant_offsets(
+			current_fragment_program.get_data(), current_fragment_program.ucode_length);
+		if (program.constant_offsets.size() > fragment_constant_slots)
+			program.constant_offsets.resize(fragment_constant_slots);
+	}
 
 	WGPUShaderSourceWGSL source{};
 	source.chain.sType = WGPUSType_ShaderSourceWGSL;
@@ -968,12 +1024,25 @@ WebGPUDirectGSRender::gpu_program& WebGPUDirectGSRender::get_program(const progr
 		entry.binding = binding;
 		entry.visibility = stage;
 		entry.buffer.type = type;
+		entry.buffer.hasDynamicOffset = m_bind_cache_enabled;
 		entries.push_back(entry);
 	};
 	buffer_entry(32, WGPUShaderStage_Vertex, WGPUBufferBindingType_Uniform);
 	buffer_entry(34, WGPUShaderStage_Vertex, WGPUBufferBindingType_ReadOnlyStorage);
 	buffer_entry(35, WGPUShaderStage_Vertex, WGPUBufferBindingType_ReadOnlyStorage);
 	buffer_entry(33, WGPUShaderStage_Fragment, WGPUBufferBindingType_Uniform);
+	if (m_bind_cache_enabled)
+	{
+		// All translated draw programs share the same four buffer bindings.
+		if (!m_draw_buffer_layout)
+		{
+			WGPUBindGroupLayoutDescriptor descriptor{};
+			descriptor.entryCount = entries.size();
+			descriptor.entries = entries.data();
+			m_draw_buffer_layout = wgpuDeviceCreateBindGroupLayout(m_device, &descriptor);
+		}
+		entries.clear();
+	}
 	static const WGPUTextureViewDimension view_dimensions[4] = { WGPUTextureViewDimension_1D, WGPUTextureViewDimension_2D, WGPUTextureViewDimension_Cube, WGPUTextureViewDimension_3D };
 	for (u32 slot : program.texture_slots)
 	{
@@ -994,11 +1063,14 @@ WebGPUDirectGSRender::gpu_program& WebGPUDirectGSRender::get_program(const progr
 	layout_descriptor.entries = entries.data();
 	program.bind_group_layout = wgpuDeviceCreateBindGroupLayout(m_device, &layout_descriptor);
 	WGPUPipelineLayoutDescriptor pipeline_layout_descriptor{};
-	pipeline_layout_descriptor.bindGroupLayoutCount = 1;
-	pipeline_layout_descriptor.bindGroupLayouts = &program.bind_group_layout;
+	const std::array<WGPUBindGroupLayout, 2> layouts{program.bind_group_layout, m_draw_buffer_layout};
+	pipeline_layout_descriptor.bindGroupLayoutCount = m_bind_cache_enabled ? 2 : 1;
+	pipeline_layout_descriptor.bindGroupLayouts = layouts.data();
 	program.pipeline_layout = wgpuDeviceCreatePipelineLayout(m_device, &pipeline_layout_descriptor);
 	program.valid = true;
 	m_stats.programs++;
+	if (key.color_output_map != (0xe4u & ((1u << (key.target_count * 2)) - 1)))
+		m_stats.remapped_color_programs++;
 	return m_programs.emplace(key, program).first->second;
 }
 
@@ -1015,10 +1087,11 @@ WGPURenderPipeline WebGPUDirectGSRender::get_pipeline(const pipeline_key& key, c
 	for (usz i = 0; i < targets.colors.size(); i++)
 	{
 		color_targets[i].format = targets.colors[i]->format;
-		const u32 mask = state.color_write_mask[i];
+		const u32 output = (targets.color_output_map >> (i * 2)) & 3;
+		const u32 mask = state.color_write_mask[output];
 		color_targets[i].writeMask = (mask & 1 ? WGPUColorWriteMask_Red : 0) | (mask & 2 ? WGPUColorWriteMask_Green : 0) |
 			(mask & 4 ? WGPUColorWriteMask_Blue : 0) | (mask & 8 ? WGPUColorWriteMask_Alpha : 0);
-		if (state.blend_enabled_mask & (1u << i))
+		if (state.blend_enabled_mask & (1u << output))
 		{
 			blends[i].color = { blend_operation(state.blend_equation_rgb), blend_factor(state.blend_sfactor_rgb), blend_factor(state.blend_dfactor_rgb) };
 			blends[i].alpha = { blend_operation(state.blend_equation_a), blend_factor(state.blend_sfactor_a), blend_factor(state.blend_dfactor_a) };
@@ -1616,6 +1689,7 @@ void WebGPUDirectGSRender::begin()
 
 void WebGPUDirectGSRender::end()
 {
+	utils::frame_timing::phase_scope draw_scope(utils::frame_timing::phase::draw);
 	if (skip_current_frame || !m_ready || !m_graphics_state.test(rsx::rtt_config_valid) || cond_render_ctrl.disable_rendering())
 	{
 		execute_nop_draw();
@@ -1623,6 +1697,7 @@ void WebGPUDirectGSRender::end()
 		return;
 	}
 
+	draw_scope.next(utils::frame_timing::phase::draw_setup);
 	analyse_current_rsx_pipeline();
 	if (!current_fp_metadata.referenced_textures_mask)
 	{
@@ -1651,6 +1726,7 @@ void WebGPUDirectGSRender::end()
 		return;
 	}
 
+	draw_scope.next(utils::frame_timing::phase::draw_textures);
 	// Textures of this draw (the program key depends on their dimensions and swizzles)
 	std::array<sampled_texture, 16> textures{};
 	std::array<u8, 16> dimensions{};
@@ -1658,19 +1734,29 @@ void WebGPUDirectGSRender::end()
 	for (u32 slot = 0; slot < 16; slot++)
 	{
 		if (!(current_fp_metadata.referenced_textures_mask & (1u << slot))) continue;
-		textures[slot] = resolve_texture(rsx::method_registers.fragment_textures[slot], slot);
+		const auto& texture = rsx::method_registers.fragment_textures[slot];
+		// Record enabled, shader-referenced use before changing coordinate semantics.
+		if (texture.enabled() && (texture.format() & CELL_GCM_TEXTURE_UN))
+			m_stats.unnormalized_texture_slots |= 1u << slot;
+		textures[slot] = resolve_texture(texture, slot);
 		dimensions[slot] = textures[slot].dimension;
 	}
 
+	draw_scope.next(utils::frame_timing::phase::draw_program);
+	const double ts_state0 = utils::frame_timing::now_us();
 	rsx::webgpu::resolved_state_packet state{};
 	rsx::webgpu::fill_resolved_state(state, 0, m_framebuffer_layout);
+	m_stats.preamble_state_ns += static_cast<u64>((utils::frame_timing::now_us() - ts_state0) * 1000.0);
 	const u32 alpha_func = state.alpha_test_enabled ? (state.alpha_func & 7) : 0xff;
 	const u32 target_count = static_cast<u32>(targets.colors.size());
 
 	// RPCS3's ucode hashes: the fragment hash skips the inline constants, which the draw
 	// supplies through the fragment uniform (fragment_program_utils::get_fragment_program_ucode_hash)
+	const double ts_hash0 = utils::frame_timing::now_us();
 	const u64 vp_hash = program_hash_util::vertex_program_utils::get_vertex_program_ucode_hash(current_vertex_program);
 	const u64 fp_hash = program_hash_util::fragment_program_utils::get_fragment_program_ucode_hash(current_fragment_program);
+	m_stats.preamble_hash_ns += static_cast<u64>((utils::frame_timing::now_us() - ts_hash0) * 1000.0);
+	const double ts_key0 = utils::frame_timing::now_us();
 	program_key program_id{};
 	program_id.vertex_hash = vp_hash;
 	program_id.fragment_hash = fp_hash;
@@ -1679,6 +1765,7 @@ void WebGPUDirectGSRender::end()
 	program_id.output_mask = rsx::method_registers.vertex_attrib_output_mask();
 	program_id.shader_control = rsx::method_registers.shader_control();
 	program_id.target_count = target_count;
+	program_id.color_output_map = targets.color_output_map;
 	program_id.alpha_func = alpha_func;
 	program_id.dimensions = dimensions;
 	for (u32 slot = 0; slot < 16; slot++)
@@ -1686,6 +1773,7 @@ void WebGPUDirectGSRender::end()
 		if (current_fp_metadata.referenced_textures_mask & (1u << slot)) program_id.swizzles[slot] = textures[slot].swizzle;
 	}
 	gpu_program& program = get_program(program_id, textures);
+	m_stats.preamble_keymap_ns += static_cast<u64>((utils::frame_timing::now_us() - ts_key0) * 1000.0);
 	if (!program.valid)
 	{
 		m_stats.draws_skipped++;
@@ -1705,6 +1793,7 @@ void WebGPUDirectGSRender::end()
 	u32 subdraw = 0;
 	do
 	{
+		utils::frame_timing::phase_scope stage(utils::frame_timing::phase::draw_clause);
 		const auto pipeline_state = subdraw == 0 ? rsx::flags32_t{ rsx::vertex_arrays_changed } : rsx::flags32_t{ clause.execute_pipeline_dependencies(m_ctx) };
 		subdraw++;
 		if (pipeline_state & rsx::vertex_arrays_changed)
@@ -1720,6 +1809,7 @@ void WebGPUDirectGSRender::end()
 			}
 		}
 		if (!m_vertex_layout.validate()) continue;
+		stage.next(utils::frame_timing::phase::draw_vertex);
 
 		const auto command = m_draw_processor.get_draw_command(rsx::method_registers);
 		const auto upload = rsx::webgpu::prepare_draw_vertex_upload(m_vertex_layout, command);
@@ -1737,15 +1827,23 @@ void WebGPUDirectGSRender::end()
 
 		// Vertex streams and uniforms (the same RPCS3 draw-processor data the packet backend ships)
 		const auto requirements = calculate_memory_requirements(m_vertex_layout, upload.first_vertex, upload.allocated_vertex_count);
-		auto& persistent = m_draw_persistent;
-		auto& transient = m_draw_transient;
-		persistent.resize(requirements.first);
-		transient.resize(requirements.second);
+		// Reserve the complete draw before exposing staging pointers. Growing a ring
+		// invalidates its staging pointers and retires its previous GPU buffer.
+		const u64 persistent_span = utils::align<u64>(std::max<usz>(requirements.first, 16), uniform_alignment);
+		const u64 transient_span = utils::align<u64>(std::max<usz>(requirements.second, 16), uniform_alignment);
+		const u64 persistent_offset = ring_allocate(m_stream_ring, persistent_span + transient_span, WGPUBufferUsage_Storage, "RPCS3 RSX vertex streams");
+		const u64 transient_offset = persistent_offset + persistent_span;
+		const std::span<std::byte> persistent{m_stream_ring.staging.data() + persistent_offset, requirements.first};
+		const std::span<std::byte> transient{m_stream_ring.staging.data() + transient_offset, requirements.second};
+		// Prepare directly in the upload ring instead of copying per-draw scratch
+		// vectors into it. The queue submission consumes these bytes before reuse.
 		m_draw_processor.write_vertex_data_to_memory(m_vertex_layout, upload.first_vertex, upload.allocated_vertex_count,
 			persistent.empty() ? nullptr : persistent.data(), transient.empty() ? nullptr : transient.data());
 
-		auto& vertex_state = m_draw_vertex_state;
-		vertex_state.assign(vertex_state_bytes, std::byte{});
+		stage.next(utils::frame_timing::phase::draw_uniform);
+		const u64 uniform_offset = ring_allocate(m_uniform_ring, vertex_state_stride + fragment_state_stride, WGPUBufferUsage_Uniform, "RPCS3 RSX uniforms");
+		const std::span<std::byte> vertex_state{m_uniform_ring.staging.data() + uniform_offset, vertex_state_bytes};
+		std::fill(vertex_state.begin(), vertex_state.end(), std::byte{});
 		m_draw_processor.fill_scale_offset_data(vertex_state.data(), false);
 		m_draw_processor.fill_user_clip_data(vertex_state.data() + 64);
 		*reinterpret_cast<u32*>(vertex_state.data() + 68) = rsx::method_registers.transform_branch_bits();
@@ -1758,24 +1856,15 @@ void WebGPUDirectGSRender::end()
 		layout_words[1] = upload.vertex_index_offset;
 		m_draw_processor.fill_vertex_layout_state(m_vertex_layout, current_vp_metadata, upload.first_vertex, upload.allocated_vertex_count, reinterpret_cast<s32*>(layout_words + 4), 0, 0);
 
-		auto& fragment_state = m_draw_fragment_state;
-		fragment_state.assign(fragment_state_bytes, std::byte{});
+		const std::span<std::byte> fragment_state{m_uniform_ring.staging.data() + uniform_offset + vertex_state_stride, fragment_state_bytes};
+		std::fill(fragment_state.begin(), fragment_state.end(), std::byte{});
 		m_draw_processor.fill_fragment_state_buffer(fragment_state.data(), current_fragment_program);
-		if (program.constant_count)
+		if (!program.constant_offsets.empty())
 		{
-			const auto offsets = rsx::webgpu::fragment_inline_constant_offsets(current_fragment_program.get_data(), current_fragment_program.ucode_length);
-			std::vector<f32> constants(offsets.size() * 4);
-			rsx::write_fragment_constants_to_buffer(constants, current_fragment_program, offsets, false);
-			std::memcpy(fragment_state.data() + 32, constants.data(), std::min<usz>(constants.size() * 4, fragment_constant_slots * 16));
+			const std::span<f32> constants{reinterpret_cast<f32*>(fragment_state.data() + 32), program.constant_offsets.size() * 4};
+			rsx::write_fragment_constants_to_buffer(constants, current_fragment_program, program.constant_offsets, false);
 		}
 
-		const u64 uniform_offset = ring_allocate(m_uniform_ring, vertex_state_stride + fragment_state_stride, WGPUBufferUsage_Uniform, "RPCS3 RSX uniforms");
-		ring_write(m_uniform_ring, uniform_offset, vertex_state.data(), vertex_state.size());
-		ring_write(m_uniform_ring, uniform_offset + vertex_state_stride, fragment_state.data(), fragment_state.size());
-		const u64 persistent_offset = ring_allocate(m_stream_ring, std::max<usz>(persistent.size(), 16), WGPUBufferUsage_Storage, "RPCS3 RSX vertex streams");
-		if (!persistent.empty()) ring_write(m_stream_ring, persistent_offset, persistent.data(), persistent.size());
-		const u64 transient_offset = ring_allocate(m_stream_ring, std::max<usz>(transient.size(), 16), WGPUBufferUsage_Storage, "RPCS3 RSX vertex streams");
-		if (!transient.empty()) ring_write(m_stream_ring, transient_offset, transient.data(), transient.size());
 		u64 index_offset = 0;
 		if (upload.indexed)
 		{
@@ -1783,16 +1872,17 @@ void WebGPUDirectGSRender::end()
 			ring_write(m_index_ring, index_offset, upload.indices.data(), upload.indices.size());
 		}
 
-		// Bind group of this draw
-		std::vector<WGPUBindGroupEntry> entries;
+		stage.next(utils::frame_timing::phase::draw_bind);
+		std::array<WGPUBindGroupEntry, 36> entries{};
+		usz entry_count = 0;
 		auto buffer_entry = [&](u32 binding, WGPUBuffer buffer, u64 offset, u64 size)
 		{
 			WGPUBindGroupEntry entry{};
 			entry.binding = binding;
 			entry.buffer = buffer;
-			entry.offset = offset;
+			entry.offset = m_bind_cache_enabled ? 0 : offset;
 			entry.size = size;
-			entries.push_back(entry);
+			entries[entry_count++] = entry;
 		};
 		buffer_entry(32, m_uniform_ring.buffer, uniform_offset, vertex_state_bytes);
 		buffer_entry(34, m_stream_ring.buffer, persistent_offset, utils::align(std::max<usz>(persistent.size(), 16), 16));
@@ -1800,21 +1890,48 @@ void WebGPUDirectGSRender::end()
 		buffer_entry(33, m_uniform_ring.buffer, uniform_offset + vertex_state_stride, fragment_state_bytes);
 		for (u32 slot : program.texture_slots)
 		{
-			WGPUBindGroupEntry view{};
+			auto& view = entries[entry_count++];
 			view.binding = slot * 2;
 			view.textureView = textures[slot].view ? textures[slot].view : null_texture_view(program.texture_dimensions[slot]);
-			entries.push_back(view);
-			WGPUBindGroupEntry sampler{};
+			auto& sampler = entries[entry_count++];
 			sampler.binding = slot * 2 + 1;
 			sampler.sampler = textures[slot].sampler ? textures[slot].sampler : null_sampler();
-			entries.push_back(sampler);
 		}
 		WGPUBindGroupDescriptor group_descriptor{};
 		group_descriptor.layout = program.bind_group_layout;
-		group_descriptor.entryCount = entries.size();
+		group_descriptor.entryCount = entry_count;
 		group_descriptor.entries = entries.data();
-		WGPUBindGroup group = wgpuDeviceCreateBindGroup(m_device, &group_descriptor);
+		WGPUBindGroup group = nullptr;
+		WGPUBindGroup texture_group = nullptr;
+		if (m_bind_cache_enabled)
+		{
+			// Clear before acquiring either group, so eviction cannot invalidate
+			// the first group handle while constructing the second one.
+			if (m_draw_bind_groups.size() >= 16384) clear_draw_bind_groups();
+			const auto buffer_key = rsx::webgpu::buffer_binding_key(
+				reinterpret_cast<uintptr_t>(m_draw_buffer_layout), reinterpret_cast<uintptr_t>(m_uniform_ring.buffer),
+				reinterpret_cast<uintptr_t>(m_stream_ring.buffer), entries[1].size, entries[2].size);
+			group_descriptor.layout = m_draw_buffer_layout;
+			group_descriptor.entryCount = 4;
+			group = cached_draw_bind_group(buffer_key, group_descriptor, false);
 
+			draw_bind_key texture_key{};
+			texture_key[0] = reinterpret_cast<uintptr_t>(program.bind_group_layout);
+			for (usz i = 4; i < entry_count; ++i)
+				texture_key[5 + entries[i].binding] = reinterpret_cast<uintptr_t>(entries[i].textureView ?
+					static_cast<void*>(entries[i].textureView) : static_cast<void*>(entries[i].sampler));
+			group_descriptor.layout = program.bind_group_layout;
+			group_descriptor.entryCount = entry_count - 4;
+			group_descriptor.entries = entries.data() + 4;
+			texture_group = cached_draw_bind_group(texture_key, group_descriptor, true);
+		}
+		else
+		{
+			group = wgpuDeviceCreateBindGroup(m_device, &group_descriptor);
+			m_stats.bind_group_creates++;
+		}
+
+		stage.next(utils::frame_timing::phase::draw_encode);
 		pipeline_key pipeline_id{};
 		pipeline_id.program = &program;
 		pipeline_id.formats = targets.formats;
@@ -1837,7 +1954,7 @@ void WebGPUDirectGSRender::end()
 		const u32 sx2 = std::min<u32>(m_scissor.x2, extent_w), sy2 = std::min<u32>(m_scissor.y2, extent_h);
 		if (sx2 <= sx || sy2 <= sy)
 		{
-			wgpuBindGroupRelease(group);
+			if (!m_bind_cache_enabled) wgpuBindGroupRelease(group);
 			continue;
 		}
 		wgpuRenderPassEncoderSetPipeline(m_pass, pipeline);
@@ -1847,7 +1964,11 @@ void WebGPUDirectGSRender::end()
 			const WGPUColor constant{ state.blend_color[0], state.blend_color[1], state.blend_color[2], state.blend_color[3] };
 			wgpuRenderPassEncoderSetBlendConstant(m_pass, &constant);
 		}
-		wgpuRenderPassEncoderSetBindGroup(m_pass, 0, group, 0, nullptr);
+		// Dynamic offsets are ordered by binding number, not descriptor insertion.
+		const std::array<u32, 4> offsets{static_cast<u32>(uniform_offset),
+			static_cast<u32>(uniform_offset + vertex_state_stride), static_cast<u32>(persistent_offset), static_cast<u32>(transient_offset)};
+		if (m_bind_cache_enabled) wgpuRenderPassEncoderSetBindGroup(m_pass, 0, texture_group, 0, nullptr);
+		wgpuRenderPassEncoderSetBindGroup(m_pass, m_bind_cache_enabled ? 1 : 0, group, m_bind_cache_enabled ? 4 : 0, m_bind_cache_enabled ? offsets.data() : nullptr);
 		if (upload.indexed)
 		{
 			wgpuRenderPassEncoderSetIndexBuffer(m_pass, m_index_ring.buffer, index_format, index_offset, upload.indices.size());
@@ -1857,11 +1978,12 @@ void WebGPUDirectGSRender::end()
 		{
 			wgpuRenderPassEncoderDraw(m_pass, upload.draw_count, 1, 0, 0);
 		}
-		wgpuBindGroupRelease(group);
+		if (!m_bind_cache_enabled) wgpuBindGroupRelease(group);
 		m_stats.draws++;
 	}
 	while (clause.next());
 
+	draw_scope.next(utils::frame_timing::phase::draw_end);
 	m_rtts.on_write(m_framebuffer_layout.color_write_enabled, m_framebuffer_layout.zeta_write_enabled);
 	rsx::thread::end();
 }
@@ -2071,7 +2193,10 @@ void WebGPUDirectGSRender::flip(const rsx::display_flip_info_t& info)
 			wgpuTextureViewRelease(view);
 			wgpuTextureRelease(surface_texture.texture);
 			submit();
-			rpcs3_web_direct_present(static_cast<u32>(m_presented));
+			{
+				utils::frame_timing::phase_scope timing(utils::frame_timing::phase::present);
+				rpcs3_web_direct_present(static_cast<u32>(m_presented));
+			}
 			m_presented++;
 		}
 		else
@@ -2085,7 +2210,10 @@ void WebGPUDirectGSRender::flip(const rsx::display_flip_info_t& info)
 	m_rtts.trim(m_surface_ops, rsx::problem_severity::low);
 
 	// The host frame counter is what the runtime worker waits on for frame pacing
-	rsx::webgpu::host_command_queue().note_flip();
+	if (info.emu_flip)
+	{
+		rsx::webgpu::host_command_queue().note_flip();
+	}
 
 	if (m_frame)
 	{

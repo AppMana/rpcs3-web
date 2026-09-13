@@ -69,6 +69,7 @@ if(RPCS3_WEB)
 		"-sEXPORT_NAME=createRPCS3"
 		"-sENVIRONMENT=web,worker"
 		"-sWASMFS=1"
+		"-sIMPORTED_MEMORY=1"
 		"-sMAXIMUM_MEMORY=2147483648"
 		"-sINITIAL_MEMORY=${RPCS3_WEB_INITIAL_MEMORY}"
 		"-sSTACK_SIZE=8388608"
@@ -93,15 +94,15 @@ if(RPCS3_WEB)
 		"-sWASM_BIGINT=1")
 	set_property(TARGET rpcs3_web_runtime APPEND PROPERTY LINK_DEPENDS ${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_pre.js)
 	set_property(TARGET rpcs3_web_runtime APPEND PROPERTY LINK_DEPENDS ${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_lib.js)
-	# ASSERTIONS stays on in both variants: it only adds a stack cookie and JS
-	# glue checks, and it is what keeps Emscripten from minifying the wasm
-	# import/export names that the PPU/SPU AOT side modules link against
-	# (env.memory, rpcs3_web_* exports). The profile variant additionally keeps
-	# the function name section for CPU profiles and traces.
+	option(RPCS3_WEB_RUNTIME_ASSERTIONS "Enable Emscripten runtime and WebGPU binding assertions" ON)
+	# Preserve the AOT import/export ABI independently of diagnostic assertions.
+	# WebGPU assertions include hot per-handle dictionary membership checks.
+	# Emscripten's public exports library disables Wasm export-name minification.
+	target_link_options(rpcs3_web_runtime PRIVATE "-lexports.js")
 	# STACK_OVERFLOW_CHECK=0 drops the stack cookie and address-zero probes (any non-zero level keeps both): a host-side
 	# store of a wall-clock seconds value lands at wasm address 0 during LBP2 (harmless: static
 	# data starts at GLOBAL_BASE), and the probe aborts the runtime at the next thread exit.
-	target_link_options(rpcs3_web_runtime PRIVATE "-sASSERTIONS=1" "-sSTACK_OVERFLOW_CHECK=0")
+	target_link_options(rpcs3_web_runtime PRIVATE "-sASSERTIONS=$<BOOL:${RPCS3_WEB_RUNTIME_ASSERTIONS}>" "-sSTACK_OVERFLOW_CHECK=0")
 	if(RPCS3_WEB_JSPI)
 		# Emscripten calls a pthread entry point through a promising dyncall under this setting, so a
 		# guest thread's stack can suspend at an EM_ASYNC_JS call and resume where it left off.
@@ -115,7 +116,10 @@ if(RPCS3_WEB)
 			"-g1" "--profiling-funcs")
 	endif()
 	if(RPCS3_WEB_PROFILE)
+		# Preserve large single-caller dispatch loops as profiling boundaries. Binaryen
+		# otherwise erases LLVM noinline seams into cpu_thread::operator().
 		target_link_options(rpcs3_web_runtime PRIVATE
+			"-sBINARYEN_EXTRA_PASSES=--one-caller-inline-max-function-size=0"
 			"-g1"
 			"--profiling-funcs")
 	endif()
@@ -234,7 +238,8 @@ if(RPCS3_WEB)
 		tests/test_rsx_fp_asm.cpp
 		tests/test_tuple.cpp
 		tests/test_simple_array.cpp
-		tests/test_types_util.cpp)
+		tests/test_types_util.cpp
+		tests/test_spu_web_dispatch.cpp)
 	target_link_libraries(rpcs3_web_unit_tests PRIVATE rpcs3_web_gtest)
 	target_include_directories(rpcs3_web_unit_tests PRIVATE
 		${CMAKE_SOURCE_DIR}
@@ -429,6 +434,7 @@ if(BUILD_RPCS3_TESTS)
             tests/test_dmux_pamf.cpp
             tests/test_spu_analyser.cpp
             tests/test_types_util.cpp
+            tests/test_spu_web_dispatch.cpp
     )
 
     target_link_libraries(rpcs3_test

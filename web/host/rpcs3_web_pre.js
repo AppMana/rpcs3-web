@@ -25,6 +25,7 @@ Module["rpcs3PopulatePpuAot"] = (load) => {
   rpcs3ReserveAotTable(table, load);
   const result = { parts: [] };
   for (const part of load.parts) {
+    const guestPages = {};
     const env = {
       memory: wasmMemory,
       __indirect_function_table: table,
@@ -32,6 +33,12 @@ Module["rpcs3PopulatePpuAot"] = (load) => {
       __table_base: new WebAssembly.Global({ value: "i32", mutable: false }, part.elemBase),
     };
     for (const imported of WebAssembly.Module.imports(part.module)) {
+      if (imported.module === "GOT.mem" && imported.kind === "global" && imported.name === "__rpcs3_guest_pages") {
+        const address = wasmExports["rpcs3_web_vm_page_table_address"]?.() >>> 0;
+        if (!address) throw new Error("PPU module requires a guest page table from the runtime");
+        guestPages.__rpcs3_guest_pages = new WebAssembly.Global({ value: "i32", mutable: true }, address);
+        continue;
+      }
       if (imported.module !== "env") throw new Error(`unsupported import ${imported.module}.${imported.name}`);
       if (imported.name in env) continue;
       if (imported.kind === "global" && imported.name === "__stack_pointer") {
@@ -58,7 +65,7 @@ Module["rpcs3PopulatePpuAot"] = (load) => {
     }
     // The element segments place every block at __table_base + slot; __ppu_block_index_* returns
     // those absolute indices, so no data relocation is needed for the block tables.
-    const instance = new WebAssembly.Instance(part.module, { env });
+    const instance = new WebAssembly.Instance(part.module, { env, "GOT.mem": guestPages });
     // Shared-memory modules keep their data segments passive: __wasm_init_memory copies them once (the
     // flag makes later workers no-ops) and __wasm_call_ctors relocates the exported address globals.
     if (typeof instance.exports.__wasm_init_memory === "function") instance.exports.__wasm_init_memory();
@@ -120,6 +127,24 @@ Module["rpcs3PopulateSpuAot"] = (load) => {
     }
     if (index !== part.exportBase + part.exportCount) {
       throw new Error(`part placed ${index - part.exportBase} programs, layout expected ${part.exportCount}`);
+    }
+    for (const region of part.regionEntries || []) {
+      table.set(region.index, instance.exports[region.symbol]);
+      if (load.initializeRegionAliases) {
+        const pointer = instance.exports[region.aliases]() >>> 0;
+        if ((pointer & 3) || pointer < part.memoryBase || pointer + region.targets.length * 4 > part.memoryBase + part.memorySize) {
+          throw new Error("SPU region aliases lie outside their module allocation");
+        }
+        new Uint32Array(wasmMemory.buffer, pointer, region.targets.length).set(region.targets);
+      }
+    }
+    if (part.chainIndex) {
+      if (typeof instance.exports.rpcs3_spu_run_chain !== "function") throw new Error("SPU part is missing its chain runner");
+      table.set(part.chainIndex, instance.exports.rpcs3_spu_run_chain);
+    }
+    if (part.profileIndex) {
+      if (typeof instance.exports.rpcs3_spu_run_chain_profile !== "function") throw new Error("SPU part is missing its edge profiler");
+      table.set(part.profileIndex, instance.exports.rpcs3_spu_run_chain_profile);
     }
   }
   self.__rpcs3SpuAotReady = true;
@@ -234,6 +259,7 @@ const rpcs3PpuHotBindings = Object.freeze({
   memset: "rpcs3_web_libcall_memset", memcmp: "rpcs3_web_libcall_memcmp",
 });
 function rpcs3InstantiatePpuSide(module, elemBase, memoryBase, importsTable, table) {
+  const guestPages = {};
   const env = {
     memory: wasmMemory,
     __memory_base: new WebAssembly.Global({ value: "i32", mutable: false }, memoryBase),
@@ -241,7 +267,14 @@ function rpcs3InstantiatePpuSide(module, elemBase, memoryBase, importsTable, tab
   };
   if (importsTable) env.__indirect_function_table = table;
   for (const imported of WebAssembly.Module.imports(module)) {
-    if (imported.module !== "env" || imported.name in env) continue;
+    if (imported.module === "GOT.mem" && imported.kind === "global" && imported.name === "__rpcs3_guest_pages") {
+      const address = wasmExports["rpcs3_web_vm_page_table_address"]?.() >>> 0;
+      if (!address) throw new Error("PPU module requires a guest page table from the runtime");
+      guestPages.__rpcs3_guest_pages = new WebAssembly.Global({ value: "i32", mutable: true }, address);
+      continue;
+    }
+    if (imported.module !== "env") throw new Error(`unsupported PPU side-module import ${imported.module}.${imported.name}`);
+    if (imported.name in env) continue;
     if (imported.kind === "global" && imported.name === "__stack_pointer") {
       if (!(wasmExports["__stack_pointer"] instanceof WebAssembly.Global)) throw new Error("the runtime does not export __stack_pointer");
       env.__stack_pointer = wasmExports["__stack_pointer"];
@@ -252,7 +285,7 @@ function rpcs3InstantiatePpuSide(module, elemBase, memoryBase, importsTable, tab
     if (!target || typeof wasmExports[target] !== "function") throw new Error(`no runtime binding for PPU side-module import ${imported.name}`);
     env[imported.name] = wasmExports[target];
   }
-  const instance = new WebAssembly.Instance(module, { env });
+  const instance = new WebAssembly.Instance(module, { env, "GOT.mem": guestPages });
   for (const init of ["__wasm_init_memory", "__wasm_apply_data_relocs", "__wasm_call_ctors"]) {
     if (typeof instance.exports[init] === "function") instance.exports[init]();
   }
@@ -314,7 +347,7 @@ Module["rpcs3InstallHotTable"] = (ppuLoad, spuLoad) => {
   return { base };
 };
 
-Module["rpcs3PrepareGpu"] = (canvas, flagAddress) => new Promise((resolve, reject) => {
+Module["rpcs3PrepareGpu"] = (canvas, flagAddress, capture, presentationYield = "timer", bindGroupCache = false) => new Promise((resolve, reject) => {
   const PThread = Module["PThread"];
   const worker = PThread.unusedWorkers[PThread.unusedWorkers.length - 1];
   if (!worker) { reject(new Error("no idle pthread worker to host the GPU device")); return; }
@@ -329,7 +362,7 @@ Module["rpcs3PrepareGpu"] = (canvas, flagAddress) => new Promise((resolve, rejec
     if (!data) return;
     if (data.rpcs3GpuPong && !sentCanvas) {
       sentCanvas = true;
-      worker.postMessage({ rpcs3PrepareGpu: { canvas } }, [canvas]);
+      worker.postMessage({ rpcs3PrepareGpu: { canvas, capture, presentationYield, bindGroupCache } }, [canvas]);
     } else if (data.rpcs3GpuReady) {
       clearTimeout(deadline);
       Module["__rpcs3GpuWorker"] = worker;
@@ -338,6 +371,8 @@ Module["rpcs3PrepareGpu"] = (canvas, flagAddress) => new Promise((resolve, rejec
     } else if (data.rpcs3GpuError) {
       clearTimeout(deadline);
       reject(new Error(data.rpcs3GpuError));
+    } else if (data.rpcs3Capture && Module["rpcs3OnCapture"]) {
+      Module["rpcs3OnCapture"](data);
     } else if (data.rpcs3Present && Module["rpcs3OnPresent"]) {
       Module["rpcs3OnPresent"](data);
     } else if (data.rpcs3Presented !== undefined && Module["rpcs3OnPresented"]) {
@@ -411,6 +446,26 @@ if (typeof self !== "undefined" && typeof self.addEventListener === "function") 
     if (!data.rpcs3PrepareGpu) return;
     (async () => {
       const canvas = data.rpcs3PrepareGpu.canvas;
+      self.__rpcs3GpuCapture = data.rpcs3PrepareGpu.capture;
+      const bindGroupCache = data.rpcs3PrepareGpu.bindGroupCache === true;
+      self.__rpcs3BindGroupCache = bindGroupCache;
+      const presentationYield = data.rpcs3PrepareGpu.presentationYield ?? "timer";
+      if (!["timer", "message"].includes(presentationYield)) throw new Error(`Invalid presentation yield: ${presentationYield}`);
+      self.__rpcs3PresentationYield = presentationYield;
+      if (presentationYield === "message") {
+        // A task boundary lets the transferred canvas publish. A resolved Promise
+        // would only drain microtasks and would not release the worker event loop.
+        const channel = new MessageChannel();
+        let pending;
+        channel.port1.onmessage = () => { const resolve = pending; pending = undefined; resolve(); };
+        self.__rpcs3YieldPresentation = () => new Promise((resolve, reject) => {
+          if (pending) { reject(new Error("Concurrent presentation yield")); return; }
+          pending = resolve;
+          channel.port2.postMessage(0);
+        });
+      } else {
+        self.__rpcs3YieldPresentation = () => new Promise((resolve) => setTimeout(resolve, 0));
+      }
       if (!("gpu" in navigator)) throw new Error("navigator.gpu is unavailable in this worker");
       const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
       if (!adapter) throw new Error("requestAdapter returned null in the worker");
@@ -425,15 +480,18 @@ if (typeof self !== "undefined" && typeof self.addEventListener === "function") 
       self.__rpcs3GpuCanvas = canvas;
       Module["preinitializedWebGPUDevice"] = device;
       // WGSL translation for the direct backend (rpcs3-webgpu-renderer.mjs translateRsxProgram)
-      // The renderer module sits at the site root; the core may be staged under core/ or core/profile/
+      // The renderer module sits at the site root; the core may be staged under core/ or core/profile/.
+      // Collapse repeated leading slashes first: a base path like "https://host//core/..." would put
+      // indexOf("/core/") at position 1 and turn the renderer specifier into a protocol-relative URL.
       const coreUrl = new URL(import.meta.url);
-      const coreIndex = coreUrl.pathname.indexOf("/core/");
-      const translatorUrl = coreIndex >= 0 ? new URL(coreUrl.pathname.slice(0, coreIndex) + "/rpcs3-webgpu-renderer.mjs", coreUrl) : new URL("../rpcs3-webgpu-renderer.mjs", coreUrl);
+      const corePath = coreUrl.pathname.replace(/\/{2,}/g, "/");
+      const coreIndex = corePath.indexOf("/core/");
+      const translatorUrl = coreIndex >= 0 ? new URL(corePath.slice(0, coreIndex) + "/rpcs3-webgpu-renderer.mjs", coreUrl) : new URL("../rpcs3-webgpu-renderer.mjs", coreUrl);
       self.__rpcs3Translator = await import(translatorUrl.href);
       if (!Module["specialHTMLTargets"]) throw new Error("specialHTMLTargets is not exported to the worker");
       Module["specialHTMLTargets"]["#rpcs3-canvas"] = canvas;
       const info = adapter.info || {};
-      self.postMessage({ rpcs3GpuReady: { vendor: info.vendor, architecture: info.architecture, description: info.description, width: canvas.width, height: canvas.height, features: requiredFeatures } });
+      self.postMessage({ rpcs3GpuReady: { bindGroupCache, presentationYield, vendor: info.vendor, architecture: info.architecture, description: info.description, width: canvas.width, height: canvas.height, features: requiredFeatures } });
     })().catch((error) => self.postMessage({ rpcs3GpuError: String(error && error.stack ? error.stack : error) }));
   });
   self.addEventListener("message", (event) => {

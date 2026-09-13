@@ -129,6 +129,12 @@ static thread_local bool(*s_tls_wait_cb)(const void* data, u64 attempts, u64 sta
 // Callback for wait() function for a second custon condition, commonly passed with timeout
 static thread_local bool(*s_tls_one_time_wait_cb)(u64 attempts) = nullptr;
 
+// Web only: answers "does the current guest thread still owe the VM writer a
+// safe-point acknowledgement?" Null/unregistered means "do not know" and the
+// wait keeps its 1 ms polling ceiling (the conservative default for every
+// non-guest thread such as the RSX or pad workers).
+static thread_local bool (*s_tls_interruptible_cb)() = nullptr;
+
 // Compare data in memory with old value, and return true if they are equal
 static NEVER_INLINE bool ptr_cmp(const void* data, u32 old, atomic_wait::info* ext = nullptr)
 {
@@ -1156,9 +1162,20 @@ atomic_wait_engine::wait(const void* data, u32 old_value, u64 timeout, atomic_wa
 		else
 		{
 			// A browser cannot interrupt a worker waiting on this futex when an
-			// unrelated thread-control atomic is notified. Re-enter the wait
-			// callback periodically so CPU threads can acknowledge VM safe points.
-			const double timeout_ms = timeout + 1 ? std::min(static_cast<double>(timeout) / 1'000'000.0, 1.0) : 1.0;
+			// unrelated thread-control atomic is notified, so waiter threads
+			// historically re-entered every ~1 ms to acknowledge VM safe points.
+			// Keep that 1 ms ceiling for any thread with a one-time waiter
+			// constraint (e.g. the SPU reservation line, which needs periodic
+			// re-entry), and for guest threads that still owe the VM writer
+			// (memory flagged, or not in a pure `wait` sleep). Pure sleeper
+			// threads sleep for their full finite asked timeout (stop latency is
+			// bounded by the guest's own sleep length and any same-atomic state
+			// change wakes them at once); infinite asks are capped at 10 ms so a
+			// cooperative stop stays within a short bound.
+			const bool owed = s_tls_one_time_wait_cb != nullptr
+				|| (s_tls_interruptible_cb ? s_tls_interruptible_cb() : true);
+			const double requested_ms = timeout + 1 ? static_cast<double>(timeout) / 1'000'000.0 : 10.0;
+			const double timeout_ms = owed ? std::min(requested_ms, 1.0) : requested_ms;
 			emscripten_futex_wait(&cond->sync, val, timeout_ms);
 		}
 #elif defined(USE_STD)
@@ -1356,6 +1373,11 @@ void atomic_wait_engine::set_wait_callback(bool(*cb)(const void*, u64, u64))
 void atomic_wait_engine::set_one_time_use_wait_callback(bool(*cb)(u64 progress))
 {
 	s_tls_one_time_wait_cb = cb;
+}
+
+void atomic_wait_engine::set_interruptible_callback(bool (*cb)())
+{
+	s_tls_interruptible_cb = cb;
 }
 
 void atomic_wait_engine::notify_one(const void* data)

@@ -4,6 +4,7 @@
 #include "Emu/Cell/Common.h"
 #include "Emu/Cell/lv2/sys_sync.h"
 #include "PPUTranslator.h"
+#include "PPUWasmDispatch.h"
 #include "PPUThread.h"
 #include "SPUThread.h"
 
@@ -29,10 +30,11 @@ extern const ppu_decoder<ppu_itype> g_ppu_itype;
 extern const ppu_decoder<ppu_iname> g_ppu_iname;
 
 #ifdef RPCS3_WEB
-PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_module<lv2_obj>& info, llvm::TargetMachine& target, bool wasm_aot)
+PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_module<lv2_obj>& info, llvm::TargetMachine& target, bool wasm_aot, ppu_wasm_branch_mode branch_mode)
 	: cpu_translator(_module, false)
 	, m_info(info)
 	, m_pure_attr()
+	, m_wasm_branch_mode(branch_mode)
 	, m_wasm_aot(wasm_aot)
 {
 	// Bind context
@@ -40,10 +42,11 @@ PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_mo
 	prepare();
 }
 #else
-PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_module<lv2_obj>& info, ExecutionEngine& engine, bool wasm_aot)
+PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_module<lv2_obj>& info, ExecutionEngine& engine, bool wasm_aot, ppu_wasm_branch_mode branch_mode)
 	: cpu_translator(_module, false)
 	, m_info(info)
 	, m_pure_attr()
+	, m_wasm_branch_mode(branch_mode)
 	, m_wasm_aot(wasm_aot)
 {
 	// Bind context
@@ -57,6 +60,8 @@ void PPUTranslator::prepare()
 {
 	if (m_wasm_aot)
 	{
+		const char* inline_reads = std::getenv("RPCS3_PPU_WASM_INLINE_READS");
+		m_wasm_inline_reads = inline_reads && *inline_reads == '1';
 		m_use_ssse3 = false;
 		m_use_fma = false;
 		m_use_avx = false;
@@ -355,6 +360,22 @@ Function* PPUTranslator::Translate(const ppu_function& info)
 	}
 
 	run_transforms(*m_function);
+	if (m_wasm_aot && m_wasm_branch_mode == ppu_wasm_branch_mode::return_to_dispatcher)
+	{
+		// Helpers imported from the runtime also cross Wasm instances. Keep guest
+		// musttail calls within the module, but preserve ordinary helper call frames.
+		for (auto& block : *m_function)
+		{
+			for (auto& instruction : block)
+			{
+				if (auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction); call && !call->isMustTailCall())
+				{
+					if (const auto* callee = call->getCalledFunction(); callee && !callee->isIntrinsic())
+						call->setTailCallKind(llvm::CallInst::TCK_NoTail);
+				}
+			}
+		}
+	}
 	return m_function;
 }
 
@@ -706,6 +727,7 @@ void PPUTranslator::CallFunction(u64 target, Value* indirect)
 
 void PPUTranslator::WasmCallThroughTable(Value* target, Value* seg0)
 {
+
 	// Exec base (arg 0) is the directory of 64 KiB guest pages; a page's first member is the u32 wasm table index per guest word.
 	// Unregistered blocks store cia and return, and the owning PPU thread continues in the interpreter.
 	// A slot is callable only when it is a table index: zero means no compiled block, and the top bit
@@ -735,7 +757,26 @@ void PPUTranslator::WasmCallThroughTable(Value* target, Value* seg0)
 	const auto tier = m_ir->CreateLoad(GetType<u32>(), tier_slot);
 	const auto index = m_ir->CreateSelect(m_ir->CreateIsNull(bundled), tier, bundled);
 	const auto callable = m_ir->CreateICmpULT(m_ir->CreateSub(index, m_ir->getInt32(1)), m_ir->getInt32(0x7fff'ffff));
-	m_ir->CreateCondBr(callable, call, fallback, m_md_likely);
+	if (m_wasm_branch_mode == ppu_wasm_branch_mode::return_to_dispatcher)
+	{
+		// The optional fourth argument is ppu_wasm_dispatch_context (two u32 table bounds).
+		// Only entries belonging to this instance may tail-call on Safari 27 beta.
+		// Older runtimes pass null and safely return at every indirect branch.
+		const auto context = BasicBlock::Create(m_context, "", m_function);
+		const auto bounds = BasicBlock::Create(m_context, "", m_function);
+		m_ir->CreateCondBr(callable, context, fallback, m_md_likely);
+		m_ir->SetInsertPoint(context);
+		m_ir->CreateCondBr(m_ir->CreateIsNull(m_base), fallback, bounds);
+		m_ir->SetInsertPoint(bounds);
+		const auto begin = m_ir->CreateLoad(GetType<u32>(), m_base);
+		const auto end = m_ir->CreateLoad(GetType<u32>(), m_ir->CreatePtrAdd(m_base, m_ir->getInt32(offsetof(ppu_wasm_dispatch_context, table_end))));
+		const auto local = m_ir->CreateAnd(m_ir->CreateICmpUGE(index, begin), m_ir->CreateICmpULT(index, end));
+		m_ir->CreateCondBr(local, call, fallback);
+	}
+	else
+	{
+		m_ir->CreateCondBr(callable, call, fallback, m_md_likely);
+	}
 
 	m_ir->SetInsertPoint(call);
 	// The target's own address, so a slot the calling worker's table does not hold yet lands on a
@@ -973,19 +1014,56 @@ Value* PPUTranslator::ReadMemory(Value* addr, Type* type, bool is_be, u32 align)
 	if (m_wasm_aot)
 	{
 		const auto guest_addr = Trunc(addr, GetType<u32>());
-		Value* value;
-		if (size == 128)
+		const auto slow_read = [&]() -> Value*
 		{
-			// Two raw 64-bit reads assemble the same little-endian i128 as a 16-byte load, and need no stack
-			const auto i128 = m_ir->getIntNTy(128);
-			const auto lo = Call(GetType<u64>(), "rpcs3_web_vm_read64_raw", guest_addr);
-			const auto hi = Call(GetType<u64>(), "rpcs3_web_vm_read64_raw", m_ir->CreateAdd(guest_addr, m_ir->getInt32(8)));
-			value = m_ir->CreateOr(m_ir->CreateZExt(lo, i128), m_ir->CreateShl(m_ir->CreateZExt(hi, i128), 64));
+			Value* value;
+			if (size == 128)
+			{
+				// Two raw 64-bit reads assemble the same little-endian i128 as a 16-byte load, and need no stack
+				const auto i128 = m_ir->getIntNTy(128);
+				const auto lo = Call(GetType<u64>(), "rpcs3_web_vm_read64_raw", guest_addr);
+				const auto hi = Call(GetType<u64>(), "rpcs3_web_vm_read64_raw", m_ir->CreateAdd(guest_addr, m_ir->getInt32(8)));
+				value = m_ir->CreateOr(m_ir->CreateZExt(lo, i128), m_ir->CreateShl(m_ir->CreateZExt(hi, i128), 64));
+			}
+			else
+			{
+				const auto int_type = m_ir->getIntNTy(size);
+				value = Call(int_type, fmt::format("rpcs3_web_vm_read%u_raw", size), guest_addr);
+			}
+			return value;
+		};
+		Value* value;
+		if (m_wasm_inline_reads)
+		{
+			// The loader binds this explicit data import to vm::g_web_pages. Keeping
+			// translation here removes a cross-instance helper call for mapped reads.
+			const auto pages = m_module->getOrInsertGlobal("__rpcs3_guest_pages", ArrayType::get(GetType<u32>(), 0x100000));
+			const auto page = m_ir->CreateLoad(GetType<u32>(), m_ir->CreateGEP(GetType<u32>(), pages, m_ir->CreateLShr(guest_addr, 12)));
+			const auto offset = m_ir->CreateAnd(guest_addr, 0xfff);
+			const auto in_page = m_ir->CreateICmpULE(offset, m_ir->getInt32(0x1000 - size / 8));
+			const auto mapped = m_ir->CreateIsNotNull(page);
+			const auto direct = BasicBlock::Create(m_context, "vm_read_direct", m_function);
+			const auto fallback = BasicBlock::Create(m_context, "vm_read_fallback", m_function);
+			const auto merge = BasicBlock::Create(m_context, "vm_read_result", m_function);
+			const auto int_type = m_ir->getIntNTy(size);
+			m_ir->CreateCondBr(m_ir->CreateAnd(in_page, mapped), direct, fallback, m_md_likely);
+			m_ir->SetInsertPoint(direct);
+			const auto pointer = m_ir->CreateIntToPtr(m_ir->CreateAdd(page, offset), GetType<u8*>());
+			const auto loaded = m_ir->CreateAlignedLoad(int_type, pointer, llvm::Align(1));
+			m_ir->CreateBr(merge);
+			m_ir->SetInsertPoint(fallback);
+			const auto slow = slow_read();
+			const auto slow_block = m_ir->GetInsertBlock();
+			m_ir->CreateBr(merge);
+			m_ir->SetInsertPoint(merge);
+			const auto result = m_ir->CreatePHI(int_type, 2);
+			result->addIncoming(loaded, direct);
+			result->addIncoming(slow, slow_block);
+			value = result;
 		}
 		else
 		{
-			const auto int_type = m_ir->getIntNTy(size);
-			value = Call(int_type, fmt::format("rpcs3_web_vm_read%u_raw", size), guest_addr);
+			value = slow_read();
 		}
 
 		if (is_be ^ m_is_be && size > 8)

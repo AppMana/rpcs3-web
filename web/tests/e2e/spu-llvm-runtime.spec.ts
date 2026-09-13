@@ -10,11 +10,13 @@ type Runtime = { run(fixture?: string, options?: Record<string, unknown>): Promi
 test("matches the native oracle while dispatching LLVM-compiled SPU programs", async ({ page }, testInfo) => {
   test.setTimeout(240_000);
   await page.goto("/runtime.html");
-  const result = await page.evaluate(async () => {
+  const result = await page.evaluate(async ({ coreUrl, suspending }) => {
     const runtime = (window as Window & { __rpcs3Runtime?: Runtime }).__rpcs3Runtime;
     if (!runtime) return { ok: false, detail: "runtime acceptance API is unavailable" };
     try {
       return await runtime.run("fixtures/web_dispatch_conformance.self", {
+        ...(coreUrl ? { coreUrl } : {}),
+        suspending,
         completion: "dispatch",
         renderer: "null",
         spuDecoder: "llvm",
@@ -27,7 +29,7 @@ test("matches the native oracle while dispatching LLVM-compiled SPU programs", a
     } catch (error) {
       return { ok: false, detail: error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error) };
     }
-  });
+  }, { coreUrl: process.env.RPCS3_TEST_CORE_URL, suspending: process.env.RPCS3_TEST_SUSPENDING === "1" });
   await testInfo.attach("spu-llvm-runtime.json", { body: JSON.stringify(result, null, 2), contentType: "application/json" });
   expect(result.ok, JSON.stringify(result, null, 2)).toBe(true);
   expect(result.verdict).toBe("76ec98ba0e352b1c");

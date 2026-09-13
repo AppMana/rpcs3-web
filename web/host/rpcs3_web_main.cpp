@@ -1,4 +1,5 @@
 #include <cmath>
+#include "Utilities/FrameTiming.h"
 #include <cstring>
 #include "Emu/System.h"
 #include "Emu/IdManager.h"
@@ -110,17 +111,28 @@ extern atomic_t<u32> g_spu_web_aot_step_complete[6];
 extern atomic_t<u32> g_spu_web_aot_step_result[6];
 extern u32 ppu_web_interpreter_step(ppu_thread& ppu);
 // Set by web/host/rpcs3_web_pre.js once this worker's function table holds the compiled PPU blocks
-EM_JS(int, rpcs3_web_ppu_aot_worker_ready, (), { if (!self.__rpcs3PpuAotReady && Module["rpcs3EnsureAot"]) Module["rpcs3EnsureAot"]("rpcs3PpuAot"); return self.__rpcs3PpuAotReady ? 1 : 0; });
-
-EM_JS(int, rpcs3_web_spu_aot_worker_ready, (), { if (!self.__rpcs3SpuAotReady && Module["rpcs3EnsureAot"]) Module["rpcs3EnsureAot"]("rpcs3SpuAot"); return self.__rpcs3SpuAotReady ? 1 : 0; });
+// JS impls live in web/host/rpcs3_web_lib.js (a --js-library entry) — see PPUWebRecompiler.cpp for
+// why they are not EM_JS macros (thin-LTO strips the em_js section/import chain).
+extern "C" int rpcs3_web_ppu_aot_worker_ready();
+extern "C" int rpcs3_web_spu_aot_worker_ready();
 
 extern u32 g_rpcs3_web_clocks_scale;
 extern spu_decoder_type g_rpcs3_web_spu_decoder;
 extern spu_block_size_type g_rpcs3_web_spu_block_size;
 extern void spu_web_aot_register(const u32* pairs, u32 count);
+extern bool spu_web_register_chain_span(u32 begin, u32 end, u32 runner);
+extern bool spu_web_register_chain_span_v3(u32 begin, u32 end, u32 runner, u32 profile_runner, const u32* region_runners);
+extern bool spu_web_register_chain_span_v2(u32 begin, u32 end, u32 runner, u32 profile_runner);
+extern std::string spu_web_chain_edge_report();
 extern u32 g_spu_web_trace_lo;
 extern u32 g_spu_web_trace_hi;
 extern u64 spu_web_aot_dispatch_count();
+extern void spu_web_dispatch_profile_enable();
+extern void spu_web_dispatch_cache_enable(bool enabled);
+extern void spu_web_execution_slices_enable(bool enabled);
+extern void ppu_web_batched_diagnostics_enable(bool enabled);
+extern void ppu_web_register_instance_span(u32 begin, u32 end);
+extern std::string spu_web_dispatch_profile_report();
 extern u64 spu_web_aot_fallback_count();
 [[noreturn]] extern void spu_web_escape_now(spu_thread* spu);
 
@@ -208,29 +220,6 @@ namespace
 	std::mutex s_host_task_mutex;
 	std::deque<std::function<void()>> s_host_tasks;
 
-	// Frame-indexed pad schedule (input trace replay). Entries are applied on
-	// the RSX thread when the flip with the given index is produced, so a
-	// recorded trace replays at the same guest frames regardless of host timing.
-	struct pad_schedule_entry
-	{
-		u32 frame;
-		u32 digital1, digital2, left_x, left_y, right_x, right_y;
-	};
-	std::mutex s_pad_schedule_mutex;
-	std::vector<pad_schedule_entry> s_pad_schedule;
-	usz s_pad_schedule_cursor = 0;
-	std::atomic<u32> s_pad_schedule_applied{0};
-
-	void apply_pad_schedule(u32 flips)
-	{
-		std::lock_guard lock(s_pad_schedule_mutex);
-		while (s_pad_schedule_cursor < s_pad_schedule.size() && s_pad_schedule[s_pad_schedule_cursor].frame <= flips)
-		{
-			const auto& e = s_pad_schedule[s_pad_schedule_cursor++];
-			web_pad::set_state(e.digital1, e.digital2, e.left_x, e.left_y, e.right_x, e.right_y);
-			s_pad_schedule_applied++;
-		}
-	}
 	std::atomic<s32> s_storage_state{0};
 	std::atomic<u32> s_firmware_result{0};
 	std::atomic<u32> s_firmware_progress{0};
@@ -607,7 +596,6 @@ extern "C"
 		s_initialized = true;
 
 		Emu.SetCallbacks(make_web_callbacks());
-		rsx::webgpu::host_command_queue().set_flip_callback(apply_pad_schedule);
 		if (!s_log_listener)
 		{
 			s_log_listener = logs::make_file_listener("/opfs/cache/rpcs3/RPCS3.log", 32 * 1024 * 1024);
@@ -651,8 +639,8 @@ extern "C"
 		if (auto* render = dynamic_cast<WebGPUDirectGSRender*>(g_fxo->try_get<rsx::thread>()))
 		{
 			const auto& s = render->m_stats;
-			buffer = fmt::format("{\"draws\":%llu,\"drawsSkipped\":%llu,\"clears\":%llu,\"programs\":%llu,\"pipelines\":%llu,\"textureUploads\":%llu,\"textureInvalidations\":%llu,\"textureHits\":%llu,\"surfaceHits\":%llu,\"surfaceOps\":%llu,\"translationFailures\":%llu,\"unsupported\":%llu}",
-				s.draws, s.draws_skipped, s.clears, s.programs, s.pipelines, s.texture_uploads, s.texture_invalidations, s.texture_hits, s.surface_hits, s.surface_ops, s.translation_failures, s.unsupported);
+			buffer = fmt::format("{\"draws\":%llu,\"drawsSkipped\":%llu,\"clears\":%llu,\"programs\":%llu,\"pipelines\":%llu,\"textureUploads\":%llu,\"textureInvalidations\":%llu,\"textureHits\":%llu,\"surfaceHits\":%llu,\"surfaceOps\":%llu,\"translationFailures\":%llu,\"unsupported\":%llu,\"unnormalizedTextureSlots\":%u,\"remappedColorPrograms\":%llu,\"bindGroupHits\":%llu,\"bindGroupCreates\":%llu,\"textureBindGroupHits\":%llu,\"textureBindGroupCreates\":%llu,\"preambleStateNs\":%llu,\"preambleHashNs\":%llu,\"preambleKeymapNs\":%llu}",
+				s.draws, s.draws_skipped, s.clears, s.programs, s.pipelines, s.texture_uploads, s.texture_invalidations, s.texture_hits, s.surface_hits, s.surface_ops, s.translation_failures, s.unsupported, s.unnormalized_texture_slots, s.remapped_color_programs, s.bind_group_hits, s.bind_group_creates, s.texture_bind_group_hits, s.texture_bind_group_creates, s.preamble_state_ns, s.preamble_hash_ns, s.preamble_keymap_ns);
 		}
 		return buffer.c_str();
 	}
@@ -698,7 +686,11 @@ extern "C"
 		}
 
 		Emu.SetForceBoot(true);
-		const game_boot_result result = Emu.BootGame(path, {}, true, cfg_mode::default_config);
+		const std::string_view target(path);
+		const bool rsx_capture = target.ends_with(".rrc") || target.ends_with(".rrc.gz") || target.ends_with(".rrc.zst");
+		const game_boot_result result = rsx_capture
+			? (Emu.BootRsxCapture(path) ? game_boot_result::no_errors : game_boot_result::invalid_file_or_folder)
+			: Emu.BootGame(path, {}, true, cfg_mode::default_config);
 		s_last_boot_result = static_cast<u32>(result);
 		notify_host_event("rpcs3-boot-result", static_cast<u32>(result));
 		return static_cast<u32>(result);
@@ -725,10 +717,8 @@ extern "C"
 		s_boot_state = static_cast<u32>(boot_state::running);
 		std::thread([boot_path = std::string(path)]()
 		{
-			Emu.SetForceBoot(true);
-			const game_boot_result result = Emu.BootGame(boot_path, {}, true, cfg_mode::default_config);
-			s_last_boot_result = static_cast<u32>(result);
-			notify_host_event("rpcs3-boot-result", static_cast<u32>(result));
+			// Keep asynchronous and synchronous boot format selection identical.
+			rpcs3_web_boot(boot_path.c_str());
 			s_boot_state = static_cast<u32>(boot_state::finished);
 		}).detach();
 
@@ -844,6 +834,11 @@ extern "C"
 		std::free(first);
 		std::free(second);
 		return result;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_vm_page_table_address()
+	{
+		return static_cast<u32>(reinterpret_cast<uptr>(vm::g_web_pages.data()));
 	}
 
 	EMSCRIPTEN_KEEPALIVE u8 rpcs3_web_vm_read8_raw(u32 addr)
@@ -1110,6 +1105,67 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_aot_register_many(u32 pairs, u32 count)
 	{
 		spu_web_aot_register(reinterpret_cast<const u32*>(static_cast<uptr>(pairs)), count);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_register_chain_span(u32 begin, u32 end, u32 runner)
+	{
+		return spu_web_register_chain_span(begin, end, runner);
+	}
+
+	// ABI 1 promises that dispatch/patchpoint bindings only return and the
+	// dispatcher-address binding returns zero. AOT can erase those markers.
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_dispatch_marker_abi()
+	{
+		return 1;
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_register_chain_span_v3(u32 begin, u32 end, u32 runner, u32 profile_runner, const u32* region_runners)
+	{
+		return spu_web_register_chain_span_v3(begin, end, runner, profile_runner, region_runners);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_register_chain_span_v2(u32 begin, u32 end, u32 runner, u32 profile_runner)
+	{
+		return spu_web_register_chain_span_v2(begin, end, runner, profile_runner);
+	}
+
+	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_spu_chain_edge_report()
+	{
+		static std::string report;
+		report = spu_web_chain_edge_report();
+		return report.c_str();
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_register_instance_span(u32 begin, u32 end)
+	{
+		ppu_web_register_instance_span(begin, end);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_batched_diagnostics_enable(u32 enabled)
+	{
+		ppu_web_batched_diagnostics_enable(enabled != 0);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_dispatch_cache_enable(u32 enabled)
+	{
+		spu_web_dispatch_cache_enable(enabled != 0);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_execution_slices_enable(u32 enabled)
+	{
+		spu_web_execution_slices_enable(enabled != 0);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_dispatch_profile_enable()
+	{
+		spu_web_dispatch_profile_enable();
+	}
+
+	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_spu_dispatch_profile_report()
+	{
+		static std::string report;
+		report = spu_web_dispatch_profile_report();
+		return report.c_str();
 	}
 
 	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_spu_aot_dispatches()
@@ -1988,27 +2044,50 @@ extern "C"
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_pad(u32 digital1, u32 digital2, u32 left_x, u32 left_y, u32 right_x, u32 right_y)
 	{
-		web_pad::set_state(digital1, digital2, left_x, left_y, right_x, right_y);
+		injected_pad::set_state(digital1, digital2, left_x, left_y, right_x, right_y);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_frame_timing_start()
+	{
+		utils::frame_timing::start();
+	}
+
+	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_frame_timing_drain()
+	{
+		const auto batch = utils::frame_timing::drain();
+		static thread_local std::string result;
+		result = "{\"frames\":[";
+		bool comma = false;
+		for (const auto& sample : batch.frames)
+		{
+			if (comma) result += ',';
+			comma = true;
+			result += fmt::format("{\"emuFlipId\":%u,\"timeUs\":%.3f,\"phasesUs\":{", sample.frame, sample.time_us);
+			for (usz i = 0; i < sample.phases_us.size(); ++i)
+			{
+				if (i) result += ',';
+				result += fmt::format("\"%s\":%.3f", utils::frame_timing::phase_names[i], sample.phases_us[i]);
+			}
+			result += "}}";
+		}
+		result += fmt::format("],\"dropped\":%u,\"nowUs\":%.3f}", batch.dropped, utils::frame_timing::now_us());
+		return result.c_str();
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_pad_schedule_clear()
 	{
-		std::lock_guard lock(s_pad_schedule_mutex);
-		s_pad_schedule.clear();
-		s_pad_schedule_cursor = 0;
-		s_pad_schedule_applied = 0;
+		injected_pad::clear_schedule();
 	}
 
 	// Entries must be added in non-decreasing frame order.
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_pad_schedule_add(u32 frame, u32 digital1, u32 digital2, u32 left_x, u32 left_y, u32 right_x, u32 right_y)
 	{
-		std::lock_guard lock(s_pad_schedule_mutex);
-		s_pad_schedule.push_back({frame, digital1, digital2, left_x, left_y, right_x, right_y});
+		injected_pad::add_schedule({frame, digital1, digital2, left_x, left_y, right_x, right_y});
 	}
 
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_pad_schedule_applied()
 	{
-		return s_pad_schedule_applied;
+		return injected_pad::applied();
 	}
 
 	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_ppu_last_function()

@@ -9,6 +9,7 @@
 
 #include "Utilities/JIT.h"
 #include "Utilities/Thread.h"
+#include "Utilities/WasmCallPolicy.h"
 
 #include "llvm/IR/Module.h"
 #include "llvm/IRReader/IRReader.h"
@@ -21,6 +22,8 @@
 #include <emscripten.h>
 #include <functional>
 #include <thread>
+
+extern u32 wasm_region_linked_calls();
 
 // Host-level symbols the emulator library expects from its host (rpcs3_web_main.cpp provides the
 // runtime's); this module never boots the emulator, so they only need to exist and stay faithful.
@@ -53,6 +56,21 @@ void qt_events_aware_op(int repeat_duration_ms, std::function<bool()> wrapped_op
 
 extern "C"
 {
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_wasm_llvm_region_links()
+	{
+		return wasm_region_linked_calls();
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_wasm_llvm_regions(u32 enabled)
+	{
+		setenv("RPCS3_WASM_REGIONS", enabled ? "1" : "0", 1);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_spu_llvm_portable_calls(u32 enabled)
+	{
+		setenv("RPCS3_SPU_WASM_NO_IMPORT_TAILS", enabled ? "1" : "0", 1);
+	}
+
 	// The thread loops that ask for these never run here
 	int rpcs3_web_ppu_aot_worker_ready()
 	{
@@ -147,6 +165,10 @@ extern "C"
 			return 0;
 		}
 
+		if (const char* portable = std::getenv("RPCS3_SPU_WASM_NO_IMPORT_TAILS"); portable && *portable == '1')
+		{
+			wasm_codegen::preserve_import_call_frames(*module);
+		}
 		s_output = s_ir_compiler.emit_wasm(*module, s_error);
 		return ::size32(s_output);
 	}

@@ -4,6 +4,7 @@
 // rpcs3-spu-llvm.mjs on the runtime's module thread feeds it.
 let module = null;
 let lsPointer = 0;
+let wasmRegions = false;
 const lines = [];
 const keep = (line) => { lines.push(line); if (lines.length > 200) lines.shift(); };
 
@@ -24,6 +25,11 @@ self.onmessage = async (event) => {
       if (!module.ccall("rpcs3_ppu_llvm_init", "number", [], [])) {
         throw new Error(`${module.ccall("rpcs3_ppu_llvm_error", "string", [], [])}\n${lines.join("\n")}`);
       }
+      if (data.ppuInlineReads) module.ccall("rpcs3_ppu_llvm_inline_reads", null, ["number"], [1]);
+      if (data.ppuReturnDispatch) module.ccall("rpcs3_ppu_llvm_return_dispatch", null, ["number"], [1]);
+      if (data.spuPortableCalls) module.ccall("rpcs3_spu_llvm_portable_calls", null, ["number"], [1]);
+      wasmRegions = data.wasmRegions === true;
+      if (wasmRegions) module.ccall("rpcs3_wasm_llvm_regions", null, ["number"], [1]);
       lsPointer = module._malloc(262144) >>> 0;
       self.postMessage({ type: "ready" });
     } catch (error) {
@@ -50,7 +56,8 @@ self.onmessage = async (event) => {
       const output = module.ccall("rpcs3_ppu_llvm_output", "number", [], []) >>> 0;
       const bytes = heap().slice(output, output + size);
       const heapBytes = module.wasmMemory.buffer.byteLength;
-      self.postMessage({ type: "compiled", id: data.id, addr: data.addr, bytes, words: code.length / 4, ms, heapBytes }, [bytes.buffer]);
+      const regionLinks = wasmRegions ? module.ccall("rpcs3_wasm_llvm_region_links", "number", [], []) : undefined;
+      self.postMessage({ type: "compiled", id: data.id, addr: data.addr, bytes, words: code.length / 4, ms, heapBytes, regionLinks }, [bytes.buffer]);
     } catch (error) {
       self.postMessage({ type: "failed", id: data.id, addr: data.addr, ms: performance.now() - startedAt, error: `${String(error?.stack ?? error)}\n${lines.slice(-20).join("\n")}` });
     } finally {
@@ -78,7 +85,8 @@ self.onmessage = async (event) => {
       const words = module.ccall("rpcs3_spu_llvm_program_words", "number", [], []) >>> 0;
       // What this worker's heap has actually grown to, which is what its reservation has to cover
       const heapBytes = module.wasmMemory.buffer.byteLength;
-      self.postMessage({ type: "compiled", id: data.id, pc: data.pc, bytes, words, ms, heapBytes }, [bytes.buffer]);
+      const regionLinks = wasmRegions ? module.ccall("rpcs3_wasm_llvm_region_links", "number", [], []) : undefined;
+      self.postMessage({ type: "compiled", id: data.id, pc: data.pc, bytes, words, ms, heapBytes, regionLinks }, [bytes.buffer]);
     } catch (error) {
       self.postMessage({ type: "failed", id: data.id, pc: data.pc, ms: performance.now() - startedAt, error: `${String(error?.stack ?? error)}\n${lines.slice(-20).join("\n")}` });
     }

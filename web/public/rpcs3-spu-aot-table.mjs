@@ -1,3 +1,5 @@
+import { dylinkInfo } from "./wasm-dylink.mjs";
+export { dylinkInfo } from "./wasm-dylink.mjs";
 // Loads a title's compiled SPU programs into RPCS3's function tables so the SPU
 // pthreads call them directly (web/host/rpcs3_web_pre.js holds the per-worker
 // side). Every exported `__spu-0x<entry>-<hash>` program gets a table index;
@@ -34,39 +36,6 @@ const bindings = Object.freeze({
 const patchpointPattern = /^__spu-0x[0-9a-f]+-.+-(?:pp|chunkpp)-/i;
 const programPattern = /^__spu-0x([0-9a-f]+)-/i;
 
-function readLeb(bytes, offset) {
-  let result = 0;
-  let shift = 0;
-  for (;;) {
-    const byte = bytes[offset++];
-    result |= (byte & 0x7f) << shift;
-    if ((byte & 0x80) === 0) return [result >>> 0, offset];
-    shift += 7;
-  }
-}
-
-export function dylinkInfo(module) {
-  const sections = WebAssembly.Module.customSections(module, "dylink.0");
-  const info = { memorySize: 0, memoryAlign: 0, tableSize: 0, tableAlign: 0 };
-  if (!sections.length) return info;
-  const bytes = new Uint8Array(sections[0]);
-  let offset = 0;
-  while (offset < bytes.length) {
-    const type = bytes[offset++];
-    let size;
-    [size, offset] = readLeb(bytes, offset);
-    if (type === 1) {
-      let cursor = offset;
-      [info.memorySize, cursor] = readLeb(bytes, cursor);
-      [info.memoryAlign, cursor] = readLeb(bytes, cursor);
-      [info.tableSize, cursor] = readLeb(bytes, cursor);
-      [info.tableAlign, cursor] = readLeb(bytes, cursor);
-    }
-    offset += size;
-  }
-  return info;
-}
-
 async function mapConcurrent(items, limit, worker) {
   const results = new Array(items.length);
   let next = 0;
@@ -95,6 +64,10 @@ export async function loadSpuAotBundle({ module, mainInstance, mainMemory, manif
   if (!manifestResponse.ok) throw new Error(`SPU AOT manifest fetch returned ${manifestResponse.status}`);
   const manifest = await manifestResponse.json();
   if (manifest.version !== 1 || !Array.isArray(manifest.parts)) throw new Error("unsupported SPU AOT manifest");
+  if (manifest.dispatchMarkerAbi !== undefined && (manifest.dispatchMarkerAbi !== 1
+    || mainInstance.exports.rpcs3_web_spu_dispatch_marker_abi?.() !== 1)) {
+    throw new Error("unsupported SPU dispatch marker ABI");
+  }
   const compiled = await mapConcurrent(manifest.parts, 4, async (part) => {
     const response = await fetch(new URL(part.url, manifestUrl));
     if (!response.ok) throw new Error(`SPU AOT part ${part.url} fetch returned ${response.status}`);
@@ -127,6 +100,15 @@ export async function loadSpuAotBundle({ module, mainInstance, mainMemory, manif
     }
     const names = programExports(wasm);
     if (!names.length) throw new Error(`SPU AOT part ${manifest.parts[index].url} exports no programs`);
+    const hasChain = WebAssembly.Module.exports(wasm).some((entry) => entry.kind === "function" && entry.name === "rpcs3_spu_run_chain");
+    if (hasChain && ![1, 2, 3].includes(manifest.chainAbi)) throw new Error("unsupported SPU chain ABI");
+    const hasProfile = WebAssembly.Module.exports(wasm).some((entry) => entry.name === "rpcs3_spu_run_chain_profile" && entry.kind === "function");
+    if (hasProfile && (![2, 3].includes(manifest.chainAbi) || typeof mainInstance.exports.rpcs3_web_spu_register_chain_span_v2 !== "function")) {
+      throw new Error("SPU chain edge profiling requires ABI 2 runtime support");
+    }
+    if (hasChain && typeof mainInstance.exports.rpcs3_web_spu_register_chain_span !== "function") {
+      throw new Error("SPU same-instance chaining unsupported by this runtime");
+    }
     const align = Math.max(1, 1 << info.memoryAlign);
     let memoryBase = 0;
     if (info.memorySize > 0) {
@@ -146,7 +128,39 @@ export async function loadSpuAotBundle({ module, mainInstance, mainMemory, manif
     cursor += importsTable ? info.tableSize : 0;
     const exportBase = cursor;
     cursor += names.length;
-    parts.push({ module: wasm, memoryBase, elemBase, importsTable, tableSize: importsTable ? info.tableSize : 0, exportBase, exportCount: names.length, stackPool });
+    const chainIndex = hasChain ? cursor++ : 0;
+    const profileIndex = hasProfile ? cursor++ : 0;
+    const linkedRegions = manifest.parts[index].linkedRegions || [];
+    if (!Array.isArray(linkedRegions)) throw new Error("invalid SPU region descriptors");
+    if (linkedRegions.length && (!hasChain || manifest.chainAbi !== 3
+      || typeof mainInstance.exports.rpcs3_web_spu_register_chain_span_v3 !== "function")) {
+      throw new Error("SPU regions require ABI 3 runtime support");
+    }
+    const usedPrograms = new Set();
+    const regionEntries = linkedRegions.map(region => {
+      if (!Array.isArray(region.programs) || region.programs.length !== 2
+        || !/^__spu-rx[0-9a-f]+$/.test(region.symbol)
+        || !/^rpcs3_spu_region_aliases_[0-9a-f]+$/.test(region.aliases)) throw new Error("invalid SPU region descriptor");
+      const exports = WebAssembly.Module.exports(wasm);
+      for (const name of [region.symbol, region.aliases]) if (!exports.some(e => e.name === name && e.kind === "function")) {
+        throw new Error(`SPU region export missing: ${name}`);
+      }
+      const targets = region.programs.map(name => {
+        const position = names.indexOf(name);
+        if (position < 0 || usedPrograms.has(name)) throw new Error("SPU region members must be distinct programs in this part");
+        usedPrograms.add(name);
+        return exportBase + position;
+      });
+      return { ...region, targets, index: cursor++ };
+    });
+    const regionMap = regionEntries.length ? module._malloc(names.length * 4) >>> 0 : 0;
+    if (regionEntries.length && !regionMap) throw new Error("SPU region map allocation failed");
+    if (regionMap) {
+      const map = new Uint32Array(mainMemory.buffer, regionMap, names.length);
+      map.fill(0);
+      for (const entry of regionEntries) for (const target of entry.targets) map[target - exportBase] = entry.index;
+    }
+    parts.push({ regionEntries, regionMap, memorySize: info.memorySize, module: wasm, memoryBase, elemBase, importsTable, tableSize: importsTable ? info.tableSize : 0, exportBase, exportCount: names.length, stackPool, chainIndex, profileIndex });
     for (let position = 0; position < names.length; position += 1) {
       pairs.push(Number.parseInt(programPattern.exec(names[position])[1], 16) >>> 0, exportBase + position);
     }
@@ -164,12 +178,22 @@ export async function loadSpuAotBundle({ module, mainInstance, mainMemory, manif
     pairs.length = 0;
     pairs.push(...kept);
   }
-  const load = { tableBase, tableSize: cursor - tableBase, parts, bindings: boundNames };
+  const load = { initializeRegionAliases: true, tableBase, tableSize: cursor - tableBase, parts, bindings: boundNames };
   log(`SPU AOT bundle: layout ${pairs.length / 2} programs in ${parts.length} parts at table ${tableBase}+${load.tableSize}`);
 
   const populateStartedAt = performance.now();
   const placed = module.rpcs3PopulateSpuAot(load);
   if (!range && placed !== pairs.length / 2) throw new Error(`placed ${placed} programs, expected ${pairs.length / 2}`);
+  load.initializeRegionAliases = false;
+  for (const part of parts) {
+    const values = [part.exportBase, part.exportBase + part.exportCount, part.chainIndex];
+    if (part.profileIndex || part.regionMap) values.push(part.profileIndex);
+    if (part.regionMap) values.push(part.regionMap);
+    if (part.chainIndex && !module.ccall(part.regionMap ? "rpcs3_web_spu_register_chain_span_v3" : part.profileIndex ? "rpcs3_web_spu_register_chain_span_v2" : "rpcs3_web_spu_register_chain_span", "number",
+      values.map(() => "number"), values)) {
+      throw new Error("runtime rejected SPU chain module bounds");
+    }
+  }
   const pairBytes = module._malloc(pairs.length * 4) >>> 0;
   new Uint32Array(mainMemory.buffer, pairBytes, pairs.length).set(pairs);
   module.ccall("rpcs3_web_spu_aot_register_many", null, ["number", "number"], [pairBytes, pairs.length / 2]);

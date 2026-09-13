@@ -34,9 +34,7 @@
 #include "Utilities/Thread.h"
 #include "util/atomic.hpp"
 
-#ifdef RPCS3_WEB
 #include <atomic>
-#endif
 
 LOG_CHANNEL(sys_log, "SYS");
 
@@ -60,8 +58,7 @@ namespace rsx
 	void set_native_ui_flip();
 }
 
-#ifdef RPCS3_WEB
-namespace web_pad
+namespace injected_pad
 {
 	struct state
 	{
@@ -73,6 +70,7 @@ namespace web_pad
 		u8 right_y = 128;
 	};
 
+	static std::mutex s_writer_mutex;
 	static std::atomic<u32> s_sequence{0};
 	static std::atomic<u32> s_digital1{0};
 	static std::atomic<u32> s_digital2{0};
@@ -80,12 +78,51 @@ namespace web_pad
 
 	void set_state(u32 digital1, u32 digital2, u32 left_x, u32 left_y, u32 right_x, u32 right_y)
 	{
+		std::lock_guard lock(s_writer_mutex);
 		s_sequence.fetch_add(1, std::memory_order_acq_rel);
 		s_digital1.store(digital1, std::memory_order_relaxed);
 		s_digital2.store(digital2, std::memory_order_relaxed);
 		s_sticks.store((std::min(left_x, 255u) << 24) | (std::min(left_y, 255u) << 16) |
 			(std::min(right_x, 255u) << 8) | std::min(right_y, 255u), std::memory_order_relaxed);
 		s_sequence.fetch_add(1, std::memory_order_release);
+	}
+
+	static std::mutex s_schedule_mutex;
+	static std::vector<scheduled_state> s_schedule;
+	static usz s_cursor = 0;
+	static u32 s_frame = 0;
+	static std::atomic<bool> s_replaying{false};
+	static std::atomic<u32> s_applied{0};
+
+	bool replaying() { return s_replaying.load(std::memory_order_acquire); }
+	u32 applied() { return s_applied.load(std::memory_order_relaxed); }
+
+	void clear_schedule()
+	{
+		std::lock_guard lock(s_schedule_mutex);
+		s_schedule.clear();
+		s_cursor = s_frame = 0;
+		s_applied = 0;
+		s_replaying.store(true, std::memory_order_release);
+	}
+
+	void add_schedule(scheduled_state entry)
+	{
+		std::lock_guard lock(s_schedule_mutex);
+		s_schedule.push_back(entry);
+	}
+
+	void advance_replay()
+	{
+		if (!replaying()) return;
+		std::lock_guard lock(s_schedule_mutex);
+		++s_frame;
+		while (s_cursor < s_schedule.size() && s_schedule[s_cursor].frame <= s_frame)
+		{
+			const auto& e = s_schedule[s_cursor++];
+			set_state(e.digital1, e.digital2, e.left_x, e.left_y, e.right_x, e.right_y);
+			++s_applied;
+		}
 	}
 
 	static state get_state()
@@ -117,13 +154,13 @@ namespace web_pad
 	}
 }
 
-class web_pad_handler final : public PadHandlerBase
+class injected_pad_handler final : public PadHandlerBase
 {
 public:
-	web_pad_handler()
+	injected_pad_handler()
 		: PadHandlerBase(pad_handler::keyboard)
 	{
-		m_name_string = "Web keyboard and touch";
+		m_name_string = "Injected controller";
 		m_max_devices = 1;
 		b_has_pressure_intensity_button = false;
 		b_has_analog_limiter_button = false;
@@ -191,7 +228,7 @@ public:
 
 	void process() override
 	{
-		const web_pad::state current = web_pad::get_state();
+		const injected_pad::state current = injected_pad::get_state();
 		connected_devices = m_bindings.empty() ? 0 : 1;
 
 		for (pad_ensemble& binding : m_bindings)
@@ -216,7 +253,6 @@ public:
 		}
 	}
 };
-#endif
 
 struct pad_setting
 {
@@ -331,7 +367,7 @@ void pad_thread::Init()
 		cfg_player* cfg = g_cfg_input.player[i];
 		std::shared_ptr<PadHandlerBase> cur_pad_handler;
 
-		const pad_handler handler_type = pad_settings[i].is_ldd_pad ? pad_handler::null : cfg->handler.get();
+		const pad_handler handler_type = (i == 0 && injected_pad::replaying()) ? pad_handler::keyboard : pad_settings[i].is_ldd_pad ? pad_handler::null : cfg->handler.get();
 
 		if (m_handlers.contains(handler_type))
 		{
@@ -339,10 +375,14 @@ void pad_thread::Init()
 		}
 		else
 		{
-			if (handler_type == pad_handler::keyboard)
+			if (handler_type == pad_handler::keyboard && injected_pad::replaying())
+			{
+				cur_pad_handler = std::make_shared<injected_pad_handler>();
+			}
+			else if (handler_type == pad_handler::keyboard)
 			{
 #if defined(RPCS3_WEB)
-				cur_pad_handler = std::make_shared<web_pad_handler>();
+				cur_pad_handler = std::make_shared<injected_pad_handler>();
 #elif !defined(ANDROID)
 				keyptr = std::make_shared<keyboard_pad_handler>();
 				keyptr->moveToThread(static_cast<QThread*>(m_curthread));
@@ -1018,13 +1058,14 @@ void pad_thread::UnregisterLddPad(u32 handle)
 
 std::shared_ptr<PadHandlerBase> pad_thread::GetHandler(pad_handler type)
 {
+	if (type == pad_handler::keyboard && injected_pad::replaying()) return std::make_shared<injected_pad_handler>();
 	switch (type)
 	{
 	case pad_handler::null:
 		return std::make_shared<NullPadHandler>();
 	case pad_handler::keyboard:
 #if defined(RPCS3_WEB)
-		return std::make_shared<web_pad_handler>();
+		return std::make_shared<injected_pad_handler>();
 #elif defined(ANDROID)
 		return std::make_shared<NullPadHandler>();
 #else

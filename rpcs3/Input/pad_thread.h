@@ -113,9 +113,17 @@ namespace pad
 	}
 }
 
-#ifdef RPCS3_WEB
-namespace web_pad
+namespace injected_pad
 {
+	struct scheduled_state
+	{
+		u32 frame, digital1, digital2, left_x, left_y, right_x, right_y;
+	};
+	bool replaying();
+	u32 applied();
+	void clear_schedule();
+	void add_schedule(scheduled_state entry);
+	void advance_replay();
+
 	void set_state(u32 digital1, u32 digital2, u32 left_x, u32 left_y, u32 right_x, u32 right_y);
 }
-#endif

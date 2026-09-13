@@ -16,6 +16,7 @@
 #include "Emu/system_utils.hpp"
 #include "Emu/System.h"
 #include "PPUThread.h"
+#include "PPUWasmDispatch.h"
 #include "PPUInterpreter.h"
 #include "PPUAnalyser.h"
 #include "PPUModule.h"
@@ -615,6 +616,69 @@ static inline void ppu_write(u32 addr, ppu_intrp_func_t function)
 using ppu_web_aot_func_t = void (*)(void* exec, ppu_thread* thread, u64 seg0, void* base, u64 r0, u64 r1, u64 r2);
 
 atomic_t<u64> g_ppu_web_aot_dispatch_count{0};
+static atomic_t<bool> g_ppu_web_batched_diagnostics{true};
+// Registered by the bundle loader before guest threads start; immutable during execution.
+static std::vector<ppu_wasm_dispatch_context> g_ppu_web_instance_spans;
+
+void ppu_web_register_instance_span(u32 begin, u32 end)
+{
+	ensure(begin < end);
+	ensure(g_ppu_web_instance_spans.empty() || begin >= g_ppu_web_instance_spans.back().table_end);
+	g_ppu_web_instance_spans.push_back({begin, end});
+}
+
+static ppu_wasm_dispatch_context ppu_web_instance_span(u32 index)
+{
+	const auto found = std::upper_bound(g_ppu_web_instance_spans.begin(), g_ppu_web_instance_spans.end(), index,
+		[](u32 slot, const ppu_wasm_dispatch_context& span) { return slot < span.table_begin; });
+	if (found != g_ppu_web_instance_spans.begin() && std::prev(found)->contains(index)) return *std::prev(found);
+	return {};
+}
+
+
+void ppu_web_batched_diagnostics_enable(bool enabled)
+{
+	g_ppu_web_batched_diagnostics = enabled;
+}
+
+// Execution-local diagnostics: shared counters describe progress, never drive execution.
+// Publish at most once per 256 dispatcher entries and flush on normal or exceptional exit.
+class ppu_web_execution_counters
+{
+	const bool batched = g_ppu_web_batched_diagnostics.load();
+	u32 entries = 0;
+	u32 interpreted = 0;
+	u32 compiled = 0;
+	u32 last_pc = 0;
+
+public:
+	~ppu_web_execution_counters() { flush(); }
+
+	void flush()
+	{
+		if (interpreted) g_ppu_web_instruction_count += std::exchange(interpreted, 0);
+		if (compiled) g_ppu_web_aot_dispatch_count += std::exchange(compiled, 0);
+		if (entries) g_ppu_web_last_pc = last_pc;
+		entries = 0;
+	}
+
+	void enter(u32 pc)
+	{
+		if (entries == 256) flush();
+		last_pc = pc;
+		++entries;
+		if (!batched) g_ppu_web_last_pc = pc;
+	}
+
+	void compiled_entry()
+	{
+		if (batched) ++compiled;
+		else g_ppu_web_aot_dispatch_count++;
+	}
+
+	void interpreted_entry() { ++interpreted; }
+};
+
 
 // Diagnostic: which compiled blocks a run actually enters. A title's bundle holds every block the
 // analyser found, and every worker running a PPU thread has to hold all of them in its function
@@ -3133,7 +3197,19 @@ void ppu_thread::cpu_wait(bs_t<cpu_flag> old)
 	state.wait(old);
 }
 
+#ifdef RPCS3_WEB
 void ppu_thread::exec_task()
+{
+	// Keep the execution boundary visible after Binaryen optimization. A long-lived
+	// caller may stay in baseline code; each slice can enter the optimized callee.
+	bool (ppu_thread::*volatile execute_slice)() = &ppu_thread::exec_task_slice;
+	while ((this->*execute_slice)()) {}
+}
+
+NEVER_INLINE bool ppu_thread::exec_task_slice()
+#else
+void ppu_thread::exec_task()
+#endif
 {
 #ifdef __APPLE__
 	// Ensure correct state before executing JIT code
@@ -3158,13 +3234,18 @@ void ppu_thread::exec_task()
 
 		// HVContext pop
 		hv_ctx = old_hv_ctx;
+#ifdef RPCS3_WEB
+		return false;
+#else
 		return;
+#endif
 	}
 
 	const auto mem_ = vm::g_base_addr;
 
 #ifdef RPCS3_WEB
-	u32 web_progress_batch = 0;
+	ppu_web_execution_counters web_counters;
+	ppu_wasm_dispatch_context web_context;
 	bool web_reported_zero_pc = false;
 	// The first function table index the runtime tier may use; the host installs it before any guest
 	// code runs and the registry only grows from there
@@ -3180,11 +3261,23 @@ void ppu_thread::exec_task()
 	g_ppu_web_last_pc = cia;
 #endif
 
+#ifdef RPCS3_WEB
+	u32 remaining_entries = 65536;
+#endif
 	while (true)
 	{
+#ifdef RPCS3_WEB
+		// Return only between guest dispatches, with architectural state committed.
+		// This is a host compiler boundary, not a guest scheduler yield.
+		if (!remaining_entries--) return true;
+#endif
 		if (test_stopped()) [[unlikely]]
 		{
+#ifdef RPCS3_WEB
+			return false;
+#else
 			return;
+#endif
 		}
 
 		gv_zeroupper();
@@ -3195,8 +3288,7 @@ void ppu_thread::exec_task()
 		// instruction, keeping host stack usage bounded and guest addressing u32.
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
 		const u32 web_instruction_pc = cia;
-		const auto op = vm::_ptr<u32>(web_instruction_pc);
-		g_ppu_web_last_pc = web_instruction_pc;
+		web_counters.enter(web_instruction_pc);
 		if (const u32 delay_pc = g_ppu_web_trace_delay_pc; delay_pc && delay_pc == web_instruction_pc)
 		{
 			if (g_ppu_web_trace_delay_hits.fetch_add(1) == 0)
@@ -3275,13 +3367,15 @@ void ppu_thread::exec_task()
 				if (placed)
 				{
 					// Run the compiled block on this thread; it tail-calls through the table and returns with cia set at a boundary
-					g_ppu_web_aot_dispatch_count++;
+					web_counters.compiled_entry();
+					if (!web_context.contains(aot_index)) web_context = ppu_web_instance_span(aot_index);
 					ppu_web_note_block(aot_index, web_instruction_pc);
-					reinterpret_cast<ppu_web_aot_func_t>(static_cast<uptr>(aot_index))(ppu_web_aot_exec_base(), this, 0, nullptr, gpr[0], gpr[1], gpr[2]);
+					reinterpret_cast<ppu_web_aot_func_t>(static_cast<uptr>(aot_index))(ppu_web_aot_exec_base(), this, 0, &web_context, gpr[0], gpr[1], gpr[2]);
 					continue;
 				}
 			}
 		}
+		const auto op = vm::_ptr<u32>(web_instruction_pc);
 		const u32 opcode = *op;
 		const auto fn = ppu_read(cia, opcode);
 		fn(*this, {opcode}, op, &ppu_ret);
@@ -3292,11 +3386,7 @@ void ppu_thread::exec_task()
 				"RPCS3 Web PPU reached zero: from=0x%08x op=0x%08x lr=0x%08llx ctr=0x%08llx r2=0x%08llx r12=0x%08llx\n",
 				web_instruction_pc, static_cast<u32>(*op), lr, ctr, gpr[2], gpr[12]);
 		}
-		if (++web_progress_batch == 256)
-		{
-			g_ppu_web_instruction_count += web_progress_batch;
-			web_progress_batch = 0;
-		}
+		web_counters.interpreted_entry();
 #else
 		static const u32 native_trace_pc = []
 		{
@@ -6533,7 +6623,9 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 		: jit.get_engine().getTargetMachine()->createDataLayout());
 
 	// Initialize translator
-	PPUTranslator translator(jit.get_context(), _module.get(), module_part, jit.get_engine(), wasm_aot);
+	const auto branch_mode = std::getenv("RPCS3_PPU_WASM_RETURN_DISPATCH")
+		? ppu_wasm_branch_mode::return_to_dispatcher : ppu_wasm_branch_mode::tail_call;
+	PPUTranslator translator(jit.get_context(), _module.get(), module_part, jit.get_engine(), wasm_aot, branch_mode);
 
 	// Define some types
 	const auto _func = FunctionType::get(translator.get_type<void>(), {

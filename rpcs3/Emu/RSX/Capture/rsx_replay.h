@@ -183,6 +183,12 @@ namespace rsx
 		u32 user_mem_addr{};
 		current_state cs{};
 		std::unique_ptr<frame_capture_data> frame;
+		// Capture maps deduplicate by content. Replay accesses them by state ID;
+		// index immutable entries once instead of scanning every map per command.
+		std::unordered_map<u64, const frame_capture_data::memory_block*> memory_by_id;
+		std::unordered_map<u64, const frame_capture_data::memory_block_data*> data_by_id;
+		std::unordered_map<u64, const frame_capture_data::display_buffers_state*> displays_by_id;
+		std::unordered_map<u64, const frame_capture_data::tile_state*> tiles_by_id;
 
 	public:
 		rsx_replay_thread(std::unique_ptr<frame_capture_data>&& frame_data)

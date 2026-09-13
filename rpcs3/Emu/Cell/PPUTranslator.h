@@ -14,6 +14,12 @@ struct ppu_module;
 
 struct lv2_obj;
 
+enum class ppu_wasm_branch_mode
+{
+	tail_call,
+	return_to_dispatcher,
+};
+
 class PPUTranslator final : public cpu_translator
 {
 	// PPU Module
@@ -78,7 +84,9 @@ class PPUTranslator final : public cpu_translator
 	// Everything the constructors share once the context is bound
 	void prepare();
 	bool m_may_be_mmio = false;
+	ppu_wasm_branch_mode m_wasm_branch_mode = ppu_wasm_branch_mode::tail_call;
 	bool m_wasm_aot = false;
+	bool m_wasm_inline_reads = false;
 
 	// Block entry addresses translated into this module part (wasm AOT): calls to any other address go through the guest-address table
 	std::unordered_set<u32> m_wasm_part_blocks;
@@ -352,9 +360,9 @@ public:
 
 #ifdef RPCS3_WEB
 	// Browser compiler: the target machine stands in for the execution engine (Utilities/JIT.h)
-	PPUTranslator(llvm::LLVMContext& context, llvm::Module* _module, const ppu_module<lv2_obj>& info, llvm::TargetMachine& target, bool wasm_aot);
+	PPUTranslator(llvm::LLVMContext& context, llvm::Module* _module, const ppu_module<lv2_obj>& info, llvm::TargetMachine& target, bool wasm_aot, ppu_wasm_branch_mode branch_mode = ppu_wasm_branch_mode::tail_call);
 #else
-	PPUTranslator(llvm::LLVMContext& context, llvm::Module* _module, const ppu_module<lv2_obj>& info, llvm::ExecutionEngine& engine, bool wasm_aot = false);
+	PPUTranslator(llvm::LLVMContext& context, llvm::Module* _module, const ppu_module<lv2_obj>& info, llvm::ExecutionEngine& engine, bool wasm_aot = false, ppu_wasm_branch_mode branch_mode = ppu_wasm_branch_mode::tail_call);
 #endif
 	~PPUTranslator();
 

@@ -3,6 +3,7 @@ import { accessSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir, availableParallelism } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { ensureWasmRegionTool } from "./wasm-region-tool.mjs";
 
 // One or more IR parts lower to one wasm module: every part is lowered to an
 // object in parallel and a single wasm-ld link resolves the __0x blocks across
@@ -80,16 +81,24 @@ const llc = findTool("RPCS3_LLC", "llc");
 const wasmLd = findTool("RPCS3_WASM_LD", "wasm-ld");
 const runtimeArchives = findRuntimeArchives();
 const scratch = mkdtempSync(join(tmpdir(), "rpcs3-ppu-aot-"));
+const regionTool = (options.includes("--regions") || options.includes("--direct-exits") || options.includes("--unary-swizzles")) ? ensureWasmRegionTool() : null;
+const regionReports = new Array(inputs.length);
 
 async function lower(input, index) {
   const bitcode = join(scratch, `${index}-${basename(input)}.bc`);
   const object = join(scratch, `${index}-${basename(input)}.o`);
-  await execFileAsync(llvmAs, [input, "-o", bitcode], { maxBuffer: 1 << 24 });
+  let source = input;
+  if (regionTool) {
+    source = join(scratch, `${index}.region.ll`);
+    const result = await execFileAsync(regionTool, [input, source, ...(options.includes("--regions") ? [] : ["--no-regions"]), ...(options.includes("--direct-exits") ? ["--direct-exits"] : []), ...(options.includes("--unary-swizzles") ? ["--unary-swizzles"] : [])], { maxBuffer: 1 << 24 });
+    regionReports[index] = JSON.parse(result.stdout);
+  }
+  await execFileAsync(llvmAs, [source, "-o", bitcode], { maxBuffer: 1 << 24 });
   await execFileAsync(llc, [
     "-mtriple=wasm32-unknown-unknown",
     "-mattr=+atomics,+bulk-memory,+mutable-globals,+sign-ext,+simd128,+tail-call",
     pic ? "-relocation-model=pic" : undefined,
-    "-O2",
+    "-O3",
     "-filetype=obj",
     bitcode,
     "-o",
@@ -134,6 +143,7 @@ try {
     pic,
     bytes: bytes.byteLength,
     runtimeArchives,
+    ...(regionTool ? { regions: regionReports } : {}),
     imports: WebAssembly.Module.imports(module),
     exports: WebAssembly.Module.exports(module),
   })}\n`);

@@ -24,15 +24,21 @@ const base = positional[0] || "play-chrome.cpuprofile";
 // A second argument asks who calls that function, pooled the same way.
 const callee = positional[1];
 const targets = JSON.parse(await readFile(`${base}.targets.json`, "utf8"));
+let clock;
 
 // Each frame sample carries the run time at that frame plus cumulative frame and draw counts, so a
 // window's own frames, draws and duration all come from the difference across it.
 async function windowFrames() {
   if (!reportPath) return undefined;
   const report = JSON.parse(await readFile(reportPath, "utf8"));
+  clock = report.clock;
   const samples = (report.result?.frames ?? report.frames ?? [])
-    .map((frame) => ({ frames: frame.frameSequence, draws: frame.directStats?.draws, ms: frame.elapsedMs }))
-    .filter((sample) => Number.isFinite(sample.frames) && Number.isFinite(sample.draws) && Number.isFinite(sample.ms));
+    .map((frame) => ({ frames: frame.emuFlipId ?? frame.workingSet?.flipCounter ?? frame.frameSequence, draws: frame.directStats?.draws, ms: frame.elapsedMs, hostTimeMs: frame.hostTimeMs }))
+    .filter((sample) => Number.isFinite(sample.frames) && Number.isFinite(sample.draws) && Number.isFinite(sample.ms))
+    // A bounded CPU profile must not be divided by unprofiled flips from the same scene.
+    // startedAt follows worker attachment; stoppedAt precedes stopping the profilers.
+    .filter((sample) => (!report.profileWindow?.startedAt || sample.hostTimeMs >= report.profileWindow.startedAt)
+      && (!report.profileWindow?.stoppedAt || sample.hostTimeMs <= report.profileWindow.stoppedAt));
   if (samples.length < 2) return undefined;
   const runMs = samples.at(-1).ms;
 
@@ -55,17 +61,18 @@ async function windowFrames() {
     first = samples[index];
     const last = samples[end];
     return {
+      startTimeUs: clock && first.hostTimeMs * 1000 + clock.offsetUs,
+      endTimeUs: clock && last.hostTimeMs * 1000 + clock.offsetUs,
       matched: true, frames: last.frames - first.frames, draws: last.draws - first.draws,
       lastSeconds: (runMs - first.ms) / 1000, trailingMs: runMs - last.ms,
     };
   }
 
   const lastSeconds = Number(args.find((arg) => arg.startsWith("--last="))?.slice(7)) || 0;
-  const share = lastSeconds ? Math.min(1, (lastSeconds * 1000) / runMs) : 1;
-  first = samples[Math.max(0, Math.round(samples.length * (1 - share)) - 1)];
+  first = lastSeconds ? samples.find((sample) => sample.ms >= runMs - lastSeconds * 1000) ?? samples[0] : samples[0];
   const last = samples.at(-1);
   const frames = last.frames - first.frames;
-  return frames > 0 ? { matched: true, frames, draws: last.draws - first.draws, lastSeconds, trailingMs: 0 } : undefined;
+  return frames > 0 ? { startTimeUs: clock && first.hostTimeMs * 1000 + clock.offsetUs, endTimeUs: clock && last.hostTimeMs * 1000 + clock.offsetUs, matched: true, frames, draws: last.draws - first.draws, lastSeconds, trailingMs: 0 } : undefined;
 }
 
 const framed = await windowFrames();
@@ -75,13 +82,16 @@ if (framed && framed.matched === false) {
 }
 const lastSeconds = framed?.lastSeconds ?? Number(args.find((arg) => arg.startsWith("--last="))?.slice(7)) ?? 0;
 const trailingSeconds = (framed?.trailingMs ?? 0) / 1000;
-const slice = { lastSeconds, trailingSeconds };
+const startTimeUs = framed?.startTimeUs;
+const endTimeUs = framed?.endTimeUs;
+const slice = { lastSeconds, trailingSeconds, startTimeUs, endTimeUs };
+if (reportPath && !clock) console.error("Legacy report: no clock alignment; sample estimates are not comparable CPU measurements.");
 
 const rows = [];
 for (const target of targets.targets) {
   if (!target.profilePath || !target.workSamples) continue;
   const profile = JSON.parse(await readFile(target.profilePath, "utf8"));
-  rows.push({ target, profile, work: workSampleCount(profile, lastSeconds, trailingSeconds) });
+  rows.push({ target, profile, work: workSampleCount(profile, lastSeconds, trailingSeconds, startTimeUs, endTimeUs) });
 }
 rows.sort((left, right) => right.work - left.work);
 
@@ -92,12 +102,21 @@ console.log(`${rows.length} workers with work samples, ${targets.samplingInterva
 const totalWork = rows.reduce((sum, row) => sum + row.work, 0);
 const cpuMs = (totalWork * targets.samplingIntervalUs) / 1000;
 if (framed) {
-  console.log(`${(cpuMs / framed.frames).toFixed(1)} CPU-ms per frame at ${(framed.draws / framed.frames).toFixed(0)} draws per frame`
-    + ` (${framed.frames} frames, ${(cpuMs / 1000).toFixed(1)} CPU-s)`);
+  console.log(`${(cpuMs / framed.frames).toFixed(1)} estimated sampled-work ms per guest flip at ${(framed.draws / framed.frames).toFixed(0)} draws per frame`
+    + ` (${framed.frames} frames, ${(cpuMs / 1000).toFixed(1)} estimated sampled-work seconds)`);
 } else {
-  console.log(`${(cpuMs / 1000).toFixed(1)} CPU-s of work; pass --report=<run.json> for CPU-ms per frame`);
+  console.log(`${(cpuMs / 1000).toFixed(1)} estimated sampled-work seconds; pass --report=<run.json> for estimated sampled-work ms per guest flip`);
 }
 console.log();
+const categories = new Map();
+for (const { profile } of rows) {
+  for (const row of selfTime(profile, 10_000, { ...slice, includeUnknown: true, includeWaits: true })) {
+    const category = row.name === "(program)" ? "unknown" : row.name === "(garbage collector)" ? "GC"
+      : ["(idle)", "emscripten_futex_wait", "_do_futex_wait"].includes(row.name) ? "wait/idle" : "attributed";
+    categories.set(category, (categories.get(category) ?? 0) + row.samples);
+  }
+}
+console.log(`sample categories: ${JSON.stringify(Object.fromEntries(categories))}`);
 
 // What every worker spends its time in, pooled: one thread's hot function is not the whole picture
 // when the same loop runs on many.

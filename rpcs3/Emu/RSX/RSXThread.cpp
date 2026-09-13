@@ -1,4 +1,6 @@
 #include "stdafx.h"
+#include "Utilities/FrameTiming.h"
+#include "Input/pad_thread.h"
 #include "RSXThread.h"
 
 #include "Capture/rsx_capture.h"
@@ -2558,6 +2560,12 @@ namespace rsx
 
 		if (info.emu_flip)
 		{
+			if (utils::frame_timing::note_flip())
+			{
+				g_user_asked_for_frame_capture = true;
+				rsx_log.notice("Benchmark requested RSX capture at guest flip %u", utils::frame_timing::capture_frame);
+			}
+			injected_pad::advance_replay();
 			performance_counters.sampled_frames++;
 
 			if (m_pause_after_x_flips && m_pause_after_x_flips-- == 1)
@@ -3446,6 +3454,7 @@ namespace rsx
 				if (target_rsx_flip_time > time + 1000)
 				{
 					const auto delay_us = target_rsx_flip_time - time;
+					utils::frame_timing::phase_scope timing(utils::frame_timing::phase::limiter);
 					lv2_obj::wait_timeout(delay_us, nullptr, false);
 					performance_counters.idle_time += delay_us;
 				}

@@ -33,10 +33,21 @@ namespace
 	std::unique_ptr<jit_compiler> s_ppu_jit;
 	std::vector<u8> s_ppu_output;
 	std::string s_ppu_error;
+	ppu_wasm_branch_mode s_branch_mode = ppu_wasm_branch_mode::tail_call;
 }
 
 extern "C"
 {
+	EMSCRIPTEN_KEEPALIVE void rpcs3_ppu_llvm_return_dispatch(int enabled)
+	{
+		s_branch_mode = enabled ? ppu_wasm_branch_mode::return_to_dispatcher : ppu_wasm_branch_mode::tail_call;
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_ppu_llvm_inline_reads(int enabled)
+	{
+		setenv("RPCS3_PPU_WASM_INLINE_READS", enabled ? "1" : "0", 1);
+	}
+
 	EMSCRIPTEN_KEEPALIVE int rpcs3_ppu_llvm_init()
 	{
 		if (!s_ppu_jit)
@@ -88,7 +99,7 @@ extern "C"
 		_module->setTargetTriple(Triple("wasm32-unknown-unknown"));
 		_module->setDataLayout(DataLayout("e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128"));
 
-		PPUTranslator translator(s_ppu_jit->get_context(), _module.get(), info, s_ppu_jit->get_target_machine(), true);
+		PPUTranslator translator(s_ppu_jit->get_context(), _module.get(), info, s_ppu_jit->get_target_machine(), true, s_branch_mode);
 
 		// The signature the offline bundles and the runtime's dispatch site share (PPUThread.cpp)
 		const auto _func = FunctionType::get(translator.get_type<void>(), {

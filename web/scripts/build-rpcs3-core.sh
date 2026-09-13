@@ -35,7 +35,13 @@ fi
 # web/public/core/jspi/. The page probes for JavaScript Promise Integration and loads it when the
 # browser has it, falling back to the core beside it.
 jspi_flag=OFF
-if [[ "${RPCS3_WEB_PROFILE:-0}" == "1" ]]; then
+if [[ "${RPCS3_WEB_PROFILE:-0}" == "1" && "${RPCS3_WEB_JSPI:-0}" == "1" ]]; then
+  build_dir="${repo_root}/build-rpcs3-web-profile-jspi"
+  stage_dir="${repo_root}/web/public/core/profile-jspi"
+  profile_flag=ON
+  jspi_flag=ON
+  targets=(rpcs3_web_runtime)
+elif [[ "${RPCS3_WEB_PROFILE:-0}" == "1" ]]; then
   build_dir="${repo_root}/build-rpcs3-web-profile"
   stage_dir="${repo_root}/web/public/core/profile"
   profile_flag=ON
@@ -73,12 +79,43 @@ if [[ -n "${RPCS3_WEB_TARGETS:-}" ]]; then
   read -r -a targets <<< "${RPCS3_WEB_TARGETS}"
 fi
 
+runtime_assertions="${RPCS3_WEB_RUNTIME_ASSERTIONS:-1}"
+case "${runtime_assertions}" in
+  1) runtime_assertions=ON ;;
+  0) runtime_assertions=OFF ;;
+  *) echo "RPCS3_WEB_RUNTIME_ASSERTIONS must be 0 or 1" >&2; exit 1 ;;
+esac
+
 # Ninja schedules the ~900 objects far better than the Makefiles generator and rebuilds only what
 # changed; a tree configured with another generator is reconfigured from scratch (the objects come
 # back from the compilation cache). Configure runs only when the tree is missing or an option
 # changed: every configure regenerates third-party headers (wolfssl's config.h among them), which
 # recompiles their dependents and relinks every module.
 cache_value() { grep -E "^$1:[A-Z]+=" "${build_dir}/CMakeCache.txt" 2>/dev/null | head -1 | cut -d= -f2-; }
+# RPCS3_WEB_LTO is an experimental OPT-IN thin-LTO toggle for the runtime wasm:
+#   RPCS3_WEB_LTO=ON  -> -flto=thin C/CXX (cross-TU inlining, like FEX ENABLE_LTO)
+# It is OFF by default. The thin-LTO link used to fail on the cross-TU browser
+# hooks (undefined symbol at wasm-ld: thin-LTO strips the __em_js__ section and
+# the address-taken import chain). Those four hooks now live in the --js-library
+# (web/host/rpcs3_web_lib.js) instead of EM_JS macros, so references resolve to
+# library-provided imports in every link mode and thin-LTO links cleanly.
+# RPCS3_WEB_SIMD is an OPT-IN toggle for -msimd128 (LLVM vectorizer emits
+# wasm SIMD128 in the runtime + emulator code, the SIMD-centric codegen lever).
+web_lto="${RPCS3_WEB_LTO:-OFF}"
+web_simd="${RPCS3_WEB_SIMD:-OFF}"
+# Compose one set of codegen flags for C and CXX (thin-LTO + SIMD128 compose additively).
+compiler_opt=""
+if [[ "${web_simd}" == "ON" ]]; then
+  compiler_opt+=" -msimd128"
+fi
+if [[ "${web_lto}" == "ON" ]]; then
+  compiler_opt+=" -flto=thin"
+fi
+compiler_opt="${compiler_opt# }"
+opt_flags=()
+if [[ -n "${compiler_opt}" ]]; then
+  opt_flags+=("-DCMAKE_C_FLAGS=${compiler_opt}" "-DCMAKE_CXX_FLAGS=${compiler_opt}")
+fi
 if [[ -f "${build_dir}/CMakeCache.txt" ]] && ! grep -q "^CMAKE_GENERATOR:INTERNAL=Ninja$" "${build_dir}/CMakeCache.txt"; then
   echo "Reconfiguring ${build_dir} with Ninja" >&2
   rm -rf "${build_dir}"
@@ -86,16 +123,23 @@ fi
 if [[ ! -f "${build_dir}/build.ninja" \
    || "$(cache_value RPCS3_WEB_LLVM_DIR)" != "${llvm_dir}" \
    || "$(cache_value RPCS3_WEB_FAST_LINK)" != "${fast_link}" \
+   || "$(cache_value RPCS3_WEB_RUNTIME_ASSERTIONS)" != "${runtime_assertions}" \
    || "$(cache_value RPCS3_WEB_PROFILE)" != "${profile_flag}" \
-   || "$(cache_value RPCS3_WEB_JSPI)" != "${jspi_flag}" ]]; then
+   || "$(cache_value RPCS3_WEB_JSPI)" != "${jspi_flag}" \
+   || "$(cache_value RPCS3_WEB_LTO)" != "${web_lto}" \
+   || "$(cache_value RPCS3_WEB_SIMD)" != "${web_simd}" ]]; then
   # No C++ modules here: the Ninja generator's module dependency scan (emscan-deps) fails on the
   # emdawnwebgpu port headers and would only add a pass over every source
   emcmake cmake -S "${repo_root}" -B "${build_dir}" -G Ninja \
     -DRPCS3_WEB=ON \
     -DRPCS3_WEB_PROFILE="${profile_flag}" \
+    -DRPCS3_WEB_RUNTIME_ASSERTIONS="${runtime_assertions}" \
     -DRPCS3_WEB_JSPI="${jspi_flag}" \
     -DRPCS3_WEB_LLVM_DIR="${llvm_dir}" \
     -DRPCS3_WEB_FAST_LINK="${fast_link}" \
+    -DRPCS3_WEB_LTO="${web_lto}" \
+    -DRPCS3_WEB_SIMD="${web_simd}" \
+    "${opt_flags[@]}" \
     -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
     -DCMAKE_BUILD_TYPE=Release
 fi

@@ -28,6 +28,8 @@ const extern spu_decoder<spu_iflag> g_spu_iflag;
 
 #ifdef LLVM_AVAILABLE
 
+#include "Utilities/WasmCallPolicy.h"
+
 #include "Emu/CPU/CPUTranslator.h"
 
 #ifdef _MSC_VER
@@ -3934,6 +3936,11 @@ public:
 		m_function_queue.clear();
 		m_function_table = nullptr;
 
+		if (const char* portable = std::getenv("RPCS3_SPU_WASM_NO_IMPORT_TAILS"); m_wasm_aot && portable && *portable == '1')
+		{
+			wasm_codegen::preserve_import_call_frames(*_module);
+		}
+
 		// Append for now
 		std::string& llvm_log = function_log;
 		raw_string_ostream out(llvm_log);
@@ -3941,6 +3948,7 @@ public:
 		fmt::append(llvm_log, "LLVM IR at 0x%x:\n", func.entry_point);
 		out << *_module; // print IR
 		out << "\n\n";
+
 
 		if (verifyModule(*_module, &out))
 		{

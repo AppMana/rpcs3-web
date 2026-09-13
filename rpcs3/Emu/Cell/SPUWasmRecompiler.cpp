@@ -2031,9 +2031,9 @@ extern std::string spu_web_wasm_selftest(const u8* cache, u32 size)
 // process posted messages, so nothing may depend on message delivery.
 extern void spu_web_aot_register(const u32* pairs, u32 count);
 
-EM_JS(u32, rpcs3_web_spu_hot_sync, (), {
-	return rpcs3SpuHotSyncImpl() >>> 0;
-});
+// JS impl lives in web/host/rpcs3_web_lib.js (see PPUWebRecompiler.cpp for why it is a
+// --js-library entry rather than an EM_JS macro).
+extern "C" u32 rpcs3_web_spu_hot_sync();
 
 namespace
 {

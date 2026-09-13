@@ -4,19 +4,20 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-const IDLE_FRAMES = ["(idle)", "(program)", "(garbage collector)", "emscripten_futex_wait", "_do_futex_wait"];
+const IDLE_FRAMES = ["(idle)", "emscripten_futex_wait", "_do_futex_wait"];
+const UNKNOWN_FRAMES = ["(program)"];
 const TRAMPOLINE_FRAMES = ["wasm-to-js", "js-to-wasm::i", "js-to-wasm::v"];
 
 // A run reaches the part worth measuring some way into itself — a title's boot and its intro are not
 // its gameplay — so every reader takes the same window: the `lastSeconds` before the end, less any
 // `trailingSeconds` that belong to a different scene. timeDeltas[i] is the microseconds before
 // sample i.
-function windowed(profile, lastSeconds, trailingSeconds = 0) {
+export function windowed(profile, lastSeconds = 0, trailingSeconds = 0, startTimeUs, endTimeUs) {
   const samples = profile.samples || [];
-  if (!lastSeconds) return samples;
+  if (!lastSeconds && !trailingSeconds && startTimeUs === undefined && endTimeUs === undefined) return samples;
   const deltas = profile.timeDeltas || [];
-  const opens = profile.endTime - lastSeconds * 1_000_000;
-  const closes = profile.endTime - trailingSeconds * 1_000_000;
+  const opens = startTimeUs ?? (lastSeconds ? profile.endTime - lastSeconds * 1_000_000 : profile.startTime);
+  const closes = endTimeUs ?? profile.endTime - trailingSeconds * 1_000_000;
   let time = profile.startTime;
   let first = samples.length;
   let end = samples.length;
@@ -28,11 +29,11 @@ function windowed(profile, lastSeconds, trailingSeconds = 0) {
   return samples.slice(first, end);
 }
 
-export function workSampleCount(profile, lastSeconds = 0, trailingSeconds = 0) {
+export function workSampleCount(profile, lastSeconds = 0, trailingSeconds = 0, startTimeUs, endTimeUs) {
   const waitNodes = new Set(profile.nodes
-    .filter(({ callFrame }) => IDLE_FRAMES.includes(callFrame.functionName))
+    .filter(({ callFrame }) => IDLE_FRAMES.includes(callFrame.functionName) || UNKNOWN_FRAMES.includes(callFrame.functionName))
     .map(({ id }) => id));
-  return windowed(profile, lastSeconds, trailingSeconds).reduce((count, id) => count + !waitNodes.has(id), 0);
+  return windowed(profile, lastSeconds, trailingSeconds, startTimeUs, endTimeUs).reduce((count, id) => count + !waitNodes.has(id), 0);
 }
 
 // The busiest target lands at `outputPath`; the rest follow it as .1, .2 and so on, with a sidecar
@@ -75,7 +76,16 @@ export function createWorkerProfiler(session, samplingIntervalUs) {
   const send = async (sessionId, method, params = {}) => {
     const id = ++commandId;
     const key = `${sessionId}:${id}`;
-    const response = new Promise((resolve, reject) => pending.set(key, { resolve, reject }));
+    const response = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(key);
+        reject(new Error(`${method}: target command timed out`));
+      }, 15_000);
+      pending.set(key, {
+        resolve: (value) => { clearTimeout(timer); resolve(value); },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      });
+    });
     response.catch(() => {});
     const message = JSON.stringify({ id, method, params });
     try {
@@ -86,6 +96,7 @@ export function createWorkerProfiler(session, samplingIntervalUs) {
         await session.send("Target.sendMessageToTarget", { sessionId, message });
       }
     } catch (error) {
+      pending.get(key)?.reject(error);
       pending.delete(key);
       throw error;
     }
@@ -156,6 +167,13 @@ export function createWorkerProfiler(session, samplingIntervalUs) {
 
   return {
     async start() {
+      const { targetInfo } = await session.send("Target.getTargetInfo");
+      const pageTarget = { targetInfo, started: false };
+      targets.set("page", pageTarget);
+      await session.send("Profiler.enable");
+      await session.send("Profiler.setSamplingInterval", { interval: samplingIntervalUs });
+      await session.send("Profiler.start");
+      pageTarget.started = true;
       await session.send("Target.setAutoAttach", {
         autoAttach: true,
         waitForDebuggerOnStart: false,
@@ -167,7 +185,9 @@ export function createWorkerProfiler(session, samplingIntervalUs) {
       await Promise.all([...targets.values()].map(async (target) => {
         if (!target.started) return;
         try {
-          const { profile } = await send(target.sessionId, "Profiler.stop");
+          const { profile } = target.sessionId
+            ? await send(target.sessionId, "Profiler.stop")
+            : await session.send("Profiler.stop");
           target.profile = profile;
         } catch (error) {
           target.error = error instanceof Error ? error.message : String(error);
@@ -185,7 +205,7 @@ export function createWorkerProfiler(session, samplingIntervalUs) {
 
 // Self time names the cost; the callers name the code to change. Walks the sample tree upwards from
 // every node whose function is `name` and reports the callers by the samples they account for.
-export function callersOf(profile, name, limit = 8, { depth = 1, lastSeconds = 0, trailingSeconds = 0 } = {}) {
+export function callersOf(profile, name, limit = 8, { depth = 1, lastSeconds = 0, trailingSeconds = 0, startTimeUs, endTimeUs } = {}) {
   const byId = new Map(profile.nodes.map((node) => [node.id, node]));
   const parents = new Map();
   for (const node of profile.nodes) {
@@ -193,7 +213,7 @@ export function callersOf(profile, name, limit = 8, { depth = 1, lastSeconds = 0
   }
   const counts = new Map();
   let total = 0;
-  for (const id of windowed(profile, lastSeconds, trailingSeconds)) {
+  for (const id of windowed(profile, lastSeconds, trailingSeconds, startTimeUs, endTimeUs)) {
     if (byId.get(id)?.callFrame.functionName !== name) continue;
     // Every wasm call into a JS import goes through a trampoline frame; the code that wanted the
     // import is above it. A thin wrapper is not an answer either, so `depth` frames are reported.
@@ -220,16 +240,17 @@ export function callersOf(profile, name, limit = 8, { depth = 1, lastSeconds = 0
 // unmerged, an interpreter helper called from four opcodes reads as four small entries. Waiting is
 // excluded unless asked for, and percentages are over what is included — a worker that spends its
 // life in a futex would otherwise report nothing but the futex.
-export function selfTime(profile, limit = 25, { includeWaits = false, lastSeconds = 0, trailingSeconds = 0 } = {}) {
+export function selfTime(profile, limit = 25, { includeWaits = false, includeUnknown = false, lastSeconds = 0, trailingSeconds = 0, startTimeUs, endTimeUs } = {}) {
   const byId = new Map(profile.nodes.map((node) => [node.id, node]));
   const merged = new Map();
   let total = 0;
-  for (const id of windowed(profile, lastSeconds, trailingSeconds)) {
+  for (const id of windowed(profile, lastSeconds, trailingSeconds, startTimeUs, endTimeUs)) {
     const node = byId.get(id);
     if (!node) continue;
     const { functionName, url } = node.callFrame;
     const name = functionName || "(anonymous)";
     if (!includeWaits && IDLE_FRAMES.includes(name)) continue;
+    if (!includeUnknown && UNKNOWN_FRAMES.includes(name)) continue;
     const row = merged.get(name) ?? { name, where: (url || "").split("/").pop(), samples: 0 };
     row.samples++;
     merged.set(name, row);

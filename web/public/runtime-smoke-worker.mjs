@@ -47,6 +47,14 @@ let directGpu;
 let suspendingCore = false;
 let presentedSkips = 0;
 let frameCounterAddress = 0;
+let benchmark = false;
+
+function frameTimings() {
+  if (!benchmark) return undefined;
+  const batch = JSON.parse(module.ccall("rpcs3_web_frame_timing_drain", "string", [], []));
+  const hostTimeMs = performance.timeOrigin + performance.now();
+  return { dropped: batch.dropped, frames: batch.frames.map((frame) => ({ emuFlipId: frame.emuFlipId, hostTimeMs: hostTimeMs + (frame.timeUs - batch.nowUs) / 1000, ...(frame.phasesUs ? { phasesUs: frame.phasesUs } : {}) })) };
+}
 
 function recordLog(line) {
   const text = String(line);
@@ -57,7 +65,7 @@ function recordLog(line) {
     dispatchLines.push(protocolLine);
     scope.postMessage({ type: "runtime-dispatch", line: protocolLine });
   }
-  if (text.includes("RPCS3 Web") || text.startsWith("Aborted") ||
+  if (text.includes("RPCS3 Web") || text.startsWith("RPCS3 fatal error:") || text.startsWith("Aborted") ||
       text.includes("RuntimeError") || text.startsWith("worker:") || text.startsWith("Pthread ")) {
     scope.postMessage({ type: "runtime-log", line: text });
   }
@@ -152,7 +160,14 @@ function ppuUsedBase64() {
 }
 
 function detail(error) {
-  return error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ""}` : String(error);
+  if (error instanceof Error) return `${error.name}: ${error.message}\n${error.stack ?? ""}`;
+  // Emscripten can reject a worker operation with an ErrorEvent rather than Error.
+  // Preserve its underlying exception and source location instead of [object ErrorEvent].
+  if (error && typeof error === "object" && (error.message || error.error)) {
+    const cause = error.error && error.error !== error ? detail(error.error) : String(error.message || "worker error");
+    return `${cause}${error.filename ? ` at ${error.filename}:${error.lineno ?? 0}:${error.colno ?? 0}` : ""}`;
+  }
+  return String(error);
 }
 
 function refreshDispatchLines() {
@@ -258,6 +273,7 @@ async function progress(includeThreads = false) {
   }
   scope.postMessage({
     type: "runtime-progress",
+    frameTimings: frameTimings(),
     bootResult,
     heapBytes: module.HEAPU8?.byteLength ?? 0,
     workingSet: workingSet(),
@@ -280,8 +296,8 @@ async function progress(includeThreads = false) {
     spuLsBoundaryCount: Number(module.ccall("rpcs3_web_spu_ls_boundary_count", "bigint", [], [])),
     spuLsBoundaryLast: `0x${module.ccall("rpcs3_web_spu_ls_boundary_last", "bigint", [], []).toString(16).padStart(16, "0")}`,
     spuPageSplitDmaCount: Number(module.ccall("rpcs3_web_spu_page_split_dma_count", "bigint", [], [])),
-    vmRangeLocks: vmRangeLocks(),
-    vmPpuLocks: vmPpuLocks(),
+    vmRangeLocks: includeThreads ? vmRangeLocks() : undefined,
+    vmPpuLocks: includeThreads ? vmPpuLocks() : undefined,
     tracePc,
     clockScale,
     traceHits: module.ccall("rpcs3_web_trace_hits", "number", [], []) >>> 0,
@@ -446,6 +462,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
   scope.postMessage({
     type,
     directGpu,
+    dispatchProfile: benchmark ? JSON.parse(module.ccall("rpcs3_web_spu_dispatch_profile_report", "string", [], [])) : undefined,
     directStats: directGpu ? JSON.parse(module.ccall("rpcs3_web_direct_stats", "string", [], [])) : undefined,
     carriedSurfaceOps: packets.length ? carriedSurfaceOps.splice(0) : undefined,
     ok: initialized === 1 && bootResult === 0 && flipPacketCount === 1,
@@ -455,6 +472,8 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     status,
     frameSequence,
     packetCount,
+    emuFlipId: module.ccall("rpcs3_webgpu_frame_counter", "number", [], []) >>> 0,
+    hostTimeMs: performance.timeOrigin + performance.now(),
     drawPacketCount,
     flipPacketCount,
     packetSummaries,
@@ -467,7 +486,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     padScheduleApplied: module.ccall("rpcs3_web_pad_schedule_applied", "number", [], []) >>> 0,
     captureMs,
     workingSet: workingSet(),
-    liveThreadNames: module.ccall("rpcs3_web_live_thread_names", "string", [], []).split("\n").filter(Boolean),
+    liveThreadNames: diagnostics ? module.ccall("rpcs3_web_live_thread_names", "string", [], []).split("\n").filter(Boolean) : undefined,
     threads: diagnostics ? module.ccall("rpcs3_web_thread_snapshot", "string", [], []) : "",
     spuFallbackReport: spuFallbackHistogram ? module.ccall("rpcs3_web_spu_aot_fallback_report", "string", ["number"], [48]) : undefined,
     spuHot: module.rpcs3SpuHotStats ? module.rpcs3SpuHotStats() : undefined,
@@ -477,7 +496,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     ppuHot: ppuJit && module.rpcs3PpuHotStats ? module.rpcs3PpuHotStats() : undefined,
     ppuAotDispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])),
     spuMissCount: spuFallbackHistogram ? module.ccall("rpcs3_web_spu_miss_count", "number", [], []) >>> 0 : 0,
-    stackReport: stackReport(),
+    stackReport: diagnostics ? stackReport() : undefined,
     ppuInstructions: Number(module.ccall("rpcs3_web_ppu_instruction_count", "bigint", [], [])),
     ppuAotTable: ppuAotTable
       ? { ...ppuAotTable, dispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])), blocksUsed: Number(module.ccall("rpcs3_web_ppu_blocks_used", "number", [], [])) }
@@ -502,12 +521,23 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     elapsedMs: performance.now() - bootStartedAt,
     moduleCreateMs,
     fixtureBytes,
-    logs: logs.slice(-200),
+    logs: diagnostics || frameSequence <= 1 ? logs.slice(-200) : undefined,
     detail: `Emu.Init=${initialized}; System::BootGame=${bootResult}; frame=${frameSequence}`,
   }, packetBuffers);
 }
 
 scope.addEventListener("message", async (event) => {
+  if (event.data?.type === "spu-chain-edges") {
+    try {
+      const beginFrame = module.ccall("rpcs3_webgpu_frame_counter", "number", [], []) >>> 0;
+      const report = JSON.parse(module.ccall("rpcs3_web_spu_chain_edge_report", "string", [], []));
+      const endFrame = module.ccall("rpcs3_webgpu_frame_counter", "number", [], []) >>> 0;
+      scope.postMessage({ type: "spu-chain-edges", beginFrame, endFrame, report });
+    } catch (error) {
+      scope.postMessage({ type: "spu-chain-edges", error: String(error?.stack ?? error) });
+    }
+    return;
+  }
   if (event.data?.type === "snapshot") {
     module?.ccall("rpcs3_web_sync_logs", null, [], []);
     progress(true);
@@ -625,6 +655,15 @@ scope.addEventListener("message", async (event) => {
     }
     return;
   }
+  // Mid-session guest-clock change: the page uses this to fast-forward through a
+  // title's movie/menu (high clocks_scale) and then snap back to real time once
+  // gameplay (sustained per-frame draws) begins, so benchmarking only measures the
+  // interactive 3D rendering instead of the long intro.
+  if (event.data?.type === "set-clock-scale") {
+    if (module) module.ccall("rpcs3_web_set_clock_scale", null, ["number"], [Number(event.data.percent) >>> 0]);
+    recordLog(`set-clock-scale=${Number(event.data.percent) >>> 0} at frame ${module ? module.ccall("rpcs3_webgpu_frame_counter", "number", [], []) >>> 0 : "-"}`);
+    return;
+  }
   if (event.data?.type !== "boot") return;
   logs = [];
   dispatchLines = [];
@@ -678,6 +717,11 @@ scope.addEventListener("message", async (event) => {
     const moduleCreateStartedAt = performance.now();
     if (!reuse) module = await createRPCS3({
       locateFile: resolveCoreFile,
+      // A smaller shared-memory ceiling reduces WebKit's up-front reservation. Explicit
+      // benchmark option only: lowering the ceiling can make a large title run out of memory.
+      ...(event.data.memoryMaximumMiB ? { wasmMemory: new WebAssembly.Memory({
+        initial: 8192, maximum: Math.max(8192, Math.min(32768, Math.floor(event.data.memoryMaximumMiB * 16))), shared: true,
+      }) } : {}),
       // Emscripten workers started up front; RPCS3's homebrew boot uses 7-8
       // threads and the pool grows on demand beyond this.
       // The pool must cover the boot thread set: a thread created while the module thread is inside the
@@ -701,11 +745,14 @@ scope.addEventListener("message", async (event) => {
     atomicNotifyReentry = module.ccall("rpcs3_web_atomic_notify_reentry_probe", "number", [], []);
     let path = event.data.path;
     if (!path) {
-      const response = await fetch(event.data.fixtureUrl ?? new URL(`./${event.data.fixture}`, scope.location.href));
+      const fixtureUrl = new URL(event.data.fixtureUrl ?? `./${event.data.fixture}`, scope.location.href);
+      const response = await fetch(fixtureUrl);
       if (!response.ok) throw new Error(`fixture fetch returned ${response.status}`);
       const elf = new Uint8Array(await response.arrayBuffer());
       fixtureBytes = elf.byteLength;
-      path = "/acceptance-homebrew.elf";
+      // Preserve capture format suffixes so the host selects native RSX replay.
+      const captureSuffix = fixtureUrl.pathname.match(/\.rrc(?:\.gz|\.zst)?$/)?.[0];
+      path = captureSuffix ? `/acceptance-capture${captureSuffix}` : "/acceptance-homebrew.elf";
       module.FS.writeFile(path, elf);
     }
     module.ccall("rpcs3_web_set_null_renderer", null, ["number"], [event.data.renderer === "null" ? 1 : 0]);
@@ -715,9 +762,10 @@ scope.addEventListener("message", async (event) => {
       module.ccall("rpcs3_web_set_direct_renderer", null, ["number"], [1]);
       const flagAddress = module.ccall("rpcs3_web_rsx_spawn_flag_address", "number", [], []) >>> 0;
       module.rpcs3OnPresent = (data) => scope.postMessage({ type: "runtime-present", frame: data.frame, bitmap: data.rpcs3Present }, [data.rpcs3Present]);
+      module.rpcs3OnCapture = (data) => scope.postMessage({ type: "runtime-capture", frame: data.frame, bitmap: data.rpcs3Capture }, [data.rpcs3Capture]);
       module.rpcs3OnPresented = (frame) => scope.postMessage({ type: "runtime-presented", frame });
       if (!module.__rpcs3GpuWorker) {
-        directGpu = await module.rpcs3PrepareGpu(event.data.gpuCanvas, flagAddress);
+        directGpu = await module.rpcs3PrepareGpu(event.data.gpuCanvas, flagAddress, event.data.capture, event.data.presentationYield, event.data.bindGroupCache);
         recordLog(`direct WebGPU device ready on a pool worker: ${JSON.stringify(directGpu)}`);
       }
     }
@@ -808,10 +856,14 @@ scope.addEventListener("message", async (event) => {
           module,
           memory: mainMemory ?? module.wasmMemory,
           workers: Number(event.data.spuLlvmWorkers) > 0 ? Number(event.data.spuLlvmWorkers) : 2,
-          moduleUrl: new URL("./core/rpcs3-spu-llvm.mjs", scope.location.href).href,
+          moduleUrl: new URL(event.data.llvmCompilerUrl || "./core/rpcs3-spu-llvm.mjs", scope.location.href).href,
           log: (line) => { recordLog(line); console.log(line); },
           spu: spuDecoder === "llvm",
           ppu: ppuJit,
+          ppuReturnDispatch: event.data.ppuReturnDispatch === true,
+          ppuInlineReads: event.data.ppuInlineReads === true,
+          spuPortableCalls: event.data.spuPortableCalls === true,
+          wasmRegions: event.data.wasmRegions === true,
         });
         if (spuDecoder === "llvm") module.ccall("rpcs3_web_spu_llvm_set_enabled", null, ["number"], [1]);
       }
@@ -822,6 +874,14 @@ scope.addEventListener("message", async (event) => {
       try { fixtureBytes = Number(module.FS.stat(path).size); } catch { fixtureBytes = 0; }
     }
     applyPadState(event.data.pad);
+    benchmark = event.data.benchmark === true;
+    if (module._rpcs3_web_ppu_batched_diagnostics_enable) module.ccall("rpcs3_web_ppu_batched_diagnostics_enable", null, ["number"], [event.data.ppuBatchedDiagnostics === false ? 0 : 1]);
+    module.ccall("rpcs3_web_spu_dispatch_cache_enable", null, ["number"], [event.data.spuDispatchCache === false ? 0 : 1]);
+    if (module._rpcs3_web_spu_execution_slices_enable) module.ccall("rpcs3_web_spu_execution_slices_enable", null, ["number"], [event.data.spuExecutionSlices === false ? 0 : 1]);
+    if (benchmark) {
+      module.ccall("rpcs3_web_frame_timing_start", null, [], []);
+      module.ccall("rpcs3_web_spu_dispatch_profile_enable", null, [], []);
+    }
     if (suspendingCore) {
       // Booting reads the disc image and waits on the threads it starts, and both of those need
       // this thread's event loop, so the boot runs on its own thread and this one keeps turning.

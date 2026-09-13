@@ -15,7 +15,7 @@ function ppuExports(wasm) {
   return WebAssembly.Module.exports(wasm).filter((entry) => entry.kind === "function" && ppuBlockExport.test(entry.name));
 }
 
-export async function createLlvmCompilerPool({ module, memory, workers = 2, moduleUrl, log = () => {}, pumpIntervalMs = 2, jobTimeoutMs = 20_000, spu = true, ppu = false }) {
+export async function createLlvmCompilerPool({ module, memory, workers = 2, moduleUrl, log = () => {}, pumpIntervalMs = 2, jobTimeoutMs = 20_000, spu = true, ppu = false, ppuReturnDispatch = false, ppuInlineReads = false, spuPortableCalls = false, wasmRegions = false }) {
   // Fresh views on the shared memory: another thread may have grown it since this thread's HEAPU8 was taken
   const sharedMemory = memory ?? module.wasmMemory;
   if (!(sharedMemory instanceof WebAssembly.Memory)) throw new Error("the runtime did not expose its shared memory");
@@ -114,7 +114,7 @@ export async function createLlvmCompilerPool({ module, memory, workers = 2, modu
       if (flight) { clearTimeout(flight.timer); inFlight.delete(worker); fail(flight.job, `worker error: ${event.message}`); }
       reject(new Error(`LLVM compiler worker ${i}: ${event.message}`));
     };
-    worker.postMessage({ type: "init", moduleUrl });
+    worker.postMessage({ type: "init", moduleUrl, ppuReturnDispatch, ppuInlineReads, spuPortableCalls, wasmRegions });
   });
   await Promise.all(Array.from({ length: workers }, (_, i) => spawn(i)));
   log(`LLVM compiler pool: ${state.workers} compiler workers ready (${[spu ? "SPU" : null, ppu ? "PPU" : null].filter(Boolean).join(" + ") || "idle"})`);
@@ -178,6 +178,7 @@ export async function createLlvmCompilerPool({ module, memory, workers = 2, modu
     drain,
     stats: () => ({
       workers: state.workers, queued: state.queue.length,
+      policy: { ppuInlineReads, ppuReturnDispatch, moduleUrl },
       compileMs: Math.round(state.compileMs), maxCompileMs: Math.round(state.maxCompileMs),
       peakHeapBytes: state.peakHeapBytes,
       // Flattened SPU counters keep the shape earlier reports carry

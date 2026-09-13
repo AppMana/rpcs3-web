@@ -162,7 +162,7 @@ if (DISABLE_LTO)
 endif()
 
 string(FIND "${CMAKE_C_FLAGS} ${CMAKE_CXX_FLAGS}" "-flto" FOUND_LTO)
-if (NOT FOUND_LTO EQUAL -1)
+if (NOT FOUND_LTO EQUAL -1 AND NOT RPCS3_WEB)
     message(FATAL_ERROR "RPCS3 doesn't support building with LTO, use -DDISABLE_LTO=TRUE to force-disable it")
 endif()
 

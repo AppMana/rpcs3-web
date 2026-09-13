@@ -313,6 +313,36 @@ try {
         frames.push(await nextFrame);
       }
       if (frames.at(-1).gpu.draws < 9) throw new Error("Tetris did not enter gameplay within " + frames.length + " guest flips: draws=" + JSON.stringify(frames.map((f) => f.gpu.draws)) + " ppu=" + JSON.stringify(frames.map((f) => f.ppuInstructions)) + " skips=" + JSON.stringify(frames.map((f) => f.presentedSkips)));
+      // Optional sustained-playback soak: keep the runtime producing frames for a bounded
+      // wall-clock window and sample the working set, so memory boundedness and zero-drop
+      // continuity are recorded over a long playback rather than only at gameplay reach.
+      let soakData;
+      const soakSeconds = ${Number(process.env.RPCS3_DEVICE_SOAK_SECONDS || 0)};
+      if (soakSeconds > 0) {
+        const soakStartedAt = Date.now();
+        const soakUntil = soakStartedAt + soakSeconds * 1000;
+        let soakFrame = frames.at(-1);
+        let soakCount = 0;
+        const soakSamples = [];
+        let soakDrops = 0;
+        while (Date.now() < soakUntil && frames.length < 100_000) {
+          soakFrame = await receiveFrame("runtime-frame", false);
+          worker.postMessage({ type: "next-frame" });
+          soakCount += 1;
+          soakDrops += Number(soakFrame.droppedPackets ?? 0);
+          if (soakCount % 100 === 0) {
+            const workingSet = soakFrame.workingSet ?? {};
+            soakSamples.push({ frame: soakFrame.frameSequence, emuFlipId: soakFrame.emuFlipId,
+              heapBytes: workingSet.heapBytes, vmBackingBytes: workingSet.vmBackingBytes,
+              liveThreads: workingSet.liveThreads, startedThreads: workingSet.startedThreads,
+              peakQueuedPacketBytes: workingSet.peakQueuedPacketBytes, hostTimeMs: Date.now() });
+          }
+        }
+        frames.push(soakFrame);
+        soakData = { requestedSeconds: soakSeconds, elapsedMs: performance.now() - soakStartedAt,
+          frames: soakCount, emuFlipIdStart: frames[0]?.emuFlipId ?? 0, emuFlipIdEnd: soakFrame.emuFlipId ?? 0,
+          droppedPackets: soakDrops, samples: soakSamples };
+      }
       const center = (frame) => frame.gpu.drawDiagnostics.slice(-4)
         .reduce((sum, draw) => sum + (draw.clipBounds.min[0] + draw.clipBounds.max[0]) / 2, 0) / 4;
       // Output-based movement evidence: the mean column of green block pixels
@@ -376,6 +406,7 @@ try {
           elapsedMs: finalFrame.elapsedMs,
           droppedPackets: finalFrame.droppedPackets,
         },
+        soak: soakData,
       };
     } else {
       for (let index = 1; index < 3; index += 1) {

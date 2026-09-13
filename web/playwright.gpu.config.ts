@@ -1,8 +1,9 @@
+import { hardwareChromeArgs } from "./scripts/chrome-gpu.mjs";
 import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   testDir: "tests/e2e",
-  testMatch: ["browser-units.spec.ts", "gpu.spec.ts", "runtime-gpu.spec.ts", "runtime-cube.spec.ts", "runtime-cube-correctness.spec.ts", "runtime-animation.spec.ts", "runtime-scissor.spec.ts", "runtime-sustained.spec.ts", "input-trace.spec.ts", "playable-tetris.spec.ts", "presentation.spec.ts", "frame-oracle.spec.ts", "packet-replay.spec.ts", "ppu-aot-table-gpu.spec.ts"],
+  testMatch: ["llvm-wasm-backend.spec.ts", "fragment-output-routing.spec.ts", "ppu-inline-memory.spec.ts", "runtime-direct-session.spec.ts", "browser-units.spec.ts", "gpu.spec.ts", "runtime-gpu.spec.ts", "runtime-cube.spec.ts", "runtime-cube-correctness.spec.ts", "runtime-animation.spec.ts", "runtime-scissor.spec.ts", "runtime-sustained.spec.ts", "input-trace.spec.ts", "playable-tetris.spec.ts", "presentation.spec.ts", "frame-oracle.spec.ts", "packet-replay.spec.ts", "ppu-aot-table-gpu.spec.ts"],
   // These tests intentionally share one physical GPU. Running independent
   // RPCS3/WebGPU instances in parallel can starve the packet consumer and
   // measures cross-test contention rather than backend correctness.
@@ -10,22 +11,15 @@ export default defineConfig({
   timeout: 60_000,
   expect: { timeout: 30_000 },
   use: {
-    baseURL: "http://127.0.0.1:4174/",
+    baseURL: process.env.RPCS3_WEB_URL || "http://127.0.0.1:4174/",
     trace: "retain-on-failure",
-    headless: process.env.RPCS3_HEADED !== "1",
+    headless: process.env.RPCS3_HEADED === "0",
     launchOptions: {
       executablePath: "/usr/bin/google-chrome",
-      args: [
-        "--no-sandbox",
-        "--enable-unsafe-webgpu",
-        "--enable-webgpu-developer-features",
-        "--ignore-gpu-blocklist",
-        "--enable-features=Vulkan",
-        "--use-angle=vulkan",
-      ],
+      args: hardwareChromeArgs(),
     },
   },
-  webServer: {
+  webServer: process.env.RPCS3_WEB_URL ? undefined : {
     command: "npm run preview -- --port 4174",
     port: 4174,
     reuseExistingServer: !process.env.CI,

@@ -6,16 +6,16 @@ import { expect, test } from "@playwright/test";
 // against the runtime's side-module import contract and executes it, so the assertions are on
 // computed values, not on the module's shape alone.
 
-type Reply = { type: string; error?: string; bytes?: number[]; ms: number };
+type Reply = { type: string; error?: string; bytes?: number[]; ms: number; regionLinks?: number };
 
-const compileIrInPage = async ({ sources }: { sources: string[] }) => {
+const compileIrInPage = async ({ sources, moduleUrl = "/core/rpcs3-spu-llvm.mjs", wasmRegions = false }: { sources: string[]; moduleUrl?: string; wasmRegions?: boolean }) => {
   const worker = new Worker("/rpcs3-spu-llvm-worker.mjs", { type: "module" });
-  const next = () => new Promise<{ type: string; error?: string; bytes?: Uint8Array; ms: number }>((resolve, reject) => {
+  const next = () => new Promise<{ type: string; error?: string; bytes?: Uint8Array; ms: number; regionLinks?: number }>((resolve, reject) => {
     worker.onmessage = (event) => resolve(event.data);
     worker.onerror = (event) => reject(new Error(event.message));
   });
   const ready = next();
-  worker.postMessage({ type: "init", moduleUrl: new URL("/core/rpcs3-spu-llvm.mjs", location.href).href });
+  worker.postMessage({ type: "init", moduleUrl: new URL(moduleUrl, location.href).href, wasmRegions });
   const readiness = await ready;
   if (readiness.error) throw new Error(readiness.error);
   const replies: Reply[] = [];
@@ -23,7 +23,7 @@ const compileIrInPage = async ({ sources }: { sources: string[] }) => {
     const reply = next();
     worker.postMessage({ type: "compile-ir", id: replies.length + 1, pc: 0, ir });
     const data = await reply;
-    replies.push({ type: data.type, error: data.error, ms: data.ms, bytes: data.bytes ? Array.from(data.bytes) : undefined });
+    replies.push({ type: data.type, error: data.error, ms: data.ms, bytes: data.bytes ? Array.from(data.bytes) : undefined, regionLinks: data.regionLinks });
   }
   worker.terminate();
   return replies;
@@ -72,6 +72,55 @@ const runInPage = async ({ bytes, imports, calls }: { bytes: number[]; imports: 
 const header = 'target triple = "wasm32-unknown-unknown"\n';
 
 test.describe("LLVM WebAssembly backend in the browser", () => {
+  test("forms executable guest regions with loop PHIs and an imported barrier", async ({ page }, testInfo) => {
+    test.setTimeout(120_000);
+    await page.goto("/runtime.html");
+    const source = header + `
+declare i32 @env_twice(i32)
+define i32 @__0x1000(ptr %p, i32 %n) {
+ store i32 %n, ptr %p
+ %result = call i32 @__0x1004(ptr %p)
+ %after = load i32, ptr %p
+ %sum = add i32 %result, %after
+ ret i32 %sum
+}
+define internal i32 @__0x1004(ptr %p) {
+entry:
+ %n = load i32, ptr %p
+ br label %loop
+loop:
+ %i = phi i32 [0, %entry], [%next, %body]
+ %sum = phi i32 [0, %entry], [%added, %body]
+ %done = icmp eq i32 %i, %n
+ br i1 %done, label %exit, label %body
+body:
+ %next = add i32 %i, 1
+ %added = add i32 %sum, %next
+ br label %loop
+exit:
+ %twice = call i32 @env_twice(i32 %sum)
+ store i32 %twice, ptr %p
+ ret i32 %twice
+}
+`;
+    const replies = await page.evaluate(compileIrInPage, {
+      sources: [source, source], wasmRegions: true,
+      moduleUrl: process.env.RPCS3_TEST_LLVM_URL || "/core/rpcs3-spu-llvm.mjs",
+    });
+    const [first, second] = replies;
+    if (!first || !second) throw new Error("expected two region compiler replies");
+    expect(first.type, first.error).toBe("compiled");
+    expect(first.regionLinks).toBe(1);
+    expect(second.bytes).toEqual(first.bytes);
+    const result = await page.evaluate(runInPage, {
+      bytes: first.bytes!, imports: { env_twice: "x => x * 2" },
+      calls: [0, 1, 10, 100].map(n => ({ name: "__0x1000", args: [-64, n] })),
+    });
+    expect(result.results).toEqual([0, 4, 220, 20200]);
+    expect(result.words[0]).toBe(10100);
+    await testInfo.attach("wasm-regions.json", { body: JSON.stringify({ links: first.regionLinks, bytes: first.bytes?.length, result }), contentType: "application/json" });
+  });
+
   test("lowers scalar, loop, SIMD, import-calling and data-referencing IR to executable wasm", async ({ page }, testInfo) => {
     test.setTimeout(120_000);
     await page.goto("/runtime.html");

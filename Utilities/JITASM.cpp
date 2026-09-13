@@ -14,42 +14,28 @@
 #define CAN_OVERCOMMIT
 #endif
 
-#if defined(__APPLE__)
 #include <mutex>
-#endif
+#include <cstdlib>
 
 LOG_CHANNEL(jit_log, "JIT");
 
 void jit_announce(uptr func, usz size, std::string_view name)
 {
 #ifdef __linux__
-#if 0
-	static const struct tmp_perf_map
+	// Opt-in symbol publication for perf. Keep the map after orderly shutdown so post-run
+	// analysis can resolve translated guest code. This does no work on normal launches.
+	static const bool perf_symbols = std::getenv("RPCS3_PERF_MAP") != nullptr;
+	if (perf_symbols)
 	{
-		std::string name{fmt::format("/tmp/perf-%d.map", getpid())};
-		fs::file data{name, fs::rewrite + fs::append};
-
-		tmp_perf_map() = default;
-		tmp_perf_map(const tmp_perf_map&) = delete;
-		tmp_perf_map& operator=(const tmp_perf_map&) = delete;
-
-		~tmp_perf_map()
+		static fs::file map{fmt::format("/tmp/perf-%d.map", getpid()), fs::rewrite + fs::append};
+		static std::mutex map_mutex;
+		if (size && !name.empty())
 		{
-			fs::remove_file(name);
+			std::lock_guard lock(map_mutex);
+			map.write(fmt::format("%x %x %s\n", func, size, name));
 		}
-	} s_map;
-
-	if (size && name.size())
-	{
-		s_map.data.write(fmt::format("%x %x %s\n", func, size, name));
+		if (!func && !size && name.empty()) return;
 	}
-
-	if (!func && !size && !name.size())
-	{
-		fs::remove_file(s_map.name);
-		return;
-	}
-#endif
 #endif
 
 	if (!size)

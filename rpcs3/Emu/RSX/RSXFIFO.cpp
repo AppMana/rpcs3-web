@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Utilities/FrameTiming.h"
 
 #include "Emu/System.h"
 #include "RSXFIFO.h"
@@ -655,6 +656,7 @@ namespace rsx
 				if (performance_counters.state == FIFO::state::running)
 				{
 					performance_counters.FIFO_idle_timestamp = get_system_time();
+					utils::frame_timing::set_fifo_idle(true);
 					performance_counters.state = FIFO::state::nop;
 				}
 
@@ -665,6 +667,7 @@ namespace rsx
 				if (performance_counters.state == FIFO::state::running)
 				{
 					performance_counters.FIFO_idle_timestamp = get_system_time();
+					utils::frame_timing::set_fifo_idle(true);
 					performance_counters.state = FIFO::state::empty;
 				}
 				else
@@ -700,6 +703,7 @@ namespace rsx
 					if (performance_counters.state == FIFO::state::running)
 					{
 						performance_counters.FIFO_idle_timestamp = get_system_time();
+						utils::frame_timing::set_fifo_idle(true);
 						sync_point_request.release(true);
 					}
 
@@ -780,7 +784,9 @@ namespace rsx
 			}
 
 			// Update performance counters with time spent in idle mode
-			performance_counters.idle_time += (get_system_time() - performance_counters.FIFO_idle_timestamp);
+			const auto idle_us = get_system_time() - performance_counters.FIFO_idle_timestamp;
+			performance_counters.idle_time += idle_us;
+			utils::frame_timing::set_fifo_idle(false);
 		}
 
 		do

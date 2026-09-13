@@ -70,9 +70,10 @@ extern u32 web_hot_table_reserve(u32 count)
 // Per-worker placement without messages, as the SPU tier does it: compiled module bytes stay in a
 // registry in wasm memory and every PPU thread places the entries its own worker has not placed yet
 // right before dispatching. Returns the highest function-table index this worker holds.
-EM_JS(u32, rpcs3_web_ppu_hot_sync, (), {
-	return rpcs3PpuHotSyncImpl() >>> 0;
-});
+// JS impl lives in web/host/rpcs3_web_lib.js (a --js-library entry) instead of an EM_JS macro:
+// under thin-LTO the em_js section + address-taken import chain are stripped, which made this
+// hook an undefined symbol at wasm-ld. The library entry resolves it for all link modes.
+extern "C" u32 rpcs3_web_ppu_hot_sync();
 
 extern void ppu_web_jit_publish(u32 addr, u32 table_index);
 extern void ppu_web_jit_mark_entry(u32 addr);

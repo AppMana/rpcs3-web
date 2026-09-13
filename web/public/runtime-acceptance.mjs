@@ -1,3 +1,4 @@
+import { runtimeOptions, presentationCanvas, frameCount } from "./rpcs3-runtime-session.mjs";
 import { decodeDrawPacket, PacketKind, SectionKind } from "./rpcs3-webgpu-packet.mjs";
 import { prepareWebGPU, releaseWebGPU, renderPacketsToWebGPU, stopWebGPUPresentation } from "./rpcs3-webgpu-renderer.mjs";
 import { encodePacketFixture } from "./rpcs3-webgpu-fixture.mjs";
@@ -38,7 +39,8 @@ function setPad(state = {}) {
 // This one API serves the desktop lanes, the hosted-origin iPad runner, and
 // the hardware/commercial runner; runners differ only in how they launch a
 // browser and where they write evidence.
-function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
+async function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
+  options = await runtimeOptions(target, options);
   if (active) return active;
   // A kept runtime (options.keepRuntime) is reused instead of terminated: Safari does not release a
   // finished run's 512 MiB shared memory in time to allocate the next one.
@@ -79,10 +81,14 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
     const direct = options.directRenderer === true;
     const preparedGpu = options.render && !direct ? prepareWebGPU(canvas) : undefined;
     const reuse = options.keepRuntime === true && Boolean(persistentWorker);
-    const directCanvas = direct && !reuse ? new OffscreenCanvas(canvas.width, canvas.height) : undefined;
-    const directView = direct ? canvas.getContext("bitmaprenderer") : undefined;
-    const directScratch = direct ? document.createElement("canvas") : undefined;
+    const presentation = direct && !reuse ? presentationCanvas(canvas, options.suspending) : {};
+    const directCanvas = presentation.gpuCanvas;
+    const directView = presentation.view;
+    const wantsCapture = Boolean(options.captureRgba || options.captureEvery || options.readback === true);
+    const directScratch = direct && wantsCapture ? document.createElement("canvas") : undefined;
     let presentedFrames = 0;
+    let captureReady;
+    const finalCapture = wantsCapture ? new Promise((resolve) => { captureReady = resolve; }) : undefined;
     let presentedHash = 0;
     const frameImages = [];
     const captureEvery = Number.isInteger(options.captureEvery) && options.captureEvery > 0 ? options.captureEvery : 0;
@@ -93,23 +99,53 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
     activeWorker = worker;
     const events = [];
     const frames = [];
+    const flipTimings = [];
+    let timingDrops = 0;
     let firstResult;
     const timeout = setTimeout(() => {
       worker.terminate();
-      reject(new Error(`real RPCS3 runtime timed out; events=${JSON.stringify(events.slice(-40))}`));
+      const error = new Error("real RPCS3 runtime timed out");
+      error.partial = { ok: false, detail: error.message, frames, flipTimings, timingDrops,
+        events: events.slice(-40) };
+      reject(error);
     }, timeoutMs);
     let frameRequestedAt = performance.now();
     worker.addEventListener("message", worker.__rpcs3Handler = async (event) => {
+      if (event.data?.type === "runtime-fatal") {
+        clearTimeout(timeout);
+        const error = new Error(`real RPCS3 runtime failed: ${event.data.detail}; logs=${JSON.stringify(event.data.logs ?? [])}`);
+        error.partial = { ok: false, detail: event.data.detail, logs: event.data.logs,
+          frames, flipTimings, timingDrops, events: events.slice(-40) };
+        worker.terminate();
+        reject(error);
+        return;
+      }
+      if (event.data?.frameTimings) {
+        flipTimings.push(...event.data.frameTimings.frames);
+        timingDrops = event.data.frameTimings.dropped;
+      }
+      if (event.data?.type === "runtime-capture") {
+        directScratch?.getContext("2d", { willReadFrequently: false }).drawImage(event.data.bitmap, 0, 0);
+        event.data.bitmap.close();
+        if (event.data.frame + 1 >= requestedFrames || untilDraw) captureReady?.();
+        return;
+      }
       if (event.data?.type === "runtime-present") {
         const bitmap = event.data.bitmap;
         presentedFrames += 1;
-        // Keep a copy for the end-of-run hash and image; hashing every present would cost more than the frame
-        directScratch?.getContext("2d", { willReadFrequently: true }).drawImage(bitmap, 0, 0);
+        if (directScratch && (presentedFrames >= requestedFrames || options.readback === true || (captureEvery && presentedFrames % captureEvery === 0) || untilDraw)) {
+          directScratch.getContext("2d", { willReadFrequently: false }).drawImage(bitmap, 0, 0);
+          if (presentedFrames >= requestedFrames || untilDraw) captureReady?.();
+        }
         directView?.transferFromImageBitmap(bitmap);
         return;
       }
+      if (event.data?.type === "runtime-presented") { presentedFrames += 1; return; }
       const { packetBuffers = [], ...eventWithoutPackets } = event.data ?? {};
-      if (events.length < 4_000) events.push(compactFrame(eventWithoutPackets, requestedFrames <= 60 || events.length < 8));
+      const observation = compactFrame(eventWithoutPackets, requestedFrames <= 60 || events.length < 8);
+      if (events.length >= 4_000) events.shift();
+      events.push(observation);
+      options.onEvent?.(observation);
       if (event.data?.type === "runtime-result" || event.data?.type === "runtime-frame") {
         const receivedAt = performance.now();
         try {
@@ -202,14 +238,20 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
             }
           }
           if (direct) {
-            gpu = { direct: true, presented: presentedFrames, frameHash: presentedHash, device: event.data.directGpu, stats: event.data.directStats, width: directScratch.width, height: directScratch.height };
-            const finalFrameExpected = frames.length + 1 >= requestedFrames;
-            if (captureEvery && presentedFrames > 0 && (frames.length + 1) % captureEvery === 0) {
+            gpu = { direct: true, presented: presentedFrames, frameHash: presentedHash, device: event.data.directGpu, stats: event.data.directStats, width: canvas.width, height: canvas.height };
+            const finalFrameExpected = dispatchCompletion || frameCount(event.data) >= requestedFrames || Boolean(renderError)
+              || (untilDraw && (event.data.drawPacketCount ?? 0) > 0 && packetBuffers.length > 0);
+            if (directScratch && captureEvery && presentedFrames > 0 && (frames.length + 1) % captureEvery === 0) {
               frameImages.push({ frame: frames.length + 1, presented: presentedFrames, png: directScratch.toDataURL("image/png") });
             }
             if (frameImages.length && finalFrameExpected) gpu.frameImages = frameImages;
-            if (presentedFrames > 0 && (finalFrameExpected || options.captureRgba)) {
-              const pixels = directScratch.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, directScratch.width, directScratch.height).data;
+            if (directScratch && presentedFrames > 0 && (finalFrameExpected || options.readback === true)) {
+              if (finalFrameExpected) {
+                let captureTimer;
+                try { await Promise.race([finalCapture, new Promise((_, reject) => { captureTimer = setTimeout(() => reject(new Error("final presentation capture timed out")), 5000); })]); }
+                finally { clearTimeout(captureTimer); }
+              }
+              const pixels = directScratch.getContext("2d", { willReadFrequently: false }).getImageData(0, 0, directScratch.width, directScratch.height).data;
               let hash = 0x811c9dc5;
               for (let i = 0; i < pixels.length; i += 1) { hash ^= pixels[i]; hash = Math.imul(hash, 0x01000193) >>> 0; }
               presentedHash = hash >>> 0;
@@ -223,7 +265,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
             renderError,
             hostTimings: { waitForPacketsMs: receivedAt - frameRequestedAt, renderMs: performance.now() - receivedAt },
           };
-          const finalFrame = dispatchCompletion || frames.length + 1 >= requestedFrames || Boolean(renderError)
+          const finalFrame = dispatchCompletion || frameCount(frame) >= requestedFrames || Boolean(renderError)
             || (untilDraw && (frame.drawPacketCount ?? 0) > 0 && packetBuffers.length > 0);
           frames.push(compactFrame(frame, keepDetail(frames.length, finalFrame)));
           firstResult ??= frames[0];
@@ -243,8 +285,16 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
             worker.postMessage({ type: "spu-wasm-selftest", base64: options.spuWasmSelftestBase64 });
             spuWasmSelftest = (await requestWorker(worker, "spu-wasm-selftest-noop", "spu-wasm-selftest", 120_000))?.report;
           }
-          const result = { ...firstResult, ...frames.at(-1), gpu, renderError, packetFixture, events, spuMissBase64, ppuProfileBase64, spuWasmSelftest, frames: requestedFrames > 1 || untilDraw ? frames : undefined };
-          document.querySelector("#result").textContent = JSON.stringify(result, null, 2);
+          const result = { flipTimings, timingDrops, ...firstResult, ...frames.at(-1), gpu, renderError, packetFixture, events, spuMissBase64, ppuProfileBase64, spuWasmSelftest, frames: requestedFrames > 1 || untilDraw ? frames : undefined };
+          // The returned result retains detailed evidence. Duplicating thousands of
+          // frame records and base64 pixels into a DOM text node creates a large
+          // transient allocation precisely when a long device run finishes.
+          document.querySelector("#result").textContent = JSON.stringify({
+            ok: result.ok, detail: result.detail, emuFlipId: result.emuFlipId,
+            observations: frames.length, timingSamples: flipTimings.length, timingDrops,
+            directStats: result.directStats, workingSet: result.workingSet,
+            frameHash: gpu?.frameHash, renderError,
+          }, null, 2);
           // The worker waits up to 5 s for RPCS3's threads to exit and then
           // reports; allow that report to arrive before giving up on it.
           const shutdownTimer = setTimeout(() => {
@@ -285,12 +335,17 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
     worker.addEventListener("error", (event) => {
       clearTimeout(timeout);
       worker.terminate();
-      reject(new Error(`real RPCS3 runtime worker failed: ${event.message || ""} ${event.filename || ""}:${event.lineno || 0} ${String(event.error ?? "")}; events=${JSON.stringify(events.slice(-40))}`.trim()));
+      const error = new Error(`real RPCS3 runtime worker failed: ${event.message || ""} ${event.filename || ""}:${event.lineno || 0} ${String(event.error ?? "")}; events=${JSON.stringify(events.slice(-40))}`.trim());
+      error.partial = { ok: false, detail: error.message, frames, flipTimings, timingDrops, events: events.slice(-40) };
+      reject(error);
     }, { once: true });
     worker.postMessage({
       type: "boot",
       directRenderer: direct,
+      bindGroupCache: options.bindGroupCache === true,
+      presentationYield: options.presentationYield ?? "timer",
       gpuCanvas: directCanvas,
+      capture: wantsCapture ? { frame: requestedFrames - 1, every: options.readback === true || untilDraw ? 1 : captureEvery } : undefined,
       reuse,
       fixture,
       path: bootPath,
@@ -298,6 +353,11 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       discardPackets: !needsPackets(1) && !dispatchCompletion,
       untilDraw: untilDraw && !dispatchCompletion,
       diagnostics: options.diagnostics === true,
+      benchmark: options.benchmark === true,
+      spuDispatchCache: options.spuDispatchCache !== false,
+      spuExecutionSlices: options.spuExecutionSlices !== false,
+      spuPortableCalls: options.spuPortableCalls === true,
+      wasmRegions: options.wasmRegions === true,
       dumpSurfaces: options.dumpSurfaces === true,
       skipDraws: Array.isArray(options.skipDraws) ? options.skipDraws : undefined,
       vertexDiagnostics: options.vertexDiagnostics === true,
@@ -315,6 +375,10 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       spuDecoder: options.spuDecoder,
       ppuProfile: options.ppuProfile === true,
       ppuJit: options.ppuJit === true,
+      ppuReturnDispatch: options.ppuReturnDispatch === true,
+      ppuInlineReads: options.ppuInlineReads === true,
+      llvmCompilerUrl: typeof options.llvmCompilerUrl === "string" ? options.llvmCompilerUrl : undefined,
+      ppuBatchedDiagnostics: options.ppuBatchedDiagnostics !== false,
       ppuJitThreshold: options.ppuJitThreshold,
       ppuJitCapacity: options.ppuJitCapacity,
       spuBlockSize: options.spuBlockSize,
@@ -332,6 +396,7 @@ function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) {
       packetTimeoutMs: options.packetTimeoutMs ?? Math.max(1_000, timeoutMs - 5_000),
       progressIntervalMs: options.progressIntervalMs,
       pthreadPoolSize: options.pthreadPoolSize,
+      memoryMaximumMiB: options.memoryMaximumMiB,
       coreUrl: options.coreUrl,
       // A suspending core's file-touching entry points return promises, so the module thread awaits
       // them and boots on a thread of its own (runtime-smoke-worker.mjs)

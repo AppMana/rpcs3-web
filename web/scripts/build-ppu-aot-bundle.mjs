@@ -1,3 +1,5 @@
+import { dylinkInfo } from "../public/wasm-dylink.mjs";
+import { tableEntriesAreLocal } from "./wasm-table-ownership.mjs";
 // Lower a directory of RPCS3 wasm32 PPU IR parts (RPCS3_PPU_WASM_AOT_IR=1 dumps,
 // one .wasm.ll per module part) into a bundle the runtime loads through
 // rpcs3-ppu-aot-table.mjs: one .wasm per part plus manifest.json.
@@ -68,7 +70,7 @@ if (ebootSources.length) {
 // the runtime knows.
 async function extractBlocks(compiled) {
   const memory = new WebAssembly.Memory({ initial: 512, maximum: 32768, shared: true });
-  const table = new WebAssembly.Table({ initial: 1 << 16, element: "anyfunc" });
+  const table = new WebAssembly.Table({ initial: Math.max(1 << 16, dylinkInfo(compiled).tableSize), element: "anyfunc" });
   const memoryBase = 1 << 16;
   const env = {
     memory,
@@ -82,7 +84,11 @@ async function extractBlocks(compiled) {
     if (imported.kind === "function") env[imported.name] = () => 0;
     else if (imported.kind === "global") env[imported.name] = new WebAssembly.Global({ value: "i32", mutable: false }, 0);
   }
-  const instance = new WebAssembly.Instance(compiled, { env });
+  // This instance only reads the exported block table; it never executes guest
+  // loads. The real runtime supplies the page table when it installs the bundle.
+  const instance = new WebAssembly.Instance(compiled, { env, "GOT.mem": {
+    __rpcs3_guest_pages: new WebAssembly.Global({ value: "i32", mutable: true }, 0),
+  } });
   if (typeof instance.exports.__wasm_apply_data_relocs === "function") instance.exports.__wasm_apply_data_relocs();
   const heap = new Uint32Array(memory.buffer);
   const blocks = [];
@@ -113,6 +119,7 @@ async function describe(wasmPath, group, members) {
     irBytes: members.reduce((sum, member) => sum + statSync(join(inputDirectory, member)).size, 0),
     blockTables,
     guestImports,
+    localTableOnly: tableEntriesAreLocal(bytes, WebAssembly.Module.imports(compiled).filter((entry) => entry.kind === "function").length),
     sha256: createHash("sha256").update(bytes).digest("hex"),
     blocks: Buffer.from(new Uint32Array(await extractBlocks(compiled)).buffer).toString("base64"),
   };

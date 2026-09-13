@@ -106,26 +106,33 @@ namespace rsx
 		// apply memory needed for command
 		for (const auto& state : replay_cmd.memory_state)
 		{
-			auto it = std::find_if(frame->memory_map.begin(), frame->memory_map.end(), FN(x.second == state));
-			if (it == frame->memory_map.end())
+			auto it = memory_by_id.find(state);
+			if (it == memory_by_id.end())
 				fmt::throw_exception("requested memory state for command not found in memory_map");
 
-			const auto& memblock = it->first;
-			auto it_data = std::find_if(frame->memory_data_map.begin(), frame->memory_data_map.end(), FN(x.second == memblock.data_state));
-			if (it_data == frame->memory_data_map.end())
+			const auto& memblock = *it->second;
+			auto it_data = data_by_id.find(memblock.data_state);
+			if (it_data == data_by_id.end())
 				fmt::throw_exception("requested memory data state for command not found in memory_data_map");
 
-			const auto& data_block = it_data->first;
+			const auto& data_block = *it_data->second;
+#ifdef RPCS3_WEB
+			// Captured uploads may cross sparse guest pages and must invalidate the
+			// same texture versions as ordinary guest writes during live execution.
+			ensure(vm::web_copy_range(get_address(memblock.offset, memblock.location),
+				const_cast<u8*>(data_block.data.data()), static_cast<u32>(data_block.data.size()), true));
+#else
 			std::memcpy(vm::base(get_address(memblock.offset, memblock.location)), data_block.data.data(), data_block.data.size());
+#endif
 		}
 
 		if (replay_cmd.display_buffer_state != 0 && replay_cmd.display_buffer_state != cs.display_buffer_hash)
 		{
-			auto it = std::find_if(frame->display_buffers_map.begin(), frame->display_buffers_map.end(), FN(x.second == replay_cmd.display_buffer_state));
-			if (it == frame->display_buffers_map.end())
+			auto it = displays_by_id.find(replay_cmd.display_buffer_state);
+			if (it == displays_by_id.end())
 				fmt::throw_exception("requested display buffer for command not found");
 
-			const auto& dbstate = it->first;
+			const auto& dbstate = *it->second;
 			for (u32 i = 0; i < dbstate.count; ++i)
 			{
 				const auto& buf = dbstate.buffers[i];
@@ -142,11 +149,11 @@ namespace rsx
 
 		if (replay_cmd.tile_state != 0 && replay_cmd.tile_state != cs.tile_hash)
 		{
-			auto it = std::find_if(frame->tile_map.begin(), frame->tile_map.end(), FN(x.second == replay_cmd.tile_state));
-			if (it == frame->tile_map.end())
+			auto it = tiles_by_id.find(replay_cmd.tile_state);
+			if (it == tiles_by_id.end())
 				fmt::throw_exception("requested tile state command not found");
 
-			const auto& tstate = it->first;
+			const auto& tstate = *it->second;
 			for (u32 i = 0; i < limits::tiles_count; ++i)
 			{
 				const auto& ti = tstate.tiles[i];
@@ -173,6 +180,17 @@ namespace rsx
 
 	void rsx_replay_thread::cpu_task()
 	{
+		const auto index_states = [](const auto& source, auto& index)
+		{
+			index.clear();
+			index.reserve(source.size());
+			for (const auto& [state, id] : source) index.emplace(id, &state);
+		};
+		index_states(frame->memory_map, memory_by_id);
+		index_states(frame->memory_data_map, data_by_id);
+		index_states(frame->display_buffers_map, displays_by_id);
+		index_states(frame->tile_map, tiles_by_id);
+
 		be_t<u32> context_id = allocate_context();
 
 		auto fifo_stops = alloc_write_fifo(context_id);

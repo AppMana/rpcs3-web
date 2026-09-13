@@ -383,6 +383,9 @@ public:
 
 	be_t<u64>* get_stack_arg(s32 i, u64 align = alignof(u64));
 	void exec_task();
+#ifdef RPCS3_WEB
+	bool exec_task_slice();
+#endif
 	void fast_call(u32 addr, u64 rtoc, bool is_thread_entry = false);
 
 	static std::pair<vm::addr_t, u32> stack_push(u32 size, u32 align_v);

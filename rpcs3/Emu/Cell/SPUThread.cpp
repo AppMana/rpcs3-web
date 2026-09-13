@@ -63,6 +63,8 @@ const u32 spu_frest_fraction_lut[32] =
 extern void spu_web_set_escape_context(std::jmp_buf* context) noexcept;
 #endif
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
+#include "SPUWebDispatch.h"
+#include "SPUWasmChain.h"
 atomic_t<u64> g_spu_web_instruction_count{0};
 atomic_t<u32> g_spu_web_last_pc[6]{};
 
@@ -85,9 +87,126 @@ struct alignas(128) spu_web_dispatch_stats
 {
 	atomic_t<u64> dispatches{0};
 	atomic_t<u64> fallbacks{0};
+	atomic_t<u64> attempts{0}, rejected{0}, table_syncs{0}, interpreted{0}, same_pc{0};
+	atomic_t<u64> cache_cold{0}, cache_generation_misses{0}, cache_hits{0}, cache_rejections{0};
+	atomic_t<u64> chain_calls{0}, chain_blocks{0}, region_calls{0}, region_blocks{0};
+	// Diagnostic-only writers use atomic keys/counts. Slots never change identity,
+	// so live readers cannot attribute a count to a recycled edge.
+	struct edge { atomic_t<u64> key{0}, count{0}; };
+	std::array<edge, SPU_CHAIN_EDGE_STORAGE> edges{};
 };
 
 static std::array<spu_web_dispatch_stats, 8> g_spu_web_stats{};
+static atomic_t<bool> g_spu_web_dispatch_profile{false};
+static constexpr bool g_spu_web_cache_profile_enabled = false;
+static atomic_t<bool> g_spu_web_dispatch_cache{true};
+static atomic_t<bool> g_spu_web_execution_slices{true};
+
+struct spu_web_chain_span { u32 begin, end, runner, profile_runner; const u32* region_runners; };
+static std::array<spu_web_chain_span, 64> g_spu_web_chain_spans{};
+static atomic_t<u32> g_spu_web_chain_span_count{0};
+
+// Called by the module thread before boot, after reserving all worker aliases.
+// Published entries are immutable; workers never observe a partially written span.
+bool spu_web_register_chain_span_v3(u32 begin, u32 end, u32 runner, u32 profile_runner, const u32* region_runners)
+{
+	const u32 count = g_spu_web_chain_span_count.load();
+	if (!begin || end <= begin || !runner || (runner >= begin && runner < end) || count >= g_spu_web_chain_spans.size()) return false;
+	if (profile_runner && (profile_runner == runner || (profile_runner >= begin && profile_runner < end))) return false;
+	for (u32 i = 0; i < count; ++i)
+		if (begin < g_spu_web_chain_spans[i].end && end > g_spu_web_chain_spans[i].begin) return false;
+	g_spu_web_chain_spans[count] = {begin, end, runner, profile_runner, region_runners};
+	g_spu_web_chain_span_count.release(count + 1);
+	return true;
+}
+
+bool spu_web_register_chain_span_v2(u32 begin, u32 end, u32 runner, u32 profile_runner)
+{
+	return spu_web_register_chain_span_v3(begin, end, runner, profile_runner, nullptr);
+}
+
+bool spu_web_register_chain_span(u32 begin, u32 end, u32 runner)
+{
+	return spu_web_register_chain_span_v2(begin, end, runner, 0);
+}
+
+std::string spu_web_chain_edge_report()
+{
+	std::string report = R"({"schemaVersion":1,"sampling":"LCG-selected chains, probability 1/1024; verified internal transitions only","spans":[)";
+	for (u32 i = 0; i < g_spu_web_chain_span_count.load(); ++i)
+	{
+		const auto& span = g_spu_web_chain_spans[i];
+		fmt::append(report, R"(%s{"begin":%u,"end":%u})", i ? "," : "", span.begin, span.end);
+	}
+	report += R"(],"edges":[)";
+	bool first = true;
+	u64 dropped = 0;
+	for (const auto& stats : g_spu_web_stats)
+	{
+		for (u32 i = 0; i < SPU_CHAIN_EDGE_SLOTS; ++i)
+		{
+			const auto key = stats.edges[i].key.load();
+			const auto count = stats.edges[i].count.load();
+			if (!key || !count) continue;
+			fmt::append(report, R"(%s[%u,%u,%u])", first ? "" : ",", key >> 32, key & 0xffffffffu, count);
+			first = false;
+		}
+		dropped += stats.edges[SPU_CHAIN_EDGE_SLOTS].count.load();
+	}
+	fmt::append(report, R"(],"dropped":%u})", dropped);
+	return report;
+}
+
+void spu_web_execution_slices_enable(bool enabled)
+{
+	g_spu_web_execution_slices.store(enabled);
+}
+
+void spu_web_dispatch_cache_enable(bool enabled)
+{
+	g_spu_web_dispatch_cache.store(enabled);
+}
+
+void spu_web_dispatch_profile_enable()
+{
+	g_spu_web_dispatch_profile.store(true);
+}
+
+std::string spu_web_dispatch_profile_report()
+{
+	u64 attempts = 0, rejected = 0, syncs = 0, interpreted = 0, same_pc = 0, chain_calls = 0, chain_blocks = 0, region_calls = 0, region_blocks = 0;
+	for (const auto& slot : g_spu_web_stats)
+	{
+		attempts += slot.attempts.load();
+		rejected += slot.rejected.load();
+		syncs += slot.table_syncs.load();
+		interpreted += slot.interpreted.load();
+		same_pc += slot.same_pc.load();
+		chain_calls += slot.chain_calls.load();
+		chain_blocks += slot.chain_blocks.load();
+		region_calls += slot.region_calls.load();
+		region_blocks += slot.region_blocks.load();
+	}
+	std::string report = fmt::format(R"({"attempts":%u,"rejected":%u,"tableSyncs":%u,"interpreted":%u,"samePcReturns":%u,"publicationInterval":1024)",
+		attempts, rejected, syncs, interpreted, same_pc);
+	fmt::append(report, R"(,"chainCalls":%u,"chainBlocks":%u,"regionCalls":%u,"regionBlocks":%u)", chain_calls, chain_blocks, region_calls, region_blocks);
+	if constexpr (g_spu_web_cache_profile_enabled)
+	{
+		u64 cold = 0, generation_misses = 0, hits = 0, cache_rejections = 0;
+		for (const auto& slot : g_spu_web_stats)
+		{
+			cold += slot.cache_cold.load();
+			generation_misses += slot.cache_generation_misses.load();
+			hits += slot.cache_hits.load();
+			cache_rejections += slot.cache_rejections.load();
+		}
+		fmt::append(report, R"(,"cacheCold":%u,"cacheGenerationMisses":%u,"cachePreferredHits":%u,"cachePreferredRejections":%u)",
+			cold, generation_misses, hits, cache_rejections);
+	}
+	report += '}';
+	return report;
+}
+
 
 u64 spu_web_aot_dispatch_count()
 {
@@ -1657,11 +1776,21 @@ void spu_thread::cpu_return()
 extern thread_local std::string(*g_tls_log_prefix)();
 
 #if defined(RPCS3_WEB_INTERPRETER_ONLY) || defined(RPCS3_PORTABLE_SPU_INTERPRETER)
-// Runs the static interpreter until check_state() asks the thread to leave; escapes longjmp out of here.
+// Returns true on a thread stop and false at a browser execution-slice boundary.
+// Escapes longjmp out of here. Native portable-interpreter execution stays unbounded.
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+using spu_web_candidate_cache = spu_web::verified_dispatch_cache<SPU_CHAIN_CACHE_SLOTS, g_spu_web_cache_profile_enabled, true>;
+static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_interpreter_rt& table, u32 index, spu_web_candidate_cache& candidate_cache, spu_chain_context& chain)
+#else
 static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_interpreter_rt& table, [[maybe_unused]] u32 index)
+#endif
 {
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
 	u32 web_progress_batch = 0;
+	// Keep preferences across slices; only the unpublished diagnostic batch resets.
+	candidate_cache.observations = {};
+	u32 web_slice_iterations = 0;
+	const bool web_slice_enabled = g_spu_web_execution_slices.load();
 #endif
 
 	// True when the previous instruction branched: pc is then a block start, the only kind of
@@ -1670,6 +1799,47 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
 	const u32 stats_slot = index % g_spu_web_stats.size();
 	auto& stats = g_spu_web_stats[stats_slot];
+	// Diagnostic counters stay local; publish once per 1024 loop iterations. Escapes may leave
+	// an unpublished tail, so these are diagnostic lower bounds, not exact accounting.
+	const bool profile_dispatch = g_spu_web_dispatch_profile.load();
+	const bool cache_dispatch = g_spu_web_dispatch_cache.load();
+	const u32 chain_spans = cache_dispatch ? g_spu_web_chain_span_count.load() : 0;
+	static_assert(sizeof(spu.state) == 4 && sizeof(g_spu_web_aot_lists[0]) == 4);
+	static_assert(sizeof(spu_chain_context) == 52 && offsetof(spu_chain_context, edge_slots) == 44);
+	static_assert(sizeof(spu_web_dispatch_stats::edge) == sizeof(spu_chain_edge));
+	chain.pc = reinterpret_cast<uptr>(&spu.pc);
+	chain.failure = reinterpret_cast<uptr>(&spu.block_failure);
+	chain.state = reinterpret_cast<uptr>(&spu.state);
+	chain.lists = reinterpret_cast<uptr>(g_spu_web_aot_lists.data());
+	chain.cache = reinterpret_cast<uptr>(candidate_cache.chain_entries());
+	chain.edge_slots = reinterpret_cast<uptr>(stats.edges.data());
+	u32 profile_iterations = 0;
+	u64 attempts = stats.attempts.load(), rejected = stats.rejected.load();
+	u64 table_syncs = stats.table_syncs.load(), interpreted = stats.interpreted.load();
+	u64 same_pc = stats.same_pc.load();
+	const auto cache_before = [&]
+	{
+		spu_web_candidate_cache::counters counts{};
+		if constexpr (g_spu_web_cache_profile_enabled)
+		{
+			counts.cold = stats.cache_cold.load();
+			counts.generation_misses = stats.cache_generation_misses.load();
+			counts.preferred_hits = stats.cache_hits.load();
+			counts.preferred_rejections = stats.cache_rejections.load();
+		}
+		return counts;
+	}();
+	const auto publish_cache_observations = [&]
+	{
+		if constexpr (g_spu_web_cache_profile_enabled)
+		{
+			const auto& counts = candidate_cache.observations;
+			stats.cache_cold.store(cache_before.cold + counts.cold);
+			stats.cache_generation_misses.store(cache_before.generation_misses + counts.generation_misses);
+			stats.cache_hits.store(cache_before.preferred_hits + counts.preferred_hits);
+			stats.cache_rejections.store(cache_before.preferred_rejections + counts.preferred_rejections);
+		}
+	};
 	// The host installs the registry's table base once, before any guest code runs, and the registry
 	// only grows from there, so the dispatch path reads both of these outside its hot path
 	const u32 hot_base = spu_web_hot_table_base();
@@ -1686,6 +1856,29 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 
 	while (true)
 	{
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+		// V8 cannot replace an active Liftoff invocation with optimized Wasm. Let this
+		// hot function return periodically, at a compiled-block boundary, so its next
+		// invocation can enter optimized code. Keep guest scheduling state unchanged.
+		if (web_slice_enabled && ++web_slice_iterations >= 65536 && at_branch_target)
+		{
+			if (profile_dispatch)
+			{
+				stats.attempts.store(attempts);
+				stats.rejected.store(rejected);
+				stats.table_syncs.store(table_syncs);
+				stats.interpreted.store(interpreted);
+				stats.same_pc.store(same_pc);
+			publish_cache_observations();
+			}
+			if (web_progress_batch)
+			{
+				g_spu_web_instruction_count += web_progress_batch;
+				g_spu_web_last_pc[index % std::size(g_spu_web_last_pc)] = spu.pc;
+			}
+			return false;
+		}
+#endif
 		if (spu.state) [[unlikely]]
 		{
 			if (spu.check_state())
@@ -1695,22 +1888,31 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
 		// Only a block start can be the entry of a compiled program, and a pc is one exactly when the
 		// previous instruction branched to it
+		if (profile_dispatch && ++profile_iterations == 1024)
+		{
+			profile_iterations = 0;
+			stats.attempts.store(attempts);
+			stats.rejected.store(rejected);
+			stats.table_syncs.store(table_syncs);
+			stats.interpreted.store(interpreted);
+			stats.same_pc.store(same_pc);
+			publish_cache_observations();
+		}
 		if (aot_ready && at_branch_target)
 		{
 			if (const auto list = g_spu_web_aot_lists[(spu.pc & 0x3fffc) / 4].load())
 			{
 				// A program whose local-store verification fails increments block_failure and returns
 				// through spu_dispatch; any other return means it ran, whatever it did to pc.
-				const u64 failures = spu.block_failure;
 				const u32 pc_before = spu.pc;
 				bool ran = false;
+				bool chained = false;
 
 				// Compiled code takes interrupts at its own spu_check_interrupts sites, as the native
 				// recompiled path does; cpu_work must not redirect pc underneath it
 				spu.allow_interrupts_in_cpu_work = false;
 
-				u32 skipped = 0;
-				for (u32 i = 0; i < list->count && !ran; i++)
+				const u32 selected = candidate_cache.find(pc_before, list, list->count, [&](u32 i)
 				{
 					const u32 index = list->indices[i];
 					if (index >= hot_base) [[unlikely]]
@@ -1720,6 +1922,7 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 						if (index > hot_placed)
 						{
 							hot_placed = rpcs3_web_spu_hot_sync();
+							if (profile_dispatch) table_syncs++;
 						}
 						if (index > hot_placed)
 						{
@@ -1727,23 +1930,64 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 							{
 								spu_log.error("SPU hot program at 0x%05x (table %u, base %u, placed up to %u, registry %u) not placed on this worker; skipped", spu.pc, index, hot_base, hot_placed, spu_web_hot_count());
 							}
-							skipped++;
-							continue;
+							return false;
 						}
 					}
-					reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(index))(&spu, spu._ptr<u8>(0), 0);
-					ran = spu.block_failure == failures + (i - skipped);
+					const u64 failures = spu.block_failure;
+					chained = false;
+					for (u32 part = 0; part < chain_spans; ++part)
+					{
+						const auto& span = g_spu_web_chain_spans[part];
+						if (index < span.begin || index >= span.end) continue;
+						chain.table_begin = span.begin;
+						chain.table_end = span.end;
+						chain.target = index;
+						chain.budget = web_slice_enabled ? std::min<u32>(64, 65536 - web_slice_iterations) : 64;
+						u32 runner = span.region_runners ? span.region_runners[index - span.begin] : 0;
+						if (!runner) runner = span.runner;
+						if (span.profile_runner)
+						{
+							chain.profile_clock = chain.profile_clock * 1664525u + 1013904223u;
+							if (((chain.profile_clock >> 16) & 1023) == 0) runner = span.profile_runner;
+						}
+						reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(runner))(&spu, spu._ptr<u8>(0), reinterpret_cast<uptr>(&chain));
+						chained = true;
+						if (profile_dispatch)
+						{
+							stats.chain_calls.raw()++;
+							stats.chain_blocks.raw() += chain.completed;
+							if (runner != span.runner && runner != span.profile_runner)
+							{
+								stats.region_calls.raw()++;
+								stats.region_blocks.raw() += chain.completed;
+							}
+						}
+						break;
+					}
+					if (!chained) reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(index))(&spu, spu._ptr<u8>(0), 0);
+					// A downstream rejection does not undo earlier completed blocks.
+					ran = chained ? chain.completed != 0 || chain.reason == SPU_CHAIN_STATE : spu.block_failure == failures;
+					if (profile_dispatch)
+					{
+						attempts += chained ? chain.completed + (chain.reason == SPU_CHAIN_REJECTED) : 1;
+						rejected += chained ? chain.reason == SPU_CHAIN_REJECTED : !ran;
+					}
 					if (ran && index >= hot_base) spu_web_note_hot_dispatch(index - hot_base, stats_slot);
-				}
+					return ran;
+				}, cache_dispatch);
+				ran = selected < list->count;
 
 				spu.allow_interrupts_in_cpu_work = true;
+				if (chained && chain.reason == SPU_CHAIN_STATE && !chain.completed) continue;
 
 				if (ran)
 				{
-					stats.dispatches.raw()++;
+					stats.dispatches.raw() += chained ? chain.completed : 1;
+					if (chained && chain.completed > 1) web_slice_iterations += chain.completed - 1;
+					if (profile_dispatch) same_pc += spu.pc == pc_before;
 					// A program that returns at its own entry handed this instruction to the interpreter
 					// (stop, halt, interrupt state change): execute exactly one instruction below
-					if (spu.pc != pc_before)
+					if (chained ? chain.reason != SPU_CHAIN_INTERPRET : spu.pc != pc_before)
 					{
 						continue;
 					}
@@ -1789,6 +2033,7 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 			spu.pc += 4;
 
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
+		if (profile_dispatch) interpreted++;
 		if (++web_progress_batch == 256)
 		{
 			g_spu_web_instruction_count += web_progress_batch;
@@ -1991,6 +2236,14 @@ void spu_thread::cpu_task()
 		}
 #endif
 
+
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+		// The pointee survives execution slices and escapes. Owning it outside the
+		// setjmp region avoids indeterminate modified automatic state after longjmp.
+		const auto candidate_cache = std::make_unique<spu_web_candidate_cache>();
+		const auto chain_context = std::make_unique<spu_chain_context>();
+#endif
+
 		// The interpreter loop lives in its own function: a function containing setjmp has every call
 		// inside it routed through a JS invoke trampoline under Emscripten's setjmp/longjmp support,
 		// and that used to include the per-instruction dispatch. longjmp still unwinds through it.
@@ -2001,7 +2254,15 @@ void spu_thread::cpu_task()
 				continue;
 			}
 
-			if (spu_web_interpreter_loop(*this, table, index))
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+			// LLVM noinline alone does not survive Binaryen's single-caller inlining.
+			// A volatile function pointer keeps the slice as a real Wasm call boundary.
+			static auto* volatile run_slice = &spu_web_interpreter_loop;
+			const bool stopped = run_slice(*this, table, index, *candidate_cache, *chain_context);
+#else
+			const bool stopped = spu_web_interpreter_loop(*this, table, index);
+#endif
+			if (stopped)
 			{
 				break;
 			}

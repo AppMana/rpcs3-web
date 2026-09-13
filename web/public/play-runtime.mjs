@@ -1,8 +1,8 @@
 import { readGamepad, samePadState } from "./rpcs3-gamepad.mjs";
-import { supportsSuspending } from "./rpcs3-suspending.mjs";
+import { runtimeOptions, presentationCanvas, requestRuntime, frameCount as guestFrames } from "./rpcs3-runtime-session.mjs";
 import { importFromLibrary, listOPFS } from "./rpcs3-storage.mjs";
 
-const Digital1 = Object.freeze({ select: 0x01, start: 0x08, up: 0x10, right: 0x20, down: 0x40, left: 0x80 });
+const Digital1 = Object.freeze({ select: 0x01, l3: 0x02, r3: 0x04, start: 0x08, up: 0x10, right: 0x20, down: 0x40, left: 0x80 });
 const Digital2 = Object.freeze({ l2: 0x01, r2: 0x02, l1: 0x04, r1: 0x08, triangle: 0x10, circle: 0x20, cross: 0x40, square: 0x80 });
 // RPCS3's own keyboard pad defaults (keyboard_pad_handler::init_config), so a session played here
 // uses the same keys as the desktop emulator.
@@ -36,6 +36,27 @@ let presentedFrames = 0;
 let frameWindowStart = performance.now();
 let frameWindowCount = 0;
 let currentStatus = { state: "booting", frames: 0, fps: 0 };
+// Monotonic session timer: performance.now() is not affected by wall-clock adjustments, so it is
+// the stable reference for "how long has the session been running" (movie streaming included).
+const sessionStart = performance.now();
+const benchmarkFrames = [];
+const flipTimings = [];
+let timingDrops = 0;
+let observationDrops = 0;
+let retainedTimingDrops = 0;
+const benchmarkLimit = 120_000;
+// Intro-skip: boot at a high guest clocks_scale so a commercial title's long movie/menu idle
+// passes many guest frames per wall-second, then snap back to real time once the interactive
+// 3D gameplay begins (sustained per-frame draws) so benchmarking only measures real rendering.
+// Enabled by ?introSkip=1&introSkipScale=<percent>&introDrawsThreshold=<draws/frame>&introDrawsRun=<n>.
+const introSkip = search.get("introSkip") === "1";
+const introSkipScale = Number(search.get("introSkipScale")) || 600;
+const introDrawsThreshold = Number(search.get("introDrawsThreshold")) || 900;
+const introDrawsRun = Number(search.get("introDrawsRun")) || 30;
+let introSkipDone = !introSkip;
+let introSkipDraws = 0;
+let introSkipHighCount = 0;
+let gameplayAnchor = 0;
 
 function controlState() {
   const controls = new Set([...keys].map((code) => keyControls.get(code)).filter(Boolean));
@@ -67,6 +88,7 @@ function controlState() {
 }
 
 function sendPad(state = controlState()) {
+  if (search.has("trace")) return; // Scheduled guest-frame replay owns the controller.
   lastPadState = state;
   worker?.postMessage({ type: "pad", state });
   document.querySelectorAll("[data-control]").forEach((button) => {
@@ -77,8 +99,55 @@ function sendPad(state = controlState()) {
 }
 
 function updateStatus(frame) {
-  frameCount += 1;
-  frameWindowCount += 1;
+  const count = guestFrames(frame);
+  frameWindowCount += Math.max(0, count - frameCount);
+  frameCount = count;
+  if (!introSkipDone) {
+    const drew = frame.directStats?.draws ?? 0;
+    const pd = drew - introSkipDraws;
+    introSkipDraws = drew;
+    if (pd > introDrawsThreshold) {
+      introSkipHighCount += 1;
+      if (introSkipHighCount >= introDrawsRun) {
+        introSkipDone = true;
+        gameplayAnchor = count;
+        detailElement.textContent = `gameplay at guest-frame ${count} (dpf=${Math.round(pd)}/${introDrawsRun}); snapping clocks_scale to 100`;
+        worker.postMessage({ type: "set-clock-scale", percent: 100 });
+        // Restart the FPS window at the gameplay anchor so the movie is excluded from timing.
+        frameWindowStart = performance.now();
+        frameWindowCount = 0;
+      }
+    } else if (pd > 0) {
+      introSkipHighCount = 0;
+    }
+  }
+  if (search.has("benchmark") && benchmarkFrames.length >= benchmarkLimit) observationDrops++;
+  if (search.has("benchmark") && benchmarkFrames.length < benchmarkLimit) benchmarkFrames.push({
+    emuFlipId: count, sampleSequence: frame.frameSequence,
+    hostTimeMs: frame.hostTimeMs, elapsedMs: frame.elapsedMs,
+    bindGroupCache: frame.directGpu?.bindGroupCache,
+    presentationYield: frame.directGpu?.presentationYield,
+    presented: presentedFrames, directStats: frame.directStats, dispatchProfile: frame.dispatchProfile,
+    // Preserve execution-tier counts already supplied by the worker. Program
+    // compilation counts alone do not show which tier actually runs the game.
+    spuDispatches: frame.spuAotTable?.dispatches,
+    spuHotDispatches: frame.spuHotReport?.dispatches,
+    spuLlvmDispatches: frame.spuHotReport?.llvm?.dispatches,
+    // Retain cumulative compilation counters at the same guest-frame boundary as
+    // execution counters: final totals cannot distinguish startup from hot play.
+    compilation: frame.spuLlvm && {
+      compileMs: frame.spuLlvm.compileMs,
+      ppuInlineReads: frame.spuLlvm.policy?.ppuInlineReads,
+      compilerUrl: frame.spuLlvm.policy?.moduleUrl,
+      queued: frame.spuLlvm.queued,
+      spuRequested: frame.spuLlvm.spu?.requested,
+      spuCompiled: frame.spuLlvm.spu?.compiled,
+      ppuRequested: frame.spuLlvm.ppu?.requested,
+      ppuCompiled: frame.spuLlvm.ppu?.compiled,
+    },
+    ppuRegistered: frame.ppuJitReport?.registered,
+    ppuPending: frame.ppuJitReport?.pending,
+  });
   const now = performance.now();
   const elapsed = now - frameWindowStart;
   if (elapsed >= 500) {
@@ -96,6 +165,7 @@ function updateStatus(frame) {
     ppuInstructions: frame.ppuInstructions,
     spuInstructions: frame.spuInstructions,
     droppedPackets: frame.droppedPackets,
+    padScheduleApplied: frame.padScheduleApplied,
     // Whether a title's compiled blocks are in play, which is the difference between a title
     // running and a title crawling through the interpreter
     ppuAotBlocks: frame.ppuAotTable?.blocks,
@@ -118,8 +188,11 @@ function updateStatus(frame) {
     },
   };
   statusElement.textContent = `${currentStatus.state} · ${currentStatus.fps.toFixed(1)} fps`;
+  const elapsedSec = Math.max(0, performance.now() - sessionStart) / 1000;
+  const elapsedMin = Math.floor(elapsedSec / 60);
   detailElement.textContent = `${draws.toLocaleString()} draws · ${(frame.ppuInstructions ?? 0).toLocaleString()} PPU`
-    + `${currentStatus.ppuAotBlocks ? ` · ${currentStatus.ppuAotDispatches?.toLocaleString() ?? 0} compiled dispatches` : " · interpreted"}`;
+    + `${currentStatus.ppuAotBlocks ? ` · ${currentStatus.ppuAotDispatches?.toLocaleString() ?? 0} compiled dispatches` : " · interpreted"}`
+    + ` · t+${String(elapsedMin).padStart(2, "0")}:${(elapsedSec % 60).toFixed(1).padStart(4, "0")}`;
 }
 
 function fail(detail) {
@@ -167,20 +240,37 @@ async function start() {
   // With a suspending core the RSX thread yields between flips, so it can render into the displayed
   // canvas itself and the frame never crosses back to this page. Without one it renders into a
   // canvas of its own and hands each frame over as an ImageBitmap, which this page displays.
-  suspending = await supportsSuspending();
+  const options = await runtimeOptions(bootPath, {
+    directRenderer: true, ppuJit: true, spuDecoder: search.get("spuDecoder") ?? "llvm",
+    spuLlvmWorkers: Number(search.get("spuLlvmWorkers")) || 2,
+    ppuAotBundle: search.get("ppuAot") ?? undefined,
+    ppuBatchedDiagnostics: search.get("ppuBatchedDiagnostics") !== "0",
+    spuAotBundle: search.get("spuAot") ?? undefined,
+    clockScale: Number(search.get("clockScale")) || (introSkip ? introSkipScale : 100),
+    suspending: search.get("core") === "release" || search.get("core") === "profile" ? false : undefined,
+    coreUrl: search.has("core") ? `./core/${search.get("core") === "release" ? "" : search.get("core") + "/"}rpcs3-web.mjs` : undefined,
+  });
+  suspending = options.suspending;
   // Render at the size the canvas is actually displayed at. A backing store smaller than the display
   // is upscaled, and a thin outline that falls between samples disappears rather than blurring.
   const bounds = canvas.getBoundingClientRect();
   const scale = Math.min(devicePixelRatio || 1, 1920 / Math.max(1, bounds.width), 1080 / Math.max(1, bounds.height));
   canvas.width = Math.max(768, Math.round(bounds.width * scale));
   canvas.height = Math.max(432, Math.round(bounds.height * scale));
-  const directCanvas = suspending
-    ? canvas.transferControlToOffscreen()
-    : new OffscreenCanvas(canvas.width, canvas.height);
-  if (!suspending) directView = canvas.getContext("bitmaprenderer");
+  if (search.has("benchmark")) { canvas.width = 1280; canvas.height = 720; }
+  const presentation = presentationCanvas(canvas, suspending);
+  const directCanvas = presentation.gpuCanvas;
+  directView = presentation.view;
   worker = new Worker("./runtime-smoke-worker.mjs", { type: "module" });
   worker.addEventListener("message", (event) => {
     if (stopped) return;
+    if (event.data?.frameTimings) {
+      const batch = event.data.frameTimings.frames;
+      const available = Math.max(0, benchmarkLimit - flipTimings.length);
+      flipTimings.push(...batch.slice(0, available));
+      retainedTimingDrops += Math.max(0, batch.length - available);
+      timingDrops = event.data.frameTimings.dropped;
+    }
     if (event.data?.type === "runtime-present") {
       presentedFrames += 1;
       directView?.transferFromImageBitmap(event.data.bitmap);
@@ -212,7 +302,7 @@ async function start() {
   }
   worker.postMessage({
     type: "boot",
-    ...(bootPath ? { path: bootPath } : { fixture: "fixtures/gs_gcm_tetris.elf" }),
+    ...(bootPath ? { path: bootPath } : { fixture: search.get("fixture") ?? "fixtures/gs_gcm_tetris.elf" }),
     directRenderer: true,
     gpuCanvas: directCanvas,
     // The core has to match the canvas: only a suspending one lets the RSX thread yield, which is
@@ -226,6 +316,14 @@ async function start() {
     // A session is open-ended, so a frame waits as long as the runtime will allow
     packetTimeoutMs: 300_000,
     recordInputs: true,
+    benchmark: search.has("benchmark"),
+    spuDispatchCache: search.get("spuDispatchCache") !== "0",
+    spuExecutionSlices: search.get("spuExecutionSlices") !== "0",
+    ppuReturnDispatch: search.get("ppuReturnDispatch") === "1",
+    ppuInlineReads: search.get("ppuInlineReads") === "1",
+    bindGroupCache: search.get("bindGroupCache") === "1",
+    presentationYield: search.get("presentationYield") ?? "timer",
+    llvmCompilerUrl: search.get("llvmCompiler") || undefined,
     inputTrace,
     pad: controlState(),
     // Every tier the port has, on. A guest block starts interpreted; the PPU tier and the SPU
@@ -237,30 +335,32 @@ async function start() {
     // LLVM SPU recompiler in the compiler workers on top of it (spu_thread::init_spu_decoder).
     spuDecoder: search.get("spuDecoder") ?? "llvm",
     spuLlvmWorkers: Number(search.get("spuLlvmWorkers")) || 2,
-    ...(await bundlesFor(bootPath, search)),
-    clockScale: Number(search.get("clockScale")) || undefined,
+    ...options,
   }, [directCanvas]);
+
+  // Optional auto-advance past a title's movie/menu: ?autoStartSec=30 taps the pad START at a
+  // fixed monotonic wall time after boot. Validation runs press Start anyway ~30 s in; doing it
+  // here deterministically reaches the 3D rendering stretch without waiting out the whole intro.
+  const autoStartSec = Number(search.get("autoStartSec")) || 0;
+  if (autoStartSec > 0) {
+    const wait = Math.max(0, sessionStart + autoStartSec * 1000 - performance.now());
+    setTimeout(() => {
+      worker.postMessage({ type: "pad", state: { digital1: Digital1.start, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 } });
+      setTimeout(() => worker.postMessage({ type: "pad", state: { digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 } }), 250);
+    }, wait);
+  }
 }
 
-// A bundle is built from one disc image's code, so it is only valid for that image. local-aot's
-// index says which is which; the page uses it rather than being told, and a run with no bundle for
-// the title being booted simply starts with the compiling tiers alone.
-async function bundlesFor(path, search) {
-  const ppuAot = search.get("ppuAot");
-  const spuAot = search.get("spuAot");
-  if (ppuAot || spuAot) return { ppuAotBundle: ppuAot ?? undefined, spuAotBundle: spuAot ?? undefined };
-  if (!path) return {};
-  const index = await fetch("local-aot/index.json").then((response) => (response.ok ? response.json() : null)).catch(() => null);
-  const entry = index?.titles?.find((title) => title.disc === path);
-  if (!entry) return {};
-  return { ppuAotBundle: entry.ppu ?? undefined, spuAotBundle: entry.spu ?? undefined };
-}
-
-function stop() {
+async function stop() {
   stopped = true;
-  worker?.postMessage({ type: "shutdown" });
+  const active = worker;
+  if (!active) return;
+  let report;
+  try { report = await requestRuntime(active, { type: "shutdown" }, "runtime-shutdown"); }
+  finally { active.terminate(); }
   worker = undefined;
   currentStatus = { ...currentStatus, state: "stopped" };
+  return report;
 }
 
 for (const type of ["keydown", "keyup"]) {
@@ -334,8 +434,10 @@ window.__rpcs3Playable = {
   start,
   stop,
   status: () => ({ ...currentStatus }),
+  benchmark: () => ({ schemaVersion: 2, frames: benchmarkFrames.slice(), flipTimings: flipTimings.slice(), timingDrops: timingDrops + retainedTimingDrops, observationDrops, status: { ...currentStatus } }),
   setPad: (state) => worker?.postMessage({ type: "pad", state }),
   exportInputTrace,
+  exportSpuChainEdges: () => worker ? requestRuntime(worker, { type: "spu-chain-edges" }, "spu-chain-edges") : Promise.resolve(undefined),
 };
 
 void start().catch((error) => fail(error instanceof Error ? error.message : String(error)));

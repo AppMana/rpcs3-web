@@ -3,6 +3,9 @@
 #ifdef RPCS3_WEB
 #include "JIT.h"
 #include "util/logs.hpp"
+#include "WasmRegion.h"
+#include "WasmCallPolicy.h"
+#include <cstdlib>
 
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -20,11 +23,20 @@ LLD_HAS_DRIVER(wasm)
 
 LOG_CHANNEL(jit_log, "JIT");
 
-// The browser compiler lowers RPCS3's wasm-mode IR exactly like the offline bundle path
-// (web/scripts/compile-ppu-ir-to-wasm.mjs): llc -O2 for wasm32 with the runtime's feature set
-// and -relocation-model=pic, then wasm-ld --shared against the runtime's shared memory.
+// The browser compiler lowers RPCS3's wasm-mode IR like the offline bundle path
+// (web/scripts/compile-ppu-ir-to-wasm.mjs): llc -O3 for wasm32 with the runtime's
+// feature set and -relocation-model=pic, then wasm-ld --shared against the
+// runtime's shared memory. The TargetMachine runs at the Aggressive (-O3) codegen
+// level so LLVM's wasm backend vectorizes/schedules the guest code as hard as the
+// offline path does (FEX keeps its transpiler at maximum opt for the same reason).
 static constexpr const char* s_triple = "wasm32-unknown-unknown";
 static constexpr const char* s_features = "+atomics,+bulk-memory,+mutable-globals,+sign-ext,+simd128,+tail-call";
+static u32 s_region_linked_calls = 0;
+
+u32 wasm_region_linked_calls()
+{
+	return s_region_linked_calls;
+}
 
 jit_compiler::jit_compiler(const std::unordered_map<std::string, u64>&, std::string_view, u32, std::function<u64(const std::string&)>)
 	: m_context(std::make_unique<llvm::LLVMContext>())
@@ -43,7 +55,7 @@ jit_compiler::jit_compiler(const std::unordered_map<std::string, u64>&, std::str
 	const llvm::Target* target = llvm::TargetRegistry::lookupTarget(s_triple, error);
 	ensure(target, "WebAssembly target");
 	llvm::TargetOptions options;
-	m_target_machine.reset(target->createTargetMachine(llvm::Triple(s_triple), "generic", s_features, options, llvm::Reloc::PIC_, std::nullopt, llvm::CodeGenOptLevel::Default));
+	m_target_machine.reset(target->createTargetMachine(llvm::Triple(s_triple), "generic", s_features, options, llvm::Reloc::PIC_, std::nullopt, llvm::CodeGenOptLevel::Aggressive));
 	ensure(m_target_machine, "WebAssembly target machine");
 	static_cast<void>(s_initialized);
 }
@@ -58,6 +70,12 @@ std::vector<u8> jit_compiler::emit_wasm(llvm::Module& module, std::string& error
 
 	module.setTargetTriple(m_target_machine->getTargetTriple());
 	module.setDataLayout(m_target_machine->createDataLayout());
+	s_region_linked_calls = 0;
+	if (const char* regions = std::getenv("RPCS3_WASM_REGIONS"); regions && *regions == '1')
+	{
+		s_region_linked_calls = wasm_codegen::form_regions(module).linked_calls;
+		wasm_codegen::preserve_import_call_frames(module);
+	}
 
 	SmallVector<char, 0> object;
 	{

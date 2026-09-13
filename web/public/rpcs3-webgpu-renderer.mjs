@@ -960,7 +960,7 @@ export function translateRsxProgram(input) {
   const vertex = compileVertexProgram(packet);
   const fragment = compileFragmentProgram(packet);
   const swizzles = new Map(Object.entries(input.textureSwizzles ?? {}).map(([slot, swizzle]) => [Number(slot), swizzle]));
-  const code = assembleShader(vertex, fragment, "webgpu-wgsl", input.colorTargetCount ?? 1, input.alphaFunc, swizzles);
+  const code = assembleShader(vertex, fragment, "webgpu-wgsl", input.colorTargetCount ?? 1, input.alphaFunc, swizzles, input.colorOutputIndices, input.drawBufferGroup);
   return {
     code,
     textureSlots: [...fragment.textureSlots],
@@ -985,7 +985,8 @@ function programKey(packet, vertexBackend, textureSwizzles = new Map()) {
   ].join(":");
 }
 
-function assembleShader(vertex, fragment, vertexBackend, colorTargetCount = 1, alphaFunc = undefined, textureSwizzles = new Map()) {
+function assembleShader(vertex, fragment, vertexBackend, colorTargetCount = 1, alphaFunc = undefined, textureSwizzles = new Map(), colorOutputIndices = undefined, drawBufferGroup = 0) {
+  if (drawBufferGroup !== 0 && drawBufferGroup !== 1) throw new Error("invalid draw buffer group");
   const declarations = fragment.textureSlots.flatMap((slot) => [
     `@group(0) @binding(${slot * 2}) var rsxTexture${slot}: ${WGSL_TEXTURE_TYPES[fragment.textureDimensions.get(slot)]};`,
     `@group(0) @binding(${slot * 2 + 1}) var rsxSampler${slot}: sampler;`,
@@ -997,7 +998,7 @@ function assembleShader(vertex, fragment, vertexBackend, colorTargetCount = 1, a
       environment: array<vec4f, 2>,
       constants: array<vec4f, ${FRAGMENT_CONSTANT_SLOTS}>,
     };
-    @group(0) @binding(33) var<uniform> rsxFragmentState: RSXFragmentState;
+    @group(${drawBufferGroup}) @binding(33) var<uniform> rsxFragmentState: RSXFragmentState;
   `;
   let vertexStage;
   if (vertexBackend === "webgpu-wgsl") {
@@ -1010,9 +1011,9 @@ function assembleShader(vertex, fragment, vertexBackend, colorTargetCount = 1, a
         constants: array<vec4f, 468>,
         attributeLayout: array<vec4u, ${VERTEX_LAYOUT_BYTES / 16}>,
       };
-      @group(0) @binding(32) var<uniform> rsxVertexState: RSXVertexState;
-      @group(0) @binding(34) var<storage, read> rsxPersistentStream: array<u32>;
-      @group(0) @binding(35) var<storage, read> rsxVolatileStream: array<u32>;
+      @group(${drawBufferGroup}) @binding(32) var<uniform> rsxVertexState: RSXVertexState;
+      @group(${drawBufferGroup}) @binding(34) var<storage, read> rsxPersistentStream: array<u32>;
+      @group(${drawBufferGroup}) @binding(35) var<storage, read> rsxVolatileStream: array<u32>;
       ${RSX_VERTEX_FETCH_WGSL}
       struct RSXVertexInputs {
         ${attributeFields}
@@ -1053,7 +1054,7 @@ function assembleShader(vertex, fragment, vertexBackend, colorTargetCount = 1, a
       ${vertexOutputFields}
     };
     ${vertexStage}
-    ${fragmentSignature(fragment, colorTargetCount, alphaFunc)}
+    ${fragmentSignature(fragment, colorTargetCount, alphaFunc, colorOutputIndices)}
   `;
 }
 
@@ -1068,21 +1069,25 @@ function alphaTestCode(value, alphaFunc) {
 
 // RSX writes color targets 1..3 from r2, r3, r4 (32-bit exports) or h4, h6, h8 (16-bit
 // exports), as FragmentProgramDecompiler's ocol1..3; a single target keeps the plain return.
-function fragmentSignature(fragment, colorTargetCount, alphaFunc) {
+function fragmentSignature(fragment, colorTargetCount, alphaFunc, colorOutputIndices) {
+  const outputs = colorOutputIndices ?? Array.from({ length: colorTargetCount }, (_, i) => i);
+  if (outputs.length !== colorTargetCount || outputs.some((i) => !Number.isInteger(i) || i < 0 || i > 3)) {
+    throw new Error("invalid RSX color output mapping");
+  }
   const match = /return (r16|r32)\[0\];\s*$/.exec(fragment.code);
   if (!match) throw new Error("RSX fragment program has no color return");
   const file = match[1];
   const body = fragment.code.slice(0, match.index);
   const alphaTest = alphaTestCode(`${file}[0]`, alphaFunc);
+  const registers = file === "r32" ? [0, 2, 3, 4] : [0, 4, 6, 8];
   if (colorTargetCount <= 1) {
     return `@fragment fn fragment_main(input: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(0) vec4f {
       ${body}${alphaTest}
-      return ${file}[0];
+      return ${file}[${registers[outputs[0] ?? 0]}];
     }`;
   }
-  const registers = file === "r32" ? [0, 2, 3, 4] : [0, 4, 6, 8];
   const fields = Array.from({ length: colorTargetCount }, (_, i) => `@location(${i}) color${i}: vec4f,`).join(" ");
-  const values = Array.from({ length: colorTargetCount }, (_, i) => `${file}[${registers[i]}]`).join(", ");
+  const values = Array.from({ length: colorTargetCount }, (_, i) => `${file}[${registers[outputs[i]]}]`).join(", ");
   return `struct FragmentOut { ${fields} };
     @fragment fn fragment_main(input: VertexOut, @builtin(front_facing) frontFacing: bool) -> FragmentOut {
       ${body}${alphaTest}

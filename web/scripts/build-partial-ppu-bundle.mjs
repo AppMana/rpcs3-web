@@ -1,3 +1,5 @@
+import { dylinkInfo } from "../public/wasm-dylink.mjs";
+import { tableEntriesAreLocal } from "./wasm-table-ownership.mjs";
 // A bundle that registers only part of what its module carries, so the runtime PPU tier still has
 // blocks to compile while bundle blocks are running. A full bundle hides the interaction between
 // the two: a bundle block reaches another through the guest-address table, so it can branch into an
@@ -19,7 +21,7 @@ const stride = Math.max(1, Number(strideArgument) || 2);
 const compiled = await WebAssembly.compile(readFileSync(input));
 // The same stand-in environment the bundle builder reads block tables through (build-ppu-aot-bundle.mjs)
 const memory = new WebAssembly.Memory({ initial: 512, maximum: 32768, shared: true });
-const table = new WebAssembly.Table({ initial: 1 << 16, element: "anyfunc" });
+const table = new WebAssembly.Table({ initial: Math.max(1 << 16, dylinkInfo(compiled).tableSize), element: "anyfunc" });
 const memoryBase = 1 << 16;
 const env = {
   memory,
@@ -53,6 +55,7 @@ writeFileSync(output, `${JSON.stringify({
     url: basename(input),
     module: "partial",
     relocatable: false,
+    localTableOnly: tableEntriesAreLocal(readFileSync(input), WebAssembly.Module.imports(compiled).filter((entry) => entry.kind === "function").length),
     blocks: Buffer.from(new Uint32Array(kept).buffer).toString("base64"),
   }],
 }, null, 2)}\n`);

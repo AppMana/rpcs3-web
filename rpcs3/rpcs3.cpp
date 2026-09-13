@@ -3,6 +3,7 @@
 
 #include <iostream>
 #include <chrono>
+#include <cmath>
 #include <clocale>
 #include <span>
 
@@ -10,6 +11,12 @@
 #include <QCommandLineParser>
 #include <QFileInfo>
 #include <QTimer>
+#include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include "Input/pad_thread.h"
+#include "Utilities/FrameTiming.h"
 #include <QObject>
 #include <QStyleFactory>
 #include <QMessageBox>
@@ -822,6 +829,11 @@ int run_rpcs3(int argc, char** argv)
 	const QCommandLineOption version_option = parser.addVersionOption();
 	parser.addOption(QCommandLineOption(arg_headless, "Run RPCS3 in headless mode."));
 	parser.addOption(QCommandLineOption(arg_no_gui, "Run RPCS3 without its GUI."));
+	parser.addOption(QCommandLineOption("input-trace", "Replay frame-indexed controller input.", "path"));
+	parser.addOption(QCommandLineOption("benchmark-duration", "Stop a benchmark after this many milliseconds.", "milliseconds"));
+	parser.addOption(QCommandLineOption("benchmark-capture-frame", "Request an RSX capture after this guest flip (pauses playback).", "frame"));
+	parser.addOption(QCommandLineOption("benchmark-progress", "Write the current guest flip for profiling coordination.", "path"));
+	parser.addOption(QCommandLineOption("benchmark-report", "Write emulated flip timestamps on shutdown.", "path"));
 	parser.addOption(QCommandLineOption(arg_fullscreen, "Run games in fullscreen mode. Only used when no-gui is set."));
 	const QCommandLineOption screen_option(arg_gs_screen, "Forces the emulator to use the specified screen for the game window.", "index", "");
 	parser.addOption(screen_option);
@@ -865,6 +877,84 @@ int run_rpcs3(int argc, char** argv)
 	parser.addOption(QCommandLineOption("N/A", "Arguments after \"--\" are considered emulation arguments."));
 
 	parser.process(app->arguments());
+	if (parser.isSet("input-trace"))
+	{
+		QFile input(parser.value("input-trace"));
+		if (!input.open(QIODevice::ReadOnly)) report_fatal_error("Cannot open input trace");
+		QJsonParseError error;
+		const auto document = QJsonDocument::fromJson(input.readAll(), &error);
+		const auto root = document.object();
+		if (error.error != QJsonParseError::NoError || root.value("schema").toInt() != 1 || !root.value("entries").isArray())
+			report_fatal_error("Invalid input trace: expected schema 1 and entries array");
+		injected_pad::clear_schedule();
+		u32 previous = 0;
+		for (const auto value : root.value("entries").toArray())
+		{
+			const auto entry = value.toObject();
+			const auto number = [&](const char* key, u32 fallback, u32 maximum) -> u32
+			{
+				if (!entry.contains(key)) return fallback;
+				const double n = entry.value(key).toDouble(-1);
+				if (n < 0 || n > maximum || n != std::floor(n)) report_fatal_error("Invalid input trace integer");
+				return static_cast<u32>(n);
+			};
+			const u32 frame = number("frame", previous, UINT32_MAX);
+			if (!value.isObject() || !entry.contains("frame") || frame < previous) report_fatal_error("Input trace frames must be ordered");
+			previous = frame;
+			injected_pad::add_schedule({frame, number("digital1", 0, UINT32_MAX), number("digital2", 0, UINT32_MAX),
+				number("leftX", 128, 255), number("leftY", 128, 255), number("rightX", 128, 255), number("rightY", 128, 255)});
+		}
+	}
+	unsigned capture_frame = 0;
+	if (parser.isSet("benchmark-capture-frame"))
+	{
+		bool valid = false;
+		capture_frame = parser.value("benchmark-capture-frame").toUInt(&valid);
+		if (!valid || !capture_frame || !parser.isSet("benchmark-report"))
+			report_fatal_error("benchmark-capture-frame requires a positive frame and benchmark-report");
+	}
+	if (parser.isSet("benchmark-report"))
+	{
+		utils::frame_timing::start(capture_frame);
+		const auto output = parser.value("benchmark-report");
+		QObject::connect(app.data(), &QCoreApplication::aboutToQuit, [output]
+		{
+			const auto batch = utils::frame_timing::drain();
+			QJsonArray frames;
+			const double start = batch.frames.empty() ? 0 : batch.frames.front().time_us;
+			for (const auto& sample : batch.frames)
+				frames.append(QJsonObject{{"emuFlipId", static_cast<double>(sample.frame)}, {"elapsedMs", (sample.time_us - start) / 1000.0}, {"monotonicUs", sample.time_us}});
+			QFile file(output);
+			if (!file.open(QIODevice::WriteOnly)) { sys_log.error("Cannot write benchmark report"); return; }
+			file.write(QJsonDocument(QJsonObject{{"schemaVersion", 2}, {"frames", frames}, {"dropped", static_cast<double>(batch.dropped)},
+				{"inputEntriesApplied", static_cast<double>(injected_pad::applied())}}).toJson());
+		});
+	}
+
+	if (parser.isSet("benchmark-progress"))
+	{
+		if (!parser.isSet("benchmark-report"))
+			report_fatal_error("benchmark-progress requires benchmark-report");
+		const auto output = parser.value("benchmark-progress");
+		auto* progress = new QTimer(app.data());
+		QObject::connect(progress, &QTimer::timeout, [output]
+		{
+			QFile file(output);
+			if (file.open(QIODevice::WriteOnly))
+				file.write(QJsonDocument(QJsonObject{{"frame", static_cast<double>(utils::frame_timing::position())},
+					{"monotonicUs", utils::frame_timing::now_us()}}).toJson(QJsonDocument::Compact));
+		});
+		progress->start(500);
+	}
+
+	if (parser.isSet("benchmark-duration"))
+	{
+		bool valid = false;
+		const int duration = parser.value("benchmark-duration").toInt(&valid);
+		if (!valid || duration <= 0 || !parser.isSet("benchmark-report"))
+			report_fatal_error("benchmark-duration requires a positive duration and benchmark-report");
+		QTimer::singleShot(duration, app.data(), [] { Emu.Kill(); });
+	}
 
 	for (const auto& opt : parser.optionNames())
 	{

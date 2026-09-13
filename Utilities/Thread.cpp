@@ -3060,6 +3060,20 @@ void thread_base::initialize(void (*error_cb)())
 		return true;
 	});
 
+	// Web only: narrow the 1 kHz futex polling ceiling to guest CPU threads
+	// that still owe the VM writer a safe-point acknowledgement. The closure
+	// answers at call time on the waiting thread, where g_tls_this_thread is
+	// set during guest execution. Non-guest workers are unknown -> null -> poll.
+	atomic_wait_engine::set_interruptible_callback([]() -> bool
+	{
+		if (const auto cpu = cpu_thread::get_current())
+		{
+			const auto state = +cpu->state;
+			return (state & cpu_flag::memory) || !(state & cpu_flag::wait);
+		}
+		return true;
+	});
+
 	set_name(thread_ctrl::get_name_cached());
 }
 
@@ -3180,6 +3194,7 @@ u64 thread_base::finalize(thread_state result_state) noexcept
 		g_tls_wait_fail);
 
 	atomic_wait_engine::set_wait_callback(nullptr);
+	atomic_wait_engine::set_interruptible_callback(nullptr);
 
 #ifdef RPCS3_WEB
 	if (const auto name = m_tname.load())

@@ -849,3 +849,17 @@ this run's heavy-band window read ~23 fps @ 573 dpf (lighter content band). Cont
 across runs (heavier 941-1162 dpf bands surfaced in other runs) continues to block a
 clean transpiler f/f on live gameplay; the O3 transpile+AOT+coverage stack is
 correctness-verified (oracle 30/30, units 120/120) and entirely deployed.
+
+## Consolidated gameplay transpile/dispatch attribution (round 6) — 2026-09-12
+Nine content-drifted gameplay runs measured (frozen profile + frame-indexed trace, RTX A5000).
+SPU dispatch-profile deltas across transpile configs:
+- transpile default trace@1500: 2.47B SPU attempts, reject 2.93%, SPU interp 2.34M (heavy window ~11.8fps @1162dpf)
+- SPU mega + hot16 (round-3 coverage): 1.66B attempts (-33%), interp 1.15M (-51%) (window read ~21fps @573dpf, lighter band)
+- +PPU hot8 + SPU mega16 (round-4): 1.46B attempts, interp 1.17M
+- +O3-PPU-AOT bundle (round-5, deployed): 1.54B attempts, reject 4.53%, interp 1.22M, 5324f 0fail
+Coverage ceiling: SPU-LLVM transpiled dispatches ~5% of attempts with an always-empty transpile queue
+-> transpile RATE is not the cap; the per-dispatch atlas+verify path (312k attempts/750us-ish) and
+the per-draw Dawn path bound heavy gameplay. Transpile quality (in-browser O3, O3 PPU-AOT, mega
+blocks, low hot thresholds) is fully deployed and gameplay-boot-verified; content-FMV drift keeps
+a clean single gameplay-fps claim unattributable, so transpiler deltas are tracked by the
+content-independent dispatch signals above.

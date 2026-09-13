@@ -837,3 +837,15 @@ clean transpiler f/f on live FMV-paced content is not attributable from singleto
 content-independent signal is transpiler block density/exec with the AOT bundle covering the hot
 gameplay blocks. The content-anchored gameplay window (web/scripts/analyse-gameplay.mjs) stays
 the measurement tool for any future same-content comparison.
+
+## Round-5 (2026-09-12): game PPU AOT bundle rebuilt at -O3 + deployed; gameplay-verified
+The deployed game PPU AOT bundle (local-aot/lbp2-profiled, 85137 blocks, built 2026-09-04)
+predated the offline `-O3` transpiler change (round-1). Rebuilt it with the current compiler
+(lbp2-profiled-o3: 114 transpiled blocks, 170.7MB wasm) and pointed the deployed
+local-aot/index.json at it, so AOT-covered gameplay PPU hot blocks now run O3-quality wasm
+(earlier bundle = O2). Hardware gameplay run with the O3 bundle + aggressive transpile
+coverage (PPU hot threshold 8, SPU mega+16) completed 5324 frames / 0 failures / 0 drops;
+this run's heavy-band window read ~23 fps @ 573 dpf (lighter content band). Content drift
+across runs (heavier 941-1162 dpf bands surfaced in other runs) continues to block a
+clean transpiler f/f on live gameplay; the O3 transpile+AOT+coverage stack is
+correctness-verified (oracle 30/30, units 120/120) and entirely deployed.

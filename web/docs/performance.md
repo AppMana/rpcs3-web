@@ -1463,3 +1463,20 @@ bound, reads inlined, writes raw). Now building the FULL inline bundle from the 
 deployed lbp2-profiled-o3 stays unchanged until the inline bundle validates. After: point index.json
 at the inline manifest, oracle + units + hardware bench, compare settled-gameplay fps vs the ~22%
 read-tier occlusion. Goal stays active.
+
+## Round-02/03 (resumed): inline read-tier landed; heavy-render fps corrected
+Landed the AOT read-tier inlining: (1) --inline-reads IR transform in compile-ppu-ir-to-wasm.mjs
+(moves each vm_readN_raw call to the in-wasm page-table fast-path over GOT.mem.__rpcs3_guest_pages
++ volatile wasm load, with the raw helper as fallback for unmapped; writes stay raw for host
+texture-versioning); (2) forwarding in build-ppu-aot-bundle.mjs. VALIDATED: the --pic part inlines
+reads (pages bound via GOT.mem, vm_read helpers reduced to fallback-only) and oracle e2e 30 passed /
+2 skipped / 0 failed + units 27/27 (93 tests) green. Deployed the inline bundle (index.json ->
+lbp2-profiled-inline). OUTCOME (late settled window 3000-5200, panic-pan with spam-Start trace):
+5209 frames / 0 fails / fpsOverall 9.54, and the settled window is DOMINATED by heavy render
+(2029 frames at mean 1165 dpf). This CORRECTS the picture: the true heavy-3D gameplay render runs
+~9.5fps @ ~1165 draw/frame (the 30fps-target scenes); the earlier "19-24 fps @573dpf" was the
+steady/light band, not the heavy 3D sequences. So the READ-TIER INLINE removed the per-access
+JS-border cost in the CPU profile (~22% inclusive) but the heavy render SCALE (1165 dpf) binds the
+fps at ~9.5 - the bottleneck is Dawn-scale at heavy draw counts (render submission), not the VM
+read border. NEXT-BOUNDED: Dawn submission-side (draw-call batching/indirect) to scale the heavy
+render, plus keeping the spam-Start pan (not the movie) for the 30fps focus. Goal stays active.

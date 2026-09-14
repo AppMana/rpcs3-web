@@ -309,4 +309,16 @@ public:
 		u64 preamble_keymap_ns = 0;
 	};
 	stats m_stats;
+
+	// Program-ucode hash cache: consecutive END() clauses that redraw the SAME vertex /
+	// fragment program (byte-identical ucode, same backing pointer/len) skip re-hashing
+	// the ucode buffer every clause. Bound: pointer+len identity (addresses are stable
+	// while the program is bound; any mutation swaps the backing allocation).
+	struct ucode_hash_cache_t
+	{
+		const void* data = nullptr;
+		u32 len = 0;
+		u64 hash = 0;
+	};
+	ucode_hash_cache_t m_vp_hash_cache, m_fp_hash_cache;
 };

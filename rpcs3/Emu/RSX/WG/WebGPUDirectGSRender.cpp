@@ -1751,10 +1751,30 @@ void WebGPUDirectGSRender::end()
 	const u32 target_count = static_cast<u32>(targets.colors.size());
 
 	// RPCS3's ucode hashes: the fragment hash skips the inline constants, which the draw
-	// supplies through the fragment uniform (fragment_program_utils::get_fragment_program_ucode_hash)
+	// supplies through the fragment uniform (fragment_program_utils::get_fragment_program_ucode_hash).
+	// Consecutive clauses that redraw the SAME program (byte-identical ucode, same backing
+	// pointer/len) skip re-hashing: the preamble cost on the RSX thread drops to a pointer check.
 	const double ts_hash0 = utils::frame_timing::now_us();
-	const u64 vp_hash = program_hash_util::vertex_program_utils::get_vertex_program_ucode_hash(current_vertex_program);
-	const u64 fp_hash = program_hash_util::fragment_program_utils::get_fragment_program_ucode_hash(current_fragment_program);
+	const u64 vp_hash = [&]()
+	{
+		const auto* vd = reinterpret_cast<const u8*>(current_vertex_program.data.data());
+		const auto vl = static_cast<u32>(current_vp_metadata.ucode_length);
+		if (m_vp_hash_cache.data == vd && m_vp_hash_cache.len == vl)
+			return m_vp_hash_cache.hash;
+		const u64 h = program_hash_util::vertex_program_utils::get_vertex_program_ucode_hash(current_vertex_program);
+		m_vp_hash_cache = {vd, vl, h};
+		return h;
+	}();
+	const u64 fp_hash = [&]()
+	{
+		const auto* fd = static_cast<const u8*>(current_fragment_program.get_data());
+		const auto fl = static_cast<u32>(current_fragment_program.ucode_length);
+		if (m_fp_hash_cache.data == fd && m_fp_hash_cache.len == fl)
+			return m_fp_hash_cache.hash;
+		const u64 h = program_hash_util::fragment_program_utils::get_fragment_program_ucode_hash(current_fragment_program);
+		m_fp_hash_cache = {fd, fl, h};
+		return h;
+	}();
 	m_stats.preamble_hash_ns += static_cast<u64>((utils::frame_timing::now_us() - ts_hash0) * 1000.0);
 	const double ts_key0 = utils::frame_timing::now_us();
 	program_key program_id{};

@@ -1386,3 +1386,13 @@ which has not happened on the lighter-cadence bias. That means the spam-Start tr
 state, so THIS run's window may not be a valid *gameplay* sample. The next bounded
 action is retune the skip cadence (fewer/intermittent Starts + a longer settle) OR the
 save-resume path so a clean 3D gameplay stretch is measured. Goal stays active.
+
+## Round-01 (gameplay-window pan confirmed): AOT VM-raw tier is the dominant fixable occl
+Late-window (profile 3000-5200) inclusive attribution over the freshest settled-gameplay
+stretch (gamepray-fixed, 5205 frames / 0-fail): AOT VM raw memory tier aggregates ~22%
+of sampled guest time (read32 8.8 + write64 4.8 + read64 3.9 + write32 3.0 + read8 ~1.8),
+vs timebase now 16.7% and PPU interpreter slice ~10% (exec_task_slice 6.8 +
+check_state 3.4). VERDICT: the AOT bundle's JS-border per-access VM memory path is the
+tallest floor in real gameplay - it is the largest landable optimization, and its fix
+route (inline the page-table read into wasm) requires rebuilding the stored bundle via
+a native dump. Still kept gated for a dedicated program. Goal stays active.

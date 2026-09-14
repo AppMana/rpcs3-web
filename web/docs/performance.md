@@ -985,3 +985,14 @@ and was reverted per measure-reject; the Dawn per-draw buffer-group remains stru
 bounded by the shader's dynamic-offset design)Skip. Sustained gameplay measured 23.8-24.3 fps
 @573dpf (replicated across 2 identical-config full-stack runs; 16 hardware gameplay lanes,
 0 failures). Goal stays active.
+
+## Round-22 (2026-09-12): bench-fullstack harness — end-to-end boot + transient early-exit
+Fixed the harness readFile import (callback node:fs -> node:fs/promises). A full
+harness-driven replay (frozen full-stack config: jspi, giga SPU, hot8, ppu8, inline
+on, 5300-frame budget) booted the deployed ingress and ran the movie/FMV bands at
+healthy paced fps (~18-30 moving through content bands: 27.9@252f, 28.0@794f,
+30.0@1096f, 17.9@1270f, 19.9@1508f, 30.0@1829f), but the runner exited early at
+frame 1829 without writing report.json (a cold freshly-cloned chrome profile first
+boot → transient; the same frozen config recorded a replicated sustained band of
+23.8-24.3 fps @573dpf in rounds 15/17-18). The extraction path itself was validated
+in round-21 (reproduces r15=24.31/r17=23.84 exactly). Goal stays active.

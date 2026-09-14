@@ -904,3 +904,20 @@ ppuInlineReads true, sustained band 422 contiguous fps @573dpf = **22.1fps** (wi
 the ~23fps sustained range across the 13 gameplay runs). The inline PPU path is
 now gameplay-verified; heavy-band sustained framerate remains pacing/guest-
 aggregate bound, recorder record intact. Goal stays active.
+
+## Inline-reads gameplay-verified; AOT region/dump paths closed as unwired (round 12) — 2026-09-12
+Enabled PPU inline-reads on the deployed hoisted runtime (RPCS3_PPU_INLINE_READS=1 ->
+transpiled PPU blocks use in-wasm page-table loads over __rpcs3_guest_pages instead of
+per-access JS raw-helper imports): gameplay-verified 5373f/0fail/0drops (hw-inlprof). The
+profile leaf attribution for the heavy band still reads `now` (timebase) ~9.6% + VM raw
+helpers ~20% + slice/check_state ~11% - all guest-tier costs already addressed by the
+deployed O3 transpile stack (timebase is a wasm-side performance.now closure; the VM raw
+helpers remain on AOT blocks because the offline bundle is compiled from dumps that were
+emitted without the inline-reads policy, and the runtime's IR dump toggle reads wasm-side
+getenv, not host env, so a bundle rebuild with inline-reads baked is not reachable through
+the runner plumbing). Closed as recorded attempts: PPU region-chaining (byte-identical),
+SPU block-size sweep (coverage invariant). Sustained gameplay ~22-23fps @ 573dpf across 14
+HW runs, 0 failures; transpile stack (O3 in-browser JIT, O3 PPU-AOT, giga SPU, low hot
+thresholds, Dawn draw-state hoist, inline PPU reads on emergent blocks) fully deployed.
+Goal remains active; remaining structural gap is bounded by the measured guest-tier costs
+above (timebase/VM/spin on the interpreter path) and requires guest-tier scheduling work.

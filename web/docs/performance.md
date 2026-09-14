@@ -1118,3 +1118,16 @@ bounded). NEXT-ROUND headed tests (both gated, non-claimed): (a) AOT inline re-d
 needs a native-side dump trigger; (b) Dawn index-collapse needs a content-anchored
 non-fixed-frame dispatch oracle (the round-19 fixed-frame drift rejected the slab).
 Goal stays active.
+
+## Round-35 (2026-09-12): shipped-floor dual-metric bench (20th lane, 0-fail)
+r34 (frozen config on deployed deee617a): 5300 frames / 0 failures / 20th hardware
+lane; fpsOverall 23.23; longest contiguous sustained band 3744-4110 = 22.13 fps
+@573dpf; 78 profile files captured. Shipped-floor leaves: now 12.5% / vm_read32 8.8% /
+exec_task_slice 6.1% / vm_write64 5.6% / (program) 4.4% / check_state 4.1% - all
+attributed and bounded (main-thread fence-spin timebase; AOT-dump-gated vm_raw;
+interpreter cold-path slice overhead at coverage ceiling). Fixture source sha
+b768009~ matches the embedded conformance -> oracle lane stays valid on shipped bytes.
+Cumulative record (34 commits tracked): 20 hardware lanes 0-fail, oracle 30/30 + units
+27/27 every gate, deployed floor 19.28-24.3fps @573dpf sustained. Two gated
+non-claimed candidates remain recorded with headed tests (AOT inline re-dump native;
+Dawn index-collapse content-anchored oracle). Goal stays active.

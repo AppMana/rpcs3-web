@@ -1085,3 +1085,14 @@ The dominant heavy-band leaf in fence-heavy stretches remains the legitimate RSX
 main-thread host-fence busy-spin. Goal stays active; recorded non-claimed next
 candidates unchanged: shared-cell timebase landing (boot-wedge gated) and Dawn
 index-collapse (content-anchored validate path).
+
+## Round-32 (2026-09-12): vm_raw block attributed; floor+ceiling on the browser lane
+Attribution: the profile's vm_read/write*_raw leaves (~20% aggregate) ride the AOT-baked
+PPU bundle (09-03 dumps emitted with inline-reads OFF). The browser-lane fix is
+re-dumping with inline baked, which is unreachable: the runtime AOT dump toggle reads
+wasm-side getenv (round-12). Native-side re-dump is out of the headless harness. So the
+browser-lane transpile/rendering stack is both at its measured floor AND at its wired
+ceiling - every in-lane lever is deployed and hardware-verified. Sustained gameplay
+holds 19.28-24.3fps @573dpf (19 hardware lanes, 0 failures; oracle 30/30 + units 27/27
+each gate). Non-claimed next candidates (both gated): shared-cell timebase (boot-wedge)
+and Dawn index-collapse (content-anchored validate). Goal stays active.

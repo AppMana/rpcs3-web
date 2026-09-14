@@ -1396,3 +1396,22 @@ check_state 3.4). VERDICT: the AOT bundle's JS-border per-access VM memory path 
 tallest floor in real gameplay - it is the largest landable optimization, and its fix
 route (inline the page-table read into wasm) requires rebuilding the stored bundle via
 a native dump. Still kept gated for a dedicated program. Goal stays active.
+
+## Vision audit (round-01): captured frame is BLACK - "gameplay" pan was not visible gameplay
+The vision subagent inspected hw-gamepray-fixed-20260912/frame.png (1280x720, 20KB):
+(1) render surface ESSENTIALLY ALL BLACK - no 3D content, no menu, no movie;
+(2) only web-port overlay UI visible (trace pill; HUD "running · 11.0 fps ·
+3,737,524 draws · 844,111,663 PPU · 104,470,085 compiled dispatches · t=07:32.6";
+d-pad; START; face buttons); (3) readable labels listed.
+IMPLICATION: at t~7:32 the emulator reports "running" at 11fps with 3.7M draws +
+104M compiled dispatches, but the surface presented is BLACK -> the game renders to
+a captured-but-black surface (movie-decode/black scene/pause not yet composited). So
+the prior "19-24fps" reported over band windows INCLUDED black-presenting stretches -
+NOT valid visible-gameplay pacing. The inclusive-function attribution (AOT VM-raw ~22%)
+is still factually what the sampled CPU does, but it cannot be reported as the
+gameplay-pacing figure. NEXT-BOUNDED: frame-correlated reading - capture/read the
+presented frame, pick the pan STRETCH where it is non-black, and measure fps only over
+that visible-gameplay span; the natural target is a save-resume or a longer settle
+before the pan window so a non-black 3D scene is presented for the measured window.
+I'll proceed on that once the state/pan capture infra confirms a visible window. Goal
+stays active.

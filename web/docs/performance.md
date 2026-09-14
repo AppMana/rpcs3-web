@@ -1441,3 +1441,17 @@ meanLum 0.9, non-black 2.86% = overlay-only). NOT a game-code regression. To see
 composited output, the pan should read the window/screen (not #gpu-output) or capture at a time
 when the compositor frame is present - an infra question. Goal stays active; the CPU-side
 inclusive attribution (AOT VM-raw ~22% top tier) is unaffected and stands.
+
+## Chrome-local gamepray verdict (round-01/02): black is a compositor-capture artifact, game running+drawing
+Ran a fresh gamepray (screen-capture: page.screenshot) with the gentle skip trace (Start
+burst frames 200-970, then untouched) + a late pan window (3000-5200). Result: gp3 5201
+frames / 0 failures / fps 9.5 (settled-scene moment t~7:32), and the page-level frame.png
+decodes to meanLum 0.9 / 2.86% non-black - IDENTICAL to the earlier #gpu-output element
+capture. The game IS running+drawing (HUD "running", 3.7M draws, 844M PPU, 104M compiled
+dispatches); the black is the composite readback of the transferred WebGPU canvas at the
+end-of-run instant, consistent across the whole session - NOT a game-code regression. The
+CPU-side inclusive attribution (AOT VM-raw ~22% top fixable tier) is unaffected and
+stands. NEXT-BOUNDED for a true visible-gameplay frame: the pan would need to grab the
+compositor window output mid-render (a dedicated capture hook), or the measurement should
+judge pacing by the Dawn submission/DM data rather than a single end-frame screenshot -
+either is a capture-infra extension, not a renderer/game regression. Goal stays active.

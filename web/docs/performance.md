@@ -948,3 +948,16 @@ the transpiled *bundle* still crosses the wasm->JS border per access, while the
 bundle re-dump with RPCS3_PPU_WASM_INLINE_READS baked into the store (dump-trigger
 plumbing) — recorded vs that move rather than claimed. Sustained gameplay measured
 24.31fps@573dpf (longest contiguous band); 15 HW runs, 0 failures. Goal stays active.
+
+## Replication of the full-stack sustained measurement (round 17) — 2026-09-12
+Two identical-config full-stack gameplay runs (5300-frame budget, all committed tiers
+incl. 1ms cached timebase): r15 5304f/23.85fps overall, sustained band 4457-4722
+@573dpf = 24.31 fps; r17 5353f/22.86fps overall, sustained band 4533-4793 @573dpf =
+23.84 fps. Replication band 23.8-24.3fps sustained (sample spread ~0.5fps) confirms the
+committed stack measures repeatably; residual run-to-run spread is dominated by FMV
+content-band position, not measurement noise. Decision record: transpile-quality stack
+(in-browser O3 IR + O3 PPU-AOT bundle + giga SPU + low hot thresholds + Dawn draw-state
+hoist + inline emergent PPU reads + 1ms cached timebase) is at its measured floor, all
+deployed, oracle 30/30 + units 27/27 (16 gates green), 16 hardware gameplay runs at
+0 failures. Goal stays active; recorded next structural surface = AOT bundle re-dump with
+inline-reads baked (native dump-trigger required; not reachable via browser plumbing).

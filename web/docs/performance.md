@@ -1267,3 +1267,14 @@ Cumulative: 48 commits, 23 hardware gameplay lanes, all 0-fail; oracle 30/30 + u
 27/27/93 gates green; tree 0-diff. Sole recorded candidate (AOT read-tier inline,
 746k sites) is native-capability-gated with its landing plan committed. Goal stays
 active.
+
+## Round-50 (2026-09-12): midpoint stocktake - 49 commits, 23 HW lanes, floor+ceiling
+Midpoint of the goal capacity (round 50/256): verified the shipped floor = repository
+ahead 49 session commits, tree 0-diff, runtime 2fd02495 (Dawn index-slab + program-ucode
+hash cache + 1ms in-wasm timebase) == ingress, transpiler 28a673b (O3 NewPM) == ingress,
+O3 PPU-AOT served. Sustained gameplay floor 18.8-24.3fps @573dpf across the 23 hardware
+lanes at 0 failures; oracle 30/30 + units 27/27/93 gates green. The browser lane's
+relentless-optimization program is at its wired ceiling: every in-lane transpile/rendering
+lever landed + measured. Sole remaining entry = AOT read-tier inline (746k sites), a
+native-capability-gated program with its landing plan + gating fully committed. Goal
+stays active.

@@ -1455,3 +1455,11 @@ stands. NEXT-BOUNDED for a true visible-gameplay frame: the pan would need to gr
 compositor window output mid-render (a dedicated capture hook), or the measurement should
 judge pacing by the Dawn submission/DM data rather than a single end-frame screenshot -
 either is a capture-infra extension, not a renderer/game regression. Goal stays active.
+
+## Round-02 (resumed, relentless): building the full inline-reads AOT bundle
+The `--inline-reads` transform is built + validated (one --pic part: GOT.mem.__rpcs3_guest_pages
+bound, reads inlined, writes raw). Now building the FULL inline bundle from the stored parts
+(build-ppu-aot-bundle --inline-reads --jobs=8) to a SEPARATE out dir (lbp2-profiled-inline) so the
+deployed lbp2-profiled-o3 stays unchanged until the inline bundle validates. After: point index.json
+at the inline manifest, oracle + units + hardware bench, compare settled-gameplay fps vs the ~22%
+read-tier occlusion. Goal stays active.

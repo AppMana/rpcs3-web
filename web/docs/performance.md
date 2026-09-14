@@ -974,3 +974,14 @@ cleanly; the working tree is back at the committed, green, deployed full-stack (
 sustained, oracle 30/30 + units 27/27 each of 16 green gates). Recorded: the per-draw Dawn
 submission collapse is content- and oracle-sensitive; a dedicated (non-fixed-frame) validate
 path would be the enabler, out of bounded reach for one round. Goal stays active.
+
+## Round-20 (2026-09-12): deployment-consistency closure
+Confirmed the deployed ingress bytes match the committed green full-stack exactly:
+runtime `ab3ed08c` (1 ms in-wasm cached timebase + all transpile tiers), transpiler
+`28a673b` (O3 in-browser guest transpiler), O3 PPU-AOT bundle (114 blocks / 170MB).
+Working tree is 0-diff (all 19 prior rounds committed with their benchmark evidence).
+The bounded Dawn index-slab collapse (round-19) drifted the fixed-frame dispatch oracle
+and was reverted per measure-reject; the Dawn per-draw buffer-group remains structurally
+bounded by the shader's dynamic-offset design)Skip. Sustained gameplay measured 23.8-24.3 fps
+@573dpf (replicated across 2 identical-config full-stack runs; 16 hardware gameplay lanes,
+0 failures). Goal stays active.

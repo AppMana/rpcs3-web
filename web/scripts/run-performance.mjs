@@ -39,6 +39,10 @@ const frameBudget = Number(process.env.RPCS3_FRAMES || (durationMs ? Number.MAX_
 const edgeFrom = Number(process.env.RPCS3_EDGE_FROM_FRAME || 4500);
 const edgeTo = Number(process.env.RPCS3_EDGE_TO_FRAME || 5200);
 const timeoutMs = Number(process.env.RPCS3_TIMEOUT_MS || 1_200_000);
+// A loaded board can take >30s to serve the 17.9MB transpiler blob over the runner's
+// pre-boot artifact check; bound the per-request fetch cap (default 60s) instead of
+// inheriting playwright's 30s request timeout that spuriously fails slow-boards.
+const fetchTimeoutMs = Number(process.env.RPCS3_FETCH_TIMEOUT_MS || 60_000);
 let context, profiler, perf, perfFinished;
 let perfStarted = false;
 const stopPerf = async () => {
@@ -123,7 +127,7 @@ try {
   const corePath = `core/${report.core === "release" ? "" : report.core + "/"}rpcs3-web.wasm`;
   report.artifacts = {};
   for (const resource of [corePath, corePath.replace(/\.wasm$/, ".mjs"), "play-runtime.mjs", "runtime-smoke-worker.mjs", "rpcs3-runtime-session.mjs", "local-aot/index.json"]) {
-    const response = await context.request.get(`${origin}/${resource}`);
+    const response = await context.request.get(`${origin}/${resource}`, { timeout: fetchTimeoutMs });
     if (!response.ok()) throw new Error(`artifact ${resource}: ${response.status()}`);
     report.artifacts[resource] = createHash("sha256").update(await response.body()).digest("hex");
   }
@@ -132,7 +136,7 @@ try {
   const compilerWasmUrl = new URL(compilerUrl);
   compilerWasmUrl.pathname = compilerWasmUrl.pathname.replace(/\.mjs$/, ".wasm");
   for (const url of [compilerUrl, compilerWasmUrl]) {
-    const response = await context.request.get(url.href);
+    const response = await context.request.get(url.href, { timeout: fetchTimeoutMs });
     if (!response.ok()) throw new Error(`compiler artifact ${url}: ${response.status()}`);
     report.artifacts[url.href] = createHash("sha256").update(await response.body()).digest("hex");
   }
@@ -141,7 +145,7 @@ try {
   for (const bundle of [process.env.RPCS3_PPU_AOT, process.env.RPCS3_SPU_AOT].filter(Boolean)) {
     const manifestUrl = new URL(bundle, `${origin}/`);
     manifestUrl.hash = "";
-    const response = await context.request.get(manifestUrl.href);
+    const response = await context.request.get(manifestUrl.href, { timeout: fetchTimeoutMs });
     if (!response.ok()) throw new Error(`AOT manifest ${manifestUrl}: ${response.status()}`);
     const bytes = await response.body();
     report.artifacts[manifestUrl.href] = createHash("sha256").update(bytes).digest("hex");
@@ -149,7 +153,7 @@ try {
     if (!Array.isArray(manifest.parts)) throw new Error(`AOT manifest has no parts: ${manifestUrl}`);
     for (const part of manifest.parts) {
       const url = new URL(part.url, manifestUrl);
-      const wasm = await context.request.get(url.href);
+      const wasm = await context.request.get(url.href, { timeout: fetchTimeoutMs });
       if (!wasm.ok()) throw new Error(`AOT part ${url}: ${wasm.status()}`);
       const hash = createHash("sha256").update(await wasm.body()).digest("hex");
       report.artifacts[url.href] = hash;

@@ -888,3 +888,19 @@ bursts are transient (level/FMV interleave), not sustained gameplay bands, so th
 sits ~573dpf at ~23fps — within 1.3x of the 30fps target, with the transpile-quality stack
 (O3 in-browser JIT, O3 PPU-AOT, mega/giga SPU blocks, low hot thresholds) + Dawn draw-state
 hoist all deployed and gameplay-verified (12 runs, 0 failures).
+
+## Heavy-band profile attribution + PPU inline-reads gameplay verification (round 11) — 2026-09-12
+Per-thread CPU profile (hw-prof-20260912, profiled window 4611-5352 on the deployed
+hoisted runtime + O3 in-browser transpiler + giga SPU + O3 PPU-AOT): top leaf
+timestamps were `now` 9.6%, `rpcs3_web_vm_read32_raw` 9.3%,
+`ppu_thread::exec_task_slice` 6.4%, `(program)` 6.3%, `rpcs3_web_vm_write64_raw`
+5.4%, `cpu_thread::check_state` 4.9%, `vm_read64_raw` 3.5%, `vm_write32_raw` 3.4%,
+`vm_read8_raw` 1.9%, `wasm-to-js` 1.6%. The VM raw access helpers aggregate ~24%
+of guest CPU: every transpiled PPU memory access crossed the wasm->JS border.
+Enabled the existing fast path (RPCS3_PPU_INLINE_READS=1: emitted in-wasm
+page-table load over __rpcs3_guest_pages instead of the raw helper import) and
+gameplay-verified it: hw-inline-20260912 = 5373 frames / 0 failures / 0 drops,
+ppuInlineReads true, sustained band 422 contiguous fps @573dpf = **22.1fps** (within
+the ~23fps sustained range across the 13 gameplay runs). The inline PPU path is
+now gameplay-verified; heavy-band sustained framerate remains pacing/guest-
+aggregate bound, recorder record intact. Goal stays active.

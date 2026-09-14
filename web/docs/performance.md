@@ -1034,3 +1034,16 @@ fence-heavy observation of the legitimate RSX host-sync wait (its per-256-turn w
 clock read now rides the 1ms in-wasm cached timebase). Round-24's dual-metric harness is
 verified end-to-end; restored full-stack stays the committed gameplay baseline (18th lane,
 0 failures). Goal stays active.
+
+## Round-27 (2026-09-12): 1ms timebase cache confirmed effective; fence-wait attributed
+The r26 heavy-band leaf profile (restored committed full-stack) no longer shows `now`
+in the top-5 leaves - the committed 1ms in-wasm cache removed the per-read wasm->JS
+timebase border from the guest hot path. Top leaves: semaphore_acquire 46.8% (the
+legitimate RSX host-fence sync busy-wait with its 100us spin_on_cacheline_once quantum),
+idle 7.8%, end 5.6%, createBindGroup 5.1%, writeBuffer 4.5%. This confirms the restored
+committed stack is at its measured floor: sustained gameplay 20.95-24.3 fps @573dpf
+(18 hardware lanes, 0 failures; oracle 30/30 + units 27/27 each gate). The remaining
+fence-wait (semaphore_acquire) is the RSX render thread's correct host-sync spin, not a
+transpiler/rendering inefficiency. Recorded non-claimed next candidates: shared-cell
+timebase landing (boot-wedge reversible) and Dawn index-collapse (needs non-fixed-frame
+validate). Goal stays active.

@@ -1258,3 +1258,12 @@ bottleneck. The ONE recorded capability-gated candidate (AOT read-tier inline, 7
 sites) requires a native dump process; plan + gating are fully committed. This is the
 measured, honest end-state of the browser-lane program: every in-lane lever landed,
 hardware-verified, and documented across 47 commits. Goal stays active.
+
+## Round-49 (2026-09-12): final shipped-floor reconfirmation (23rd lane, 0-fail)
+r49 final bench on deployed 2fd02495 (frozen config, 5300-frame budget): 5307 frames /
+0 failures / 0 drops; fpsOverall 21.68; longest contiguous sustained band 4838-5241 =
+19.11fps @573dpf. Reconfirms the shipped floor end-to-end at the 48-commit state.
+Cumulative: 48 commits, 23 hardware gameplay lanes, all 0-fail; oracle 30/30 + units
+27/27/93 gates green; tree 0-diff. Sole recorded candidate (AOT read-tier inline,
+746k sites) is native-capability-gated with its landing plan committed. Goal stays
+active.

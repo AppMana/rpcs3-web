@@ -39,7 +39,7 @@ namespace utils
 			static volatile u64 s_web_tb_cache = 0;
 			static volatile double s_web_tb_at = 0.0;
 			const double now = emscripten_get_now();
-			if (now - s_web_tb_at > 1000.0)
+			if (now - s_web_tb_at > 1.0)
 			{
 				s_web_tb_at = now;
 				s_web_tb_cache = static_cast<u64>(now * 1'000'000.0);

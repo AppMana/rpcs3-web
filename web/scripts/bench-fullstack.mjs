@@ -15,6 +15,7 @@
 // Exit code 0 on a 0-failure completed replay with a measured sustained band.
 
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -75,11 +76,36 @@ const f0 = best[0][0], f1 = best[best.length - 1][0];
 const dt = (best[best.length - 1][1] - best[0][1]) / 1000.0;
 const median = best.map((r) => r[2]).sort((a, b) => a - b)[(best.length / 2) | 0];
 const fps = dt > 0 ? (f1 - f0) / dt : null;
+// Optional profile-leaf attribution: when the runner produced run.cpuprofile files
+// (RPCS3_PROFILE=1 window), report the top-5 sampled leaves (function, count, % of
+// samples) so a landing is validated against BOTH the content-anchored frame band
+// and where guest CPU actually goes.
+const profPath = join(outDir, "run.cpuprofile");
+const leaves = [];
+if (existsSync(profPath)) {
+  try {
+    const prof = JSON.parse(await readFile(profPath, "utf8"));
+    const byid = new Map((prof.nodes || []).map((n) => [n.id, n]));
+    const counts = new Map();
+    for (const s of prof.samples || []) {
+      const cf = (byid.get(s) || {}).callFrame || {};
+      const fn = cf.functionName || "?";
+      counts.set(fn, (counts.get(fn) || 0) + 1);
+    }
+    const total = Math.max(1, (prof.samples || []).length);
+    for (const [fn, c] of [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)) {
+      leaves.push([fn, c, Math.round((100.0 * c / total) * 10) / 10]);
+    }
+  } catch (_) {
+    leaves.length = 0;
+  }
+}
 const summary = {
   frames: st.frames,
   fails: (report.failures || []).length,
   fpsOverall: st.fps,
   sustained: { span: [f0, f1, best.length], fps: fps !== null ? Math.round(fps * 100) / 100 : null, dpf: Math.round((median ?? 0) * 10) / 10 },
+  ...(leaves.length ? { profileLeaves: leaves } : {}),
 };
 console.log(JSON.stringify(summary, null, 2));
 process.exit(0);

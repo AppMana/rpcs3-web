@@ -1072,3 +1072,16 @@ BEFORE the subdraw do-loop (1805) -> it is already once-per-clause, so the ~4.5m
 preamble keymap cost is genuine WGSL translation on program-key changes (not a reducible
 per-subdraw redundancy). Sustained gameplay holds at 20.95-24.3fps @573dpf (18 hardware
 lanes, 0 failures; oracle 30/30 + units 27/27 each gate). Goal stays active.
+
+## Round-31 (2026-09-12): r30 floor confirmed + preamble cost quantified as micro
+Current deployed bytes verified consistent (runtime deee617a == ingress, transpiler
+28a673b == ingress, O3 PPU-AOT served). The r30 profile window (687 frames at 4600+)
+quantifies the RSX preamble to MICRO level: hash ~8us/frame, keymap ~36us/frame,
+state ~6us/frame - the preamble path is not a meaningful renderer-frame consumer, and
+the round-30 ucode-hash dedupe is a correct bounded micro-optimization landed and
+validated (oracle 30/30 + units 27/27; hardware 0-fail). Sustained gameplay on the
+current floor 19.28fps (r30) .. 24.3fps (r17/18), 19 hardware lanes, 0 failures.
+The dominant heavy-band leaf in fence-heavy stretches remains the legitimate RSX
+main-thread host-fence busy-spin. Goal stays active; recorded non-claimed next
+candidates unchanged: shared-cell timebase landing (boot-wedge gated) and Dawn
+index-collapse (content-anchored validate path).

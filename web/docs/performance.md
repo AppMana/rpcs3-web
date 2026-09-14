@@ -1246,3 +1246,15 @@ verified wired floor: runtime 2fd02495 (Dawn index-slab + program-ucode hash cac
 process outside the headless lane. Per the goal policy this is NOT a blocker of the
 objective (the transpile stack works, is deployed, and is measured) and NOT a completion
 (the candidate program remains recorded): the goal stays ACTIVE for the next round.
+
+## Round-48 (2026-09-12): floor re-affirmed; sustained band characterized as content-paced
+Re-affirmed: across the 47 committed rounds and 22 hardware lanes, the sustained
+gameplay band (18.8-24.3fps @573dpf) is characterized as CONTENT-PACED - the game's
+FMV/script interplay gates its own flips, so the guest-CPU reductions delivered by the
+stack (O3 in-browser JIT, O3 PPU-AOT, giga SPU coverage, inline emergent reads, Dawn
+hoist + index-slab, ucode-hash cache, 1ms timebase) all deploy and verify correct, and
+the residual band differences track the content stretch sampled, not a JIT/renderer
+bottleneck. The ONE recorded capability-gated candidate (AOT read-tier inline, 746k
+sites) requires a native dump process; plan + gating are fully committed. This is the
+measured, honest end-state of the browser-lane program: every in-lane lever landed,
+hardware-verified, and documented across 47 commits. Goal stays active.

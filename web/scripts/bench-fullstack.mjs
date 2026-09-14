@@ -15,7 +15,7 @@
 // Exit code 0 on a 0-failure completed replay with a measured sustained band.
 
 import { execFileSync } from "node:child_process";
-import { readFile } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 

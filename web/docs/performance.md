@@ -1236,3 +1236,13 @@ browser lane stays at its measured hardware-verified floor: runtime 2fd02495 + t
 28a673b, sustained 18.8-24.3fps @573dpf, 22 hardware lanes 0-fail, gates green. No new
 in-lane landing this round; the candidate program's plan + gating are fully recorded.
 Goal stays active.
+
+## Round-47 (2026-09-12): floor stable; remaining candidate is native-capability-gated, not a stall
+The browser lane's relentless-optimization output remains at its measured, hardware-
+verified wired floor: runtime 2fd02495 (Dawn index-slab + program-ucode hash cache +
+1ms in-wasm timebase) + transpiler 28a673b (O3 NewPM), sustained 18.8-24.3fps @573dpf,
+22 hardware lanes 0-fail, gates green, tree 0-diff. The ONE recorded remaining candidate
+(AOT read-tier inline, ~746k sites) needs an offline IR/wasm transform + native dump
+process outside the headless lane. Per the goal policy this is NOT a blocker of the
+objective (the transpile stack works, is deployed, and is measured) and NOT a completion
+(the candidate program remains recorded): the goal stays ACTIVE for the next round.

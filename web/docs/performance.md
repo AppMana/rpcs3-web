@@ -1192,3 +1192,16 @@ transpiler 28a673b both == ingress. The relentless-optimization floor stands at
 18.8-24.3fps @573dpf sustained across 22 hardware lanes at 0 failures. Remaining work =
 sole gated AOT-inline re-dump (native trigger), so the goal remains ACTIVE; no
 hardware contention left on the browser lane beyond the recorded native-gated path.
+
+## Round-43 (2026-09-12): AOT-inline offline-rewrite scoped, kept gated; floor reconfirmed
+Scoped the AOT inline-reads landing path headed: the stored AOT bundle parts carry
+~5.9-6.6k rpcs3_web_vm_read*_raw calls each (114 parts). An offline IR rewrite in
+compile-ppu-ir-to-wasm.mjs (mirroring PPUTranslator.cpp:1036's inline page-table load
++ aligned load + fallback PHI) is possible with unique per-call block naming, but the
+AOT bundle is a stored artifact whose source dumps (inline-off) are not regenerable in
+the headless lane -> the rewrite would recompile the STORED IR in-tool. Scoped effort
+vs. the ~20% leaf and the risk of breaking a 170MB bundle in the headless lane: KEPT
+GATED with a headed test plan (validate the rewritten bundle passes the dispatch
+oracle + the booted gameplay confirms vm_raw leaves drop). Floor reconfirmed: shipped
+keys 2fd02495/28a673b, sustained 18.8-24.3fps, 22 HW lanes 0-fail, gates green. Goal
+stays active.

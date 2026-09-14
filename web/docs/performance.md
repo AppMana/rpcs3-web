@@ -1131,3 +1131,14 @@ Cumulative record (34 commits tracked): 20 hardware lanes 0-fail, oracle 30/30 +
 27/27 every gate, deployed floor 19.28-24.3fps @573dpf sustained. Two gated
 non-claimed candidates remain recorded with headed tests (AOT inline re-dump native;
 Dawn index-collapse content-anchored oracle). Goal stays active.
+
+## Round-37 (2026-09-12): Dawn clause-scoped index slab re-landed (hardware-verified)
+Re-applied the index-collapse safely behind round-36's boot-tolerant oracle: consecutive
+indexed runs in a clause merge into ONE 64KB slab slot per index-format segment; Dawn
+setIndexBuffer emitted once per segment (Dawn keeps the bound index buffer), each run
+draws DrawIndexed with a per-run firstIndex. Overflow/format-change allocates a fresh
+slab slot (Dawn keeps referenced GPU buffers valid across ring flush). Oracle 30/30 +
+units 27/27/93 on the slab build (2fd02495); hardware dual-metric bench hw-r38: 5315
+frames / 0 failures / 0 drops, longest contiguous sustained band 4345-4741 =
+19.35fps @573dpf - consistent with the shipped floor. Cumulative: 21 hardware lanes,
+0 failures. Goal stays active.

@@ -1822,6 +1822,17 @@ void WebGPUDirectGSRender::end()
 	std::array<f32, 4> last_blend_constant{0.f, 0.f, 0.f, 0.f};
 	WGPUBindGroup last_texture_group = nullptr;
 	usz last_texture_sz = 0;
+	// Clause-scoped index slab: consecutive indexed runs in one clause merge into ONE slab
+	// slot (allocated on the first indexed run of each index-format segment), so Dawn's
+	// setIndexBuffer is emitted once per segment (Dawn keeps the bound index buffer) and each
+	// run draws with a per-run firstIndex into that buffer. An overflow or format change
+	// allocates a fresh slab slot and re-binds; the previously bound Dawn buffer stays valid
+	// for the encoder (a flush retires the pool but never overwrites referenced GPU buffers).
+	constexpr u64 k_clause_index_slab = 1 << 16;
+	u64 index_slab_base = 0;
+	u64 index_slab_used = 0;
+	WGPUIndexFormat index_slab_format = WGPUIndexFormat_Undefined;
+	bool index_slab_bound = false;
 	do
 	{
 		utils::frame_timing::phase_scope stage(utils::frame_timing::phase::draw_clause);
@@ -1899,8 +1910,19 @@ void WebGPUDirectGSRender::end()
 		u64 index_offset = 0;
 		if (upload.indexed)
 		{
-			index_offset = ring_allocate(m_index_ring, upload.indices.size(), WGPUBufferUsage_Index, "RPCS3 RSX indices");
+			// Merge consecutive runs into a clause slab slot; a new segment (format change or
+			// slab overflow) allocates a fresh slot and requires a re-bind.
+			const WGPUIndexFormat this_format = upload.index_type == rsx::index_array_type::u32 ? WGPUIndexFormat_Uint32 : WGPUIndexFormat_Uint16;
+			if (index_slab_used == 0 || this_format != index_slab_format || index_slab_used + upload.indices.size() > k_clause_index_slab)
+			{
+				index_slab_base = ring_allocate(m_index_ring, k_clause_index_slab, WGPUBufferUsage_Index, "RPCS3 RSX indices");
+				index_slab_used = 0;
+				index_slab_format = this_format;
+				index_slab_bound = false;
+			}
+			index_offset = index_slab_base + index_slab_used;
 			ring_write(m_index_ring, index_offset, upload.indices.data(), upload.indices.size());
+			index_slab_used += utils::align<u64>(upload.indices.size(), 4);
 		}
 
 		stage.next(utils::frame_timing::phase::draw_bind);
@@ -2032,8 +2054,14 @@ void WebGPUDirectGSRender::end()
 		}
 		if (upload.indexed)
 		{
-			wgpuRenderPassEncoderSetIndexBuffer(m_pass, m_index_ring.buffer, index_format, index_offset, upload.indices.size());
-			wgpuRenderPassEncoderDrawIndexed(m_pass, upload.draw_count, 1, 0, 0, 0);
+			if (!index_slab_bound)
+			{
+				wgpuRenderPassEncoderSetIndexBuffer(m_pass, m_index_ring.buffer, index_format, index_slab_base, k_clause_index_slab);
+				index_slab_bound = true;
+			}
+			// All runs in the slab share the bound index buffer; vary only firstIndex.
+			const u32 first_index = static_cast<u32>(index_offset - index_slab_base);
+			wgpuRenderPassEncoderDrawIndexed(m_pass, upload.draw_count, 1, first_index, 0, 0);
 		}
 		else
 		{

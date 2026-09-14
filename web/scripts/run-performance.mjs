@@ -281,7 +281,7 @@ try {
     await writeCpuProfiles(await profiler.stop(), path.join(output, "run.cpuprofile"), samplingIntervalUs);
     profiler = undefined;
   }
-  await page.locator("#gpu-output").screenshot({ path: path.join(output, "frame.png") });
+  await page.screenshot({ path: path.join(output, "frame.png") });
   report.shutdown = await page.evaluate(() => window.__rpcs3Playable?.stop());
   if (!report.completed) throw new Error("guest frame budget was not reached");
 } catch (error) {

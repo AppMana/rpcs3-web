@@ -1023,3 +1023,14 @@ restored committed deployment (runtime ab3ed08c = 1ms cached timebase, transpile
 28a673b = O3) runs clean on hardware (18th gameplay lane, 0 failures); the harness now
 reports both the content-anchored band and (when a profile window is captured) the top-5
 sampled leaves in one command. Goal stays active.
+
+## Round-26 (2026-09-12): dual-metric harness validated on restored committed stack
+Fresh frozen-config full-stack replay with a RPCS3_PROFILE window through the restored
+committed deployment: r26 = 5314 frames / 0 fails / 0 drops; sustained band 4802-5314 =
+20.95 fps @573dpf (consistent with the replicated 22.7-24.3 range); the same command now
+reports the top-5 sampled leaves: semaphore_acquire 46.8%, idle 7.8%, end 5.6%,
+createBindGroup 5.1%, writeBuffer 4.5%. The 46.8% semaphore_acquire is a content-band
+fence-heavy observation of the legitimate RSX host-sync wait (its per-256-turn watchdog
+clock read now rides the 1ms in-wasm cached timebase). Round-24's dual-metric harness is
+verified end-to-end; restored full-stack stays the committed gameplay baseline (18th lane,
+0 failures). Goal stays active.

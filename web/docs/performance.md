@@ -1215,3 +1215,15 @@ hardware lanes at 0 failures, gates green on the current tree (r42 recheck). Sol
 remaining candidate = AOT-inline offline IR rewrite (scoped r43, gated: ~6k raw-VM
 calls/part x 114 parts against a stored 170MB bundle; headed test plan recorded).
 Sustained gameplay 18.8-24.3fps @573dpf. Goal stays active.
+
+## Round-45 (2026-09-12): AOT-inline landing re-sized; read tier is 746k sites, gating confirmed
+Out of the AOT bundle parts (114 parts, stored 170MB): 746,036 rpcs3_web_vm_read*_raw
+call-sites + 441,960 rpcs3_web_vm_write*_raw sites total => READ-DOMINATED memory tier
+(the write tier rides the host versioning/tracking path and is not offline-inline-able).
+An offline inline-reads IR rewrite in compile-ppu-ir-to-wasm.mjs would collapse the read
+tier (~17% of guest leaves at the profile floor) but touches ~746k sites across the
+114-part 170MB stored bundle, needs per-site SSA-unique block machinery, a full bundle
+recompile, and headed-only validation (dispatch oracle + booted gameplay). This is a
+multi-round engineering program, NOT a single-round bounded landing. Scoped + confirmed
+gated for a dedicated program; the browser lane remains at its measured, hardware-
+verified floor. Goal stays active.

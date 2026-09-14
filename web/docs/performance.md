@@ -1047,3 +1047,16 @@ fence-wait (semaphore_acquire) is the RSX render thread's correct host-sync spin
 transpiler/rendering inefficiency. Recorded non-claimed next candidates: shared-cell
 timebase landing (boot-wedge reversible) and Dawn index-collapse (needs non-fixed-frame
 validate). Goal stays active.
+
+## Round-28 (2026-09-12): fresh gates on current deployed bytes + fence-wait attribution
+Fresh final verification on the current deployed full-stack: oracle e2e 30 passed /
+2 skipped / 0 failed and Vitest units 27/27 (93 tests); deployed bytes reinforced
+(runtime ab3ed08c == ingress, transpiler 28a673b == ingress). The heavy-band dominant
+leaf (semaphore_acquire 46.8%) is attributed to the RSX render thread's LEGITIMATE
+host-fence busy-spin: the web spin_on_cacheline_once already uses
+memory.atomic.wait32 on worker threads (releases cores there), and only the main
+runtime thread must busy-spin (memory.atomic.wait traps on main) - not an
+inefficiency. Sustained gameplay holds at 20.95-24.3fps @573dpf (18 hardware lanes,
+0 failures; all gate builds green). Goal stays active; recorded non-claimed next
+surface: shared-cell timebase landing (boot-wedge reversible with a deferred start)
+and Dawn index-collapse (needs non-fixed-frame validate).

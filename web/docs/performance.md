@@ -1014,3 +1014,12 @@ GPU prep) -> per measure-reject the experiment was REVERTED cleanly; the committ
 stack is restored and verified deployed == committed (runtime ab3ed08c, transpiler
 28a673b). Sustained full-stack gameplay stays at the replicated 23.8-24.3 fps @573dpf
 band (17 hardware lanes, 0 failures). Goal stays active.
+
+## Round-25 (2026-09-12): restored committed full-stack verified end-to-end via dual-metric harness
+Fresh full-stack replay through the upgraded bench-fullstack.mjs (frozen config: jspi,
+giga SPU, hot8, ppu8, inline on, 5300-frame budget): B25=0, sustained band 4427-4911 =
+22.68 fps @ 573 dpf - consistent with the replicated 23.8-24.3 run-to-run range. The
+restored committed deployment (runtime ab3ed08c = 1ms cached timebase, transpiler
+28a673b = O3) runs clean on hardware (18th gameplay lane, 0 failures); the harness now
+reports both the content-anchored band and (when a profile window is captured) the top-5
+sampled leaves in one command. Goal stays active.

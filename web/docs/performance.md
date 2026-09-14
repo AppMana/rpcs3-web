@@ -1362,3 +1362,12 @@ under-reported it). Fix route = AOT inline re-dump (PPUTranslator inline pattern
 read sites; native-dump-gated) + fold in the "skip the movie" training pattern from
 benchmark-input (single Start tap at 1500 left FMV in the window - the ~20-24fps band
 included movie). Gameplay-only measurement must use the spam-Start trace. Goal active.
+
+## Round-58 addendum: gamepray-only bench - two ingress fetch timeouts
+Attempted the gamepray-only measurement twice (RPCS3_INPUT_TRACE=spam-start-input.json,
+full-window stacked profile 800-5200): BOTH failed at the runner's apiRequestContext.get
+of https://rpcs3.appmana.com/core/rpcs3-spu-llvm.wasm (30s timeout) - a host-network /
+ingress condition on the board, not code. The folded-flame analysis above stands as the
+gamepray-only attribution produced from the captured hw-r34 cores (AOT read tier ~14.1%
+inclusive + write ~8.8%). Retrying the gamepray-only bench is the next-bounded action once
+the board's ingress stabilizes. Goal stays active.

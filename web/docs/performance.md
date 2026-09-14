@@ -1108,3 +1108,13 @@ rejected (cost exceeds the saved Dawn call). Sustained gameplay stays at the
 replicated 19.28-24.3fps @573dpf band (19 hardware lanes, 0 failures; oracle 30/30 +
 units 27/27 frozen on the shipped bytes). Goal remains active; the two gated
 candidates (AOT inline re-dump native / Dawn index-collapse validate) stay recorded.
+
+## Round-34 (2026-09-12): cumulative 34-round record + gated-candidate headed tests
+34 commits (19 hardware gameplay lanes at 0 failures; oracle 30/30 + units 27/27/93
+every gate; tree 0-diff every round). Deployed floor frozen: runtime deee617a (1ms
+cached timebase + program-ucode hash cache), transpiler 28a673b (O3 NewPM),
+O3 PPU-AOT (114 blocks/170MB). Sustained gameplay 19.28-24.3fps @573dpf (content-band
+bounded). NEXT-ROUND headed tests (both gated, non-claimed): (a) AOT inline re-dump
+needs a native-side dump trigger; (b) Dawn index-collapse needs a content-anchored
+non-fixed-frame dispatch oracle (the round-19 fixed-frame drift rejected the slab).
+Goal stays active.

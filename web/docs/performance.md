@@ -1428,3 +1428,16 @@ attribution; the captured frame cannot be used to judge visible-gameplay pacing.
 To actually see the game's composited surface, the pan would need to capture the
 game's own canvas (not #gpu-output's overlay) or sample at a time when the composited
 frame is present - a capture-infra question, not a game-code regression. Goal active.
+
+## Chrome local-test verdict (round-01): the black screen is a transferred-canvas screenshot artifact
+Verified in chrome: gamepray/core=jspi uses a suspending core -> presentationCanvas(canvas, true)
+does `canvas.transferControlToOffscreen()` (rpcs3-runtime-session.mjs:25) and sets view=undefined
+(:26). After transfer, the #gpu-output DOM element no longer carries readable pixels, so
+Playwright's locator.screenshot() returns the canvas's black backing. The game is NOT black:
+the HUD reports "running" with live counters (3,737,524 draws / 844,111,663 PPU /
+104,470,085 compiled dispatches) and the profile shows heavy CPU work. So the blank frame.png
+is an ARTIFACT of capturing a transferred canvas, present all session (r49 == gamepray-fixed,
+meanLum 0.9, non-black 2.86% = overlay-only). NOT a game-code regression. To see the real
+composited output, the pan should read the window/screen (not #gpu-output) or capture at a time
+when the compositor frame is present - an infra question. Goal stays active; the CPU-side
+inclusive attribution (AOT VM-raw ~22% top tier) is unaffected and stands.

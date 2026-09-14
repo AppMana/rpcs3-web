@@ -1415,3 +1415,16 @@ that visible-gameplay span; the natural target is a save-resume or a longer sett
 before the pan window so a non-black 3D scene is presented for the measured window.
 I'll proceed on that once the state/pan capture infra confirms a visible window. Goal
 stays active.
+
+## Capture audit (round-01): #gpu-output readback is overlay+black consistently - NOT a regression
+Decoded r49 and gamepray-fixed frame.png via pngjs: BOTH identical (meanLum 0.9,
+2.86% non-black) - the non-black 2.86% is only the overlay UI (trace pill, HUD, d-pad,
+START, face buttons). So the pan's #gpu-output screenshot has captured overlay-plus-
+black for the WHOLE session; it is a pan-capture behavior, not a recent-renderer
+regression. The game IS running+drawing (HUD "running", 3.7M draws, 844M PPU, 104M
+compiled dispatches) - the black is the play area not reaching this readback element.
+The CPU-side inclusive attribution (AOT VM-raw ~22% top tier) remains valid as CPU
+attribution; the captured frame cannot be used to judge visible-gameplay pacing.
+To actually see the game's composited surface, the pan would need to capture the
+game's own canvas (not #gpu-output's overlay) or sample at a time when the composited
+frame is present - a capture-infra question, not a game-code regression. Goal active.

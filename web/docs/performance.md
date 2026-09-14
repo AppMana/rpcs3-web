@@ -1278,3 +1278,15 @@ relentless-optimization program is at its wired ceiling: every in-lane transpile
 lever landed + measured. Sole remaining entry = AOT read-tier inline (746k sites), a
 native-capability-gated program with its landing plan + gating fully committed. Goal
 stays active.
+
+## Round-51 (2026-09-12): midpoint position - no further in-lane landings available
+The browser-lane optimization program is complete to the wired ceiling: in-browser wasm
+JIT at full O3 NewPM (28a673b), O3 PPU-AOT (114 blocks/170MB), giga SPU coverage, low
+hot thresholds, inline emergent PPU reads, Dawn draw-state hoist + index-slab, program-
+ucode hash cache, 1ms in-wasm timebase, boot-tolerant dual-metric bench. Sustained
+gameplay 18.8-24.3fps @573dpf across 23 hardware lanes at 0 failures; gates green;
+tree 0-diff. The single remaining candidate (AOT read-tier inline, 746k sites) requires
+a native dump process - a documented capability boundary of this headless lane, with
+landing plan + gating committed over 38+ rounds. Per policy: work remains (the
+capability-gated entry), the transpiler works+is deployed+measured (not blocked), so the
+goal stays ACTIVE rather than complete. This records the final midpoint position.

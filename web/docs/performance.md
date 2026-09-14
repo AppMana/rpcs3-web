@@ -1160,3 +1160,12 @@ the full-rail heavy-gameplay replay: 18.8-24.3fps sustained across all 22 hardwa
 lanes at 0 failures. The AOT-inline re-dump remains the sole gated candidate (native
 dump trigger required; not reachable through the headless harness). Landscape: every
 in-lane transpile/rendering lever landed + measured. Goal stays active.
+
+## Round-40 (2026-09-12): PPU JIT threshold 8->4 bounded exploration - no improvement, shipped config confirmed
+r40 (threshold 4 => more emergent PPU transpile) measured 5306 frames / 0 fails /
+20.94 overall, longest contiguous sustained band 5026-5306 = 18.92fps @573dpf - within
+the shipped floor and LOWER overall than threshold-8 (23.2-23.85 overall r15/r17). The
+extra transpile backlog offsets the marginal cold-path coverage gain; the shipped
+threshold-8 remains the right config on the deployed slab floor. Landscape unchanged:
+all in-lane levers landed + 22 hardware lanes 0-fail; sole gated candidate remains the
+AOT-inline re-dump (native trigger). Goal stays active.

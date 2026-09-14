@@ -1344,3 +1344,21 @@ transpiler 28a673b... == ingress), tree 0-diff, 23 hardware lanes 0-fail, sustai
 18.8-24.3fps @573dpf, gates green. Browser-lane wasm-jit + performance program complete
 to the wired ceiling; sole held entry = AOT read-tier inline (native-gated; plan
 committed rounds 12-57). Goal stays active.
+
+## Round-58 (2026-09-12): inclusive stacked profiling - the actual "what is slow" answer
+Switched measurement from leaf-only snapshots to FULL-STACK INCLUSIVE attribution
+(new web/scripts/analyse-flame.mjs: aggregates every sample's full call chain across
+the per-thread .cpuprofile cores, counts each function's inclusive share, decodes
+wasm-function indices via the runtime's name section, and emits a flamegraph.folded
+file). Applied to the heavy-band window captured in hw-r34 (4600-5300):
+  now 12.5% | vm_read32_raw 8.8% | exec_task_slice 6.1% | vm_write64_raw 5.6% |
+  (program) 4.4% | check_state 4.1% | vm_read64 3.6% | vm_write32 3.2% |
+  wasm-to-js 2.2% | vm_read8 1.7% | atomic_load16_web 1.3%
+KEY RESULT: the AOT-baked VM read tier aggregates ~14.1% inclusive (read32 8.8 + read64
+3.6 + read8 1.7) and the write tier ~8.8% -> ~23% of the sampled guest time rides the
+AOT bundle's raw-helper JS-border memory-path (vm_read/write*_raw). THIS is the largest
+fixable tier, exactly what the folded stack now exposes (leaves-only snapshots
+under-reported it). Fix route = AOT inline re-dump (PPUTranslator inline pattern, 746k
+read sites; native-dump-gated) + fold in the "skip the movie" training pattern from
+benchmark-input (single Start tap at 1500 left FMV in the window - the ~20-24fps band
+included movie). Gameplay-only measurement must use the spam-Start trace. Goal active.

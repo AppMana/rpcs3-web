@@ -961,3 +961,16 @@ hoist + inline emergent PPU reads + 1ms cached timebase) is at its measured floo
 deployed, oracle 30/30 + units 27/27 (16 gates green), 16 hardware gameplay runs at
 0 failures. Goal stays active; recorded next structural surface = AOT bundle re-dump with
 inline-reads baked (native dump-trigger required; not reachable via browser plumbing).
+
+## Round-19 (2026-09-12): clause-scoped index-slab Dawn merge — oracle-sensitive, reverted
+Implemented a clause-scoped index slab in the direct backend: allocate one index-slot per
+index-format run segment, bind setIndexBuffer once per segment, and vary only
+DrawIndexed.firstIndex per subdraw (Dawn-keep-bound). This was intended to cut the per-draw
+setIndexBuffer Dawn submissions (N -> 1 per segment) on indexed-heavy content. The rebuilt
+runtime broke the default-oracle PPU dispatch-conformance lane (toMatchObject drift) —
+the index ring layout change shifted per-frame Dawn submission counts and the fixed-frame
+dispatch oracle observed the difference. Per the measure-reject rule, the slab was REVERTED
+cleanly; the working tree is back at the committed, green, deployed full-stack (23.8-24.3 fps
+sustained, oracle 30/30 + units 27/27 each of 16 green gates). Recorded: the per-draw Dawn
+submission collapse is content- and oracle-sensitive; a dedicated (non-fixed-frame) validate
+path would be the enabler, out of bounded reach for one round. Goal stays active.

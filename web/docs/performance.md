@@ -1183,3 +1183,12 @@ thresholds (r40 left threshold-8 optimal). SOLE gated non-claimed candidate: AOT
 re-dump via a native-side dump trigger (not reachable through the headless harness).
 This records the relentless-optimization floor for the objective; remaining work is the
 gated native path, so the goal stays active.
+
+## Round-42 (2026-09-12): shipped-floor gates re-verified green on current tree
+Fresh correctness gate on the CURRENT checkout (runtime 2fd02495 slab floor tree, no
+code delta since round-37): oracle e2e 30 passed / 2 skipped / 0 failed and Vitest
+units 27/27 (93 tests), both UE/OE=0. Shipped keys reinforced: runtime 2fd02495 and
+transpiler 28a673b both == ingress. The relentless-optimization floor stands at
+18.8-24.3fps @573dpf sustained across 22 hardware lanes at 0 failures. Remaining work =
+sole gated AOT-inline re-dump (native trigger), so the goal remains ACTIVE; no
+hardware contention left on the browser lane beyond the recorded native-gated path.

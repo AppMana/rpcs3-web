@@ -127,7 +127,7 @@ async function describe(wasmPath, group, members) {
 const parts = [];
 for (const [group, members] of groups) {
   const wasmPath = join(outputDirectory, `${group}.wasm`);
-  execFileSync(process.execPath, [compiler, ...members.map((member) => join(inputDirectory, member)), wasmPath, "--pic", `--jobs=${jobs}`], { stdio: ["ignore", "ignore", "inherit"] });
+  execFileSync(process.execPath, [compiler, ...members.map((member) => join(inputDirectory, member)), wasmPath, "--pic", `--jobs=${jobs}`, ...(options.includes("--inline-reads") ? ["--inline-reads"] : [])], { stdio: ["ignore", "ignore", "inherit"] });
   parts.push(await describe(wasmPath, group, members));
 }
 

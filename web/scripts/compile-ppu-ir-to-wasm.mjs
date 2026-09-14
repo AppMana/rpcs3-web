@@ -1,5 +1,6 @@
 import { execFile, execFileSync } from "node:child_process";
 import { accessSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
 import { homedir, tmpdir, availableParallelism } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -82,7 +83,52 @@ const wasmLd = findTool("RPCS3_WASM_LD", "wasm-ld");
 const runtimeArchives = findRuntimeArchives();
 const scratch = mkdtempSync(join(tmpdir(), "rpcs3-ppu-aot-"));
 const regionTool = (options.includes("--regions") || options.includes("--direct-exits") || options.includes("--unary-swizzles")) ? ensureWasmRegionTool() : null;
+const inlineReads = options.includes("--inline-reads");
 const regionReports = new Array(inputs.length);
+
+// Inline the AOT bundle's host-VM-helper reads into wasm (mirrors PPUTranslator.cpp:1036):
+// page-table load over @__rpcs3_guest_pages + bounds check + volatile aligned load + a
+// fallback to the raw helper for unmapped pages. Register index = unique suffix.
+function inlineVmReads(text) {
+  if (!text.includes("rpcs3_web_vm_read")) return text;
+  const re = /^  %(\d+) = call (i\d+) @rpcs3_web_vm_read(\d+)_raw\(i32 %(\d+)\)$/gm;
+  const t = [];
+  let last = 0, m;
+  while ((m = re.exec(text))) {
+    const reg = m[1], ty = m[2], w = Number(m[3]), addr = m[4];
+    const lim = (4096 - (w / 8)) | 0;
+    t.push(text.slice(last, m.index));
+    t.push(`  %vmrpi_${reg} = lshr i32 %${addr}, 12\n`);
+    t.push(`  %vmrp_${reg} = getelementptr [1048576 x i32], ptr @__rpcs3_guest_pages, i32 0, i32 %vmrpi_${reg}\n`);
+    t.push(`  %vmrpv_${reg} = load i32, ptr %vmrp_${reg}, align 4\n`);
+    t.push(`  %vmro_${reg} = and i32 %${addr}, 4095\n`);
+    t.push(`  %vmrin_${reg} = icmp ule i32 %vmro_${reg}, ${lim}\n`);
+    t.push(`  %vmrm_${reg} = icmp ne i32 %vmrpv_${reg}, 0\n`);
+    t.push(`  %vmrgo_${reg} = and i1 %vmrin_${reg}, %vmrm_${reg}\n`);
+    t.push(`  br i1 %vmrgo_${reg}, label %vmr_d_${reg}, label %vmr_f_${reg}\n`);
+    t.push(`vmr_d_${reg}:\n`);
+    t.push(`  %vmra_${reg} = add i32 %vmrpv_${reg}, %vmro_${reg}\n`);
+    t.push(`  %vmrpt_${reg} = inttoptr i32 %vmra_${reg} to ptr\n`);
+    t.push(`  %vmrv_${reg} = load volatile ${ty}, ptr %vmrpt_${reg}, align 1\n`);
+    t.push(`  br label %vmr_m_${reg}\n`);
+    t.push(`vmr_f_${reg}:\n`);
+    t.push(`  %vmrs_${reg} = call ${ty} @rpcs3_web_vm_read${w}_raw(i32 %${addr})\n`);
+    t.push(`  br label %vmr_m_${reg}\n`);
+    t.push(`vmr_m_${reg}:\n`);
+    t.push(`  %${reg} = phi ${ty} [ %vmrv_${reg}, %vmr_d_${reg} ], [ %vmrs_${reg}, %vmr_f_${reg} ]\n`);
+    last = re.lastIndex;
+  }
+  t.push(text.slice(last));
+  let out = t.join("");
+  // Inject the @__rpcs3_guest_pages declaration only if the ORIGINAL input lacked
+  // it (the transformed body references it as a global, not a declaration).
+  if (!text.includes("@__rpcs3_guest_pages = external")) {
+    const decl = `@__rpcs3_guest_pages = external global [1048576 x i32]\n`;
+    const idx = out.indexOf("define ");
+    out = idx > 0 ? out.slice(0, idx) + decl + out.slice(idx) : decl + out;
+  }
+  return out;
+}
 
 async function lower(input, index) {
   const bitcode = join(scratch, `${index}-${basename(input)}.bc`);
@@ -92,6 +138,11 @@ async function lower(input, index) {
     source = join(scratch, `${index}.region.ll`);
     const result = await execFileAsync(regionTool, [input, source, ...(options.includes("--regions") ? [] : ["--no-regions"]), ...(options.includes("--direct-exits") ? ["--direct-exits"] : []), ...(options.includes("--unary-swizzles") ? ["--unary-swizzles"] : [])], { maxBuffer: 1 << 24 });
     regionReports[index] = JSON.parse(result.stdout);
+  }
+  if (inlineReads) {
+    const inline = join(scratch, `${index}.inline.ll`);
+    await writeFile(inline, inlineVmReads(await readFile(source, "utf8")));
+    source = inline;
   }
   await execFileAsync(llvmAs, [source, "-o", bitcode], { maxBuffer: 1 << 24 });
   await execFileAsync(llc, [

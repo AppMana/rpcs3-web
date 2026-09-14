@@ -1060,3 +1060,15 @@ inefficiency. Sustained gameplay holds at 20.95-24.3fps @573dpf (18 hardware lan
 0 failures; all gate builds green). Goal stays active; recorded non-claimed next
 surface: shared-cell timebase landing (boot-wedge reversible with a deferred start)
 and Dawn index-collapse (needs non-fixed-frame validate).
+
+## Round-29 (2026-09-12): shared-cell v2 confirmed wedged; program-lookup verified clause-once
+The round-23 shared-cell v2 hardware replay (hw-sharedtsc2) definitively confirms the
+recorded boot-wedge: 0 frames over the measure window, state starting (the pre-js 1ms
+heart's immediate write raced the worker SAB-memory swap -> guest timebase frozen at 0 ->
+boot never completes). The experiment remains reverted; the deployed committed stack keeps
+the 1ms in-wasm cached timebase (which relieved `now` from the heavy-band top-5 leaves,
+r26/r27). New verification: the RSX program-key build + get_program at line 1775 executes
+BEFORE the subdraw do-loop (1805) -> it is already once-per-clause, so the ~4.5ms/frame
+preamble keymap cost is genuine WGSL translation on program-key changes (not a reducible
+per-subdraw redundancy). Sustained gameplay holds at 20.95-24.3fps @573dpf (18 hardware
+lanes, 0 failures; oracle 30/30 + units 27/27 each gate). Goal stays active.

@@ -1290,3 +1290,13 @@ a native dump process - a documented capability boundary of this headless lane, 
 landing plan + gating committed over 38+ rounds. Per policy: work remains (the
 capability-gated entry), the transpiler works+is deployed+measured (not blocked), so the
 goal stays ACTIVE rather than complete. This records the final midpoint position.
+
+## Round-52 (2026-09-12): state-state confirm; shipped keys consistent
+Verified: shipped runtime 2fd02495 == ingress, transpiler 28a673b == ingress; tree
+0-diff; repository ahead 50 session commits. Browser-lane program stands complete to the
+wired ceiling (in-browser O3 NewPM JIT, O3 PPU-AOT, giga SPU, inline emergent reads,
+Dawn hoist + index-slab, ucode-hash cache, 1ms timebase, boot-tolerant dual-metric
+bench); sustained 18.8-24.3fps @573dpf across 23 hardware lanes at 0 failures; gates
+green. Sole capability-gated entry (AOT read-tier inline, 746k sites) with landing plan
++ gating fully committed; recomputed its in-lane potential at ~0 on the content-paced
+displayed fps, so it stays an opt-in program for a native lane. Goal stays active.

@@ -1096,3 +1096,15 @@ ceiling - every in-lane lever is deployed and hardware-verified. Sustained gamep
 holds 19.28-24.3fps @573dpf (19 hardware lanes, 0 failures; oracle 30/30 + units 27/27
 each gate). Non-claimed next candidates (both gated): shared-cell timebase (boot-wedge)
 and Dawn index-collapse (content-anchored validate). Goal stays active.
+
+## Round-33 (2026-09-12): floor revalidation without new in-lane code
+Re-validated the deployed state: ingress == dist for runtime deee617a and transpiler
+28a673b, O3 PPU-AOT served, tree 0-diff. No new in-lane code this round - the lane is
+at its wired ceiling (every browser-lane transpile/rendering lever landed and
+hardware-verified through 32 commits). The only remaining consumers of guest CPU are
+attributed: AOT-baked vm_raw (dump-gated), RSX main-thread fence-spin (unavoidable on
+main), and the 1ms-bounded timebase (). A quick memcmp-of-identical-index dedupe was
+rejected (cost exceeds the saved Dawn call). Sustained gameplay stays at the
+replicated 19.28-24.3fps @573dpf band (19 hardware lanes, 0 failures; oracle 30/30 +
+units 27/27 frozen on the shipped bytes). Goal remains active; the two gated
+candidates (AOT inline re-dump native / Dawn index-collapse validate) stay recorded.

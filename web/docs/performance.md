@@ -1227,3 +1227,12 @@ recompile, and headed-only validation (dispatch oracle + booted gameplay). This 
 multi-round engineering program, NOT a single-round bounded landing. Scoped + confirmed
 gated for a dedicated program; the browser lane remains at its measured, hardware-
 verified floor. Goal stays active.
+
+## Round-46 (2026-09-12): read-tier gating reconfirmed; floor stable
+Reconfirmed the read-tier gating: the AOT bundle's read-raw tier (746,036 sites) is
+collapsible only via a multi-round offline IR/wasm-level inline transform (SSA-unique
+per-site block machinery + full 170MB bundle recompile + headed-only validation). The
+browser lane stays at its measured hardware-verified floor: runtime 2fd02495 + transpiler
+28a673b, sustained 18.8-24.3fps @573dpf, 22 hardware lanes 0-fail, gates green. No new
+in-lane landing this round; the candidate program's plan + gating are fully recorded.
+Goal stays active.

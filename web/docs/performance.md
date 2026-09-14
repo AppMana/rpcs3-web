@@ -921,3 +921,16 @@ HW runs, 0 failures; transpile stack (O3 in-browser JIT, O3 PPU-AOT, giga SPU, l
 thresholds, Dawn draw-state hoist, inline PPU reads on emergent blocks) fully deployed.
 Goal remains active; remaining structural gap is bounded by the measured guest-tier costs
 above (timebase/VM/spin on the interpreter path) and requires guest-tier scheduling work.
+
+## Full-stack sustained-pacing confirmation (round 15) — 2026-09-12
+Definitive full-stack gameplay measure (hw-r15-20260912, all tiers committed:
+in-browser O3 transpiler + O3 PPU-AOT + giga SPU + low hot thresholds + Dawn
+draw-state hoist + inline PPU reads + 1ms in-wasm cached timebase):
+5304 frames / 0 failures / 0 drops; 23.85 fps overall; longest contiguous
+sustained render band (300-700 dpf) 4457-4722 = 24.31 fps @ 573 dpf. This is
+the session's best sustained replay (early-round runners read 20.0-23.6).
+Correctness-lane gates stayed green every round (default oracle e2e 30/30,
+Vitest units 27/27, 93 tests). Reflects 15 hardware gameplay runs at 0 failures.
+Goal remains active; remaining structural surface = per-draw Dawn indirect
+submission coalescing + deterministic content-pinning for a single-attribute
+gameplay-fps delta. 

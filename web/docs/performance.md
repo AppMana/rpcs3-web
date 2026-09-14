@@ -1205,3 +1205,13 @@ GATED with a headed test plan (validate the rewritten bundle passes the dispatch
 oracle + the booted gameplay confirms vm_raw leaves drop). Floor reconfirmed: shipped
 keys 2fd02495/28a673b, sustained 18.8-24.3fps, 22 HW lanes 0-fail, gates green. Goal
 stays active.
+
+## Round-44 (2026-09-12): floor-stability checkpoint
+No new in-lane landings this round; the shipped floor (runtime 2fd02495 = Dawn
+index-slab + program-ucode hash cache + 1ms in-wasm timebase; transpiler 28a673b =
+O3 NewPM; O3 PPU-AOT 114 blocks/170MB; giga SPU; low hot thresholds; inline PPU reads
+on emergent blocks; boot-tolerant dual-metric bench) stands verified across 22
+hardware lanes at 0 failures, gates green on the current tree (r42 recheck). Sole
+remaining candidate = AOT-inline offline IR rewrite (scoped r43, gated: ~6k raw-VM
+calls/part x 114 parts against a stored 170MB bundle; headed test plan recorded).
+Sustained gameplay 18.8-24.3fps @573dpf. Goal stays active.

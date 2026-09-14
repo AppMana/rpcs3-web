@@ -1371,3 +1371,18 @@ ingress condition on the board, not code. The folded-flame analysis above stands
 gamepray-only attribution produced from the captured hw-r34 cores (AOT read tier ~14.1%
 inclusive + write ~8.8%). Retrying the gamepray-only bench is the next-bounded action once
 the board's ingress stabilizes. Goal stays active.
+
+## Round-01 (resumed, gameplay-only): inclusive folded-flame attribution + black-screen catch
+Used the new analyse-flame.mjs (inclusive, full-stack) over the gamepray window
+(profile 800-5200, 77 cores, 72,210 samples). THE ALL-CALLER ATTRIBUTION:
+- AOT VM raw memory tier ~17.5% inclusive (read32 6.6 + write64 4.0 + read64 3.3 +
+  write32 2.3 + read8 ~1.3) => the LARGEST fixable tier
+- timebase (now) ~16.7% (bounded by the 1ms in-wasm cache; sampled border crossings)
+- PPU interpreter slice ~8.3% (exec_task_slice 5.6 + check_state 2.7)
+- wasm-to-js border 3.3%
+USER OBSERVATION (real-time): during this gamepray run the screen presented BLACK,
+which has not happened on the lighter-cadence bias. That means the spam-Start trace
+(frame-250-every-150) can drive the title into a non-3D/black menu or a paused gamepray
+state, so THIS run's window may not be a valid *gameplay* sample. The next bounded
+action is retune the skip cadence (fewer/intermittent Starts + a longer settle) OR the
+save-resume path so a clean 3D gameplay stretch is measured. Goal stays active.

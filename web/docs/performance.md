@@ -1152,3 +1152,11 @@ a win. The 1ms bound is the correct conservative setting and stays. The r38 slab
 confirmed (2fd02495 == ingress; 5315f/0-fail/19.35fps sustained @573dpf, 21st HW lane).
 Remaining gated non-claimed candidate unchanged: AOT-bundle inline re-dump needs a
 native-side dump trigger (out of the headless lane). Goal stays active.
+
+## Round-39 (2026-09-12): definitive shipped-floor bench on the slab build (22nd lane, 0-fail)
+r39: 5314 frames / 0 failures / 0 drops on the deployed slab bytes (2fd02495);
+longest contiguous sustained band 5010-5314 = 18.8fps @573dpf. This is the floor over
+the full-rail heavy-gameplay replay: 18.8-24.3fps sustained across all 22 hardware
+lanes at 0 failures. The AOT-inline re-dump remains the sole gated candidate (native
+dump trigger required; not reachable through the headless harness). Landscape: every
+in-lane transpile/rendering lever landed + measured. Goal stays active.

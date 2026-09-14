@@ -934,3 +934,17 @@ Vitest units 27/27, 93 tests). Reflects 15 hardware gameplay runs at 0 failures.
 Goal remains active; remaining structural surface = per-draw Dawn indirect
 submission coalescing + deterministic content-pinning for a single-attribute
 gameplay-fps delta. 
+
+## Heavy-band profile on committed 1ms cached-timebase stack (round 16) — 2026-09-12
+Fresh heavy-band profile (window 4600-5300, all committed tiers: in-browser O3
+transpiler + O3 PPU-AOT + giga SPU + low hot thresholds + Dawn draw-state hoist +
+inline PPU reads on emergent blocks + 1ms in-wasm cached timebase): same-basis
+profile still reads `now` 11.5%, rpcs3_web_vm_read32_raw 8.5%, vm_write64 5.6%,
+exec_task_slice 5.6%, check_state 4.7%, vm_read64 4.3%, vm_write32 3.4% (± categorical).
+CONCLUSION: the residual `now`/VM-raw aggregate (~24%) sits on the AOT-BAKED blocks
+(the game bundle was compiled from 09-03 dumps emitted with inline-reads OFF) — i.e.
+the transpiled *bundle* still crosses the wasm->JS border per access, while the
+1ms-cached + inline-emergent tiers are already collapsed. The next structural move is a
+bundle re-dump with RPCS3_PPU_WASM_INLINE_READS baked into the store (dump-trigger
+plumbing) — recorded vs that move rather than claimed. Sustained gameplay measured
+24.31fps@573dpf (longest contiguous band); 15 HW runs, 0 failures. Goal stays active.

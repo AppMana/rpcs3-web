@@ -1142,3 +1142,13 @@ units 27/27/93 on the slab build (2fd02495); hardware dual-metric bench hw-r38: 
 frames / 0 failures / 0 drops, longest contiguous sustained band 4345-4741 =
 19.35fps @573dpf - consistent with the shipped floor. Cumulative: 21 hardware lanes,
 0 failures. Goal stays active.
+
+## Round-38 (2026-09-12): cache-gate coarsening evaluated and rejected; floor held
+Evaluated coarsening the committed 1ms timebase-cache refresh gate (1ms -> 4ms) to cut
+the wasm->JS crossing rate ~4x (the persistent `now` leaf ~11%). REJECTED on analysis:
+the guest timebase only advances on refresh, so a 4ms quantum makes sub-4ms guest
+spin/sleep delays resolve up to 4x slower wall-time -> emulation pacing regression, not
+a win. The 1ms bound is the correct conservative setting and stays. The r38 slab floor
+confirmed (2fd02495 == ingress; 5315f/0-fail/19.35fps sustained @573dpf, 21st HW lane).
+Remaining gated non-claimed candidate unchanged: AOT-bundle inline re-dump needs a
+native-side dump trigger (out of the headless lane). Goal stays active.

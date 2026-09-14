@@ -996,3 +996,21 @@ frame 1829 without writing report.json (a cold freshly-cloned chrome profile fir
 boot → transient; the same frozen config recorded a replicated sustained band of
 23.8-24.3 fps @573dpf in rounds 15/17-18). The extraction path itself was validated
 in round-21 (reproduces r15=24.31/r17=23.84 exactly). Goal stays active.
+Round-23 (2026-09-12): shared-cell guest timebase — oracle-green, hardware-boot-fail, reverted
+Implemented a shared guest-timebase cell to collapse the #1 measured guest leaf ("now",
+~9-11% of heavy-band leaves): rpcs3_web_main.cpp strong g_web_ticks_ns atomic + init/address/
+read keepalives; pre-js worker-ready heart overwrote the cell from performance.now() every
+1ms via a growth-safe DataView over HEAPU8.buffer; tsc.hpp WASM32 get_tsc became a plain
+in-wasm load (verified the wasm exported the 3 ticks symbols with 0 ticks imports).
+Two real bugs caught on the way: (1) a recursion cycle — the host fallback called
+get_timebased_time() which calls get_tsc() -> rpcs3_web_ticks_read() (fixed to read
+performance.now() directly pre-heart); (2) u64 boundary mismatches — ticksInit u64 param
+needed BigInt, and the u64-returning ticks_address needed Number() coercion before >>>0.
+
+ORACLE-GREEN: the BigInt-wrapped rebuild passed default e2e 30/30 (oracle-r23e) + units
+27/27 (93 tests). HARDWARE-BOOT-FAIL: the shared-cell runtime stuck at state booting with
+0 frames over the measure window (the pre-js heart's boot-time install wedged the worker
+GPU prep) -> per measure-reject the experiment was REVERTED cleanly; the committed full
+stack is restored and verified deployed == committed (runtime ab3ed08c, transpiler
+28a673b). Sustained full-stack gameplay stays at the replicated 23.8-24.3 fps @573dpf
+band (17 hardware lanes, 0 failures). Goal stays active.

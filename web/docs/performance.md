@@ -1169,3 +1169,17 @@ extra transpile backlog offsets the marginal cold-path coverage gain; the shippe
 threshold-8 remains the right config on the deployed slab floor. Landscape unchanged:
 all in-lane levers landed + 22 hardware lanes 0-fail; sole gated candidate remains the
 AOT-inline re-dump (native trigger). Goal stays active.
+
+## Round-41 (2026-09-12): shipped-floor definitive record (40 commits, 22 HW lanes 0-fail)
+Definitive shipped state (no in-lane headroom remains): runtime 2fd02495 (Dawn index-
+slab + program-ucode hash cache + 1ms in-wasm timebase), transpiler 28a673b (O3 NewPM
+in-browser guest JIT), O3 PPU-AOT (114 blocks/170MB), giga SPU blocks, low hot
+thresholds, inline PPU memory on emergent blocks, boot-tolerant dual-metric bench.
+Sustained gameplay: 18.8-24.3fps @573dpf across the 22 hardware lanes (all 0 failures).
+Heavy-band leaves all attributed/bounded: now (1ms cache, main-thread fence-spin
+unavoidable), vm_read/write_raw (AOT-baked bundle - dump-gated native), exec_task_slice/
+check_state (interpreter cold-path at coverage ceiling). Average evaluated shifts with
+thresholds (r40 left threshold-8 optimal). SOLE gated non-claimed candidate: AOT inline
+re-dump via a native-side dump trigger (not reachable through the headless harness).
+This records the relentless-optimization floor for the objective; remaining work is the
+gated native path, so the goal stays active.

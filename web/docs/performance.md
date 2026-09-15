@@ -1496,3 +1496,24 @@ part inlines reads + binds pages) and oracle 30/30 + units 27/27/93 green. Deplo
 lbp2-profiled-inline. To benchmark on ACTUAL 3D render, the game must REACH a playable
 3D scene (save-resume or a specifically-frame-correlated pan where a 3D render appears) -
 the current pan windows don't. Goal stays active.
+
+## Round-04 (resumed): complete answer on "what else needs rewriting" in the transpiled memory path
+TRANSLATION (the guest->host-linear step): host_linear = g_web_pages[addr>>12] + (addr & 0xfff),
+where g_web_pages[guest_page] is a u8* into the wasm linear memory (each guest page mapped
+individually by web_map; shared aliases / sparse-locked pages can sit at non-contiguous host
+offsets, vm.cpp:129-134). WHAT WAS THE SLOWDOWN (pre-inline): every transpiled guest access
+crossed the wasm->JS border into rpcs3_web_vm_*_raw -> border + translation + conditional read
+= ~22% inclusive. LANDED (fixed): the --inline-reads transform moves each read to the in-wasm
+page-table fast-path (load g_web_pages[addr>>12], bounds+mapped check, volatile wasm load) - no
+border, no per-access host translation call. WHAT ELSE COULD BE REWRITTEN: (1) the per-access
+PAGE-TABLE ENTRY LOAD (still 1 wasm load + shift + add) -> collapse to a direct-mapped subtract
+(host_linear = guest_addr - guest_base + origin) with ONE range check for the bulk contiguous
+window, falling back to the table for sparse/unmapped - MARGINAL (wasm loads are cheap; the
+border was the cost, now gone). (2) CANNOT be rewritten in-wasm: WRITES (host bumps
+g_web_page_versions[guest_page] for texture invalidation) and ATOMICS (__lwarx/__stwcx/__check
+need host-side atomicity+fence sync) - these are correctness requirements, not overhead. So the
+transpiled memory path is now minimal: reads = in-wasm (2 wasm loads, no border); writes/atomics
+= inherently JS-border(host-required). MEASURED STATE: the genuine heavy-3D render (frame-
+confirmed) is ~9.5fps @ ~1165 dpf; the inline read-tier transform landed + validated (--pic part
+inlines reads, pages bound, oracle 30/30 + units 27/27/93 green), deployed at lbp2-profiled-inline.
+Goal stays active.

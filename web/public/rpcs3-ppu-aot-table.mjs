@@ -64,6 +64,17 @@ export async function loadPpuAotBundle({ module, mainInstance, mainMemory, manif
         }
         continue;
       }
+      if (imported.module === "GOT.mem" && imported.kind === "global" && imported.name === "__rpcs3_web_page_versions") {
+        if (typeof module._rpcs3_web_versions_address !== "function") {
+          throw new Error("PPU bundle requires the write-version array unsupported by this runtime");
+        }
+        continue;
+      }
+        if (typeof module._rpcs3_web_vm_page_table_address !== "function") {
+          throw new Error("PPU bundle requires direct guest-page reads unsupported by this runtime");
+        }
+        continue;
+      }
       if (imported.module !== "env") throw new Error(`unsupported PPU AOT import module ${imported.module}.${imported.name}`);
       if (imported.kind !== "function") continue;
       if (imported.name.startsWith("rpcs3_web_vm_")) {

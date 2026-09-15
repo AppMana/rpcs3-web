@@ -841,6 +841,8 @@ extern "C"
 		return static_cast<u32>(reinterpret_cast<uptr>(vm::g_web_pages.data()));
 	}
 
+
+
 	EMSCRIPTEN_KEEPALIVE u8 rpcs3_web_vm_read8_raw(u32 addr)
 	{
 		return read_guest_raw<u8>(addr);

@@ -1533,3 +1533,15 @@ oracle 22/22 + units... (93 tests green), deployed at lbp2-profiled-inline. THE 
 save-resume hook), and (b) at 1165 dpf the Dawn per-draw submission scale-binds - the only
 remaining large rewrite is Dawn-side draw-batching (indirect multi-draw over a same-pipeline
 run), which I separately scoped but rejected on ring-fragility. Goal stays ACTIVE.
+
+## Round-05 pt2 (resumed): write-path inline machinery added
+To remove the LAST per-access JS border on memory (the user's "every single place"), added
+the WRITE inline machinery: (1) vm.cpp exports EMSCRIPTEN_KEEPALIVE rpcs3_web_versions_address()
+(the shared g_web_page_versions array address - the version bump the renderer reads lazily via
+web_page_version_sum); (2) compile-ppu-ir-to-wasm.mjs also inlines vm_writeN_raw -> page-table
+load over @__rpcs3_guest_pages + bounds/mapped check + volatile wasm STORE +
+atomicrmw add on @__rpcs3_web_page_versions[page] (preserving the texture-invalidation bump),
+falling back to the raw write helper for cross-page/unmapped; (3) the AOT loader binds the new
+GOT.mem.__rpcs3_web_page_versions global to the runtime export. Rebuild in progress; then
+validate (oracle+units), deploy the write-inline bundle, measure the settled heavy-3D-render fps.
+Goal stays active.

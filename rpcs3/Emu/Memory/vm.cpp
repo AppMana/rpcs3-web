@@ -2755,3 +2755,8 @@ void fmt_class_string<vm::_ptr_base<const char, u32>>::format(std::string& out, 
 
 	out += reinterpret_cast<const char*>(u8"”");
 }
+
+EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_versions_address() noexcept
+{
+	return static_cast<u32>(reinterpret_cast<uptr>(g_web_page_versions.data()));
+}

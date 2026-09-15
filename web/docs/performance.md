@@ -1517,3 +1517,19 @@ transpiled memory path is now minimal: reads = in-wasm (2 wasm loads, no border)
 confirmed) is ~9.5fps @ ~1165 dpf; the inline read-tier transform landed + validated (--pic part
 inlines reads, pages bound, oracle 30/30 + units 27/27/93 green), deployed at lbp2-profiled-inline.
 Goal stays active.
+
+## Round-05 (resumed): definitive state - CPU fix landed; 3D-render benchmark blocked on reaching gameplay
+CONFIRMED via late-window no-Start pan (5604 frames / 0 fails / 14.73fps Overall): even at
+5600+ frames the game landed only ONE heavy>900dpf frame (1129 dpf) in the 4600+ settled
+window - the benchmark pan never reaches a SUSTAINED 3D render scene)Skip The play-runtime
+pan (no input beyond Start-burst, no save-resume) keeps the title in a mostly-movie/menu/
+loading state for the sampled range. So the "3D-render fps" cannot be reliably measured yet.
+LANDED + VALIDATED: the AOT read-tier inline transform (--inline-reads in
+compile-ppu-ir-to-wasm.mjs + build-ppu-aot-bundle.mjs forwarding) - reads move to the in-wasm
+page-table fast-path (GOT.mem.__rpcs3_guest_pages bound, bounds+mapped check, volatile wasm
+load; raw helper only for unmapped fallback; writes stay raw for host texture-versioning);
+oracle 22/22 + units... (93 tests green), deployed at lbp2-profiled-inline. THE BOTTLENECK for
+30fps: (a) the pan doesn't reach real 3D gameplay (needs input-driven menu navigation or a
+save-resume hook), and (b) at 1165 dpf the Dawn per-draw submission scale-binds - the only
+remaining large rewrite is Dawn-side draw-batching (indirect multi-draw over a same-pipeline
+run), which I separately scoped but rejected on ring-fragility. Goal stays ACTIVE.

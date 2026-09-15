@@ -1545,3 +1545,6 @@ falling back to the raw write helper for cross-page/unmapped; (3) the AOT loader
 GOT.mem.__rpcs3_web_page_versions global to the runtime export. Rebuild in progress; then
 validate (oracle+units), deploy the write-inline bundle, measure the settled heavy-3D-render fps.
 Goal stays active.
+
+## Round-05 (resumed) acknowledgment: benchmarks were on the WRONG content
+User is right: the pan windows I sampled (movie/FMV/menu/loading or transient >900-dpf bursts) were NOT sustained 3D render - so the earlier "19-24fps @573dpf" and even the late-window "14.7fps / 9.5fps @1165dpf" did not represent a measurable sustained 3D gameplay scene. The benchmark pan must run LONG ENOUGH to reach ACTUAL 3D gameplay (LBP2's intro/movie is multi-minute), profile the LATE gameplay stretch, and VISION-AUDIT the captured end frame to confirm a real 3D render before reporting fps. Correct state: READ-inline landed+validated (reads -> in-wasm page-table fast-path, pages bound via GOT.mem; oracle 30/30 + units green; deployed lbp2-profiled-inline); WRITE-inline machinery added then REVERTED (needs linker EXPORTED_FUNCTIONS wiring; kept clean). Next: a HIGH-FRAME pan (past the intro) + vision-audit for the genuine 3D render window. Goal stays active.

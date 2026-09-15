@@ -1480,3 +1480,19 @@ JS-border cost in the CPU profile (~22% inclusive) but the heavy render SCALE (1
 fps at ~9.5 - the bottleneck is Dawn-scale at heavy draw counts (render submission), not the VM
 read border. NEXT-BOUNDED: Dawn submission-side (draw-call batching/indirect) to scale the heavy
 render, plus keeping the spam-Start pan (not the movie) for the 30fps focus. Goal stays active.
+
+## Round-03 (resumed): bench has NOT isolated 3D render; inline read-tier landed
+Vision-audit of the no-Start late-window pan (5600 frames, no Start input) confirms the
+sampled windows are NOT sustained 3D render: the end-frame still decodes essentially
+black (meanLum 0.9, ~2.86% non-black = overlay only), and the 4600+ settled window has
+only ONE heavy>900 dpf frame (mean 1129 dpf) at fpsOverall 14.73. So the "3D render fps"
+is NOT yet measured - the game sits in a mostly-black/movie/menu state through the
+sampled windows with transient 3D bursts. LANDED this round: the AOT read-tier inline
+transform (compile-ppu-ir-to-wasm.mjs --inline-reads: each vm_readN_raw JS-border call
+becomes the in-wasm page-table fast-path over GOT.mem.__rpcs3_guest_pages + bounds/mapped
+check + volatile wasm load, raw helper only for unmapped fallback, writes stay raw for
+host texture-versioning), wired through build-ppu-aot-bundle.mjs; validated (the --pic
+part inlines reads + binds pages) and oracle 30/30 + units 27/27/93 green. Deployed at
+lbp2-profiled-inline. To benchmark on ACTUAL 3D render, the game must REACH a playable
+3D scene (save-resume or a specifically-frame-correlated pan where a 3D render appears) -
+the current pan windows don't. Goal stays active.

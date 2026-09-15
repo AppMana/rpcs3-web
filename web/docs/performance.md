@@ -1560,3 +1560,15 @@ black backing of the transferred canvas). Ran a Start-at-30s pan (RPCS3_AUTO_STA
 budget). After it completes: vision-audit the captured screen for a visible 3D render, then benchmark
 over the gameplay window. The prior "fps @ N dpf" were movie/black-content numbers (user's valid
 correctness call), so this is the FIRST Start-driven, screen-captured gameplay benchmark. Goal active.
+
+## Round-06 (resumed): black-screen regression root-caused = read-inline bundle; known-good o3 restored
+Root cause of the solid-black chrome screen: when I pointed the deployed manifest at the
+read-inline bundle (lbp2-profiled-inline), the inlined guest reads mis-handle the game's
+specific memory accesses -> the presented frame is black even though the game is running+drawing
+(HUD "running"). This regressed the KNOWN-GOOD present path (lbp2-profiled-o3 rendered gameplay).
+FIX: reverted the deployed manifest to local-aot/lbp2-profiled-o3/manifest.json (the known-good
+bundle) and kept the read-inline out of the deployed path (it passes the dispatch oracle but
+breaks the live present). Runner now forwards RPCS3_AUTO_START_SEC (pans tap Start at ~30s wall).
+Verify pan (o3 + Start@30s) running; its frame will be vision-audited. If visible -> the revert
+is the working render path; the read-inline remains a measure-rejected candidate (border removed
+in the CPU profile but breaks the live present). Goal stays active.

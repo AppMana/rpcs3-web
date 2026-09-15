@@ -1551,3 +1551,12 @@ User is right: the pan windows I sampled (movie/FMV/menu/loading or transient >9
 
 ## Round-05 (high-frame, current): pan now targeting REAL 3D gameplay
 Running a high-frame pan (RPCS3_FRAMES=11000, profile window 9500-11000) to run LBP2 PAST its multi-minute movie into ACTUAL 3D gameplay, then VISION-AUDIT the captured end frame to confirm a genuine 3D render before any fps is trusted. Correct position: prior "fps" numbers were on movie/menu/black content (user's valid point); the READ-inline (substantive border removal) is landed+validated; write-inline machinery was added then reverted (linker wiring); the high-frame pan is the FIRST attempt to reach real 3D render. Goal stays active.
+
+## Round-06 (resumed): harness fix - autoStartSec=30 + composited screen capture
+Per the user's exact instruction: hit Start 30s in, then start recording. Wired the runner to
+forward RPCS3_AUTO_START_SEC (play-runtime taps the pad START at a fixed wall time ~30s -> skips
+the movie into gameplay). The pan now captures the COMPOSITED screen (page-level screenshot, not the
+black backing of the transferred canvas). Ran a Start-at-30s pan (RPCS3_AUTO_START_SEC=30, 9000-frame
+budget). After it completes: vision-audit the captured screen for a visible 3D render, then benchmark
+over the gameplay window. The prior "fps @ N dpf" were movie/black-content numbers (user's valid
+correctness call), so this is the FIRST Start-driven, screen-captured gameplay benchmark. Goal active.

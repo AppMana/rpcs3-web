@@ -120,45 +120,13 @@ function inlineVmReads(text) {
   }
   t.push(text.slice(last));
   let out = t.join("");
-  // Inline the write-raw helper calls too: page-table load + bounds/mapped check +
-  // volatile store + a wasm version-bump on the shared version array.
-  const w_re = /^  call void @rpcs3_web_vm_write(\d+)_raw\(i32 %(\d+), (i\d+) %(\d+)\)$/gm;
-  const wt = [];
-  let wl = 0, wm;
-  while ((wm = w_re.exec(out))) {
-    const w = wm[1], wa = wm[2], ty = wm[3], v = wm[4];
-    const lim = (4096 - (w / 8)) | 0;
-    wt.push(out.slice(wl, wm.index));
-    wt.push(`  %wp_${wa}_i = lshr i32 %${wa}, 12\n`);
-    wt.push(`  %wp_${wa}_p = getelementptr [1048576 x i32], ptr @__rpcs3_guest_pages, i32 0, i32 %wp_${wa}_i\n`);
-    wt.push(`  %wp_${wa}_v = load i32, ptr %wp_${wa}_p, align 4\n`);
-    wt.push(`  %wp_${wa}_o = and i32 %${wa}, 4095\n`);
-    wt.push(`  %wp_${wa}_in = icmp ule i32 %wp_${wa}_o, ${lim}\n`);
-    wt.push(`  %wp_${wa}_m = icmp ne i32 %wp_${wa}_v, 0\n`);
-    wt.push(`  %wp_${wa}_go = and i1 %wp_${wa}_in, %wp_${wa}_m\n`);
-    wt.push(`  br i1 %wp_${wa}_go, label %wp_d_${wa}, label %wp_f_${wa}\n`);
-    wt.push(`wp_d_${wa}:\n`);
-    wt.push(`  %wp_${wa}_a = add i32 %wp_${wa}_v, %wp_${wa}_o\n`);
-    wt.push(`  %wp_${wa}_pt = inttoptr i32 %wp_${wa}_a to ptr\n`);
-    wt.push(`  store volatile ${ty} ${v}, ptr %wp_${wa}_pt, align 1\n`);
-    wt.push(`  %wp_${wa}_vp = getelementptr [1048576 x i32], ptr @__rpcs3_web_page_versions, i32 0, i32 %wp_${wa}_i\n`);
-    wt.push(`  %wp_${wa}_old = atomicrmw add ptr %wp_${wa}_vp, i32 1, seq_cst\n`);
-    wt.push(`  br label %wp_m_${wa}\n`);
-    wt.push(`wp_f_${wa}:\n`);
-    wt.push(`  call void @rpcs3_web_vm_write${w}_raw(i32 %${wa}, ${ty} ${v})\n`);
-    wt.push(`  br label %wp_m_${wa}\n`);
-    wt.push(`wp_m_${wa}:\n`);
-    wl = w_re.lastIndex;
+  // Inject the @__rpcs3_guest_pages declaration only if the ORIGINAL input lacked
+  // it (the transformed bodies reference it as a global, not a declaration).
+  if (!text.includes("@__rpcs3_guest_pages = external")) {
+    const decl = `@__rpcs3_guest_pages = external global [1048576 x i32]\n`;
+    const idx = out.indexOf("define ");
+    out = idx > 0 ? out.slice(0, idx) + decl + out.slice(idx) : decl + out;
   }
-  wt.push(out.slice(wl));
-  out = wt.join("");
-  // Inject the @__rpcs3_guest_pages / @__rpcs3_web_page_versions declarations only if the
-  // ORIGINAL input lacked them (the transformed bodies reference them as globals, not decls).
-  let decls = "";
-  if (!text.includes("@__rpcs3_guest_pages = external")) decls += `@__rpcs3_guest_pages = external global [1048576 x i32]\n`;
-  if (!text.includes("@__rpcs3_web_page_versions = external")) decls += `@__rpcs3_web_page_versions = external global [1048576 x i32]\n`;
-  const idx = out.indexOf("define ");
-  out = idx > 0 ? out.slice(0, idx) + decls + out.slice(idx) : decls + out;
   return out;
 }
 

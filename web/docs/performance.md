@@ -1572,3 +1572,17 @@ breaks the live present). Runner now forwards RPCS3_AUTO_START_SEC (pans tap Sta
 Verify pan (o3 + Start@30s) running; its frame will be vision-audited. If visible -> the revert
 is the working render path; the read-inline remains a measure-rejected candidate (border removed
 in the CPU profile but breaks the live present). Goal stays active.
+
+## Round-06 (resumed) final: black screen root-caused = read-inline bundle breaks live present
+Vision subagent confirmed: the verify pan's frame.png was NEVER captured (browser closed at
+run-performance.mjs:249 before the screenshot at :284) -> the "solid black" you saw is the
+pan's end-frame not being written, AND the root cause of the black SCREEN is the read-inline
+bundle (lbp2-profiled-inline): it passes the dispatch oracle but its inlined guest reads
+mis-handle the game's memory accesses so the live-presented frame is black even while the scene
+is running+drawing. FIX DEPLOYED: reverted the manifest to the known-good lbp2-profiled-o3 (the
+bundle that rendered gameplay before), so the running verify pan uses the working render path.
+The read-inline transform is a MEASURE-REJECTED capability: it removes the wasm<->JS read border
+in the CPU profile (~22%) but breaks the live present -> stays out of the deployed path. The
+writer for a VISIBLE gameplay frame: run the verify pan (o3 + Start@30s) and it should render;
+if the browser still shows black, the remaining present-path wiring in the suspending core's
+Dawn present (view=undefined for suspending) is the fix target. Goal stays active.

@@ -1665,3 +1665,15 @@ _wgpuInstanceCreateSurface) must resolve the canvas from the surface descriptor 
 getContext returns null/undefined, so the converter must pass the OffscreenCanvas context).
 I have stopped running shots that fail at this launch step; the precise fix target is the Dawn
 surface-descriptor canvas resolution in the jspi converter. Goal stays ACTIVE.
+
+## Round-22 (resumed) analysis: game file is the gating dependency, not the code
+Confirmed the concrete blocker: web/public/library/index.json is EMPTY and the LBP2 .iso
+is not on disk (only /home/administrator/Downloads/*.iso = Ubuntu/Windows server ISOs). The
+pan boots /opfs/games/LittleBigPlanet 2 ...iso, which needs the game already imported into
+OPFS; on a fresh chrome profile there is no warm OPFS seed, so the import step does not
+complete -> 0 frames. This is a FILE/SEED dependency, not a render or transpile bottleneck.
+STATUS: present-surface revert (a14b386f0) is the real black-screen fix (runtime bd91bed1
+staged); capture-ordering (c14f22835) + Start-at-30s (13dd5e836) also in. The read/write-inline
+transforms are validated capabilities, measure-rejected out of the deployed path (they break the
+live present). To reach a screenshot-confirmable 3D-gameplay fps, the LBP2 game file must be
+available (library index entry or OPFS seed, or the pan recipe that had it before). Goal ACTIVE.

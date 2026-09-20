@@ -1623,3 +1623,20 @@ reaches and CAPTURES a rendered 3D gameplay frame (needs the import step to comp
 known-good pan recipe); (b) then land the read/write-inline remap as a present-path-safe
 program. Until (a), no gameplay fps is trustworthy; the present-selector fix and capture-order
 fix are the concrete source changes in this stretch. Goal stays ACTIVE.
+
+## Round-08/09 status (concise): present fix committed; verification gated on harness launch
+Concrete source changes in this stretch (all committed, tree 0-diff):
+- PRESENT-SURFACE FIX (dd10c4b68): Dawn dagger surface selector was #rpcs3-canvas (not in the
+  pan's DOM; the displayed canvas is #gpu-output, play.html:64) -> null surface -> black while
+  the scene runs+draws. Now targets #gpu-output.
+- CAPTURE-ORDERING FIX (c14f22835): frame.png was captured AFTER profiler.stop() (which can
+  outlive/close the browser) -> never written. Now captured BEFORE profiler.stop().
+- Known-good o3 bundle re-deployed (manifest -> lbp2-profiled-o3).
+- LANDED as VALIDATED CAPABILITIES but kept MEASURE-REJECTED from the deployed path:
+  read-inline and write-inline transpiler transforms (they pass the dispatch oracle + units test
+  but break the live present -> black; they are a present-path-fix-and-remap program, not shipped).
+BLOCKED ON: the screenshot pans hang BEFORE the render loop at the ISO-import step (empty 113-byte
+log "importing ...iso", no frames, chrome not progressing) - a harness launch/environment
+instability independent of the present fix. I have stopped running shots that fail at this step.
+Goal stays ACTIVE; a confirmed-visible 3D render + its fps is the target and needs a gameplay
+save-state (to skip the movie) and a working launch, neither of which I have on disk right now.

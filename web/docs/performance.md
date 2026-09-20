@@ -1607,3 +1607,19 @@ GOAL DETERMINATION: work remains - the present-path fix is in source but unverif
 verification pans fail before render at the import step); a confirmed-visible 3D-gameplay
 fps is the target and not yet measured. Goal stays ACTIVE; the concrete blocker is the
 harness-launch (ISO import) failing to reach the render loop for verification.
+
+## Round-08 final: present-fix committed+deployed; verification gated on harness launch, not render
+CONFIRMED (in source, committed): the black-screen cause is the Dawn present-surface
+selector (#rpcs3-canvas -> #gpu-output, play.html:64) - fixed; capture-ordering also fixed
+(frame.png after profiler.stop() -> before). Runtime rebuilt + staged (9d20f9ec); known-good
+o3 bundle deployed (manifest -> lbp2-profiled-o3).
+HONEST VERIFICATION STATUS: the 3000/2400-frame screenshot pans produced NO report/NO frame
+because the harness launch hangs BEFORE the render loop at the ISO-import step (113-byte log
+"importing ...iso" only; chrome not progressing; repo-root test-results/ output dir also
+missing). This is a harness-launch instability independent of the present fix. I have stopped
+running further pans because they fail at the same launch step, not at the render.
+STILL-TO-DO (the real path to a confirmed 3D-render fps): (a) get a franStance/pan that actually
+reaches and CAPTURES a rendered 3D gameplay frame (needs the import step to complete or a
+known-good pan recipe); (b) then land the read/write-inline remap as a present-path-safe
+program. Until (a), no gameplay fps is trustworthy; the present-selector fix and capture-order
+fix are the concrete source changes in this stretch. Goal stays ACTIVE.

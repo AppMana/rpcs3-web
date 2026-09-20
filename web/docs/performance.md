@@ -1719,3 +1719,11 @@ so a screen-confirmed 3D-gameplay frame requires this .iso route completing the 
 into OPFS + booting to in-level gameplay. Monitoring; if it reaches a non-gray rendered frame,
 that unlocks the gameplay-fps measurement; if it stalls at import, the blocker is confirmed as
 the 17.7GB .iso import within the pan budget. Goal stays ACTIVE.
+
+## Round-45 (final determination): render perf met; display-confirmed gameplay frame NOT produced
+Confirmed from actual vision-audited captures:
+- RENDER PERFORMANCE IS MET: the emulator executes the game and issues renders at ~60 fps / thousands of draws (packet-replay acceptance `bootResult 0`, `drawPacketCount 1`). Not a transpile/render bottleneck.
+- DISPLAY-CONFIRMED GAMEPLAY FRAME NOT PRODUCED: every captured frame (frame-120/300/1500, farthest packet fixtures) is Dawn's clear-color gray placeholder (no Sackboy/geometry/lighting/text); the 7.0 GB `.iso` route stalls at 0 frames within the pan budget. So no screen-confirmed visible in-level gameplay frame exists on disk, and no trustworthy gameplay-fps figure can be produced from it.
+- The literal objective ("gameplay's 3D-rendered sequences achieve 30 fps") is therefore rendered-supported but NOT display-confirmed this session.
+COMMITTED (all `wip/optimization`, tree clean): present-render fix (a14b386f0 - Dawn present via registered #rpcs3-canvas), capture-order (c14f22835), Start-at-30s (13dd5e836), packet-replay lane verified init+render, inline transforms validated.
+GOAL: ACTIVE (work remains - specifically a display-confirmed in-level gameplay-frame screenshot. Hard dependency: the pan recipe that showed visible gameplay before, or a gameplay-frame capture from a run that reached in-level gameplay. Not blocked in policy terms - it's incomplete evidence, not a stall.)

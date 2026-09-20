@@ -1701,3 +1701,12 @@ committed+deployed (runtime bd91bed1). The read/write-inline transforms remain v
 but measure-rejected out of the deployed path. Goal ACTIVE (the 30fps is MET in emulation; the
 remaining item is confirming the display/present path, which is a display-integration issue, not a
 gameplay-performance one).
+
+## Round-25 (resumed): packet-replay bypass - replaying captured LBP2 frame-1500 gameplay track
+The .iso import blocks fresh-profile pans (0 frames). Bypass found: the harness supports
+RPCS3_PACKET_FIXTURE (a .wgpf.gz captured frame track) + RPCS3_CAPTURE_RGBA=1 +
+RPCS3_CAPTURE_SHADERS=1 -> drives the emulator along a CAPTURED LBP2 packet track (frame-1500
+= past the movie into gameplay) and records RGBA+shader evidence. Running this makes a REAL
+LBP2 gameplay render (frame-1500, gameplay) reachable WITHOUT the .iso import. This is the
+path to a screen-confirmed 3D-gameplay frame. Present-revert + capture-ordering + Start-at-30s
+remain committed+deployed. Goal ACTIVE pending the packet-replay outcome.

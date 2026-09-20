@@ -1710,3 +1710,12 @@ RPCS3_CAPTURE_SHADERS=1 -> drives the emulator along a CAPTURED LBP2 packet trac
 LBP2 gameplay render (frame-1500, gameplay) reachable WITHOUT the .iso import. This is the
 path to a screen-confirmed 3D-gameplay frame. Present-revert + capture-ordering + Start-at-30s
 remain committed+deployed. Goal ACTIVE pending the packet-replay outcome.
+
+## Round-43/44: full-budget .iso pan attempt (reach in-level gameplay, past gray movie frames)
+Started a full .iso pan (RPCS3_FRAMES=7000, RPCS3_TIMEOUT_MS=3000000 = 50-min budget, Start at 30s)
+targeting IN-LEVEL 3D gameplay (frame-5000+, well past the gray movie frames at fixture caps
+frame-120/300/1500). The packet-replay fixtures admit only drawPacketCount:1 (gray clear only),
+so a screen-confirmed 3D-gameplay frame requires this .iso route completing the 17.7GB import
+into OPFS + booting to in-level gameplay. Monitoring; if it reaches a non-gray rendered frame,
+that unlocks the gameplay-fps measurement; if it stalls at import, the blocker is confirmed as
+the 17.7GB .iso import within the pan budget. Goal stays ACTIVE.

@@ -402,7 +402,7 @@ bool WebGPUDirectGSRender::configure_surface()
 	{
 		WGPUEmscriptenSurfaceSourceCanvasHTMLSelector source{};
 		source.chain.sType = WGPUSType_EmscriptenSurfaceSourceCanvasHTMLSelector;
-		source.selector = sv("#gpu-output");
+		source.selector = sv("#rpcs3-canvas");
 		WGPUSurfaceDescriptor descriptor{};
 		descriptor.nextInChain = &source.chain;
 		descriptor.label = sv("RPCS3 RSX presentation");

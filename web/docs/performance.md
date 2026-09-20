@@ -1640,3 +1640,14 @@ log "importing ...iso", no frames, chrome not progressing) - a harness launch/en
 instability independent of the present fix. I have stopped running shots that fail at this step.
 Goal stays ACTIVE; a confirmed-visible 3D render + its fps is the target and needs a gameplay
 save-state (to skip the movie) and a working launch, neither of which I have on disk right now.
+
+## Round-09 status (direct): present fix committed + deployed; verifying chrome run
+The hw-fresh pan is at the ISO-import step (2 chrome procs, no report yet). Direct state:
+- PRESENT-SURFACE FIX (dd10c4b68) + CAPTURE-ORDERING FIX (c14f22835): committed; runtime rebuilt
+  + staged (9d20f9ec); known-good o3 bundle deployed.
+- READ/WRITE-INLINE transforms: validated capabilities (pass dispatch oracle + units) but
+  MEASURE-REJECTED out of the deployed path (they remove the ~22% CPU border but break the
+  live present -> black). A present-path-safe landing requires confirmed-visible 3D gameplay.
+- BLOCKED ON: a gameplay save-state at a 3D gameplay checkpoint + a working harness launch
+  (the recent pans hang at ISO-import, a separate instability from the present fix).
+Goal stays ACTIVE.

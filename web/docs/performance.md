@@ -1677,3 +1677,13 @@ staged); capture-ordering (c14f22835) + Start-at-30s (13dd5e836) also in. The re
 transforms are validated capabilities, measure-rejected out of the deployed path (they break the
 live present). To reach a screenshot-confirmable 3D-gameplay fps, the LBP2 game file must be
 available (library index entry or OPFS seed, or the pan recipe that had it before). Goal ACTIVE.
+
+## Round-23 (resumed): fixture pan VERIFIED a captured screen (present-revert works)
+A short fixture-drive pan (gs_gcm_tetris.elf, 400-frame handshake, screen-capture before
+profiler.stop) produced a WRITTEN frame.png (1280x720, meanLum 0.8, ~2.8% non-black) -
+so the capture path now writes a screen, confirming the present-revert (a14b386f0) works at
+the capture level. The low luminance suggests the fixture's initial (title/menu) frame is
+mostly-dark/overlay, which the vision subagent (856ba16e) is confirming. LBP2 gameplay
+itself is still gated on the .iso being importable (library index empty, no LBP2 .iso on
+disk), so no gameplay-fps has been produced. Present-revert + capture-ordering + Start-at-30s
+are committed+deployed (runtime bd91bed1). Goal stays ACTIVE (game-load dependency).

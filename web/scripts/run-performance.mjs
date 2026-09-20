@@ -277,11 +277,11 @@ try {
     report.edgeWindow.end = await page.evaluate(() => window.__rpcs3Playable?.exportSpuChainEdges());
     if (report.edgeWindow.end?.error) throw new Error(report.edgeWindow.end.error);
   }
+  await page.screenshot({ path: path.join(output, "frame.png") });
   if (profiler) {
     await writeCpuProfiles(await profiler.stop(), path.join(output, "run.cpuprofile"), samplingIntervalUs);
     profiler = undefined;
   }
-  await page.screenshot({ path: path.join(output, "frame.png") });
   report.shutdown = await page.evaluate(() => window.__rpcs3Playable?.stop());
   if (!report.completed) throw new Error("guest frame budget was not reached");
 } catch (error) {

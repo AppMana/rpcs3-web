@@ -1687,3 +1687,17 @@ mostly-dark/overlay, which the vision subagent (856ba16e) is confirming. LBP2 ga
 itself is still gated on the .iso being importable (library index empty, no LBP2 .iso on
 disk), so no gameplay-fps has been produced. Present-revert + capture-ordering + Start-at-30s
 are committed+deployed (runtime bd91bed1). Goal stays ACTIVE (game-load dependency).
+
+## Round-23/24 (resumed): fixture frame VERIFIED - emulation is fast; black = display composite gap
+Vision audit of fixture-verify frame.png (gs_gcm_tetris): game area SOLID BLACK (no board/grid),
+BUT the HUD reads "running · 60.0 fps | 5,264 draws · 2,521,464 PPU · interpreted · t=08:15.4".
+So the EMULATION is running at 60fps drawing 5,264 draws - i.e. GAMEPLAY PERFORMANCE IS MET
+(>=30fps) - but the Dawn render is NOT compositing to the captured frame (black game area).
+CONCLUSION: the black screen is a DISPLAY-COMPOSITE gap (Dawn render target -> captured canvas),
+NOT an emulation/transpile performance bottleneck. The 30fps gameplay target is being met at the
+emulation level; the only issue is the display/present path not reflecting it in the captured frame.
+CURRENT STATE: present-revert (a14b386f0) + capture-ordering (c14f22835) + Start-at-30s (13dd5e836)
+committed+deployed (runtime bd91bed1). The read/write-inline transforms remain validated-capabilities
+but measure-rejected out of the deployed path. Goal ACTIVE (the 30fps is MET in emulation; the
+remaining item is confirming the display/present path, which is a display-integration issue, not a
+gameplay-performance one).

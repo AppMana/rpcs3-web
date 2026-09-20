@@ -1651,3 +1651,17 @@ The hw-fresh pan is at the ISO-import step (2 chrome procs, no report yet). Dire
 - BLOCKED ON: a gameplay save-state at a 3D gameplay checkpoint + a working harness launch
   (the recent pans hang at ISO-import, a separate instability from the present fix).
 Goal stays ACTIVE.
+
+## Round-10 (resumed): launch failure = wgpuInstanceCreateSurface gets undefined canvas
+Root cause of the black screen (from the fresh-pan report): the pan fails at launch with
+"TypeError: Cannot read properties of undefined (reading 'getContext') at
+_wgpuInstanceCreateSurface (core/jspi/rpcs3-web.mjs)". So the Dawn surface creation passes an
+UNDEFINED canvas to .getContext() -> the surface is null -> the render target is never
+composited to the on-screen #gpu-output -> solid black. This is the actual regression, and it
+is NOT the game, NOT a selector, NOT a render freeze - it is the Dawn surface creation being
+given an undefined canvas. The Chrome Dawn dagger converter (web/public/core/jspi/rpcs3-web.mjs
+_wgpuInstanceCreateSurface) must resolve the canvas from the surface descriptor correctly
+(the suspending core uses an OffscreenCanvas; after transferControlToOffscreen the DOM canvas's
+getContext returns null/undefined, so the converter must pass the OffscreenCanvas context).
+I have stopped running shots that fail at this launch step; the precise fix target is the Dawn
+surface-descriptor canvas resolution in the jspi converter. Goal stays ACTIVE.

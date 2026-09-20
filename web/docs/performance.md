@@ -1586,3 +1586,24 @@ in the CPU profile (~22%) but breaks the live present -> stays out of the deploy
 writer for a VISIBLE gameplay frame: run the verify pan (o3 + Start@30s) and it should render;
 if the browser still shows black, the remaining present-path wiring in the suspending core's
 Dawn present (view=undefined for suspending) is the fix target. Goal stays active.
+
+## Round-08 (resumed): present-fix in source; harness launch stuck at ISO import
+BLACK-SCREEN FIX (source, committed dd10c4b68): Dawn presentation surface selector was
+#rpcs3-canvas (not in the pan's DOM) -> null surface -> Dawn render target never composited
+to on-screen #gpu-output -> solid black while scene runs+draws. FIXED to #gpu-output; runtime
+rebuilt + staged (digest 9d20f9ec). Capture-ordering also fixed (frame.png was after
+profiler.stop() which can outlive/close chrome -> never written; moved screenshot BEFORE
+profiler.stop(), committed c14f22835).
+HARNESS LAUNCH: the 3000/2400-frame verification pans produced NO report/NO frame - the
+runner/pan is stuck BEFORE the render loop at the ISO-import step (empty 113-byte log,
+'importing ...iso' only, no frames, browser not progressing). This is a harness-launch
+instability (fresh chrome profile + import), NOT a render freeze - separate from the
+present-path fix which is in source.
+MEASURE-REJECTED (validated capabilities, kept out of deployed path): read-inline and
+write-inline transforms (they pass the dispatch oracle + units but remove the ~22% CPU
+border; landing them currently breaks the live present -> needs the present-path fix + a
+gameplay save-state to re-measure over a confirmed-visible 3D render).
+GOAL DETERMINATION: work remains - the present-path fix is in source but unverified (the
+verification pans fail before render at the import step); a confirmed-visible 3D-gameplay
+fps is the target and not yet measured. Goal stays ACTIVE; the concrete blocker is the
+harness-launch (ISO import) failing to reach the render loop for verification.

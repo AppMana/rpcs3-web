@@ -5,6 +5,7 @@ self.addEventListener("message", async (event) => {
   try {
     const { default: createRPCS3Units } = await import(event.data.coreUrl || "./core/rpcs3-web-units.mjs");
     await createRPCS3Units({
+      arguments: event.data.filter ? [`--gtest_filter=${event.data.filter}`] : [],
       locateFile: (name) => name.endsWith(".wasm")
         ? (event.data.wasmUrl || new URL(`./core/${name}`, self.location.href).href)
         : name,

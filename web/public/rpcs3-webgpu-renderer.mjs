@@ -183,7 +183,7 @@ function readConstant(packet, index) {
   return [0, 4, 8, 12].map((component) => view.getFloat32(component, true));
 }
 
-function decodeVertexSource(words, sourceIndex, d0, d1, d3, inputs, temps, packet) {
+function decodeVertexSource(words, sourceIndex, d0, d1, d3, inputs, temps, packet, address) {
   let source;
   let absolute;
   if (sourceIndex === 0) {
@@ -201,8 +201,10 @@ function decodeVertexSource(words, sourceIndex, d0, d1, d3, inputs, temps, packe
   if (type === 1) value = temps[bits(source, 2, 6)];
   else if (type === 2) value = inputs.get(d1.inputSource) ?? vector(0, 1);
   else if (type === 3) {
-    if (d3.indexConstant) throw new Error("indexed RSX vertex constants are not yet translated");
-    value = readConstant(packet, d1.constantSource);
+    const constIndex = d3.indexConstant
+      ? Math.max(0, Math.min(467, d1.constantSource + (address?.[d0.addrRegSel]?.[d0.addrSwizzle] ?? 0)))
+      : d1.constantSource;
+    value = readConstant(packet, constIndex);
   } else throw new Error("undefined RSX vertex source register");
   value = [...value];
   const swizzleCode = bits(source, 8, 8);
@@ -212,7 +214,7 @@ function decodeVertexSource(words, sourceIndex, d0, d1, d3, inputs, temps, packe
   return value;
 }
 
-function compileVertexSource(words, sourceIndex, d1, d3, referencedInputs) {
+function compileVertexSource(words, sourceIndex, d0, d1, d3, referencedInputs, constantRange) {
   let source;
   let absolute;
   if (sourceIndex === 0) {
@@ -233,8 +235,18 @@ function compileVertexSource(words, sourceIndex, d1, d3, referencedInputs) {
     expression = `input.attribute${d1.inputSource}`;
   }
   else if (type === 3) {
-    if (d3.indexConstant) throw new Error("indexed RSX vertex constants are not yet translated");
-    expression = `rsxVertexState.constants[${d1.constantSource}]`;
+    if (constantRange) {
+      if (d3.indexConstant) {
+        constantRange.min = 0;
+        constantRange.max = 468;
+      } else {
+        constantRange.min = Math.min(constantRange.min, d1.constantSource);
+        constantRange.max = Math.max(constantRange.max, d1.constantSource + 1);
+      }
+    }
+    expression = d3.indexConstant
+      ? `rsxVertexState.constants[clamp(i32(${d1.constantSource}) + address[${d0.addrRegSel}].${"xyzw"[d0.addrSwizzle]}, 0, 467)]`
+      : `rsxVertexState.constants[${d1.constantSource}]`;
   } else throw new Error("undefined RSX vertex source register");
   const swizzleCode = bits(source, 8, 8);
   if (swizzleCode !== 0x1b) {
@@ -252,18 +264,22 @@ function compileVertexProgram(packet) {
   const view = new DataView(program.buffer, program.byteOffset, program.byteLength);
   const lines = [
     "var temporary: array<vec4f, 32>;",
+    "var address: array<vec4i, 2>;",
     "var destination: array<vec4f, 16>;",
     ...Array.from({ length: 16 }, (_, index) => `destination[${index}] = vec4f(0.0, 0.0, 0.0, 1.0);`),
   ];
   const opcodes = [];
   const scalarOpcodes = [];
   const referencedInputs = new Set();
+  const constantRange = { min: 468, max: 0 };
   let emitted = 0;
   for (let instruction = packet.vertexProgramEntry; instruction * 16 < program.byteLength; instruction += 1) {
     const base = instruction * 16;
     const words = [0, 4, 8, 12].map((offset) => view.getUint32(base + offset, true));
     const d0 = {
+      addrSwizzle: bits(words[0], 0, 2),
       destinationTemp: bits(words[0], 15, 6),
+      addrRegSel: bits(words[0], 24, 1),
       saturate: Boolean(bits(words[0], 26, 1)),
       vectorResult: Boolean(bits(words[0], 30, 1)),
     };
@@ -282,44 +298,56 @@ function compileVertexProgram(packet) {
       scalarMask: [20, 19, 18, 17].map((bit) => Boolean(bits(words[3], bit, 1))),
     };
     if (d1.vectorOpcode !== 0) {
-      const a = compileVertexSource(words, 0, d1, d3, referencedInputs);
-      let value;
-      if (d1.vectorOpcode === 1) value = a;
-      else if (d1.vectorOpcode === 2) value = `(${a} * ${compileVertexSource(words, 1, d1, d3, referencedInputs)})`;
-      else if (d1.vectorOpcode === 3) value = `(${a} + ${compileVertexSource(words, 2, d1, d3, referencedInputs)})`;
-      else if (d1.vectorOpcode === 4) value = `fma(${a}, ${compileVertexSource(words, 1, d1, d3, referencedInputs)}, ${compileVertexSource(words, 2, d1, d3, referencedInputs)})`;
-      else if (d1.vectorOpcode === 5) value = `vec4f(dot(${a}.xyz, ${compileVertexSource(words, 1, d1, d3, referencedInputs)}.xyz))`;
-      else if (d1.vectorOpcode === 6) {
-        const b = compileVertexSource(words, 1, d1, d3, referencedInputs);
-        value = `vec4f(dot(${a}.xyz, ${b}.xyz) + ${b}.w)`;
-      } else if (d1.vectorOpcode === 7) value = `vec4f(dot(${a}, ${compileVertexSource(words, 1, d1, d3, referencedInputs)}))`;
-      else if (d1.vectorOpcode === 8) {
-        const b = compileVertexSource(words, 1, d1, d3, referencedInputs);
-        value = `vec4f(1.0, ${a}.y * ${b}.y, ${a}.z, ${b}.w)`;
-      } else if (d1.vectorOpcode === 9) value = `min(${a}, ${compileVertexSource(words, 1, d1, d3, referencedInputs)})`;
-      else if (d1.vectorOpcode === 10) value = `max(${a}, ${compileVertexSource(words, 1, d1, d3, referencedInputs)})`;
-      else if ([11, 12, 16, 18, 19, 20].includes(d1.vectorOpcode)) {
-        const comparison = new Map([[11, "<"], [12, ">="], [16, "=="], [18, ">"], [19, "<="], [20, "!="]]).get(d1.vectorOpcode);
-        value = `select(vec4f(0.0), vec4f(1.0), ${a} ${comparison} ${compileVertexSource(words, 1, d1, d3, referencedInputs)})`;
-      } else if (d1.vectorOpcode === 14) value = `fract(${a})`;
-      else if (d1.vectorOpcode === 15) value = `floor(${a})`;
-      else if (d1.vectorOpcode === 17) value = "vec4f(0.0)";
-      else if (d1.vectorOpcode === 21) value = "vec4f(1.0)";
-      else if (d1.vectorOpcode === 22) value = `sign(${a})`;
-      else throw new Error(`RSX vector vertex opcode ${d1.vectorOpcode} is not yet translated`);
-      if (d0.saturate) value = `clamp(${value}, vec4f(0.0), vec4f(1.0))`;
-      const result = `vertexVectorValue${emitted++}`;
-      lines.push(`let ${result} = ${value};`);
-      for (let component = 0; component < 4; component += 1) {
-        if (!d3.vectorMask[component]) continue;
-        const channel = "xyzw"[component];
-        if (d0.destinationTemp !== 0x3f) lines.push(`temporary[${d0.destinationTemp}].${channel} = ${result}.${channel};`);
-        if (d0.vectorResult && d3.destination < 16) lines.push(`destination[${d3.destination}].${channel} = ${result}.${channel};`);
+      const a = compileVertexSource(words, 0, d0, d1, d3, referencedInputs, constantRange);
+      if (d1.vectorOpcode === 13) {
+        const result = `vertexVectorValue${emitted++}`;
+        lines.push(`let ${result} = vec4i(floor(${a}));`);
+        const addrIdx = d0.destinationTemp & 1;
+        for (let component = 0; component < 4; component += 1) {
+          if (!d3.vectorMask[component]) continue;
+          const channel = "xyzw"[component];
+          lines.push(`address[${addrIdx}].${channel} = ${result}.${channel};`);
+        }
+        opcodes.push(d1.vectorOpcode);
+      } else {
+        let value;
+        if (d1.vectorOpcode === 1) value = a;
+        else if (d1.vectorOpcode === 2) value = `(${a} * ${compileVertexSource(words, 1, d0, d1, d3, referencedInputs, constantRange)})`;
+        else if (d1.vectorOpcode === 3) value = `(${a} + ${compileVertexSource(words, 2, d0, d1, d3, referencedInputs, constantRange)})`;
+        else if (d1.vectorOpcode === 4) value = `fma(${a}, ${compileVertexSource(words, 1, d0, d1, d3, referencedInputs, constantRange)}, ${compileVertexSource(words, 2, d0, d1, d3, referencedInputs, constantRange)})`;
+        else if (d1.vectorOpcode === 5) value = `vec4f(dot(${a}.xyz, ${compileVertexSource(words, 1, d0, d1, d3, referencedInputs, constantRange)}.xyz))`;
+        else if (d1.vectorOpcode === 6) {
+          const b = compileVertexSource(words, 1, d0, d1, d3, referencedInputs, constantRange);
+          value = `vec4f(dot(${a}.xyz, ${b}.xyz) + ${b}.w)`;
+        } else if (d1.vectorOpcode === 7) value = `vec4f(dot(${a}, ${compileVertexSource(words, 1, d0, d1, d3, referencedInputs, constantRange)}))`;
+        else if (d1.vectorOpcode === 8) {
+          const b = compileVertexSource(words, 1, d0, d1, d3, referencedInputs, constantRange);
+          value = `vec4f(1.0, ${a}.y * ${b}.y, ${a}.z, ${b}.w)`;
+        } else if (d1.vectorOpcode === 9) value = `min(${a}, ${compileVertexSource(words, 1, d0, d1, d3, referencedInputs, constantRange)})`;
+        else if (d1.vectorOpcode === 10) value = `max(${a}, ${compileVertexSource(words, 1, d0, d1, d3, referencedInputs, constantRange)})`;
+        else if ([11, 12, 16, 18, 19, 20].includes(d1.vectorOpcode)) {
+          const comparison = new Map([[11, "<"], [12, ">="], [16, "=="], [18, ">"], [19, "<="], [20, "!="]]).get(d1.vectorOpcode);
+          value = `select(vec4f(0.0), vec4f(1.0), ${a} ${comparison} ${compileVertexSource(words, 1, d0, d1, d3, referencedInputs, constantRange)})`;
+        } else if (d1.vectorOpcode === 14) value = `fract(${a})`;
+        else if (d1.vectorOpcode === 15) value = `floor(${a})`;
+        else if (d1.vectorOpcode === 17) value = "vec4f(0.0)";
+        else if (d1.vectorOpcode === 21) value = "vec4f(1.0)";
+        else if (d1.vectorOpcode === 22) value = `sign(${a})`;
+        else throw new Error(`RSX vector vertex opcode ${d1.vectorOpcode} is not yet translated`);
+        if (d0.saturate) value = `clamp(${value}, vec4f(0.0), vec4f(1.0))`;
+        const result = `vertexVectorValue${emitted++}`;
+        lines.push(`let ${result} = ${value};`);
+        for (let component = 0; component < 4; component += 1) {
+          if (!d3.vectorMask[component]) continue;
+          const channel = "xyzw"[component];
+          if (d0.destinationTemp !== 0x3f) lines.push(`temporary[${d0.destinationTemp}].${channel} = ${result}.${channel};`);
+          if (d0.vectorResult && d3.destination < 16) lines.push(`destination[${d3.destination}].${channel} = ${result}.${channel};`);
+        }
+        opcodes.push(d1.vectorOpcode);
       }
-      opcodes.push(d1.vectorOpcode);
     }
     if (d1.scalarOpcode !== 0) {
-      const source = compileVertexSource(words, 2, d1, d3, referencedInputs);
+      const source = compileVertexSource(words, 2, d0, d1, d3, referencedInputs, constantRange);
       let value;
       if (d1.scalarOpcode === 1) value = `vec4f(${source}.x)`;
       else if (d1.scalarOpcode === 2) value = `vec4f(1.0 / ${source}.x)`;
@@ -369,6 +397,8 @@ function compileVertexProgram(packet) {
     opcodes: [...new Set(opcodes)].sort((a, b) => a - b),
     scalarOpcodes: [...new Set(scalarOpcodes)].sort((a, b) => a - b),
     inputs: [...referencedInputs].sort((a, b) => a - b),
+    constantCount: constantRange.max,
+    constantMin: constantRange.max > 0 ? constantRange.min : 0,
   };
 }
 
@@ -381,6 +411,7 @@ function executeVertexProgram(packet, inputs) {
   if (program.byteLength % 16 !== 0) throw new Error("unaligned RSX vertex program");
   const view = new DataView(program.buffer, program.byteOffset, program.byteLength);
   const temps = Array.from({ length: 32 }, () => vector());
+  const address = [vector(0, 0), vector(0, 0)];
   const destinations = Array.from({ length: 16 }, () => vector(0, 1));
   const opcodes = [];
   const scalarOpcodes = [];
@@ -388,7 +419,9 @@ function executeVertexProgram(packet, inputs) {
     const base = instruction * 16;
     const words = [0, 4, 8, 12].map((offset) => view.getUint32(base + offset, true));
     const d0 = {
+      addrSwizzle: bits(words[0], 0, 2),
       destinationTemp: bits(words[0], 15, 6),
+      addrRegSel: bits(words[0], 24, 1),
       saturate: Boolean(bits(words[0], 26, 1)),
       vectorResult: Boolean(bits(words[0], 30, 1)),
     };
@@ -407,66 +440,73 @@ function executeVertexProgram(packet, inputs) {
       scalarMask: [20, 19, 18, 17].map((bit) => Boolean(bits(words[3], bit, 1))),
     };
     if (d1.vectorOpcode !== 0) {
-      const a = decodeVertexSource(words, 0, d0, d1, d3, inputs, temps, packet);
-      let value;
-      if (d1.vectorOpcode === 1) value = a;
-      else if (d1.vectorOpcode === 2) {
-        const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet);
-        value = a.map((component, index) => component * b[index]);
-      } else if (d1.vectorOpcode === 3) {
-        const b = decodeVertexSource(words, 2, d0, d1, d3, inputs, temps, packet);
-        value = a.map((component, index) => component + b[index]);
-      } else if (d1.vectorOpcode === 4) {
-        const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet);
-        const c = decodeVertexSource(words, 2, d0, d1, d3, inputs, temps, packet);
-        value = a.map((component, index) => component * b[index] + c[index]);
-      } else if (d1.vectorOpcode === 5) {
-        const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet);
-        const dot = a.slice(0, 3).reduce((sum, component, index) => sum + component * b[index], 0);
-        value = vector(dot);
-      } else if (d1.vectorOpcode === 6) {
-        const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet);
-        const dot = a.slice(0, 3).reduce((sum, component, index) => sum + component * b[index], b[3]);
-        value = vector(dot);
-      } else if (d1.vectorOpcode === 7) {
-        const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet);
-        const dot = a.reduce((sum, component, index) => sum + component * b[index], 0);
-        value = vector(dot);
-      } else if (d1.vectorOpcode === 8) {
-        const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet);
-        value = [1, a[1] * b[1], a[2], b[3]];
-      } else if (d1.vectorOpcode === 9 || d1.vectorOpcode === 10) {
-        const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet);
-        value = a.map((component, index) => d1.vectorOpcode === 9 ? Math.min(component, b[index]) : Math.max(component, b[index]));
-      } else if ([11, 12, 16, 18, 19, 20].includes(d1.vectorOpcode)) {
-        const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet);
-        value = a.map((component, index) => Number(
-          d1.vectorOpcode === 11 ? component < b[index]
-            : d1.vectorOpcode === 12 ? component >= b[index]
-              : d1.vectorOpcode === 16 ? component === b[index]
-                : d1.vectorOpcode === 18 ? component > b[index]
-                  : d1.vectorOpcode === 19 ? component <= b[index]
-                    : component !== b[index],
-        ));
-      } else if (d1.vectorOpcode === 14) {
-        value = a.map((component) => component - Math.floor(component));
-      } else if (d1.vectorOpcode === 15) {
-        value = a.map(Math.floor);
-      } else if (d1.vectorOpcode === 17 || d1.vectorOpcode === 21) {
-        value = vector(d1.vectorOpcode === 17 ? 0 : 1);
-      } else if (d1.vectorOpcode === 22) {
-        value = a.map(Math.sign);
+      const a = decodeVertexSource(words, 0, d0, d1, d3, inputs, temps, packet, address);
+      if (d1.vectorOpcode === 13) {
+        const intVal = a.map((component) => Math.floor(component) | 0);
+        const target = address[d0.destinationTemp & 1];
+        d3.vectorMask.forEach((enabled, component) => { if (enabled) target[component] = intVal[component]; });
+        opcodes.push(d1.vectorOpcode);
       } else {
-        throw new Error(`RSX vector vertex opcode ${d1.vectorOpcode} is not yet translated`);
+        let value;
+        if (d1.vectorOpcode === 1) value = a;
+        else if (d1.vectorOpcode === 2) {
+          const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet, address);
+          value = a.map((component, index) => component * b[index]);
+        } else if (d1.vectorOpcode === 3) {
+          const b = decodeVertexSource(words, 2, d0, d1, d3, inputs, temps, packet, address);
+          value = a.map((component, index) => component + b[index]);
+        } else if (d1.vectorOpcode === 4) {
+          const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet, address);
+          const c = decodeVertexSource(words, 2, d0, d1, d3, inputs, temps, packet, address);
+          value = a.map((component, index) => component * b[index] + c[index]);
+        } else if (d1.vectorOpcode === 5) {
+          const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet, address);
+          const dot = a.slice(0, 3).reduce((sum, component, index) => sum + component * b[index], 0);
+          value = vector(dot);
+        } else if (d1.vectorOpcode === 6) {
+          const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet, address);
+          const dot = a.slice(0, 3).reduce((sum, component, index) => sum + component * b[index], b[3]);
+          value = vector(dot);
+        } else if (d1.vectorOpcode === 7) {
+          const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet, address);
+          const dot = a.reduce((sum, component, index) => sum + component * b[index], 0);
+          value = vector(dot);
+        } else if (d1.vectorOpcode === 8) {
+          const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet, address);
+          value = [1, a[1] * b[1], a[2], b[3]];
+        } else if (d1.vectorOpcode === 9 || d1.vectorOpcode === 10) {
+          const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet, address);
+          value = a.map((component, index) => d1.vectorOpcode === 9 ? Math.min(component, b[index]) : Math.max(component, b[index]));
+        } else if ([11, 12, 16, 18, 19, 20].includes(d1.vectorOpcode)) {
+          const b = decodeVertexSource(words, 1, d0, d1, d3, inputs, temps, packet, address);
+          value = a.map((component, index) => Number(
+            d1.vectorOpcode === 11 ? component < b[index]
+              : d1.vectorOpcode === 12 ? component >= b[index]
+                : d1.vectorOpcode === 16 ? component === b[index]
+                  : d1.vectorOpcode === 18 ? component > b[index]
+                    : d1.vectorOpcode === 19 ? component <= b[index]
+                      : component !== b[index],
+          ));
+        } else if (d1.vectorOpcode === 14) {
+          value = a.map((component) => component - Math.floor(component));
+        } else if (d1.vectorOpcode === 15) {
+          value = a.map(Math.floor);
+        } else if (d1.vectorOpcode === 17 || d1.vectorOpcode === 21) {
+          value = vector(d1.vectorOpcode === 17 ? 0 : 1);
+        } else if (d1.vectorOpcode === 22) {
+          value = a.map(Math.sign);
+        } else {
+          throw new Error(`RSX vector vertex opcode ${d1.vectorOpcode} is not yet translated`);
+        }
+        if (d0.saturate) value = value.map((component) => Math.max(0, Math.min(1, component)));
+        const write = (target) => d3.vectorMask.forEach((enabled, component) => { if (enabled) target[component] = value[component]; });
+        if (d0.destinationTemp !== 0x3f) write(temps[d0.destinationTemp]);
+        if (d0.vectorResult && d3.destination < destinations.length) write(destinations[d3.destination]);
+        opcodes.push(d1.vectorOpcode);
       }
-      if (d0.saturate) value = value.map((component) => Math.max(0, Math.min(1, component)));
-      const write = (target) => d3.vectorMask.forEach((enabled, component) => { if (enabled) target[component] = value[component]; });
-      if (d0.destinationTemp !== 0x3f) write(temps[d0.destinationTemp]);
-      if (d0.vectorResult && d3.destination < destinations.length) write(destinations[d3.destination]);
-      opcodes.push(d1.vectorOpcode);
     }
     if (d1.scalarOpcode !== 0) {
-      const source = decodeVertexSource(words, 2, d0, d1, d3, inputs, temps, packet);
+      const source = decodeVertexSource(words, 2, d0, d1, d3, inputs, temps, packet, address);
       let value;
       if (d1.scalarOpcode === 1) value = vector(source[0]);
       else if (d1.scalarOpcode === 2) value = vector(1 / source[0]);
@@ -580,15 +620,31 @@ function compileFragmentProgram(packet) {
   const textureSlots = new Set();
   const textureDimensions = new Map();
   let constantIndex = 0;
+  const scopeStack = [];
+  let loopDepth = 0;
   for (let offset = 0; offset < bytes.byteLength;) {
+    while (scopeStack.length > 0) {
+      const top = scopeStack[scopeStack.length - 1];
+      if (top.endOffset === offset) {
+        lines.push("}");
+        if (top.kind === "loop") loopDepth -= 1;
+        scopeStack.pop();
+      } else if (top.kind === "if" && !top.inElse && top.elseOffset === offset) {
+        lines.push("} else {");
+        top.inElse = true;
+        break;
+      } else {
+        break;
+      }
+    }
     const words = [0, 4, 8, 12].map((wordOffset) => fragmentWord(view, offset + wordOffset));
-    const opcode = bits(words[0], 24, 6);
+    const opcode = bits(words[0], 24, 6) | (bits(words[2], 31, 1) << 6);
     const end = Boolean(bits(words[0], 0, 1));
-    // Any source of type 2 means the next 16 bytes are an inline constant,
-    // regardless of opcode (fragment_program_utils::is_any_src_constant).
+    // Any source of type 2 on a non-flow-control instruction means the next 16 bytes
+    // are an inline constant (fragment_program_utils::is_any_src_constant).
     // RPCS3 uploads those constants in instruction order; the packet's
     // fragment_constants section is indexed the same way.
-    const hasConstant = [1, 2, 3].some((index) => bits(words[index], 0, 2) === 2);
+    const hasConstant = opcode < 0x40 && [1, 2, 3].some((index) => bits(words[index], 0, 2) === 2);
     if (hasConstant && offset + 32 > bytes.byteLength) throw new Error("truncated RSX fragment inline constant");
     const inlineConstant = hasConstant ? `rsxFragmentState.constants[${constantIndex++}]` : undefined;
     if (opcode === 0 || opcode === 0x3d || opcode === 0x3e) {
@@ -607,6 +663,7 @@ function compileFragmentProgram(packet) {
       [0x1a, 1], [0x1b, 1], [0x1c, 1], [0x1d, 1], [0x1e, 1], [0x1f, 3],
       [0x20, 0], [0x21, 0], [0x22, 1], [0x23, 1], [0x2e, 3],
       [0x38, 2], [0x39, 1], [0x3a, 2], [0x3b, 2], [0x3c, 1],
+      [0x40, 0], [0x42, 0], [0x43, 0], [0x44, 0],
     ]);
     const operandCount = operandCounts.get(opcode);
     if (operandCount === undefined) throw new Error(`RSX fragment opcode ${opcode} is not yet translated`);
@@ -615,16 +672,71 @@ function compileFragmentProgram(packet) {
     const conditionSwizzle = bits(words[1], 21, 8);
     const conditionChannels = [0, 2, 4, 6].map((shift) => "xyzw"[bits(conditionSwizzle, shift, 2)]).join("");
     const condition = `cc[${conditionRegister}].${conditionChannels}`;
+    const flowComparisons = [undefined, "<", "==", "<=", ">", "!=", ">=", undefined];
+    const flowCondition = execution === 7
+      ? "true"
+      : execution === 0
+        ? "false"
+        : `any(${condition} ${flowComparisons[execution]} vec4f(0.0))`;
     if (opcode === 0x12) {
       // KIL: RPCS3's AddFlowOp gates _kill() on the instruction's condition
       // (unconditional for an all-set execution mask, dropped for a clear
       // one, otherwise `if (any(cond))`); the ROP epilogue discards after
       // the program completes.
-      const flowComparisons = [undefined, "<", "==", "<=", ">", "!=", ">=", undefined];
       if (execution === 7) lines.push("rsxDiscard = true;");
-      else if (execution !== 0) lines.push(`if (any(${condition} ${flowComparisons[execution]} vec4f(0.0))) { rsxDiscard = true; }`);
+      else if (execution !== 0) lines.push(`if (${flowCondition}) { rsxDiscard = true; }`);
       opcodes.push(opcode);
       offset += hasConstant ? 32 : 16;
+      if (end) break;
+      continue;
+    }
+    if (opcode === 0x40) {
+      // BRK: break out of innermost LOOP/REP block
+      if (loopDepth > 0) {
+        if (execution === 7) lines.push("break;");
+        else if (execution !== 0) lines.push(`if (${flowCondition}) { break; }`);
+      }
+      opcodes.push(opcode);
+      offset += 16;
+      if (end) break;
+      continue;
+    }
+    if (opcode === 0x42) {
+      // IFE: structured conditional block with else_offset (words[2]) and end_offset (words[3])
+      const elseOffset = ((words[2] & 0x7fffffff) >>> 2) * 16;
+      const endOffset = (words[3] >>> 2) * 16;
+      if (endOffset > offset + 16) {
+        if (elseOffset === offset + 16) {
+          lines.push(`if (${flowCondition}) {} else {`);
+          scopeStack.push({ kind: "if", elseOffset: -1, endOffset, inElse: true });
+        } else {
+          lines.push(`if (${flowCondition}) {`);
+          scopeStack.push({
+            kind: "if",
+            elseOffset: (elseOffset > offset + 16 && elseOffset < endOffset) ? elseOffset : -1,
+            endOffset,
+            inElse: false,
+          });
+        }
+      }
+      opcodes.push(opcode);
+      offset += 16;
+      if (end) break;
+      continue;
+    }
+    if (opcode === 0x43 || opcode === 0x44) {
+      // LOOP / REP: structured loop block with rep_count (bits 2..9 of words[2]) and end_offset (words[3])
+      const repCount = bits(words[2], 2, 8);
+      const endOffset = (words[3] >>> 2) * 16;
+      if (endOffset > offset + 16) {
+        const iter = `rsxLoop${opcodes.length}`;
+        lines.push(`for (var ${iter} = 0u; ${iter} < ${repCount}u; ${iter} += 1u) {`);
+        if (execution !== 7) lines.push(`if (!(${flowCondition})) { break; }`);
+        scopeStack.push({ kind: "loop", elseOffset: -1, endOffset });
+        loopDepth += 1;
+      }
+      opcodes.push(opcode);
+      offset += 16;
       if (end) break;
       continue;
     }
@@ -728,6 +840,10 @@ function compileFragmentProgram(packet) {
     opcodes.push(opcode);
     offset += hasConstant ? 32 : 16;
     if (end) break;
+  }
+  while (scopeStack.length > 0) {
+    scopeStack.pop();
+    lines.push("}");
   }
   lines.push("if (rsxDiscard) { discard; }");
   lines.push(`return ${(packet.fragmentProgramControl & 0x40) !== 0 ? "r32" : "r16"}[0];`);
@@ -966,6 +1082,8 @@ export function translateRsxProgram(input) {
     textureSlots: [...fragment.textureSlots],
     textureDimensions: Object.fromEntries(fragment.textureDimensions),
     constantCount: fragment.constantCount,
+    vertexConstantCount: vertex.constantCount,
+    vertexConstantMin: vertex.constantMin,
     inputs: vertex.inputs,
   };
 }
@@ -1005,13 +1123,31 @@ function assembleShader(vertex, fragment, vertexBackend, colorTargetCount = 1, a
     // Attributes are fetched from RPCS3's raw vertex streams in the shader.
     const attributeFields = Array.from({ length: 16 }, (_, attribute) => `attribute${attribute}: vec4f,`).join("\n");
     const fetches = vertex.inputs.map((attribute) => `input.attribute${attribute} = rsxReadLocation(${attribute}u, vertexIn.vertexIndex);`).join("\n");
-    vertexStage = `
+    const vertexStateDeclarations = drawBufferGroup === 1
+      ? `
+      struct RSXVertexConstants {
+        constants: array<vec4f, 468>,
+      };
+      struct RSXVertexState {
+        environment: array<vec4f, 6>,
+        attributeLayout: array<vec4u, ${VERTEX_LAYOUT_BYTES / 16}>,
+      };
+      @group(1) @binding(31) var<uniform> rsxVertexConstants: RSXVertexConstants;
+      @group(1) @binding(32) var<uniform> rsxVertexState: RSXVertexState;
+      `
+      : `
       struct RSXVertexState {
         environment: array<vec4f, 6>,
         constants: array<vec4f, 468>,
         attributeLayout: array<vec4u, ${VERTEX_LAYOUT_BYTES / 16}>,
       };
-      @group(${drawBufferGroup}) @binding(32) var<uniform> rsxVertexState: RSXVertexState;
+      @group(0) @binding(32) var<uniform> rsxVertexState: RSXVertexState;
+      `;
+    const vertexBody = drawBufferGroup === 1
+      ? vertex.code.replaceAll("rsxVertexState.constants", "rsxVertexConstants.constants")
+      : vertex.code;
+    vertexStage = `
+      ${vertexStateDeclarations}
       @group(${drawBufferGroup}) @binding(34) var<storage, read> rsxPersistentStream: array<u32>;
       @group(${drawBufferGroup}) @binding(35) var<storage, read> rsxVolatileStream: array<u32>;
       ${RSX_VERTEX_FETCH_WGSL}
@@ -1026,7 +1162,7 @@ function assembleShader(vertex, fragment, vertexBackend, colorTargetCount = 1, a
         ${Array.from({ length: 16 }, (_, attribute) => `input.attribute${attribute} = vec4f(0.0, 0.0, 0.0, 1.0);`).join("\n")}
         ${fetches}
         var result: VertexOut;
-        ${vertex.code}
+        ${vertexBody}
         return result;
       }
     `;

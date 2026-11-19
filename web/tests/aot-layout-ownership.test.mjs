@@ -51,3 +51,39 @@ test('prebuilt PPU ownership survives later SPU placement and worker role change
     globalThis.fetch = originalFetch;
   }
 });
+
+test('stale PPU AOT codegen policies are rejected before table placement', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    version: 1,
+    codegen: {
+      semanticsVersion: 21,
+      returnDispatch: false,
+      inlineReads: true,
+      inlineWrites: false,
+      wasmRegions: true,
+    },
+    parts: [],
+  }), { headers: { 'Content-Type': 'application/json' } });
+  const lines = [];
+  try {
+    const result = await loadPpuAotBundle({
+      module: {},
+      mainInstance: { exports: {} },
+      mainMemory: new WebAssembly.Memory({ initial: 1 }),
+      manifestUrl: 'https://rpcs3.test/stale.manifest.json',
+      expectedPolicy: {
+        semanticsVersion: 22,
+        returnDispatch: true,
+        inlineReads: true,
+        inlineWrites: false,
+        wasmRegions: true,
+      },
+      log: line => lines.push(line),
+    });
+    assert.equal(result, null);
+    assert.match(lines.join('\n'), /rejected stale codegen policy: semanticsVersion=21 \(need 22\), returnDispatch=false \(need true\)/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

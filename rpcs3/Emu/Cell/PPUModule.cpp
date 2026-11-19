@@ -32,12 +32,92 @@
 
 LOG_CHANNEL(ppu_loader);
 
+#ifdef RPCS3_WEB
+extern u32 ppu_get_exported_func_addr(u32 fnid, const std::string& module_name);
+
+namespace
+{
+	struct ppu_web_import_stub_info
+	{
+		std::string module;
+		std::string name;
+		u32 fnid = 0;
+	};
+
+	shared_mutex g_ppu_web_import_stub_mutex;
+	std::unordered_map<u32, ppu_web_import_stub_info> g_ppu_web_import_stubs;
+	std::unordered_map<u32, u32> g_ppu_web_import_descriptors;
+
+	void ppu_web_record_import_stub(u32 stub, u32 descriptor, std::string module, std::string name, u32 fnid)
+	{
+		if (!stub)
+		{
+			return;
+		}
+
+		std::lock_guard lock(g_ppu_web_import_stub_mutex);
+		g_ppu_web_import_stubs.insert_or_assign(stub, ppu_web_import_stub_info{std::move(module), std::move(name), fnid});
+		g_ppu_web_import_descriptors.insert_or_assign(descriptor, stub);
+	}
+
+	void ppu_web_record_import_descriptor(u32 descriptor, u32 stub)
+	{
+		if (!descriptor || !stub)
+		{
+			return;
+		}
+
+		std::lock_guard lock(g_ppu_web_import_stub_mutex);
+		g_ppu_web_import_descriptors.insert_or_assign(descriptor, stub);
+	}
+}
+
+extern std::string ppu_web_describe_import(u32 stub, u32 descriptor)
+{
+	reader_lock lock(g_ppu_web_import_stub_mutex);
+	auto found = g_ppu_web_import_stubs.find(stub);
+	if (const auto descriptor_stub = g_ppu_web_import_descriptors.find(descriptor); descriptor_stub != g_ppu_web_import_descriptors.end())
+	{
+		stub = descriptor_stub->second;
+		found = g_ppu_web_import_stubs.find(stub);
+	}
+	if (found == g_ppu_web_import_stubs.end())
+	{
+		for (auto it = g_ppu_web_import_stubs.begin(); it != g_ppu_web_import_stubs.end(); ++it)
+		{
+			if (stub >= it->first && stub - it->first < 0x20)
+			{
+				found = it;
+				break;
+			}
+		}
+	}
+	if (found == g_ppu_web_import_stubs.end())
+	{
+		return {};
+	}
+
+	const auto& info = found->second;
+	return fmt::format("stub=0x%08x descriptor=0x%08x %s:%s fnid=0x%08x export=0x%08x", stub, descriptor, info.module, info.name, info.fnid,
+		ppu_get_exported_func_addr(info.fnid, info.module));
+}
+#endif
+
 extern std::string ppu_get_function_name(const std::string& _module, u32 fnid);
 extern std::string ppu_get_variable_name(const std::string& _module, u32 vnid);
 extern void ppu_register_range(u32 addr, u32 size);
 extern void ppu_register_function_at(u32 addr, u32 size, ppu_intrp_func_t ptr);
 
 extern void sys_initialize_tls(ppu_thread&, u64, u32, u32, u32);
+
+#ifdef RPCS3_WEB
+static std::set<std::string> s_ppu_web_explicit_libraries_control;
+
+extern void ppu_web_capture_libraries_control()
+{
+	s_ppu_web_explicit_libraries_control = g_cfg.core.libraries_control.get_set();
+}
+#endif
 
 std::unordered_map<std::string, ppu_static_module*>& ppu_module_manager::get()
 {
@@ -695,10 +775,18 @@ struct ppu_prx_module_info
 };
 
 bool ppu_form_branch_to_code(u32 entry, u32 target);
+extern atomic_t<u32> g_ppu_far_jump_generation;
 
 extern u32 ppu_get_exported_func_addr(u32 fnid, const std::string& module_name)
 {
-	return g_fxo->get<ppu_linkage_info>().modules[module_name].functions[fnid].export_addr;
+	auto& flink = g_fxo->get<ppu_linkage_info>().modules[module_name].functions[fnid];
+#ifdef RPCS3_WEB
+	if (!flink.export_addr && flink.static_func)
+	{
+		return g_fxo->get<ppu_function_manager>().func_addr(flink.static_func->index, true) - 4;
+	}
+#endif
+	return flink.export_addr;
 }
 
 extern bool ppu_register_library_lock(std::string_view libname, bool lock_lib)
@@ -897,19 +985,46 @@ static auto ppu_load_exports(const ppu_module<lv2_obj>& _module, ppu_linkage_inf
 			{
 				// Static function
 				const auto _sf = _sm && _sm->functions.count(fnid) ? &::at32(_sm->functions, fnid) : nullptr;
+#ifdef RPCS3_WEB
+				// Browser execution is HLE-first. A registered host implementation is
+				// authoritative even when the firmware module was selected for LLE:
+				// resolving through a firmware export that was not loaded leaves the
+				// imported descriptor pointing at an uninitialised OPD.
+				const bool web_hle_first = _sf != nullptr;
+#else
+				constexpr bool web_hle_first = false;
+#endif
 
-				if (_sf && (_sf->flags & MFF_FORCED_HLE))
+				if (_sf && (web_hle_first || (_sf->flags & (MFF_FORCED_HLE | MFF_PERFECT))))
 				{
 					// Inject a branch to the HLE implementation
 					const u32 target = g_fxo->get<ppu_function_manager>().func_addr(_sf->index, true);
 
-					// Set exported function
-					flink.export_addr = target - 4;
+					// Browser imports must retain the HLE sentinel until the AOT
+					// compiler has lowered their callers. Publishing the fake OPD
+					// here makes ppu_load_imports() overwrite the sentinel and
+					// hides every HLE call site from ps3recomp.
+#ifdef RPCS3_WEB
+					if (web_hle_first)
+					{
+						flink.export_addr = 0;
+					}
+					else
+#endif
+					{
+						flink.export_addr = target - 4;
+					}
 
 					if (auto ptr = _module.get_ptr<u32>(faddr); vm::try_get_addr(ptr).first)
 					{
 						ppu_form_branch_to_code(*ptr, target);
 					}
+
+					// Keep import slots at the HLE sentinel until the caller is
+					// lowered. Redirecting them to the fake OPD before ps3recomp
+					// scans the module hides the HLE call sites and changes the
+					// planned block graph. The unresolved-import patcher rewrites
+					// surviving indirect references to this export address later.
 				}
 				else
 				{
@@ -973,6 +1088,7 @@ static auto ppu_load_exports(const ppu_module<lv2_obj>& _module, ppu_linkage_inf
 		}
 	}
 
+	g_ppu_far_jump_generation.fetch_add(1);
 	return result;
 }
 
@@ -1036,10 +1152,16 @@ static import_result_t ppu_load_imports(const ppu_module<lv2_obj>& _module, std:
 			if (fstub && fstub >= _module.segs[0].addr && fstub < _module.segs[0].addr + _module.segs[0].size)
 			{
 				nid_to_use_addr.emplace(fnid, fstub);
+#ifdef RPCS3_WEB
+				ppu_web_record_import_stub(fstub, faddr, module_name, ppu_get_function_name(module_name, fnid), fnid);
+#endif
 			}
 
 			// Link address (special HLE function by default)
 			const u32 link_addr = flink.export_addr ? flink.export_addr : g_fxo->get<ppu_function_manager>().addr;
+#ifdef RPCS3_WEB
+			ppu_web_record_import_descriptor(link_addr, fstub);
+#endif
 
 			// Write import table
 			_module.get_ref<u32>(faddr) = link_addr;
@@ -1184,6 +1306,7 @@ void init_ppu_functions(utils::serial* ar, bool full = false)
 		// Initialize HLE modules
 		ppu_initialize_modules(&g_fxo->get<ppu_linkage_info>(), ar);
 	}
+	g_ppu_far_jump_generation.fetch_add(1);
 }
 
 static void ppu_check_patch_spu_images(const ppu_module<lv2_obj>& mod, const ppu_segment& seg)
@@ -2040,7 +2163,14 @@ shared_ptr<lv2_prx> ppu_load_prx(const ppu_prx_object& elf, bool virtual_load, c
 
 	prx->applied_patches = applied;
 	prx->is_relocatable = true;
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+	if (g_cfg.core.ppu_debug)
+	{
+		prx->analyse(toc, 0, end, applied, exported_funcs);
+	}
+#else
 	prx->analyse(toc, 0, end, applied, exported_funcs);
+#endif
 
 	if (!ar && !virtual_load)
 	{
@@ -2056,6 +2186,19 @@ void ppu_unload_prx(const lv2_prx& prx)
 	{
 		return;
 	}
+
+#ifdef RPCS3_WEB
+	extern void ppu_web_clear_prx_range(u32 addr, u32 size);
+	extern void ppu_web_recomp_forget_range(u32 addr, u32 size);
+	for (const auto& seg : prx.segs)
+	{
+		if (seg.size)
+		{
+			ppu_web_clear_prx_range(seg.addr, seg.size);
+			ppu_web_recomp_forget_range(seg.addr, seg.size);
+		}
+	}
+#endif
 
 	std::unique_lock lock(g_fxo->get<ppu_linkage_info>().mutex, std::defer_lock);
 
@@ -2612,19 +2755,30 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 	// Initialize process
 	std::vector<shared_ptr<lv2_prx>> loaded_modules;
 
-	// A browser build cannot discover or redistribute a desktop firmware
-	// installation.  When no user-provided dev_flash is mounted, use RPCS3's
-	// existing HLE modules for homebrew instead of selecting firmware SPRXes.
+	// Browser execution is HLE-first even when the user supplies dev_flash.
+	// Firmware files remain useful for module metadata and for libraries without
+	// host implementations, but every module with an RPCS3 HLE backend should
+	// call that backend unless the user explicitly selected LLE.
 #ifdef RPCS3_WEB
-	if (!virtual_load && !fs::is_file(vfs::get("/dev_flash/") + "sys/external/liblv2.sprx"))
+	if (!virtual_load)
 	{
 		std::set<std::string> hle_libraries = g_cfg.core.libraries_control.get_set();
 		extern const std::map<std::string_view, int> g_prx_list;
+		const bool firmware_available = fs::is_file(vfs::get("/dev_flash/") + "sys/external/liblv2.sprx");
 
-		for (const auto& [name, _] : g_prx_list)
+		for (const auto& [name, use_hle] : g_prx_list)
 		{
-			hle_libraries.erase(std::string{name} + ":lle");
-			hle_libraries.emplace(std::string{name} + ":hle");
+			const std::string library{name};
+			if ((use_hle || !firmware_available) && !s_ppu_web_explicit_libraries_control.contains(library + ":lle") && !s_ppu_web_explicit_libraries_control.contains(library + ":hle"))
+			{
+				hle_libraries.erase(library + ":lle");
+				hle_libraries.emplace(library + ":hle");
+			}
+		}
+
+		if (!hle_libraries.contains("liblv2.sprx:lle") && !hle_libraries.contains("liblv2.sprx:hle"))
+		{
+			hle_libraries.emplace("liblv2.sprx:hle");
 		}
 
 		g_cfg.core.libraries_control.set_set(std::move(hle_libraries));
@@ -2722,7 +2876,9 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 
 				if (prx->funcs.empty())
 				{
+#if !defined(RPCS3_WEB_INTERPRETER_ONLY)
 					ppu_loader.error("Module %s has no functions!", name);
+#endif
 				}
 				else
 				{

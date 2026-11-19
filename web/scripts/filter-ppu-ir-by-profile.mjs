@@ -80,10 +80,19 @@ function parse(text) {
       const body = lines.slice(start, index + 1);
       const address = Number.parseInt(definition[1], 16);
       bodies.set(address, body);
-      // A direct tail call names its callee, so the callee has to survive with the caller
+      const bodyText = body.join("\n");
+      // A direct tail call names its callee, so the callee has to survive with the caller.
+      // Also keep post-syscall (sc_pc + 4) and post-call (constant lr) continuation blocks
+      // so lower_syscall_continuations and lower_import_stub_calls can tail-call/inline them.
       const calls = new Set();
-      for (const call of body.join("\n").matchAll(/musttail call void @__0x([0-9a-f]+)\(/g)) {
+      for (const call of bodyText.matchAll(/musttail call void @__0x([0-9a-f]+)\(/g)) {
         calls.add(Number.parseInt(call[1], 16));
+      }
+      if (bodyText.includes("@__syscall(") && entered.has(address)) {
+        const scConst = /i32 0, i32 166\s+store i32 (\d+),/.exec(bodyText);
+        if (scConst) calls.add((Number(scConst[1]) + 4) >>> 0);
+        const scReloc = /= add i64 (-?\d+), (\d+)\s+%\d+ = trunc i64 %\d+ to i32\s+%\d+ = getelementptr [^\n]+i32 0, i32 166/.exec(bodyText);
+        if (scReloc) calls.add((Number(scReloc[1]) + Number(scReloc[2]) + 4) >>> 0);
       }
       flush();
       segments.push({ kind: "block", address, calls });
@@ -139,6 +148,8 @@ for (const source of sources) {
     continue;
   }
 
+  const callsOf = new Map();
+  for (const segment of part.segments) if (segment.kind === "block") callsOf.set(segment.address, segment.calls);
   const keep = new Set();
   const queue = [];
   for (const segment of part.segments) {
@@ -147,8 +158,6 @@ for (const source of sources) {
       queue.push(segment.address);
     }
   }
-  const callsOf = new Map();
-  for (const segment of part.segments) if (segment.kind === "block") callsOf.set(segment.address, segment.calls);
   while (queue.length) {
     for (const callee of callsOf.get(queue.pop()) ?? []) {
       if (!callsOf.has(callee) || keep.has(callee)) continue;

@@ -81,10 +81,10 @@ async function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) 
     const direct = options.directRenderer === true;
     const preparedGpu = options.render && !direct ? prepareWebGPU(canvas) : undefined;
     const reuse = options.keepRuntime === true && Boolean(persistentWorker);
-    const presentation = direct && !reuse ? presentationCanvas(canvas, options.suspending) : {};
+    const wantsCapture = Boolean(options.captureRgba || options.captureEvery || options.readback === true);
+    const presentation = direct && !reuse ? presentationCanvas(canvas, options.suspending && !wantsCapture) : {};
     const directCanvas = presentation.gpuCanvas;
     const directView = presentation.view;
-    const wantsCapture = Boolean(options.captureRgba || options.captureEvery || options.readback === true);
     const directScratch = direct && wantsCapture ? document.createElement("canvas") : undefined;
     let presentedFrames = 0;
     let captureReady;
@@ -100,6 +100,7 @@ async function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) 
     const events = [];
     const frames = [];
     const flipTimings = [];
+    const workerErrors = [];
     let timingDrops = 0;
     let firstResult;
     const timeout = setTimeout(() => {
@@ -111,6 +112,10 @@ async function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) 
     }, timeoutMs);
     let frameRequestedAt = performance.now();
     worker.addEventListener("message", worker.__rpcs3Handler = async (event) => {
+      if (event.data?.type === "worker-error") {
+        if (workerErrors.length < 100) workerErrors.push(event.data.error);
+        return;
+      }
       if (event.data?.type === "runtime-fatal") {
         clearTimeout(timeout);
         const error = new Error(`real RPCS3 runtime failed: ${event.data.detail}; logs=${JSON.stringify(event.data.logs ?? [])}`);
@@ -126,7 +131,8 @@ async function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) 
       }
       if (event.data?.type === "runtime-capture") {
         directScratch?.getContext("2d", { willReadFrequently: false }).drawImage(event.data.bitmap, 0, 0);
-        event.data.bitmap.close();
+        if (directView) directView.transferFromImageBitmap(event.data.bitmap);
+        else event.data.bitmap.close();
         if (event.data.frame + 1 >= requestedFrames || untilDraw) captureReady?.();
         return;
       }
@@ -285,7 +291,7 @@ async function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) 
             worker.postMessage({ type: "spu-wasm-selftest", base64: options.spuWasmSelftestBase64 });
             spuWasmSelftest = (await requestWorker(worker, "spu-wasm-selftest-noop", "spu-wasm-selftest", 120_000))?.report;
           }
-          const result = { flipTimings, timingDrops, ...firstResult, ...frames.at(-1), gpu, renderError, packetFixture, events, spuMissBase64, ppuProfileBase64, spuWasmSelftest, frames: requestedFrames > 1 || untilDraw ? frames : undefined };
+          const result = { flipTimings, timingDrops, workerErrors, ...firstResult, ...frames.at(-1), gpu, renderError, packetFixture, events, spuMissBase64, ppuProfileBase64, spuWasmSelftest, frames: requestedFrames > 1 || untilDraw ? frames : undefined };
           // The returned result retains detailed evidence. Duplicating thousands of
           // frame records and base64 pixels into a DOM text node creates a large
           // transient allocation precisely when a long device run finishes.
@@ -295,14 +301,15 @@ async function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) 
             directStats: result.directStats, workingSet: result.workingSet,
             frameHash: gpu?.frameHash, renderError,
           }, null, 2);
-          // The worker waits up to 5 s for RPCS3's threads to exit and then
-          // reports; allow that report to arrive before giving up on it.
+          // The worker waits up to 5 s (or 65 s when saving state) for RPCS3's
+          // threads to exit and then reports; allow that report to arrive before giving up on it.
+          const shutdownWaitMs = options.saveState === true || Boolean(options.saveStatePath) ? 65_000 : 8_000;
           const shutdownTimer = setTimeout(() => {
             worker.terminate();
             if (activeWorker === worker) activeWorker = undefined;
-            result.shutdown = { stoppedCleanly: false, detail: "no shutdown report within 8 s" };
+            result.shutdown = { stoppedCleanly: false, detail: `no shutdown report within ${Math.round(shutdownWaitMs / 1000)} s` };
             resolve(result);
-          }, 8_000);
+          }, shutdownWaitMs);
           const onShutdown = (shutdownEvent) => {
             if (shutdownEvent.data?.type !== "runtime-shutdown") return;
             clearTimeout(shutdownTimer);
@@ -324,7 +331,12 @@ async function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) 
           if (typeof window.__rpcs3BeforeShutdown === "function") {
             try { await window.__rpcs3BeforeShutdown(); } catch (_) {}
           }
-          worker.postMessage({ type: "shutdown", keepRuntime: options.keepRuntime === true });
+          worker.postMessage({
+            type: "shutdown",
+            keepRuntime: options.keepRuntime === true,
+            saveState: options.saveState === true || Boolean(options.saveStatePath),
+            saveStatePath: typeof options.saveStatePath === "string" ? options.saveStatePath : undefined,
+          });
         } catch (error) {
           clearTimeout(timeout);
           worker.terminate();
@@ -369,6 +381,9 @@ async function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) 
       dispatchTimeoutMs: options.dispatchTimeoutMs ?? 30_000,
       ppuAot: options.ppuAot === true,
       ppuAotBundle: typeof options.ppuAotBundle === "string" ? options.ppuAotBundle : undefined,
+      ppuBackend: typeof options.ppuBackend === "string" ? options.ppuBackend : undefined,
+      ppuFailClosed: typeof options.ppuFailClosed === "boolean" ? options.ppuFailClosed : undefined,
+      autoRecomp: typeof options.autoRecomp === "boolean" ? options.autoRecomp : undefined,
       spuAotBundle: typeof options.spuAotBundle === "string" ? options.spuAotBundle : undefined,
       spuTraceRange: Array.isArray(options.spuTraceRange) ? options.spuTraceRange : undefined,
       spuFallbackHistogram: options.spuFallbackHistogram === true,
@@ -383,6 +398,7 @@ async function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) 
       ppuJitCapacity: options.ppuJitCapacity,
       spuBlockSize: options.spuBlockSize,
       spuLlvmWorkers: options.spuLlvmWorkers,
+      recompMaxBlocksPerShard: options.recompMaxBlocksPerShard,
       spuHotThreshold: options.spuHotThreshold,
       spuAot: options.spuAot === true,
       clockScale: options.clockScale,
@@ -403,6 +419,8 @@ async function run(target = "fixtures/gs_gcm_basic_triangle.elf", options = {}) 
       suspending: options.suspending === true,
       inputTrace: Array.isArray(options.inputTrace) ? options.inputTrace : undefined,
       recordInputs: options.recordInputs === true,
+      saveState: options.saveState === true,
+      saveStatePath: typeof options.saveStatePath === "string" ? options.saveStatePath : undefined,
       // RPCS3's WebGPU RSX backend always produces packets; page-side WebGPU
       // rendering is separately gated by options.render. Only an explicit
       // renderer: "null" selects NullGSRender (dispatch-only fixtures).

@@ -86,7 +86,10 @@ for (let i = 0; i < 240; i++) {
 }
 
 const options = {
-  ppuJit: process.env.RPCS3_PPU_JIT !== "0", benchmark: true,
+  ppuBackend: process.env.RPCS3_PPU_BACKEND || "aot",
+  ppuFailClosed: process.env.RPCS3_PPU_FAIL_CLOSED !== "0",
+  autoRecomp: process.env.RPCS3_AUTO_RECOMP !== "0",
+  ppuJit: process.env.RPCS3_PPU_JIT === "1", benchmark: true,
   ppuReturnDispatch: process.env.RPCS3_PPU_RETURN_DISPATCH === "1",
   spuPortableCalls: process.env.RPCS3_SPU_PORTABLE_CALLS === "1",
   ppuBatchedDiagnostics: process.env.RPCS3_PPU_BATCHED_DIAGNOSTICS !== "0",

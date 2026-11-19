@@ -138,22 +138,7 @@ s32 _sys_memcmp(vm::cptr<u8> buf1, vm::cptr<u8> buf2, u32 size)
 {
 	sysPrxForUser.trace("_sys_memcmp(buf1=*0x%x, buf2=*0x%x, size=%d)", buf1, buf2, size);
 
-	for (u32 i = 0; i < size; i++)
-	{
-		const u8 b1 = buf1[i], b2 = buf2[i];
-
-		if (b1 < b2)
-		{
-			return -1;
-		}
-
-		if (b1 > b2)
-		{
-			return 1;
-		}
-	}
-
-	return 0;
+	return size ? std::memcmp(buf1.get_ptr(), buf2.get_ptr(), size) : 0;
 }
 
 vm::ptr<u8> _sys_memchr(vm::ptr<u8> buf, u8 ch, s32 size)
@@ -492,26 +477,26 @@ void _sys_qsort(vm::ptr<void> base, u32 nelem, u32 size, vm::ptr<qsortcmp> cmp)
 
 void sysPrxForUser_sys_libc_init()
 {
-	REG_FUNC(sysPrxForUser, __sys_look_ctype_table);
-	REG_FUNC(sysPrxForUser, _sys_tolower);
-	REG_FUNC(sysPrxForUser, _sys_toupper);
+	REG_FUNC(sysPrxForUser, __sys_look_ctype_table).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, _sys_tolower).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, _sys_toupper).flag(MFF_PERFECT);
 
-	REG_FUNC(sysPrxForUser, _sys_memset);
-	REG_FUNC(sysPrxForUser, _sys_memcpy);
-	REG_FUNC(sysPrxForUser, _sys_memcmp);
-	REG_FUNC(sysPrxForUser, _sys_memchr);
-	REG_FUNC(sysPrxForUser, _sys_memmove);
+	REG_FUNC(sysPrxForUser, _sys_memset).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, _sys_memcpy).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, _sys_memcmp).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, _sys_memchr).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, _sys_memmove).flag(MFF_PERFECT);
 
-	REG_FUNC(sysPrxForUser, _sys_strlen);
-	REG_FUNC(sysPrxForUser, _sys_strcmp);
-	REG_FUNC(sysPrxForUser, _sys_strncmp);
-	REG_FUNC(sysPrxForUser, _sys_strcat);
-	REG_FUNC(sysPrxForUser, _sys_strchr);
-	REG_FUNC(sysPrxForUser, _sys_strncat);
-	REG_FUNC(sysPrxForUser, _sys_strcpy);
-	REG_FUNC(sysPrxForUser, _sys_strncpy);
-	REG_FUNC(sysPrxForUser, _sys_strncasecmp);
-	REG_FUNC(sysPrxForUser, _sys_strrchr);
+	REG_FUNC(sysPrxForUser, _sys_strlen).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, _sys_strcmp).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, _sys_strncmp).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, _sys_strcat).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, _sys_strchr).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, _sys_strncat).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, _sys_strcpy).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, _sys_strncpy).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, _sys_strncasecmp).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, _sys_strrchr).flag(MFF_PERFECT);
 
 	REG_FUNC(sysPrxForUser, _sys_malloc);
 	REG_FUNC(sysPrxForUser, _sys_memalign);

@@ -22,6 +22,7 @@
 
 #include "SPURecompiler.h"
 
+#include <array>
 #include <vector>
 
 class spu_wasm_recompiler final : public spu_recompiler_base
@@ -290,7 +291,7 @@ private:
 	};
 
 	// Locals of the program function
-	enum : u32 { l_thread = 0, l_ls = 1, l_arg2 = 2, l_pc = 3, l_t0 = 4, l_t1 = 5, l_t2 = 6, l_v0 = 7, l_v1 = 8, l_v2 = 9, l_v3 = 10, l_i64 = 11 };
+	enum : u32 { l_thread = 0, l_ls = 1, l_arg2 = 2, l_pc = 3, l_t0 = 4, l_t1 = 5, l_t2 = 6, l_v0 = 7, l_v1 = 8, l_v2 = 9, l_v3 = 10, l_i64 = 11, l_gpr_base = 12 };
 	// Imports (function indices)
 	enum : u32
 	{
@@ -308,6 +309,7 @@ private:
 	void gpr_store_begin();              // pushes the thread pointer for a later gpr_store_end
 	void gpr_store_end(u32 reg);
 	void gpr_lane3(u32 reg);             // pushes i32 preferred slot
+	void flush_gprs();                   // stores written v128 GPR locals back to thread memory
 	void splat32(u32 value);             // pushes v128
 	void splat16(u32 value);
 	void splat8(u32 value);
@@ -338,7 +340,13 @@ private:
 	u32 m_depth = 0;                     // nesting depth of the current position relative to the dispatch loop
 	u32 m_loop_depth = 0;                // br depth reaching the dispatch loop from m_depth == 0
 	u32 m_exit_depth = 0;
+	u32 m_current_block = 0;
+	bool m_scanning = false;
+	std::array<s32, 128> m_gpr_local{};
+	std::array<bool, 128> m_gpr_used{};
+	std::array<bool, 128> m_gpr_written{};
 	std::vector<bool> m_is_block_start;  // per word of the program
+	std::vector<s32> m_block_index_by_word;
 	code m_code;
 	std::vector<u8> m_module;
 	std::string m_export_name;

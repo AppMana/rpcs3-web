@@ -1337,6 +1337,11 @@ void spu_cache::initialize(bool build_existing_cache)
 		spu_log.success("SPU Runtime: Built %u functions.", func_list.size());
 	}
 
+	if (const char* exit_after = std::getenv("RPCS3_SPU_WASM_AOT_EXIT_AFTER_CACHE"); exit_after && *exit_after == '1')
+	{
+		std::_Exit(0);
+	}
+
 	// Initialize global cache instance
 	if (g_cfg.core.spu_cache && !spu_precompilation_enabled && cache)
 	{
@@ -1348,6 +1353,12 @@ void spu_cache::initialize(bool build_existing_cache)
 
 bool spu_program::operator==(const spu_program& rhs) const noexcept
 {
+	static const bool wasm_aot_ir = std::getenv("RPCS3_SPU_WASM_AOT_IR") != nullptr;
+	if (wasm_aot_ir)
+	{
+		return entry_point == rhs.entry_point && lower_bound == rhs.lower_bound && data == rhs.data;
+	}
+
 	// TODO
 	return entry_point - lower_bound == rhs.entry_point - rhs.lower_bound && data == rhs.data;
 }
@@ -9041,7 +9052,7 @@ void spu_recompiler_base::dump(const spu_program& result, std::string& out, u32 
 
 #ifdef RPCS3_WEB
 // Browser: compiles a local-store snapshot in a compiler worker and registers the side module (SPUWasmRecompiler.cpp)
-extern bool spu_web_llvm_compile_remote(const be_t<u32>* ls, u32 entry);
+extern bool spu_web_llvm_compile_remote(const be_t<u32>* ls, u32 entry, u32 fast_index = 0);
 #endif
 
 struct spu_llvm_worker
@@ -9143,11 +9154,10 @@ struct spu_llvm_worker
 				// The side module the compiler worker returns becomes the leading dispatch candidate of
 				// the entry (SPUWasmRecompiler.cpp); nothing to patch, the SPU threads pick it up at
 				// their next hot sync
-				if (!spu_web_llvm_compile_remote(ls.data(), func.entry_point) && thread_ctrl::state() != thread_state::aborting)
+				if (!spu_web_llvm_compile_remote(ls.data(), func.entry_point, static_cast<u32>(prog->first)) && thread_ctrl::state() != thread_state::aborting)
 				{
 					spu_log.error("[0x%05x] SPU LLVM tier compile failed.", func.entry_point);
 				}
-			}
 #else
 #ifdef ARCH_ARM64
 				const auto target = compile_spu_llvm_with_retry(compiler, func2);
@@ -9177,8 +9187,8 @@ struct spu_llvm_worker
 				bytes[7] = 0x90;
 
 				atomic_storage<u64>::release(*reinterpret_cast<u64*>(prog->first), result);
-			}
 #endif
+			}
 
 			// Clear fake LS
 			std::memset(ls.data() + start / 4, 0, 4 * (size0 - 1));
@@ -10094,6 +10104,36 @@ namespace
 	constexpr usz spu_web_miss_limit = 8u << 20;
 }
 
+extern void spu_web_record_miss_program(const spu_program& program)
+{
+	if (program.data.empty())
+	{
+		return;
+	}
+
+	u64 hash = program.entry_point;
+	for (const u32 word : program.data) hash = (hash ^ word) * 0x100000001b3ull;
+
+	const u32 size = ::size32(program.data);
+	const be_t<u32> size_crc = size | std::max<u32>(calculate_crc16(reinterpret_cast<const uchar*>(program.data.data()), size * 4), 1) << 16;
+	const be_t<u32> addr = program.entry_point;
+
+	std::lock_guard lock(g_spu_web_miss_mutex);
+	if (g_spu_web_miss_bytes.size() >= spu_web_miss_limit || !g_spu_web_miss_programs.insert(hash).second)
+	{
+		return;
+	}
+	const auto append = [&](const void* data, usz bytes)
+	{
+		const auto p = static_cast<const u8*>(data);
+		g_spu_web_miss_bytes.insert(g_spu_web_miss_bytes.end(), p, p + bytes);
+	};
+	append(&size_crc, 4);
+	append(&addr, 4);
+	append(program.data.data(), program.data.size() * 4);
+	g_spu_web_miss_count++;
+}
+
 extern void spu_web_record_miss(spu_thread& spu)
 {
 	const u32 pc = spu.pc & 0x3fffc;
@@ -10117,32 +10157,7 @@ extern void spu_web_record_miss(spu_thread& spu)
 	thread_local std::unique_ptr<spu_web_analyser> analyser;
 	if (!analyser) analyser = std::make_unique<spu_web_analyser>();
 	const spu_program program = analyser->analyse(ls, pc);
-	if (program.data.empty())
-	{
-		return;
-	}
-
-	u64 hash = program.entry_point;
-	for (const u32 word : program.data) hash = (hash ^ word) * 0x100000001b3ull;
-
-	const u32 size = ::size32(program.data);
-	const be_t<u32> size_crc = size | std::max<u32>(calculate_crc16(reinterpret_cast<const uchar*>(program.data.data()), size * 4), 1) << 16;
-	const be_t<u32> addr = program.entry_point;
-
-	std::lock_guard lock(g_spu_web_miss_mutex);
-	if (!g_spu_web_miss_programs.insert(hash).second)
-	{
-		return;
-	}
-	const auto append = [&](const void* data, usz bytes)
-	{
-		const auto p = static_cast<const u8*>(data);
-		g_spu_web_miss_bytes.insert(g_spu_web_miss_bytes.end(), p, p + bytes);
-	};
-	append(&size_crc, 4);
-	append(&addr, 4);
-	append(program.data.data(), program.data.size() * 4);
-	g_spu_web_miss_count++;
+	spu_web_record_miss_program(program);
 }
 
 extern u32 spu_web_miss_count() { return g_spu_web_miss_count; }

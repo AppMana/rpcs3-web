@@ -7,6 +7,22 @@ import path from "node:path";
 const IDLE_FRAMES = ["(idle)", "emscripten_futex_wait", "_do_futex_wait"];
 const UNKNOWN_FRAMES = ["(program)"];
 const TRAMPOLINE_FRAMES = ["wasm-to-js", "js-to-wasm::i", "js-to-wasm::v"];
+const SPIN_WAIT_PATTERNS = [
+  "semaphore_acquire",
+  "spin_on_cacheline_once",
+  "lv2_obj::sleep",
+  "atomic_wait_engine::wait",
+  "thread_ctrl::wait",
+  "emscripten_get_now",
+  "steady_clock::now",
+  "__timedwait",
+  "pthread_cond_timedwait",
+];
+
+export function isSpinWaitFunction(name = "") {
+  if (!name) return false;
+  return SPIN_WAIT_PATTERNS.some((pattern) => name.includes(pattern));
+}
 
 // A run reaches the part worth measuring some way into itself — a title's boot and its intro are not
 // its gameplay — so every reader takes the same window: the `lastSeconds` before the end, less any
@@ -36,13 +52,51 @@ export function workSampleCount(profile, lastSeconds = 0, trailingSeconds = 0, s
   return windowed(profile, lastSeconds, trailingSeconds, startTimeUs, endTimeUs).reduce((count, id) => count + !waitNodes.has(id), 0);
 }
 
+export function activeWorkSampleCount(profile, lastSeconds = 0, trailingSeconds = 0, startTimeUs, endTimeUs) {
+  const waitOrSpinNodes = new Set((profile.nodes || [])
+    .filter(({ callFrame }) => {
+      const fn = callFrame?.functionName || "";
+      return IDLE_FRAMES.includes(fn) || UNKNOWN_FRAMES.includes(fn) || isSpinWaitFunction(fn);
+    })
+    .map(({ id }) => id));
+  return windowed(profile, lastSeconds, trailingSeconds, startTimeUs, endTimeUs).reduce((count, id) => count + !waitOrSpinNodes.has(id), 0);
+}
+
+export function classifyWorkerProfile(profile, targetInfo = {}) {
+  const url = targetInfo?.url || "";
+  if (targetInfo?.type === "page") return "MainPage";
+  if (url.includes("rpcs3-spu-llvm")) return "Compiler";
+  if (url.includes("runtime-smoke-worker")) return "HostWorker";
+  if (!profile?.nodes?.length) return "Idle";
+  const byId = new Map(profile.nodes.map((n) => [n.id, n]));
+  const counts = { RSX: 0, SPU: 0, PPU: 0, Compiler: 0 };
+  for (const id of profile.samples || []) {
+    const fn = byId.get(id)?.callFrame?.functionName || "";
+    const fnUrl = byId.get(id)?.callFrame?.url || "";
+    if (!fn || IDLE_FRAMES.includes(fn) || UNKNOWN_FRAMES.includes(fn) || isSpinWaitFunction(fn)) continue;
+    if (/WebGPU|RSXThread|wgpu|rpcs3_web_direct_|translateRsxProgram|GSRender/i.test(fn) || fnUrl.includes("rpcs3-webgpu-renderer")) counts.RSX++;
+    else if (/spu_thread|spu_wasm|spu_recompiler|__spu-0x|rpcs3_web_spu_/i.test(fn)) counts.SPU++;
+    else if (/ppu_thread|ppu_interpreter|rpcs3_web_ppu_|^__0x|^__fn_0x|ppu_acall/i.test(fn)) counts.PPU++;
+    else if (/SelectionDAG|MachineFunction|SPULLVMRecompiler|CompilePpu|CompileSpu/.test(fn)) counts.Compiler++;
+  }
+  const best = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+  if (best && best[1] > 0) return best[0];
+  const active = activeWorkSampleCount(profile);
+  const work = workSampleCount(profile);
+  if (active === 0 && work > 0) return "SpinWait";
+  if (active > 0) return "Service";
+  return "Idle";
+}
+
 // The busiest target lands at `outputPath`; the rest follow it as .1, .2 and so on, with a sidecar
 // naming which is which.
 export async function writeCpuProfiles(targets, outputPath, samplingIntervalUs) {
   if (!outputPath) return undefined;
   const ranked = targets
     .filter(({ profile }) => profile)
-    .sort((left, right) => workSampleCount(right.profile) - workSampleCount(left.profile));
+    .sort((left, right) =>
+      (activeWorkSampleCount(right.profile) - activeWorkSampleCount(left.profile))
+      || (workSampleCount(right.profile) - workSampleCount(left.profile)));
   await mkdir(path.dirname(outputPath), { recursive: true });
   const profilePaths = new Map();
   await Promise.all(ranked.map(async (target, index) => {
@@ -55,9 +109,11 @@ export async function writeCpuProfiles(targets, outputPath, samplingIntervalUs) 
     selected: ranked[0]?.targetInfo,
     targets: targets.map((target) => ({
       targetInfo: target.targetInfo,
+      role: target.profile ? classifyWorkerProfile(target.profile, target.targetInfo) : "Unattached",
       profilePath: profilePaths.get(target),
       samples: target.profile?.samples?.length || 0,
       workSamples: target.profile ? workSampleCount(target.profile) : 0,
+      activeWorkSamples: target.profile ? activeWorkSampleCount(target.profile) : 0,
       started: Boolean(target.started),
       recursiveAttachError: target.recursiveAttachError,
       error: target.error,
@@ -240,7 +296,7 @@ export function callersOf(profile, name, limit = 8, { depth = 1, lastSeconds = 0
 // unmerged, an interpreter helper called from four opcodes reads as four small entries. Waiting is
 // excluded unless asked for, and percentages are over what is included — a worker that spends its
 // life in a futex would otherwise report nothing but the futex.
-export function selfTime(profile, limit = 25, { includeWaits = false, includeUnknown = false, lastSeconds = 0, trailingSeconds = 0, startTimeUs, endTimeUs } = {}) {
+export function selfTime(profile, limit = 25, { includeWaits = false, includeUnknown = false, excludeSpinWaits = false, lastSeconds = 0, trailingSeconds = 0, startTimeUs, endTimeUs } = {}) {
   const byId = new Map(profile.nodes.map((node) => [node.id, node]));
   const merged = new Map();
   let total = 0;
@@ -251,6 +307,7 @@ export function selfTime(profile, limit = 25, { includeWaits = false, includeUnk
     const name = functionName || "(anonymous)";
     if (!includeWaits && IDLE_FRAMES.includes(name)) continue;
     if (!includeUnknown && UNKNOWN_FRAMES.includes(name)) continue;
+    if (excludeSpinWaits && isSpinWaitFunction(name)) continue;
     const row = merged.get(name) ?? { name, where: (url || "").split("/").pop(), samples: 0 };
     row.samples++;
     merged.set(name, row);

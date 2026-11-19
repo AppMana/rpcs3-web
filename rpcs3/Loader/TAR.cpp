@@ -15,6 +15,7 @@
 #include <charconv>
 #include <span>
 #include <thread>
+#include <unordered_set>
 
 LOG_CHANNEL(tar_log, "TAR");
 
@@ -203,6 +204,7 @@ std::unique_ptr<utils::serial> tar_object::get_file(const std::string& path, std
 bool tar_object::extract(const std::string& prefix_path, bool is_vfs)
 {
 	std::vector<std::vector<u8>> filedata_buffers;
+	std::unordered_set<std::string> created_dirs;
 	
 	auto iter = m_map.begin();
 
@@ -276,10 +278,18 @@ bool tar_object::extract(const std::string& prefix_path, bool is_vfs)
 		case '0':
 		{
 			// Create the directories which should have been mount points if prefix_path is not empty
-			if (!prefix_path.empty() && !fs::create_path(fs::get_parent_dir(result)))
+			if (!prefix_path.empty())
 			{
-				tar_log.error("TAR Loader: failed to create directory for file %s (%s)", name, fs::g_tls_error);
-				return false;
+				std::string parent_dir = fs::get_parent_dir(result);
+				if (!created_dirs.contains(parent_dir))
+				{
+					if (!fs::create_path(parent_dir))
+					{
+						tar_log.error("TAR Loader: failed to create directory for file %s (%s)", name, fs::g_tls_error);
+						return false;
+					}
+					created_dirs.insert(std::move(parent_dir));
+				}
 			}
 
 			// For restoring m_ar->m_max_data
@@ -299,8 +309,27 @@ bool tar_object::extract(const std::string& prefix_path, bool is_vfs)
 
 			const usz filesize = file_data->get_size() - file_data->pos;
 
+#ifdef __EMSCRIPTEN__
+			if (!should_ignore && file_data && result.find("/dev_flash/") != std::string::npos)
+			{
+				fs::stat_t st{};
+				if (fs::get_stat(result, st) && !st.is_directory && st.size == filesize)
+				{
+					file_data->seek_pos(m_ar_tar_start + largest_offset, true);
+					if (!m_file)
+					{
+						*m_ar = std::move(*file_data);
+						m_ar->m_max_data = restore_limit;
+					}
+					break;
+				}
+			}
+			constexpr usz chunk_size = 0x10 * 0x100000;
+			constexpr usz chunk_count = 1;
+#else
 			constexpr usz chunk_size = 0x8 * 0x100000;
 			constexpr usz chunk_count = 16;
+#endif
 
 			if (should_ignore)
 			{
@@ -341,6 +370,7 @@ bool tar_object::extract(const std::string& prefix_path, bool is_vfs)
 					if (filedata_buffers.size() == 1)
 					{
 						file_data->try_read(get_span_at(filedata_read_pos));
+						file_data->breathe();
 						filedata_read_pos++;
 					}
 					else if (!async_reader)
@@ -355,6 +385,7 @@ bool tar_object::extract(const std::string& prefix_path, bool is_vfs)
 								}
 
 								const usz unread_size = file_data->try_read(get_span_at(filedata_read_pos));
+								file_data->breathe();
 
 								if (unread_size)
 								{
@@ -406,11 +437,13 @@ bool tar_object::extract(const std::string& prefix_path, bool is_vfs)
 					break;
 				}
 
+#ifndef __EMSCRIPTEN__
 				if (mtime != umax && !fs::utime(result, atime, mtime))
 				{
 					tar_log.error("TAR Loader: fs::utime failed on %s (%s)", result, fs::g_tls_error);
 					return false;
 				}
+#endif
 
 				(m_ar && filesize > 1024 ? tar_log.success : tar_log.notice)("TAR Loader: written file %s (took: %f seconds)", name, (get_system_time() - current_time) / 1'000'000.);
 				break;
@@ -430,7 +463,7 @@ bool tar_object::extract(const std::string& prefix_path, bool is_vfs)
 
 		case '5':
 		{
-			if (should_ignore)
+			if (should_ignore || created_dirs.contains(result))
 			{
 				break;
 			}
@@ -440,12 +473,15 @@ bool tar_object::extract(const std::string& prefix_path, bool is_vfs)
 				tar_log.error("TAR Loader: failed to create directory %s (%s)", name, fs::g_tls_error);
 				return false;
 			}
+			created_dirs.insert(result);
 
+#ifndef __EMSCRIPTEN__
 			if (mtime != umax && !fs::utime(result, atime, mtime))
 			{
 				tar_log.error("TAR Loader: fs::utime failed on %s (%s)", result, fs::g_tls_error);
 				return false;
 			}
+#endif
 
 			break;
 		}

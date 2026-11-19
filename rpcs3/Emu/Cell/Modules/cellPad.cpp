@@ -254,6 +254,19 @@ extern void pad_state_notify_state_change(usz index, u32 state)
 	send_sys_io_connect_event(index, state);
 }
 
+static void sync_injected_pad_if_active(pad_thread* handler)
+{
+	if (injected_pad::active() && handler)
+	{
+		handler->sync_injected_pad_locked();
+		const auto& pads = handler->GetPads();
+		if (pads[0] && !pads[0]->is_fake_pad && pads[0]->is_connected())
+		{
+			cellPad_NotifyStateChange(0, CELL_PAD_STATUS_CONNECTED, false);
+		}
+	}
+}
+
 error_code cellPadInit(ppu_thread& ppu, u32 max_connect)
 {
 	cellPad.warning("cellPadInit(max_connect=%d)", max_connect);
@@ -275,11 +288,12 @@ error_code cellPadInit(ppu_thread& ppu, u32 max_connect)
 	config.reported_info = {};
 
 	const auto handler = pad::get_pad_thread();
+	sync_injected_pad_if_active(handler);
 	const auto& pads = handler->GetPads();
 
 	for (usz i = 0; i < config.get_max_connect(); ++i)
 	{
-		if (!pads[i]->is_fake_pad && pads[i]->is_connected())
+		if (pads[i] && !pads[i]->is_fake_pad && pads[i]->is_connected())
 		{
 			send_sys_io_connect_event(i, CELL_PAD_STATUS_CONNECTED);
 		}
@@ -341,6 +355,7 @@ error_code cellPadClearBuf(u32 port_no)
 		return CELL_PAD_ERROR_NO_DEVICE;
 
 	const auto handler = pad::get_pad_thread();
+	sync_injected_pad_if_active(handler);
 	const auto& pads = handler->GetPads();
 	const auto& pad = pads[port_no];
 
@@ -356,6 +371,7 @@ void pad_get_data(u32 port_no, CellPadData* data, bool get_periph_data = false)
 {
 	auto& config = g_fxo->get<pad_info>();
 	const auto handler = pad::get_pad_thread();
+	sync_injected_pad_if_active(handler);
 	const auto& pad = handler->GetPads()[port_no];
 	const PadInfo& rinfo = handler->GetInfo();
 
@@ -710,6 +726,7 @@ error_code cellPadGetData(u32 port_no, vm::ptr<CellPadData> data)
 		return CELL_PAD_ERROR_NO_DEVICE;
 
 	const auto handler = pad::get_pad_thread();
+	sync_injected_pad_if_active(handler);
 	const auto& pads = handler->GetPads();
 	const auto& pad = pads[port_no];
 
@@ -741,6 +758,7 @@ error_code cellPadPeriphGetInfo(vm::ptr<CellPadPeriphInfo> info)
 		return CELL_PAD_ERROR_INVALID_PARAMETER;
 
 	const auto handler = pad::get_pad_thread();
+	sync_injected_pad_if_active(handler);
 	const PadInfo& rinfo = handler->GetInfo();
 
 	std::memset(info.get_ptr(), 0, sizeof(CellPadPeriphInfo));
@@ -925,6 +943,7 @@ error_code cellPadGetInfo(vm::ptr<CellPadInfo> info)
 	std::memset(info.get_ptr(), 0, sizeof(CellPadInfo));
 
 	const auto handler = pad::get_pad_thread();
+	sync_injected_pad_if_active(handler);
 	const PadInfo& rinfo = handler->GetInfo();
 	info->max_connect = config.max_connect;
 	info->system_info = rinfo.system_info;
@@ -970,6 +989,7 @@ error_code cellPadGetInfo2(vm::ptr<CellPadInfo2> info)
 	std::memset(info.get_ptr(), 0, sizeof(CellPadInfo2));
 
 	const auto handler = pad::get_pad_thread();
+	sync_injected_pad_if_active(handler);
 	const PadInfo& rinfo = handler->GetInfo();
 	info->max_connect = config.get_max_connect(); // Here it is forcibly clamped
 	info->system_info = rinfo.system_info;

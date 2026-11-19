@@ -14,7 +14,7 @@
 // of LittleBigPlanet 2 entered gameplay 400 flips apart — so the same --last window lands on
 // different scenes and the numbers mean nothing. --last remains for a run with no report beside it.
 import { readFile } from "node:fs/promises";
-import { callersOf, selfTime, workSampleCount } from "./worker-profiler.mjs";
+import { callersOf, selfTime, workSampleCount, activeWorkSampleCount, classifyWorkerProfile, isSpinWaitFunction } from "./worker-profiler.mjs";
 
 const args = process.argv.slice(2);
 const reportPath = args.find((arg) => arg.startsWith("--report="))?.slice(9);
@@ -91,48 +91,57 @@ const rows = [];
 for (const target of targets.targets) {
   if (!target.profilePath || !target.workSamples) continue;
   const profile = JSON.parse(await readFile(target.profilePath, "utf8"));
-  rows.push({ target, profile, work: workSampleCount(profile, lastSeconds, trailingSeconds, startTimeUs, endTimeUs) });
+  const work = workSampleCount(profile, lastSeconds, trailingSeconds, startTimeUs, endTimeUs);
+  const active = activeWorkSampleCount(profile, lastSeconds, trailingSeconds, startTimeUs, endTimeUs);
+  const role = target.role || classifyWorkerProfile(profile, target.targetInfo);
+  rows.push({ target, profile, work, active, role });
 }
-rows.sort((left, right) => right.work - left.work);
+rows.sort((left, right) => (right.active - left.active) || (right.work - left.work));
 
 const window = targetDraws ? `${lastSeconds.toFixed(1)}s at ~${targetDraws} draws/frame`
   : lastSeconds ? `last ${lastSeconds}s` : "whole run";
 console.log(`${rows.length} workers with work samples, ${targets.samplingIntervalUs} us interval, ${window}`);
 
 const totalWork = rows.reduce((sum, row) => sum + row.work, 0);
+const totalActive = rows.reduce((sum, row) => sum + row.active, 0);
 const cpuMs = (totalWork * targets.samplingIntervalUs) / 1000;
+const activeCpuMs = (totalActive * targets.samplingIntervalUs) / 1000;
 if (framed) {
-  console.log(`${(cpuMs / framed.frames).toFixed(1)} estimated sampled-work ms per guest flip at ${(framed.draws / framed.frames).toFixed(0)} draws per frame`
-    + ` (${framed.frames} frames, ${(cpuMs / 1000).toFixed(1)} estimated sampled-work seconds)`);
+  console.log(`${(activeCpuMs / framed.frames).toFixed(1)} active CPU ms/flip (${(cpuMs / framed.frames).toFixed(1)} total incl. spin-wait) at ${(framed.draws / framed.frames).toFixed(0)} draws per frame`
+    + ` (${framed.frames} frames, ${(activeCpuMs / 1000).toFixed(1)}s active / ${(cpuMs / 1000).toFixed(1)}s total)`);
 } else {
-  console.log(`${(cpuMs / 1000).toFixed(1)} estimated sampled-work seconds; pass --report=<run.json> for estimated sampled-work ms per guest flip`);
+  console.log(`${(activeCpuMs / 1000).toFixed(1)}s active sampled-work (${(cpuMs / 1000).toFixed(1)}s incl. spin-wait); pass --report=<run.json> for ms per guest flip`);
 }
 console.log();
 const categories = new Map();
-for (const { profile } of rows) {
+const byRole = new Map();
+for (const { profile, role, active } of rows) {
+  if (active > 0) byRole.set(role, (byRole.get(role) ?? 0) + active);
   for (const row of selfTime(profile, 10_000, { ...slice, includeUnknown: true, includeWaits: true })) {
     const category = row.name === "(program)" ? "unknown" : row.name === "(garbage collector)" ? "GC"
-      : ["(idle)", "emscripten_futex_wait", "_do_futex_wait"].includes(row.name) ? "wait/idle" : "attributed";
+      : ["(idle)", "emscripten_futex_wait", "_do_futex_wait"].includes(row.name) ? "wait/idle"
+      : isSpinWaitFunction(row.name) ? "spin-wait" : "attributed";
     categories.set(category, (categories.get(category) ?? 0) + row.samples);
   }
 }
 console.log(`sample categories: ${JSON.stringify(Object.fromEntries(categories))}`);
+console.log(`active work by role: ${JSON.stringify(Object.fromEntries(byRole))}`);
 
 // What every worker spends its time in, pooled: one thread's hot function is not the whole picture
 // when the same loop runs on many.
 const pooled = new Map();
 let pooledSamples = 0;
 for (const { profile } of rows) {
-  for (const row of selfTime(profile, 10_000, slice)) {
+  for (const row of selfTime(profile, 10_000, { ...slice, excludeSpinWaits: true })) {
     const key = `${row.name}`;
     pooled.set(key, (pooled.get(key) ?? 0) + row.samples);
     pooledSamples += row.samples;
   }
 }
 
-console.log(`pooled across workers (${pooledSamples} work samples)`);
+console.log(`pooled active work across workers (${pooledSamples} active samples, excluding spin-wait)`);
 for (const [name, samples] of [...pooled].sort((a, b) => b[1] - a[1]).slice(0, 25)) {
-  const percent = (samples / pooledSamples) * 100;
+  const percent = (samples / (pooledSamples || 1)) * 100;
   console.log(`  ${percent.toFixed(1).padStart(5)}%  ${samples.toString().padStart(6)}  ${name}`);
 }
 
@@ -151,10 +160,10 @@ if (callee) {
   }
 }
 
-console.log(`\nbusiest workers`);
-for (const { target, profile, work } of rows.slice(0, 5)) {
-  console.log(`\n  ${target.profilePath.split("/").pop()} — ${work} work of ${profile.samples.length} samples`);
-  for (const row of selfTime(profile, 6, slice)) {
+console.log(`\nbusiest workers (ranked by active non-spin work)`);
+for (const { target, profile, work, active, role } of rows.slice(0, 8)) {
+  console.log(`\n  [${role}] ${target.profilePath.split("/").pop()} — ${active} active / ${work} work / ${profile.samples.length} total samples`);
+  for (const row of selfTime(profile, 6, { ...slice, excludeSpinWaits: active > 0 })) {
     console.log(`    ${row.percent.toFixed(1).padStart(5)}%  ${row.name}`);
   }
 }

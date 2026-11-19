@@ -15,20 +15,22 @@ enum CellGcmError : u32
 
 struct CellGcmOffsetTable
 {
+	ENABLE_BITWISE_SERIALIZATION;
+
 	vm::bptr<u16> ioAddress;
 	vm::bptr<u16> eaAddress;
 };
 
 struct gcm_config
 {
-	u32 zculls_addr;
+	u32 zculls_addr = 0;
 	vm::ptr<CellGcmDisplayInfo> gcm_buffers = vm::null;
-	u32 tiles_addr;
-	u32 ctxt_addr;
+	u32 tiles_addr = 0;
+	u32 ctxt_addr = 0;
 
-	CellGcmConfig current_config;
-	CellGcmContextData current_context;
-	gcmInfo gcm_info;
+	CellGcmConfig current_config{};
+	CellGcmContextData current_context{};
+	gcmInfo gcm_info{};
 
 	CellGcmOffsetTable offsetTable{};
 	u16 IoMapTable[0xC00]{};
@@ -39,6 +41,21 @@ struct gcm_config
 	u32 local_addr = 0;
 
 	atomic_t<u32> reserved_size = 0;
+	u32 default_cmd_buffer_begin = 0;
+	u32 default_cmd_buffer_frag_count = 0;
+
+	SAVESTATE_INIT_POS(46);
+
+	gcm_config() = default;
+	gcm_config(utils::serial& ar)
+	{
+		save(ar);
+	}
+
+	void save(utils::serial& ar)
+	{
+		ar(zculls_addr, gcm_buffers, tiles_addr, ctxt_addr, current_config, current_context, gcm_info, offsetTable, IoMapTable, system_mode, local_size, local_addr, reserved_size, default_cmd_buffer_begin, default_cmd_buffer_frag_count);
+	}
 };
 
 void InitOffsetTable();

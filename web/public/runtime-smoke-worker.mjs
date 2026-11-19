@@ -16,6 +16,7 @@ let fixtureBytes = 0;
 let frameSequence = 0;
 let debugAddresses = [];
 let tracePc = 0;
+let tracePcs = [];
 let traceDelayPc = 0;
 let watchAddress = 0;
 let clockScale = 0;
@@ -31,11 +32,15 @@ let ppuAotTable = null;
 let spuAotTable = null;
 let spuLlvmPool = null;
 let ppuJit = false;
+let autoRecomp = false;
 let spuDispatcher;
 let padState = { digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 };
 let moduleCreateMs = 0;
 let recordInputs = false;
 const inputTrace = [];
+const pendingScheduledInput = [];
+let inputScheduleReady = false;
+let scheduledInputLastFrame = 0;
 let spuFallbackHistogram = false;
 let ppuProfile = false;
 let diagnostics = false;
@@ -65,8 +70,10 @@ function recordLog(line) {
     dispatchLines.push(protocolLine);
     scope.postMessage({ type: "runtime-dispatch", line: protocolLine });
   }
-  if (text.includes("RPCS3 Web") || text.startsWith("RPCS3 fatal error:") || text.startsWith("Aborted") ||
+  if (text.includes("RPCS3 Web") || text.includes("[trace -") || text.startsWith("RPCS3 fatal error:") || text.startsWith("RPCS3 thread fatal error:") || text.startsWith("Aborted") ||
+      text.includes("(in file ") || text.includes("Verification failed") || text.includes("Range check failed") ||
       text.includes("RuntimeError") || text.startsWith("worker:") || text.startsWith("Pthread ")) {
+    console.error(text);
     scope.postMessage({ type: "runtime-log", line: text });
   }
 }
@@ -131,7 +138,8 @@ async function captureDispatch(expectedVerdict = "", timeoutMs = 30_000) {
       module.ccall("rpcs3_web_spu_aot_abi", "number", ["number"], [field]) >>> 0),
     spuHotReport: JSON.parse(module.ccall("rpcs3_web_spu_hot_report", "string", [], [])),
     spuLlvm: spuLlvmPool ? spuLlvmPool.stats() : undefined,
-    ppuJitReport: ppuJit ? JSON.parse(module.ccall("rpcs3_web_ppu_jit_report", "string", [], [])) : undefined,
+    ppuJitReport: (ppuJit || autoRecomp) ? JSON.parse(module.ccall("rpcs3_web_ppu_jit_report", "string", [], [])) : undefined,
+    ppuHleHooks: module._rpcs3_web_ppu_hle_hooks ? Number(module.ccall("rpcs3_web_ppu_hle_hooks", "bigint", [], [])) : 0,
     ppuAotDispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])),
     elapsedMs: performance.now() - bootStartedAt,
     logs: logs.slice(-300),
@@ -255,9 +263,19 @@ function stackReport() {
 
 // RPCS3 queues work for its main thread; this worker is that thread. On a suspending core that
 // queue carries file access, which suspends, so draining it returns a promise the caller awaits.
+// Serialize concurrent callers so two JSPI exports never share the main thread's C stack.
+let hostTaskPromise = null;
+let shuttingDown = false;
+
 function runHostTasks() {
   if (!module) return 0;
-  return module.ccall("rpcs3_web_run_host_tasks", "number", [], []);
+  if (hostTaskPromise) return hostTaskPromise;
+  const result = module.ccall("rpcs3_web_run_host_tasks", "number", [], []);
+  if (result && typeof result.then === "function") {
+    hostTaskPromise = result.finally(() => { hostTaskPromise = null; });
+    return hostTaskPromise;
+  }
+  return result;
 }
 
 let progressInFlight = false;
@@ -289,7 +307,9 @@ async function progress(includeThreads = false) {
     ppuLastFunction: module.ccall("rpcs3_web_ppu_last_function", "string", [], []),
     ppuAotEntryReady: module.ccall("rpcs3_web_ppu_aot_entry_ready", "number", [], []),
     ppuAotDispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])),
-    ppuJitReport: ppuJit ? JSON.parse(module.ccall("rpcs3_web_ppu_jit_report", "string", [], [])) : undefined,
+    ppuHleHooks: module._rpcs3_web_ppu_hle_hooks ? Number(module.ccall("rpcs3_web_ppu_hle_hooks", "bigint", [], [])) : 0,
+    ppuJitReport: (ppuJit || autoRecomp) ? JSON.parse(module.ccall("rpcs3_web_ppu_jit_report", "string", [], [])) : undefined,
+    spuLlvm: spuLlvmPool ? spuLlvmPool.stats() : undefined,
     spuInstructions: Number(module.ccall("rpcs3_web_spu_instruction_count", "bigint", [], [])),
     spuLastPcs: Array.from({ length: 6 }, (_, index) =>
       module.ccall("rpcs3_web_spu_last_pc", "number", ["number"], [index]) >>> 0),
@@ -302,6 +322,7 @@ async function progress(includeThreads = false) {
     clockScale,
     traceHits: module.ccall("rpcs3_web_trace_hits", "number", [], []) >>> 0,
     threads: includeThreads ? module.ccall("rpcs3_web_thread_snapshot", "string", [], []) : "",
+    logs: diagnostics ? logs.slice(-200) : undefined,
     elapsedMs: bootStartedAt ? performance.now() - bootStartedAt : 0,
   });
   progressInFlight = false;
@@ -335,6 +356,32 @@ function applyPadState(next = {}) {
   module?.ccall("rpcs3_web_set_pad", null,
     ["number", "number", "number", "number", "number", "number"],
     [padState.digital1, padState.digital2, padState.leftX, padState.leftY, padState.rightX, padState.rightY]);
+}
+
+function autoAdvanceEntries(delaySec, untilFrame = 1_500, intervalFrames = 60) {
+  if (!(delaySec > 0)) return [];
+  const entries = [];
+  const delayFrames = Math.max(1, Math.round(delaySec * 60));
+  const interval = Math.max(16, intervalFrames);
+  for (let frame = delayFrames, presses = 0; frame < untilFrame && presses < 500; frame += interval, presses += 1) {
+    const cross = (presses & 1) !== 0;
+    entries.push({ frame, digital1: cross ? 0 : 0x08, digital2: cross ? 0x40 : 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 });
+    entries.push({ frame: frame + 15, digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 });
+  }
+  return entries;
+}
+
+function appendScheduledInput(entries) {
+  const ordered = [...(Array.isArray(entries) ? entries : [])].sort((a, b) => a.frame - b.frame);
+  for (const entry of ordered) {
+    const frame = Number(entry.frame) >>> 0;
+    if (frame < scheduledInputLastFrame) continue;
+    module.ccall("rpcs3_web_pad_schedule_add", null, ["number", "number", "number", "number", "number", "number", "number"], [
+      frame, Number(entry.digital1 ?? 0) >>> 0, Number(entry.digital2 ?? 0) >>> 0,
+      Number(entry.leftX ?? 128) >>> 0, Number(entry.leftY ?? 128) >>> 0, Number(entry.rightX ?? 128) >>> 0, Number(entry.rightY ?? 128) >>> 0,
+    ]);
+    scheduledInputLastFrame = frame;
+  }
 }
 
 function pendingFlips() {
@@ -379,7 +426,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
   const packetSummaries = [];
   const packets = [];
   const captureStartedAt = performance.now();
-  const packetDeadline = captureStartedAt + packetTimeoutMs;
+  let packetDeadline = captureStartedAt + packetTimeoutMs;
   // Interactive presentation only wants the newest complete frame. Skip
   // older complete frames that queued while the page was busy; they are
   // counted separately from host queue drops.
@@ -399,7 +446,7 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
   // Capture exactly one coherent RSX frame. Stopping at the first draw can
   // omit overlays, while draining past a flip would blend independent frames.
   for (;;) {
-  while (bootResult === 0 && flipPacketCount === 0 && status !== 0 && performance.now() < packetDeadline) {
+  while (!shuttingDown && bootResult === 0 && flipPacketCount === 0 && status !== 0 && performance.now() < packetDeadline) {
     if (directGpu) {
       // Direct backend: frames are presented by the RSX thread itself; a frame is complete when
       // the host frame counter advanced (no packets to drain)
@@ -434,6 +481,10 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     // and status changes are still observed). This is not guest pacing.
     await waitForFlip(Math.min(250, packetDeadline - performance.now()));
     await runHostTasks();
+    const recompProgress = spuLlvmPool?.stats()?.recomp;
+    if (recompProgress && recompProgress.modulesCompiled + recompProgress.modulesFailed < recompProgress.modulesRequested) {
+      packetDeadline = Math.max(packetDeadline, performance.now() + packetTimeoutMs);
+    }
     status = module.ccall("rpcs3_web_status", "number", [], []);
   }
   if (untilDraw && flipPacketCount === 1 && drawPacketCount === 0 && bootResult === 0 && status !== 0 && performance.now() < packetDeadline) {
@@ -459,13 +510,22 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
       const address = (texture.address + offset) >>> 0;
       return [`0x${address.toString(16)}`, debugRead32(address)];
     })))) : undefined;
+  const frameOk = initialized === 1 && bootResult === 0 && flipPacketCount === 1;
+  let failRpcs3Log;
+  if (!frameOk) {
+    try {
+      module?.ccall("rpcs3_web_sync_logs", null, [], []);
+      failRpcs3Log = module.FS.readFile("/opfs/cache/rpcs3/RPCS3.log", { encoding: "utf8" }).slice(-4000);
+    } catch {}
+  }
   scope.postMessage({
     type,
     directGpu,
     dispatchProfile: benchmark ? JSON.parse(module.ccall("rpcs3_web_spu_dispatch_profile_report", "string", [], [])) : undefined,
     directStats: directGpu ? JSON.parse(module.ccall("rpcs3_web_direct_stats", "string", [], [])) : undefined,
     carriedSurfaceOps: packets.length ? carriedSurfaceOps.splice(0) : undefined,
-    ok: initialized === 1 && bootResult === 0 && flipPacketCount === 1,
+    ok: frameOk,
+    rpcs3Log: failRpcs3Log,
     initialized,
     storageState: module.ccall("rpcs3_web_storage_state", "number", [], []),
     bootResult,
@@ -492,8 +552,9 @@ async function captureFrame(type, discardPackets = false, untilDraw = false) {
     spuHot: module.rpcs3SpuHotStats ? module.rpcs3SpuHotStats() : undefined,
     spuHotReport: module ? JSON.parse(module.ccall("rpcs3_web_spu_hot_report", "string", [], [])) : undefined,
     spuLlvm: spuLlvmPool ? spuLlvmPool.stats() : undefined,
-    ppuJitReport: ppuJit ? JSON.parse(module.ccall("rpcs3_web_ppu_jit_report", "string", [], [])) : undefined,
-    ppuHot: ppuJit && module.rpcs3PpuHotStats ? module.rpcs3PpuHotStats() : undefined,
+    ppuJitReport: (ppuJit || autoRecomp) ? JSON.parse(module.ccall("rpcs3_web_ppu_jit_report", "string", [], [])) : undefined,
+    ppuHot: (ppuJit || autoRecomp) && module.rpcs3PpuHotStats ? module.rpcs3PpuHotStats() : undefined,
+    ppuHleHooks: module._rpcs3_web_ppu_hle_hooks ? Number(module.ccall("rpcs3_web_ppu_hle_hooks", "bigint", [], [])) : 0,
     ppuAotDispatches: Number(module.ccall("rpcs3_web_ppu_aot_dispatches", "number", [], [])),
     spuMissCount: spuFallbackHistogram ? module.ccall("rpcs3_web_spu_miss_count", "number", [], []) >>> 0 : 0,
     stackReport: diagnostics ? stackReport() : undefined,
@@ -546,8 +607,19 @@ scope.addEventListener("message", async (event) => {
   if (event.data?.type === "pad") {
     applyPadState(event.data.state);
     if (recordInputs && module) {
-      // Frame-indexed record: the state takes effect after this flip count.
-      inputTrace.push({ frame: module.ccall("rpcs3_webgpu_frame_counter", "number", [], []) >>> 0, ...padState });
+      // Frame-indexed record: the state takes effect after this guest flip count (backend-agnostic).
+      const frame = module._rpcs3_web_pad_schedule_frame
+        ? (module.ccall("rpcs3_web_pad_schedule_frame", "number", [], []) >>> 0)
+        : (module.ccall("rpcs3_webgpu_frame_counter", "number", [], []) >>> 0);
+      inputTrace.push({ frame, ...padState });
+    }
+    return;
+  }
+  if (event.data?.type === "schedule-input") {
+    if (inputScheduleReady) {
+      appendScheduledInput(event.data.entries);
+    } else {
+      pendingScheduledInput.push(...(Array.isArray(event.data.entries) ? event.data.entries : []));
     }
     return;
   }
@@ -556,7 +628,11 @@ scope.addEventListener("message", async (event) => {
       type: "input-trace",
       schema: 1,
       entries: inputTrace.slice(),
-      flipCounter: module ? module.ccall("rpcs3_webgpu_frame_counter", "number", [], []) >>> 0 : 0,
+      flipCounter: module
+        ? (module._rpcs3_web_pad_schedule_frame
+          ? (module.ccall("rpcs3_web_pad_schedule_frame", "number", [], []) >>> 0)
+          : (module.ccall("rpcs3_webgpu_frame_counter", "number", [], []) >>> 0))
+        : 0,
       applied: module ? module.ccall("rpcs3_web_pad_schedule_applied", "number", [], []) >>> 0 : 0,
     });
     return;
@@ -579,7 +655,7 @@ scope.addEventListener("message", async (event) => {
 
   if (event.data?.type === "ppu-profile") {
     // The guest addresses this run entered, for building a bundle of only the blocks a run reaches
-    scope.postMessage({ type: "ppu-profile", base64: ppuProfile && module ? ppuUsedBase64() : "" });
+    scope.postMessage({ type: "ppu-profile", base64: module ? ppuUsedBase64() : "" });
     return;
   }
 
@@ -590,22 +666,22 @@ scope.addEventListener("message", async (event) => {
   }
 
   if (event.data?.type === "shutdown") {
+    shuttingDown = true;
     try {
       clearInterval(progressTimer);
-      spuLlvmPool?.stop();
-      spuLlvmPool = null;
-      ppuDispatcher?.release();
-      ppuDispatcher = undefined;
-      spuDispatcher?.release();
-      spuDispatcher = undefined;
+      if (hostTaskPromise) {
+        try { await hostTaskPromise; } catch {}
+      }
       const stopStartedAt = performance.now();
-      await module?.ccall("rpcs3_web_stop", null, [], []);
+      const saveState = event.data.saveState === true;
+      const stopTimeoutMs = saveState ? 60_000 : 5_000;
+      await module?.ccall(saveState ? "rpcs3_web_save_state" : "rpcs3_web_stop", null, [], []);
       // Emu.Kill is asynchronous. Wait (without blocking this event-loop
       // thread) for RPCS3's threads to exit cooperatively: they record their
       // stack high-water marks on the way out, and a clean exit is what lets
       // the browser release the workers and the shared heap.
       let stoppedCleanly = false;
-      while (module && performance.now() - stopStartedAt < 5_000) {
+      while (module && performance.now() - stopStartedAt < stopTimeoutMs) {
         await runHostTasks();
         if (module.ccall("rpcs3_web_is_stopped", "number", [], []) === 1
           && (module.ccall("rpcs3_web_live_thread_count", "number", [], []) >>> 0) === 0) {
@@ -613,6 +689,56 @@ scope.addEventListener("message", async (event) => {
           break;
         }
         await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      spuLlvmPool?.stop();
+      spuLlvmPool = null;
+      ppuDispatcher?.release();
+      ppuDispatcher = undefined;
+      spuDispatcher?.release();
+      spuDispatcher = undefined;
+      let savestatePath;
+      let savestateBytes = 0;
+      if (saveState && module && module._rpcs3_web_last_savestate_path) {
+        savestatePath = module.ccall("rpcs3_web_last_savestate_path", "string", [], []);
+        if (savestatePath && typeof event.data.saveStatePath === "string" && event.data.saveStatePath && savestatePath !== event.data.saveStatePath) {
+          try {
+            if (module._rpcs3_web_move_savestate) {
+              const movedBytes = (await Promise.resolve(module.ccall(
+                "rpcs3_web_move_savestate",
+                "number",
+                ["string"],
+                [event.data.saveStatePath],
+              ))) >>> 0;
+              if (movedBytes > 0) {
+                savestatePath = event.data.saveStatePath;
+                savestateBytes = movedBytes;
+              } else {
+                recordLog(`savestate move from ${savestatePath} to ${event.data.saveStatePath} returned 0 bytes`);
+              }
+            } else {
+              const bytes = module.FS.readFile(savestatePath);
+              try { module.FS.unlink(event.data.saveStatePath); } catch {}
+              module.FS.writeFile(event.data.saveStatePath, bytes);
+              savestatePath = event.data.saveStatePath;
+            }
+          } catch (copyErr) {
+            recordLog(`savestate copy to ${event.data.saveStatePath} failed: ${String(copyErr)}`);
+          }
+        }
+        if (!savestateBytes && savestatePath) {
+          try {
+            if (module._rpcs3_web_savestate_size) {
+              savestateBytes = (await Promise.resolve(module.ccall(
+                "rpcs3_web_savestate_size",
+                "number",
+                ["string"],
+                [savestatePath],
+              ))) >>> 0;
+            } else {
+              savestateBytes = Number(module.FS.stat(savestatePath).size) || 0;
+            }
+          } catch {}
+        }
       }
       const shutdownStackReport = stackReport();
       const shutdownWorkingSet = workingSet({ arena: true });
@@ -624,10 +750,13 @@ scope.addEventListener("message", async (event) => {
         ok: true,
         kept: keepRuntime,
         stoppedCleanly,
+        savestatePath,
+        savestateBytes,
         stopMs: performance.now() - stopStartedAt,
         stackReport: shutdownStackReport,
         workingSet: shutdownWorkingSet,
         liveThreadNames,
+        logs: logs.slice(-50),
       });
     } catch (error) {
       scope.postMessage({ type: "runtime-shutdown", ok: false, detail: detail(error) });
@@ -668,16 +797,24 @@ scope.addEventListener("message", async (event) => {
   logs = [];
   dispatchLines = [];
   debugAddresses = Array.isArray(event.data.debugAddresses) ? event.data.debugAddresses : [];
-  tracePc = Number(event.data.tracePc) >>> 0;
+  tracePcs = String(event.data.tracePc ?? "")
+    .split(",")
+    .map((value) => Number(value) >>> 0)
+    .filter(Boolean)
+    .slice(0, 8);
+  tracePc = tracePcs[0] ?? 0;
   traceDelayPc = Number(event.data.traceDelayPc) >>> 0;
   watchAddress = Number(event.data.watchAddress) >>> 0;
   clockScale = Math.max(0, Math.min(3_000, Number(event.data.clockScale) || 0)) >>> 0;
   accurateSpuDma = typeof event.data.accurateSpuDma === "boolean" ? event.data.accurateSpuDma : undefined;
-  packetTimeoutMs = Math.max(1_000, Math.min(300_000, Number(event.data.packetTimeoutMs) || 10_000));
+  packetTimeoutMs = Math.max(1_000, Math.min(1_800_000, Number(event.data.packetTimeoutMs) || 10_000));
   diagnostics = event.data.diagnostics === true;
   presentLatestOnly = event.data.presentLatestOnly === true;
   recordInputs = event.data.recordInputs === true;
   inputTrace.length = 0;
+  pendingScheduledInput.length = 0;
+  inputScheduleReady = false;
+  scheduledInputLastFrame = 0;
   consumedFlips = 0;
   presentedSkips = 0;
   progressIntervalMs = Math.max(100, Math.min(10_000, Number(event.data.progressIntervalMs) || 250));
@@ -723,10 +860,9 @@ scope.addEventListener("message", async (event) => {
         initial: 8192, maximum: Math.max(8192, Math.min(32768, Math.floor(event.data.memoryMaximumMiB * 16))), shared: true,
       }) } : {}),
       // Emscripten workers started up front; RPCS3's homebrew boot uses 7-8
-      // threads and the pool grows on demand beyond this.
-      // The pool must cover the boot thread set: a thread created while the module thread is inside the
-      // synchronous boot call cannot get a new worker (worker loads need this thread's event loop).
-      pthreadPoolSize: Math.max(2, Math.min(64, Number(event.data.pthreadPoolSize) || 40)),
+      // threads and commercial titles like LBP2 reach ~69 threads. Pre-warming
+      // 72 workers avoids cold Worker creation + Wasm/AOT cloning mid-gameplay.
+      pthreadPoolSize: Math.max(2, Math.min(96, Number(event.data.pthreadPoolSize) || 72)),
       print: recordLog,
       printErr: recordLog,
       ...(mainWasm ? {
@@ -744,6 +880,7 @@ scope.addEventListener("message", async (event) => {
     frameCounterAddress = module.ccall("rpcs3_webgpu_frame_counter_address", "number", [], []) >>> 0;
     atomicNotifyReentry = module.ccall("rpcs3_web_atomic_notify_reentry_probe", "number", [], []);
     let path = event.data.path;
+    let stagedElf;
     if (!path) {
       const fixtureUrl = new URL(event.data.fixtureUrl ?? `./${event.data.fixture}`, scope.location.href);
       const response = await fetch(fixtureUrl);
@@ -754,6 +891,7 @@ scope.addEventListener("message", async (event) => {
       const captureSuffix = fixtureUrl.pathname.match(/\.rrc(?:\.gz|\.zst)?$/)?.[0];
       path = captureSuffix ? `/acceptance-capture${captureSuffix}` : "/acceptance-homebrew.elf";
       module.FS.writeFile(path, elf);
+      if (!captureSuffix) stagedElf = elf;
     }
     module.ccall("rpcs3_web_set_null_renderer", null, ["number"], [event.data.renderer === "null" ? 1 : 0]);
     bootStartedAt = performance.now();
@@ -764,14 +902,30 @@ scope.addEventListener("message", async (event) => {
       module.rpcs3OnPresent = (data) => scope.postMessage({ type: "runtime-present", frame: data.frame, bitmap: data.rpcs3Present }, [data.rpcs3Present]);
       module.rpcs3OnCapture = (data) => scope.postMessage({ type: "runtime-capture", frame: data.frame, bitmap: data.rpcs3Capture }, [data.rpcs3Capture]);
       module.rpcs3OnPresented = (frame) => scope.postMessage({ type: "runtime-presented", frame });
+      module.rpcs3OnWorkerError = (err) => {
+        const msg = String(err || "").slice(0, 2000);
+        recordLog(`[rpcs3 gpu worker error] ${msg}`);
+        console.error(`[rpcs3 gpu worker error] ${msg}`);
+        scope.postMessage({ type: "worker-error", error: msg });
+      };
       if (!module.__rpcs3GpuWorker) {
         directGpu = await module.rpcs3PrepareGpu(event.data.gpuCanvas, flagAddress, event.data.capture, event.data.presentationYield, event.data.bindGroupCache);
+        module.__rpcs3GpuWorker?.addEventListener("message", (gpuEvent) => {
+          const err = gpuEvent.data?.rpcs3WorkerError;
+          if (typeof err === "string") module.rpcs3OnWorkerError?.(err);
+        });
         recordLog(`direct WebGPU device ready on a pool worker: ${JSON.stringify(directGpu)}`);
       }
     }
     // A suspending core's file-touching entry points return a promise, because the file system they
     // reach suspends the calling stack rather than blocking it.
     initialized = await module.ccall("rpcs3_web_init", "number", [], []);
+    if (stagedElf && (event.data.saveState || event.data.saveStatePath)) {
+      try {
+        module.FS.writeFile("/opfs/rpcs3/dev_hdd0/acceptance-homebrew.elf", stagedElf);
+        path = "/opfs/rpcs3/dev_hdd0/acceptance-homebrew.elf";
+      } catch {}
+    }
     sparseVmProbe = module.ccall("rpcs3_web_sparse_vm_probe", "number", [], []);
     module.ccall("rpcs3_webgpu_set_capture_level", null, ["number"], [Number(event.data.packetCaptureLevel ?? 4)]);
     if (clockScale) module.ccall("rpcs3_web_set_clock_scale", null, ["number"], [clockScale]);
@@ -786,6 +940,7 @@ scope.addEventListener("message", async (event) => {
       module.ccall("rpcs3_web_set_accurate_spu_dma", null, ["number"], [accurateSpuDma ? 1 : 0]);
     }
     module.ccall("rpcs3_web_set_trace_pc", null, ["number"], [tracePc]);
+    for (const pc of tracePcs.slice(1)) module.ccall("rpcs3_web_add_trace_pc", null, ["number"], [pc]);
     module.ccall("rpcs3_web_set_trace_delay", null, ["number", "number"], [
       traceDelayPc,
       Number(event.data.traceDelayMs) >>> 0,
@@ -799,25 +954,32 @@ scope.addEventListener("message", async (event) => {
     if (Array.isArray(event.data.spuTraceRange)) {
       module.ccall("rpcs3_web_set_spu_trace_range", null, ["number", "number"], [Number(event.data.spuTraceRange[0]) >>> 0, Number(event.data.spuTraceRange[1]) >>> 0]);
     }
-    // Input trace replay: applied on the RSX thread at the recorded flips.
+    // Input replay is applied on the RSX thread at the recorded flips. Put the opening
+    // auto-advance on the same frame schedule so it cannot race boot or overwrite trace
+    // entries once the recorded gameplay section begins.
+    const scheduledInput = [
+      ...autoAdvanceEntries(Number(event.data.autoStartSec) || 0, Number(event.data.autoStartUntilFrame) || 1_500, Number(event.data.autoStartIntervalFrames) || 60),
+      ...(Array.isArray(event.data.inputTrace) ? event.data.inputTrace : []),
+      ...pendingScheduledInput.splice(0),
+    ];
     module.ccall("rpcs3_web_pad_schedule_clear", null, [], []);
-    for (const entry of [...(Array.isArray(event.data.inputTrace) ? event.data.inputTrace : [])].sort((a, b) => a.frame - b.frame)) {
-      module.ccall("rpcs3_web_pad_schedule_add", null, ["number", "number", "number", "number", "number", "number", "number"], [
-        Number(entry.frame) >>> 0, Number(entry.digital1 ?? 0) >>> 0, Number(entry.digital2 ?? 0) >>> 0,
-        Number(entry.leftX ?? 128) >>> 0, Number(entry.leftY ?? 128) >>> 0, Number(entry.rightX ?? 128) >>> 0, Number(entry.rightY ?? 128) >>> 0,
-      ]);
-    }
-    if (typeof event.data.ppuAotBundle === "string" && !reuse) {
-      // Title bundle: compiled blocks placed in every worker's function table before boot, run by the PPU pthreads.
-      const { loadPpuAotBundle } = await import("./rpcs3-ppu-aot-table.mjs");
-      ppuAotTable = await loadPpuAotBundle({
-        module,
-        mainInstance,
-        mainMemory,
-        manifestUrl: new URL(event.data.ppuAotBundle, scope.location.href).href,
-        log: (line) => { recordLog(line); console.log(line); },
-      });
-    }
+    appendScheduledInput(scheduledInput);
+    // Keep event-loop schedule updates queued while the guest boots. The boot
+    // loop yields to this worker, so accepting a trace update here can race
+    // PPU initialization and leave a thread branching through address zero.
+    inputScheduleReady = false;
+    autoRecomp = event.data.autoRecomp !== false && event.data.ppuAot !== true;
+    const ppuBackend = event.data.ppuBackend === "aot" || event.data.ppuAot === true ? "aot" : "jit";
+    const ppuSemanticsVersion = module._rpcs3_web_ppu_codegen_semantics_version
+      ? module.ccall("rpcs3_web_ppu_codegen_semantics_version", "number", [], []) >>> 0
+      : 0;
+    const expectedPpuPolicy = {
+      semanticsVersion: ppuSemanticsVersion,
+      returnDispatch: event.data.ppuReturnDispatch === true,
+      inlineReads: autoRecomp ? event.data.ppuInlineReads !== false : event.data.ppuInlineReads === true,
+      inlineWrites: event.data.ppuInlineWrites === true,
+      wasmRegions: autoRecomp ? event.data.wasmRegions !== false : event.data.wasmRegions === true,
+    };
     if (typeof event.data.spuAotBundle === "string" && !reuse) {
       const { loadSpuAotBundle } = await import("./rpcs3-spu-aot-table.mjs");
       spuAotTable = await loadSpuAotBundle({
@@ -827,50 +989,83 @@ scope.addEventListener("message", async (event) => {
         manifestUrl: new URL(event.data.spuAotBundle, scope.location.href).href,
         log: (line) => { recordLog(line); console.log(line); },
       });
+      // Reserve a dedicated 16384-slot SPU hot/LLVM region immediately above SPU AOT before PPU AOT
+      // claims 575k slots, so SPU workers never grow their WebAssembly.Table across the PPU AOT span.
+      const table = mainInstance?.exports?.__indirect_function_table;
+      if (table && module._rpcs3_web_spu_set_hot_table_base) {
+        const spuHotBase = Math.max(table.length, (spuAotTable.tableBase >>> 0) + (spuAotTable.tableSize >>> 0));
+        const spuHotEnd = spuHotBase + 16384;
+        if (table.length < spuHotEnd) table.grow(spuHotEnd - table.length);
+        module.ccall("rpcs3_web_spu_set_hot_table_base", null, ["number"], [spuHotBase]);
+      }
+    }
+    if (typeof event.data.ppuAotBundle === "string" && !reuse) {
+      // Title bundle: compiled blocks placed in every worker's function table before boot, run by the PPU pthreads.
+      const { loadPpuAotBundle } = await import("./rpcs3-ppu-aot-table.mjs");
+      ppuAotTable = await loadPpuAotBundle({
+        module,
+        mainInstance,
+        mainMemory,
+        manifestUrl: new URL(event.data.ppuAotBundle, scope.location.href).href,
+        expectedPolicy: expectedPpuPolicy,
+        log: (line) => { recordLog(line); console.log(line); },
+      });
     }
     if (!reuse) {
       // Everything either runtime tier compiles goes into the function table above the bundles
       module.rpcs3InstallHotTable(ppuAotTable, spuAotTable);
       // The binding map (one entry per patchpoint import) is not report material
       if (spuAotTable) spuAotTable = { ...spuAotTable, bindings: undefined };
-      if (Number(event.data.spuHotThreshold) > 0) {
-        module.ccall("rpcs3_web_spu_set_hot_threshold", null, ["number"], [Number(event.data.spuHotThreshold)]);
+      const ppuFailClosed = event.data.ppuFailClosed === true || ppuBackend === "aot";
+      if (module._rpcs3_web_ppu_set_backend) {
+        module.ccall("rpcs3_web_ppu_set_backend", null, ["number", "number"], [ppuBackend === "aot" ? 1 : 0, ppuFailClosed ? 1 : 0]);
       }
-      // The PPU tier compiles blocks the bundle does not carry, so a block the analyser found never
-      // falls back to the interpreter for the whole run. Enabled before boot, because ppu_initialize
-      // is where the analyser hands it the blocks it may compile.
-      ppuJit = event.data.ppuJit === true;
+      const effectiveSpuHotThreshold = Number(event.data.spuHotThreshold) > 0
+        ? Number(event.data.spuHotThreshold)
+        : (autoRecomp ? 1 : 0);
+      if (effectiveSpuHotThreshold > 0) {
+        module.ccall("rpcs3_web_spu_set_hot_threshold", null, ["number"], [effectiveSpuHotThreshold]);
+      }
+      ppuJit = event.data.ppuJit === true || (autoRecomp && event.data.ppuJit !== false);
       if (ppuJit) {
-        if (Number(event.data.ppuJitThreshold) > 0) {
-          module.ccall("rpcs3_web_ppu_llvm_set_threshold", null, ["number"], [Number(event.data.ppuJitThreshold)]);
-        }
+        const effectivePpuThreshold = Number(event.data.ppuJitThreshold) > 0 ? Number(event.data.ppuJitThreshold) : 1;
+        module.ccall("rpcs3_web_ppu_llvm_set_threshold", null, ["number"], [effectivePpuThreshold]);
         if (Number(event.data.ppuJitCapacity) > 0) {
           module.ccall("rpcs3_web_ppu_llvm_set_capacity", null, ["number"], [Number(event.data.ppuJitCapacity)]);
         }
         module.ccall("rpcs3_web_ppu_llvm_set_enabled", null, ["number"], [1]);
       }
-      if (spuDecoder === "llvm" || ppuJit) {
-        // RPCS3's own recompilers run in these compiler workers (see rpcs3-spu-llvm.mjs)
+      if (autoRecomp && module._rpcs3_web_recomp_set_enabled) {
+        module.ccall("rpcs3_web_recomp_set_enabled", null, ["number"], [1]);
+      }
+      if (spuDecoder === "llvm" || ppuJit || autoRecomp) {
+        const defaultWorkers = autoRecomp
+          ? Math.max(2, Math.min(16, Math.floor((Number(scope.navigator?.hardwareConcurrency) || 8) / 2)))
+          : 2;
         const { createLlvmCompilerPool } = await import("./rpcs3-spu-llvm.mjs");
         spuLlvmPool = await createLlvmCompilerPool({
           module,
           memory: mainMemory ?? module.wasmMemory,
-          workers: Number(event.data.spuLlvmWorkers) > 0 ? Number(event.data.spuLlvmWorkers) : 2,
+          workers: Number(event.data.spuLlvmWorkers) > 0 ? Number(event.data.spuLlvmWorkers) : defaultWorkers,
           moduleUrl: new URL(event.data.llvmCompilerUrl || "./core/rpcs3-spu-llvm.mjs", scope.location.href).href,
           log: (line) => { recordLog(line); console.log(line); },
           spu: spuDecoder === "llvm",
-          ppu: ppuJit,
+          // Fail-closed AOT misses compile synchronously through the same PPU worker tier
+          // even when block-JIT is disabled.
+          ppu: ppuJit || (autoRecomp && ppuBackend === "aot"),
+          autoRecomp,
+          recompMaxBlocksPerShard: Number(event.data.recompMaxBlocksPerShard) > 0 ? Number(event.data.recompMaxBlocksPerShard) : 2048,
           ppuReturnDispatch: event.data.ppuReturnDispatch === true,
-          ppuInlineReads: event.data.ppuInlineReads === true,
+          ppuInlineReads: autoRecomp ? event.data.ppuInlineReads !== false : event.data.ppuInlineReads === true,
           spuPortableCalls: event.data.spuPortableCalls === true,
-          wasmRegions: event.data.wasmRegions === true,
+          wasmRegions: autoRecomp ? event.data.wasmRegions !== false : event.data.wasmRegions === true,
         });
         if (spuDecoder === "llvm") module.ccall("rpcs3_web_spu_llvm_set_enabled", null, ["number"], [1]);
       }
     }
     if (aotWasm) module.ccall("rpcs3_web_set_ppu_aot_handoff", null, ["number"], [1]);
     if (spuAotWasm) module.ccall("rpcs3_web_set_spu_aot_handoff", null, ["number"], [1]);
-    if (event.data.path) {
+    if (event.data.path && !suspendingCore) {
       try { fixtureBytes = Number(module.FS.stat(path).size); } catch { fixtureBytes = 0; }
     }
     applyPadState(event.data.pad);
@@ -882,15 +1077,18 @@ scope.addEventListener("message", async (event) => {
       module.ccall("rpcs3_web_frame_timing_start", null, [], []);
       module.ccall("rpcs3_web_spu_dispatch_profile_enable", null, [], []);
     }
-    if (suspendingCore) {
-      // Booting reads the disc image and waits on the threads it starts, and both of those need
-      // this thread's event loop, so the boot runs on its own thread and this one keeps turning.
+    if (suspendingCore || autoRecomp) {
+      // Booting on its own thread keeps this worker's JS event loop free to service both
+      // suspending filesystem tasks and whole-module static recompilation of EBOOT + .sprx modules!
+      console.log(`RPCS3 Web: starting async boot of ${path} (suspending=${suspendingCore}, autoRecomp=${autoRecomp})`);
       bootResult = module.ccall("rpcs3_web_boot_begin", "number", ["string"], [path]);
       while (bootResult === 0 && !module.ccall("rpcs3_web_boot_finished", "number", [], [])) {
+        spuLlvmPool?.pump();
         await runHostTasks();
         await new Promise((resolve) => setTimeout(resolve, 4));
       }
       if (bootResult === 0) bootResult = module.ccall("rpcs3_web_boot_result", "number", [], []);
+      console.log(`RPCS3 Web: async boot finished with result ${bootResult}`);
     } else {
       bootResult = module.ccall("rpcs3_web_boot", "number", ["string"], [path]);
     }
@@ -912,10 +1110,14 @@ scope.addEventListener("message", async (event) => {
       });
     }
     progress();
-    progressTimer = setInterval(progress, progressIntervalMs);
+    progressTimer = setInterval(() => progress(Boolean(initialized)), progressIntervalMs);
     if (event.data.completion === "dispatch") {
       await captureDispatch(String(event.data.expectedVerdict ?? ""), Number(event.data.dispatchTimeoutMs) || 30_000);
     } else {
+      // The runtime is initialized at this point. Merge any trace fetched while
+      // boot was in flight, then allow later schedule messages to be applied live.
+      appendScheduledInput(pendingScheduledInput.splice(0));
+      inputScheduleReady = true;
       await captureFrame("runtime-result", event.data.discardPackets === true, event.data.untilDraw === true);
     }
   } catch (error) {

@@ -206,7 +206,7 @@ void initialize_timebased_time(u64 timebased_init, bool reset)
 	timebased_init = current - timebased_init;
 
 	g_timebase_offs = timebased_init;
-	systemtime_offset = timebased_init / (g_timebase_freq / 1000000);
+	systemtime_offset = static_cast<u64>(static_cast<s64>(timebased_init) / static_cast<s64>(g_timebase_freq / 1000000));
 }
 
 // Returns some relative time in microseconds, don't change this fact

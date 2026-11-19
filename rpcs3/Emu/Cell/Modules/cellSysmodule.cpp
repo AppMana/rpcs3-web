@@ -419,9 +419,16 @@ static error_code load_module(ppu_thread& ppu, u8 module_idx, u32 args, vm::ptr<
 		return CELL_OK;
 	}
 
-	if (loaded_count == smax
-		|| ppu_execute<&sys_lwmutex_lock>(ppu, s_sysmodule_context.ptr(&sysmodule_context::mutex), 0) != CELL_OK)
+	const error_code lock_result = loaded_count == smax
+		? CELL_SYSMODULE_ERROR_FATAL
+		: ppu_execute<&sys_lwmutex_lock>(ppu, s_sysmodule_context.ptr(&sysmodule_context::mutex), 0);
+
+	if (lock_result != CELL_OK)
 	{
+#ifdef RPCS3_WEB
+		std::fprintf(stderr, "RPCS3 Web cellSysmodule load failed: path=%s loaded_count=%d lock=0x%x\n", path.data(), loaded_count, lock_result + 0u);
+#endif
+		cellSysmodule.error("load_module failed: path=\"%s\", loaded_count=%d, lock=0x%x", path, loaded_count, lock_result + 0u);
 		return CELL_SYSMODULE_ERROR_FATAL;
 	}
 
@@ -730,6 +737,20 @@ extern error_code sysmoduleModuleStart(ppu_thread& ppu, u32 args, vm::ptr<void> 
 
 	return CELL_OK; // SYS_PRX_RESIDENT
 }
+
+#ifdef RPCS3_WEB
+extern error_code sysmoduleInitializeWeb(ppu_thread& ppu)
+{
+	const vm::var<sys_lwmutex_attribute_t> lwmutex_attr
+	{{
+		.protocol = SYS_SYNC_PRIORITY,
+		.recursive = SYS_SYNC_NOT_RECURSIVE,
+		.name_u64 = "_smolwm"_u64
+	}};
+
+	return ppu_execute<&sys_lwmutex_create>(ppu, s_sysmodule_context.ptr(&sysmodule_context::mutex), +lwmutex_attr);
+}
+#endif
 
 error_code cellSysmoduleInitialize()
 {

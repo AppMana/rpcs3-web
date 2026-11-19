@@ -6888,6 +6888,10 @@ auto UNK()
 				return hle_funcs[index](ppu, op, this_op, nullptr);
 			}
 
+#ifdef RPCS3_WEB
+			extern void ppu_web_dump_last_blocks(const ppu_thread& ppu);
+			ppu_web_dump_last_blocks(ppu);
+#endif
 			fmt::throw_exception("Unknown/Illegal opcode: 0x%08x at 0x%x", op.opcode, ppu.cia);
 		};
 	}

@@ -33,7 +33,7 @@ export function emitSpuRegion(region) {
     const word = member.pc >>> 2;
     return `
   const uint32_t alias_${i} = aliases[${i}];
-  uint32_t generation_${i} = __atomic_load_n(lists + ${word}, __ATOMIC_ACQUIRE);
+  uint32_t generation_${i} = *(const volatile uint32_t*)(lists + ${word});
   const uint32_t* preferred_${i} = cache + spu_chain_cache_slot(${member.pc}) * 2;
   if (alias_${i} < begin || alias_${i} >= end || !generation_${i} || preferred_${i}[0] != generation_${i}
       || preferred_${i}[1] >= *(const uint32_t*)(uintptr_t)generation_${i}
@@ -43,9 +43,7 @@ export function emitSpuRegion(region) {
     const other = 1 - i;
     return `
 node_${i}: {
-    if (__atomic_load_n(state, __ATOMIC_ACQUIRE)) { c->reason = SPU_CHAIN_STATE; goto done; }
-    const uint32_t entry_pc = *pc;
-    const uint64_t before_failure = *failure;
+    if (*(const volatile uint32_t*)state) { c->reason = SPU_CHAIN_STATE; goto done; }
     program_${i}(thread, ls, 0);
     if (*failure != before_failure) { c->reason = SPU_CHAIN_REJECTED; goto done; }
     ++completed;
@@ -53,9 +51,9 @@ node_${i}: {
     if (next_pc == entry_pc) { c->reason = SPU_CHAIN_INTERPRET; goto done; }
     if (completed == budget) goto done;
     if (next_pc == ${members[other].pc} && generation_${other}
-        && __atomic_load_n(lists + ${members[other].pc >>> 2}, __ATOMIC_ACQUIRE) == generation_${other}) goto node_${other};
+        && *(const volatile uint32_t*)(lists + ${members[other].pc >>> 2}) == generation_${other}) { entry_pc = next_pc; goto node_${other}; }
     uint32_t continuation;
-    if (!spu_chain_cached_target(c, next_pc, &continuation)) { c->reason = SPU_CHAIN_MISS; goto done; }
+    if (!spu_chain_cached_target_pairs(lists, cache, next_pc, &continuation)) { c->reason = SPU_CHAIN_MISS; goto done; }
     // Leaving a small region must not shorten the original chain's scheduling
     // slice. Continue locally through its normal runner, then restore the ABI.
     c->target = continuation;
@@ -83,6 +81,8 @@ static __attribute__((always_inline)) inline void execute_region(void* restrict 
   uint32_t* state = (void*)(uintptr_t)c->state;
   uint32_t* lists = (void*)(uintptr_t)c->lists;
   const uint32_t* cache = (void*)(uintptr_t)c->cache;
+  const uint64_t before_failure = *failure;
+  uint32_t entry_pc = *pc;
   ${snapshots}
   if (c->target == alias_0) goto node_0;
   if (c->target == alias_1) goto node_1;

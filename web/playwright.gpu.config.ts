@@ -1,8 +1,9 @@
-import { hardwareChromeArgs } from "./scripts/chrome-gpu.mjs";
+import { hardwareChromeArgs, hardwareChromeEnv } from "./scripts/chrome-gpu.mjs";
 import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   testDir: "tests/e2e",
+  outputDir: "test-results/playwright-gpu",
   testMatch: ["llvm-wasm-backend.spec.ts", "fragment-output-routing.spec.ts", "ppu-inline-memory.spec.ts", "runtime-direct-session.spec.ts", "browser-units.spec.ts", "gpu.spec.ts", "runtime-gpu.spec.ts", "runtime-cube.spec.ts", "runtime-cube-correctness.spec.ts", "runtime-animation.spec.ts", "runtime-scissor.spec.ts", "runtime-sustained.spec.ts", "input-trace.spec.ts", "playable-tetris.spec.ts", "presentation.spec.ts", "frame-oracle.spec.ts", "packet-replay.spec.ts", "ppu-aot-table-gpu.spec.ts"],
   // These tests intentionally share one physical GPU. Running independent
   // RPCS3/WebGPU instances in parallel can starve the packet consumer and
@@ -13,10 +14,11 @@ export default defineConfig({
   use: {
     baseURL: process.env.RPCS3_WEB_URL || "http://127.0.0.1:4174/",
     trace: "retain-on-failure",
-    headless: process.env.RPCS3_HEADED === "0",
+    headless: process.env.RPCS3_HEADED !== "1",
     launchOptions: {
       executablePath: "/usr/bin/google-chrome",
       args: hardwareChromeArgs(),
+      env: hardwareChromeEnv(),
     },
   },
   webServer: process.env.RPCS3_WEB_URL ? undefined : {

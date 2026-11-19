@@ -453,6 +453,17 @@ error_code sys_timer_usleep(ppu_thread& ppu, u64 sleep_time)
 
 	sys_timer.trace("sys_timer_usleep(sleep_time=0x%llx)", sleep_time);
 
+#ifdef __EMSCRIPTEN__
+	if (sleep_time < 100)
+	{
+		// std::this_thread::yield() is a no-op on WebAssembly pthread workers and does not
+		// yield in the LV2 PPU scheduler (g_ppu) or notify SPU reservation waiters.
+		// Clamp tiny/zero usleep polling calls so runnable PPU/SPU workers can make progress
+		// without hammering lv2_obj::g_mutex millions of times.
+		sleep_time = 100;
+	}
+#endif
+
 	if (sleep_time)
 	{
 		const s64 add_time = g_cfg.core.usleep_addend;

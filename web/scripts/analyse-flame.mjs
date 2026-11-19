@@ -9,65 +9,95 @@
 //
 // Usage: node scripts/analyse-flame.mjs <report-dir> [topN]
 
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { classifyWorkerProfile, isSpinWaitFunction } from "./worker-profiler.mjs";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const webRoot = join(here, "..");
 
 const dir = process.argv[2];
-const topN = Number(process.argv[3] || 12);
+const topN = Number(process.argv[3] || 20);
 if (!dir) { console.error("usage: node scripts/analyse-flame.mjs <report-dir> [topN]"); process.exit(2); }
 
-function stackOf(node, byId) {
-  // Build root->leaf by walking parents; wasm frames have url https://.../rpcs3-web.wasm:wasm-function[N]
+function buildParentMap(nodes) {
+  const parentById = new Map();
+  for (const n of nodes) {
+    if (n.parent !== undefined) parentById.set(n.id, n.parent);
+    for (const childId of n.children || []) {
+      parentById.set(childId, n.id);
+    }
+  }
+  return parentById;
+}
+
+function stackOf(node, byId, parentById) {
+  // Build root->leaf by walking parents via parentById built from node.children
   const chain = [];
+  const visited = new Set();
   let cur = node;
-  for (let i = 0; i < 64 && cur; i++) {
+  for (let i = 0; i < 96 && cur && !visited.has(cur.id); i++) {
+    visited.add(cur.id);
     const cf = cur.callFrame || {};
     const fn = cf.functionName || "?";
     const url = cf.url || "";
     const label = url.includes("wasm-function")
       ? fn.replace(/^wasm-function\[(\d+)\]$/, (_, n) => `wasm[${n}]`)
       : (fn || "?");
-    chain.unshift(label);
-    cur = byId.get(cur.parent);
+    if (label !== "(root)") chain.unshift(label);
+    const parentId = parentById.get(cur.id);
+    cur = parentId !== undefined ? byId.get(parentId) : undefined;
   }
   return chain;
 }
 
+function readLebU32(binary, state) {
+  let result = 0;
+  let shift = 0;
+  while (state.off < binary.length) {
+    const b = binary[state.off++];
+    result |= (b & 0x7f) << shift;
+    if ((b & 0x80) === 0) break;
+    shift += 7;
+  }
+  return result >>> 0;
+}
+
 function nameSectionMap(binary) {
-  // Parse enough of the custom "name" section to map function index -> name.
-  const dv = new DataView(binary);
+  // Parse the WebAssembly custom "name" section (section id 0, name === "name", subsection id 1 = function names)
   const map = new Map();
-  let off = 8; // magic + version
-  while (off < binary.length) {
-    const id = binary[off++];
-    let size = 0, len = 0;
-    do { len = binary[off]; size |= (len & 0x7f) << (7 * 0); } while (0); // placeholder
-    // proper LEB read:
-    let shift = 0; size = 0; let b;
-    do { b = binary[off++]; size |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
-    const end = off + size;
-    if (id === 0) { // "name" section
-      // subsection id, subsection size, then name map
-      while (off < end) {
-        const sid = binary[off++];
-        let sshift = 0, ssize = 0, sb;
-        do { sb = binary[off++]; ssize |= (sb & 0x7f) << sshift; sshift += 7; } while (sb & 0x80);
-        const send = off + ssize;
-        if (sid === 0) { // FUNCTION_NAMES
-          let rshift = 0, rsize = 0, rb;
-          do { rb = binary[off++]; rsize |= (rb & 0x7f) << rshift; rshift += 7; } while (rb & 0x80);
-          for (let i = 0; i < rsize; i++) {
-            let idx = 0, is = 0, ib;
-            do { ib = binary[off++]; idx |= (ib & 0x7f) << is; is += 7; } while (ib & 0x80);
-            let nl = 0, ns = 0, nb;
-            do { nb = binary[off++]; nl |= (nb & 0x7f) << ns; ns += 7; } while (nb & 0x80);
-            const name = new TextDecoder().decode(binary.subarray(off, off + nl)); off += nl;
-            map.set(idx, name);
+  const decoder = new TextDecoder();
+  const state = { off: 8 }; // skip 8-byte Wasm header (magic + version)
+  while (state.off < binary.length) {
+    const id = binary[state.off++];
+    const size = readLebU32(binary, state);
+    const end = Math.min(binary.length, state.off + size);
+    if (id === 0) {
+      const secNameLen = readLebU32(binary, state);
+      const secName = decoder.decode(binary.subarray(state.off, state.off + secNameLen));
+      state.off += secNameLen;
+      if (secName === "name") {
+        while (state.off < end) {
+          const sid = binary[state.off++];
+          const ssize = readLebU32(binary, state);
+          const send = Math.min(end, state.off + ssize);
+          if (sid === 1) { // subsection 1: function names
+            const count = readLebU32(binary, state);
+            for (let i = 0; i < count && state.off < send; i++) {
+              const idx = readLebU32(binary, state);
+              const nl = readLebU32(binary, state);
+              const name = decoder.decode(binary.subarray(state.off, state.off + nl));
+              state.off += nl;
+              map.set(idx, name);
+            }
           }
-        } else off = send;
+          state.off = send;
+        }
       }
-    } else off = end;
+    }
+    state.off = end;
   }
   return map;
 }
@@ -75,66 +105,117 @@ function nameSectionMap(binary) {
 const dirExists = existsSync(dir);
 if (!dirExists) { console.error(`no such dir: ${dir}`); process.exit(1); }
 
-// Collect per-thread cores. run.cpuprofile is the aggregated profile; run.cpuprofile.N are thread slices.
-const files = (await readdirSafe(dir));
-let profile = null;
-let coring = null;
-for (const f of files) {
-  if (f.startsWith("run.cpuprofile") && !f.endsWith(".targets.json")) {
-    try { const core = JSON.parse(await readFile(join(dir, f), "utf8")); coring = core; break; }
-    catch { /* try next */ }
-  }
-}
-if (!coring) { console.error("no run.cpuprofile core found in " + dir); process.exit(1); }
-
-const nodes = coring.nodes || [];
-const byId = new Map(nodes.map((n) => [n.id, n]));
 // Resolve wasm function names from the runtime's wasm binary (shared across threads).
 const wasmName = await (async () => {
-  try {
-    const wasmPath = join("web/dist/core/jspi/rpcs3-web.wasm");
-    if (existsSync(wasmPath)) return nameSectionMap(new Uint8Array(await readFile(wasmPath)));
-  } catch { /* ignore */ }
+  for (const candidate of [
+    join(webRoot, "public/core/jspi/rpcs3-web.wasm"),
+    join(webRoot, "dist/core/jspi/rpcs3-web.wasm"),
+    join(webRoot, "public/core/profile-jspi/rpcs3-web.wasm"),
+    join(webRoot, "public/core/rpcs3-web.wasm"),
+  ]) {
+    try {
+      if (existsSync(candidate)) {
+        const m = nameSectionMap(new Uint8Array(await readFile(candidate)));
+        if (m.size > 0) return m;
+      }
+    } catch { /* ignore */ }
+  }
   return new Map();
 })();
 
-const samples = coring.samples || [];
-const stacks = new Map(); // folded string -> count
-for (const s of samples) {
-  const chain = stackOf(byId.get(s), byId);
-  const folded = chain.map((f) => wasmName.has(parseInt((f.match(/wasm\[(\d+)\]/) || [])[1] ?? "", 10))
-    && f.startsWith("wasm[")
-    ? `wasm(${wasmName.get(parseInt(f.slice(5, -1), 10))})`
-    : f).join(";");
-  stacks.set(folded, (stacks.get(folded) || 0) + 1);
+// Collect ALL per-thread .cpuprofile files and their roles from run.cpuprofile.targets.json
+const files = (await readdirSafe(dir))
+  .filter((f) => /^run\.cpuprofile(?:\.\d+)?$/.test(f))
+  .sort((a, b) => {
+    const ia = a === "run.cpuprofile" ? 0 : Number(a.split(".").pop());
+    const ib = b === "run.cpuprofile" ? 0 : Number(b.split(".").pop());
+    return ia - ib;
+  });
+
+if (!files.length) { console.error("no run.cpuprofile core found in " + dir); process.exit(1); }
+
+let roleByFile = new Map();
+const targetsPath = join(dir, "run.cpuprofile.targets.json");
+if (existsSync(targetsPath)) {
+  try {
+    const targetsMeta = JSON.parse(await readFile(targetsPath, "utf8"));
+    for (const t of targetsMeta.targets || []) {
+      if (t.profilePath) roleByFile.set(t.profilePath.split("/").pop(), t.role || "Worker");
+    }
+  } catch { /* ignore */ }
 }
 
-// Inclusive per-function attribution.
-const inclusive = new Map();
-for (const [folded, count] of stacks) {
-  const frames = folded.split(";");
-  let acc = "";
-  for (const fn of frames) {
-    acc = acc ? `${acc};${fn}` : fn;
-    inclusive.set(acc, (inclusive.get(acc) || 0) + count);
+const stacks = new Map(); // folded string -> count
+const activeStacks = new Map(); // excluding idle/futex/spin-wait leaves
+const roleTotals = new Map();
+let totalSamples = 0;
+let activeSamples = 0;
+
+for (const f of files) {
+  let core;
+  try { core = JSON.parse(await readFile(join(dir, f), "utf8")); }
+  catch { continue; }
+  const nodes = core.nodes || [];
+  const samples = core.samples || [];
+  if (!samples.length) continue;
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const parentById = buildParentMap(nodes);
+  const role = roleByFile.get(f) || classifyWorkerProfile(core);
+
+  for (const s of samples) {
+    const leafNode = byId.get(s);
+    if (!leafNode) continue;
+    const leafFn = leafNode.callFrame?.functionName || "?";
+    const isIdle = ["(idle)", "emscripten_futex_wait", "_do_futex_wait", "(program)"].includes(leafFn);
+    const isSpin = isSpinWaitFunction(leafFn);
+    const chain = stackOf(leafNode, byId, parentById).map((frame) => {
+      const m = frame.match(/^wasm\[(\d+)\]$/);
+      if (m) {
+        const idx = parseInt(m[1], 10);
+        if (wasmName.has(idx)) return `wasm(${wasmName.get(idx)})`;
+      }
+      return frame;
+    });
+    const folded = `[${role}];${chain.join(";")}`;
+    stacks.set(folded, (stacks.get(folded) || 0) + 1);
+    totalSamples++;
+    if (!isIdle && !isSpin) {
+      activeStacks.set(folded, (activeStacks.get(folded) || 0) + 1);
+      roleTotals.set(role, (roleTotals.get(role) || 0) + 1);
+      activeSamples++;
+    }
   }
 }
-const total = samples.length;
-const sorted = [...inclusive.entries()].sort((a, b) => b[1] - a[1]);
-console.log(`inclusive samples=${total} distinct-stacks=${stacks.size} distinct-paths=${inclusive.size}`);
-const seenFns = new Set();
-for (const [path, n] of sorted.slice(0, Math.min(topN * 4, sorted.length))) {
-  const leaf = path.split(";").pop();
-  if (seenFns.has(leaf)) continue;
-  seenFns.add(leaf);
-  if (seenFns.size > topN) break;
-  console.log(`  ${String(n).padStart(6)} (${(100.0 * n / total).toFixed(1).padStart(4)}%) ${leaf.slice(0, 76)}`);
+
+// Inclusive per-function attribution over ACTIVE (non-idle, non-spin) samples.
+const sourceStacks = activeSamples > 0 ? activeStacks : stacks;
+const denom = Math.max(1, activeSamples > 0 ? activeSamples : totalSamples);
+const inclusive = new Map();
+for (const [folded, count] of sourceStacks) {
+  const frames = folded.split(";");
+  const seenInStack = new Set();
+  for (const fn of frames) {
+    if (seenInStack.has(fn)) continue;
+    seenInStack.add(fn);
+    inclusive.set(fn, (inclusive.get(fn) || 0) + count);
+  }
 }
-// Flame-graph folded output.
+
+const sorted = [...inclusive.entries()].sort((a, b) => b[1] - a[1]);
+console.log(`workers=${files.length} total-samples=${totalSamples} active-samples=${activeSamples} distinct-active-stacks=${sourceStacks.size}`);
+console.log(`active samples by role: ${JSON.stringify(Object.fromEntries(roleTotals))}`);
+let printed = 0;
+for (const [fn, n] of sorted) {
+  if (fn.startsWith("[") && fn.endsWith("]")) continue;
+  if (++printed > topN) break;
+  console.log(`  ${String(n).padStart(6)} (${(100.0 * n / denom).toFixed(1).padStart(5)}%) ${fn.slice(0, 96)}`);
+}
+
+// Flame-graph folded output (active stacks + full stacks).
 const foldedPath = join(dir, "flame.folded");
-await import("node:fs/promises")
-  .then(async ({ writeFile }) => { const lines = [...stacks.entries()].sort((a, b) => b[1] - a[1]); await writeFile(foldedPath, lines.map(([f, c]) => `${f} ${c}`).join("\n")); });
-console.log(`folded stack file: ${foldedPath} (${stacks.size} stacks) — paste into flamegraph.pl for the chart`);
+const lines = [...sourceStacks.entries()].sort((a, b) => b[1] - a[1]);
+await writeFile(foldedPath, lines.map(([f, c]) => `${f} ${c}`).join("\n") + "\n");
+console.log(`folded stack file: ${foldedPath} (${sourceStacks.size} stacks) — paste into flamegraph.pl for the chart`);
 
 async function readdirSafe(p) {
   const { readdir } = await import("node:fs/promises");

@@ -45,12 +45,13 @@ namespace
 		simd_i16x8_eq = 45, simd_i16x8_gt_s = 49, simd_i16x8_gt_u = 50,
 		simd_i32x4_eq = 55, simd_i32x4_ne = 56, simd_i32x4_gt_s = 59, simd_i32x4_gt_u = 60,
 		simd_f32x4_eq = 65, simd_f32x4_ne = 66, simd_f32x4_lt = 67, simd_f32x4_gt = 68,
+		simd_f64x2_eq = 71, simd_f64x2_ne = 72, simd_f64x2_lt = 73, simd_f64x2_gt = 74,
 		simd_v128_not = 77, simd_v128_and = 78, simd_v128_andnot = 79, simd_v128_or = 80, simd_v128_xor = 81, simd_v128_bitselect = 82, simd_v128_any_true = 83,
 		simd_i8x16_shl = 107, simd_i8x16_add = 110, simd_i8x16_sub = 113, simd_i8x16_avgr_u = 123, simd_i8x16_bitmask = 100, simd_i16x8_bitmask = 132, simd_i32x4_bitmask = 164, simd_i64x2_eq = 214,
 		simd_i16x8_shl = 139, simd_i16x8_shr_s = 140, simd_i16x8_shr_u = 141, simd_i16x8_add = 142, simd_i16x8_sub = 145, simd_i16x8_mul = 149,
 		simd_i32x4_shl = 171, simd_i32x4_shr_s = 172, simd_i32x4_shr_u = 173, simd_i32x4_add = 174, simd_i32x4_sub = 177, simd_i32x4_mul = 181,
 		simd_i64x2_shl = 203, simd_i64x2_shr_s = 204, simd_i64x2_shr_u = 205, simd_i64x2_add = 206, simd_i64x2_sub = 209,
-		simd_f32x4_add = 228, simd_f32x4_sub = 229, simd_f32x4_mul = 230, simd_i32x4_dot_i16x8_s = 186, simd_i8x16_min_u = 119, simd_i8x16_max_u = 121, simd_i8x16_popcnt = 98, simd_f32x4_max = 233, simd_f64x2_add = 240, simd_f64x2_sub = 241, simd_f64x2_mul = 242, simd_i32x4_trunc_sat_f32x4_s = 248, simd_i32x4_trunc_sat_f32x4_u = 249, simd_f32x4_convert_i32x4_s = 250, simd_f32x4_demote_f64x2_zero = 94, simd_f64x2_promote_low_f32x4 = 95,
+		simd_f32x4_add = 228, simd_f32x4_sub = 229, simd_f32x4_mul = 230, simd_i32x4_dot_i16x8_s = 186, simd_i8x16_min_u = 119, simd_i8x16_max_u = 121, simd_i8x16_popcnt = 98, simd_f32x4_max = 233, simd_f64x2_abs = 236, simd_f64x2_add = 240, simd_f64x2_sub = 241, simd_f64x2_mul = 242, simd_i32x4_trunc_sat_f32x4_s = 248, simd_i32x4_trunc_sat_f32x4_u = 249, simd_f32x4_convert_i32x4_s = 250, simd_f32x4_demote_f64x2_zero = 94, simd_f64x2_promote_low_f32x4 = 95,
 	};
 
 	constexpr u8 k_reverse16[16] = { 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 };
@@ -122,6 +123,16 @@ void spu_wasm_recompiler::refuse(const std::string& why)
 
 void spu_wasm_recompiler::gpr_load(u32 reg)
 {
+	if (m_scanning)
+	{
+		m_gpr_used[reg & 127] = true;
+		return;
+	}
+	if (const s32 loc = m_gpr_local[reg & 127]; loc >= 0)
+	{
+		m_code.local_get(static_cast<u32>(loc));
+		return;
+	}
 	m_code.local_get(l_thread);
 	m_code.v128_load(off_gpr + reg * 16);
 }
@@ -138,6 +149,17 @@ void spu_wasm_recompiler::gpr_store_end(u32 reg)
 
 void spu_wasm_recompiler::gpr_store(u32 reg)
 {
+	if (m_scanning)
+	{
+		m_gpr_used[reg & 127] = true;
+		m_gpr_written[reg & 127] = true;
+		return;
+	}
+	if (const s32 loc = m_gpr_local[reg & 127]; loc >= 0)
+	{
+		m_code.local_set(static_cast<u32>(loc));
+		return;
+	}
 	// value is on the stack: park it, push the thread pointer, then store
 	m_code.local_set(l_v2);
 	m_code.local_get(l_thread);
@@ -147,8 +169,37 @@ void spu_wasm_recompiler::gpr_store(u32 reg)
 
 void spu_wasm_recompiler::gpr_lane3(u32 reg)
 {
+	if (m_scanning)
+	{
+		m_gpr_used[reg & 127] = true;
+		return;
+	}
+	if (const s32 loc = m_gpr_local[reg & 127]; loc >= 0)
+	{
+		m_code.local_get(static_cast<u32>(loc));
+		m_code.simd(simd_i32x4_extract_lane);
+		m_code.emit8(3);
+		return;
+	}
 	m_code.local_get(l_thread);
 	m_code.i32_load(off_gpr + reg * 16 + 12);
+}
+
+void spu_wasm_recompiler::flush_gprs()
+{
+	if (m_scanning)
+	{
+		return;
+	}
+	for (u32 r = 0; r < 128; r++)
+	{
+		if (m_gpr_written[r] && m_gpr_local[r] >= 0)
+		{
+			m_code.local_get(l_thread);
+			m_code.local_get(static_cast<u32>(m_gpr_local[r]));
+			m_code.v128_store(off_gpr + r * 16);
+		}
+	}
 }
 
 void spu_wasm_recompiler::splat32(u32 value)
@@ -228,6 +279,12 @@ void spu_wasm_recompiler::branch_to(u32 target)
 	target &= 0x3fffc;
 	if (target >= m_lower && target < m_upper && m_is_block_start[(target - m_lower) / 4])
 	{
+		const s32 target_k = m_block_index_by_word[(target - m_lower) / 4];
+		if (target_k > static_cast<s32>(m_current_block))
+		{
+			m_code.br(static_cast<u32>(target_k - static_cast<s32>(m_current_block) - 1) + m_depth);
+			return;
+		}
 		m_code.i32c(static_cast<s32>(target));
 		m_code.local_set(l_pc);
 		m_code.br(m_loop_depth + m_depth);
@@ -261,6 +318,7 @@ void spu_wasm_recompiler::state_test(u32 next_pc)
 	m_code.local_get(l_thread);
 	m_code.call(f_check_state);
 	m_code.if_void();
+	flush_gprs();
 	m_code.local_get(l_thread);
 	m_code.call(f_escape);
 	m_code.op(op_unreachable);
@@ -305,6 +363,7 @@ bool spu_wasm_recompiler::build(const spu_program& func)
 
 	// Block starts within the program: the analyser's block info plus the entry
 	m_is_block_start.assign(words, false);
+	m_block_index_by_word.assign(words, -1);
 	m_is_block_start[(entry - m_lower) / 4] = true;
 	for (u32 i = 0; i < words; i++)
 	{
@@ -313,9 +372,50 @@ bool spu_wasm_recompiler::build(const spu_program& func)
 	std::vector<u32> starts;
 	for (u32 i = 0; i < words; i++)
 	{
-		if (m_is_block_start[i] && func.data[i]) starts.push_back(i);
+		if (m_is_block_start[i] && func.data[i])
+		{
+			m_block_index_by_word[i] = ::size32(starts);
+			starts.push_back(i);
+		}
 	}
 	const u32 block_count = ::size32(starts);
+
+	// Pre-scan accessed and modified GPRs across the program so we can promote them to v128 locals
+	m_gpr_local.fill(-1);
+	m_gpr_used.fill(false);
+	m_gpr_written.fill(false);
+	m_scanning = true;
+	for (u32 k = 0; k < block_count && !refused(); k++)
+	{
+		m_current_block = k;
+		m_depth = 0;
+		m_loop_depth = block_count - 1 - k;
+		m_exit_depth = block_count - k;
+		const u32 first = starts[k];
+		const u32 last = k + 1 < block_count ? starts[k + 1] : words;
+		for (u32 i = first; i < last && !refused(); i++)
+		{
+			m_pc = m_lower + i * 4;
+			if (!func.data[i]) break;
+			const spu_opcode_t op{ std::bit_cast<be_t<u32>>(func.data[i]) };
+			(this->*s_decoder.decode(op.opcode))(op);
+		}
+	}
+	m_scanning = false;
+	m_code.b.clear();
+	if (refused())
+	{
+		return false;
+	}
+
+	u32 num_gpr_locals = 0;
+	for (u32 r = 0; r < 128; r++)
+	{
+		if (m_gpr_used[r])
+		{
+			m_gpr_local[r] = static_cast<s32>(l_gpr_base + num_gpr_locals++);
+		}
+	}
 
 	// --- function body ---
 	code& c = m_code;
@@ -379,6 +479,17 @@ bool spu_wasm_recompiler::build(const spu_program& func)
 	c.ret();
 	c.end(); // $verify_ok
 
+	// Load accessed GPRs into Wasm v128 locals
+	for (u32 r = 0; r < 128; r++)
+	{
+		if (m_gpr_local[r] >= 0)
+		{
+			c.local_get(l_thread);
+			c.v128_load(off_gpr + r * 16);
+			c.local_set(static_cast<u32>(m_gpr_local[r]));
+		}
+	}
+
 	// dispatch: block $exit { loop $loop { block $bN-1 { ... block $b0 { br_table } b0 code } b1 code ... } }
 	c.block_void(); // $exit
 	c.loop_void();  // $loop
@@ -397,15 +508,8 @@ bool spu_wasm_recompiler::build(const spu_program& func)
 	c.uleb(words);
 	for (u32 i = 0; i < words; i++)
 	{
-		u32 label = block_count + 1; // default: leave the program ($exit is outside the loop)
-		for (u32 k = 0; k < block_count; k++)
-		{
-			if (starts[k] == i)
-			{
-				label = k;
-				break;
-			}
-		}
+		const s32 k = m_block_index_by_word[i];
+		const u32 label = k >= 0 ? static_cast<u32>(k) : block_count + 1;
 		c.uleb(label);
 	}
 	c.uleb(block_count + 1);
@@ -414,6 +518,7 @@ bool spu_wasm_recompiler::build(const spu_program& func)
 	for (u32 k = 0; k < block_count && !refused(); k++)
 	{
 		c.end(); // closes $bk: block k's code starts here
+		m_current_block = k;
 		m_depth = 0;
 		m_loop_depth = block_count - 1 - k;
 		m_exit_depth = block_count - k;
@@ -441,6 +546,7 @@ bool spu_wasm_recompiler::build(const spu_program& func)
 	}
 	c.end(); // $loop
 	c.end(); // $exit
+	flush_gprs();
 	c.ret();
 	c.end(); // function
 
@@ -520,10 +626,14 @@ bool spu_wasm_recompiler::build(const spu_program& func)
 	}
 	{
 		code body;
-		body.uleb(3);                  // local groups
+		body.uleb(num_gpr_locals ? 4 : 3); // local groups
 		body.uleb(4); body.emit8(0x7f);   // pc, t0, t1, t2
 		body.uleb(4); body.emit8(0x7b);   // v0, v1, v2, v3
 		body.uleb(1); body.emit8(0x7e);   // i64 scratch
+		if (num_gpr_locals)
+		{
+			body.uleb(num_gpr_locals); body.emit8(0x7b); // promoted v128 GPR locals (l_gpr_base ..)
+		}
 		body.bytes(m_code.b.data(), m_code.b.size());
 		code cs;
 		cs.uleb(1);
@@ -1010,8 +1120,7 @@ void spu_wasm_recompiler::BRNZ(spu_opcode_t op)
 
 void spu_wasm_recompiler::BRHZ(spu_opcode_t op)
 {
-	m_code.local_get(l_thread);
-	m_code.i32_load(off_gpr + op.rt * 16 + 12);
+	gpr_lane3(op.rt);
 	m_code.i32c(0xffff);
 	m_code.op(op_i32_and);
 	m_code.op(op_i32_eqz);
@@ -1024,8 +1133,7 @@ void spu_wasm_recompiler::BRHZ(spu_opcode_t op)
 
 void spu_wasm_recompiler::BRHNZ(spu_opcode_t op)
 {
-	m_code.local_get(l_thread);
-	m_code.i32_load(off_gpr + op.rt * 16 + 12);
+	gpr_lane3(op.rt);
 	m_code.i32c(0xffff);
 	m_code.op(op_i32_and);
 	m_code.if_void();
@@ -1140,6 +1248,7 @@ void spu_wasm_recompiler::HLGT(spu_opcode_t op)
 void spu_wasm_recompiler::RDCH(spu_opcode_t op)
 {
 	store_pc(m_pc); // the helper escapes to the interpreter loop when the read would block
+	flush_gprs();
 	m_code.local_get(l_thread);
 	m_code.i32c(op.ra);
 	m_code.call(f_read_channel);
@@ -1160,6 +1269,7 @@ void spu_wasm_recompiler::RCHCNT(spu_opcode_t op)
 void spu_wasm_recompiler::WRCH(spu_opcode_t op)
 {
 	store_pc(m_pc);
+	flush_gprs();
 	m_code.local_get(l_thread);
 	m_code.i32c(op.ra);
 	gpr_lane3(op.rt);
@@ -1756,8 +1866,7 @@ void spu_wasm_recompiler::conditional_indirect(spu_opcode_t op, bool halfword, b
 		bail_to_interpreter();
 		return;
 	}
-	m_code.local_get(l_thread);
-	m_code.i32_load(off_gpr + op.rt * 16 + 12);
+	gpr_lane3(op.rt);
 	if (halfword) { m_code.i32c(0xffff); m_code.op(op_i32_and); }
 	if (branch_if_zero) m_code.op(op_i32_eqz);
 	m_code.if_void();
@@ -1948,8 +2057,24 @@ void spu_wasm_recompiler::DFNMA(spu_opcode_t op)
 	gpr_store(op.rt);
 }
 
-// Not lowered yet: the program stays on the interpreter
-REFUSE(DFCGT) REFUSE(DFCMGT) REFUSE(DFTSV) REFUSE(DFCEQ) REFUSE(DFCMEQ)
+// Double-precision compares and test-special-value (eDP instructions)
+void spu_wasm_recompiler::DFCEQ(spu_opcode_t op) { gpr_load(op.ra); gpr_load(op.rb); m_code.simd(simd_f64x2_eq); gpr_store(op.rt); }
+void spu_wasm_recompiler::DFCGT(spu_opcode_t op) { gpr_load(op.ra); gpr_load(op.rb); m_code.simd(simd_f64x2_gt); gpr_store(op.rt); }
+void spu_wasm_recompiler::DFCMEQ(spu_opcode_t op)
+{
+	gpr_load(op.ra); m_code.simd(simd_f64x2_abs);
+	gpr_load(op.rb); m_code.simd(simd_f64x2_abs);
+	m_code.simd(simd_f64x2_eq);
+	gpr_store(op.rt);
+}
+void spu_wasm_recompiler::DFCMGT(spu_opcode_t op)
+{
+	gpr_load(op.ra); m_code.simd(simd_f64x2_abs);
+	gpr_load(op.rb); m_code.simd(simd_f64x2_abs);
+	m_code.simd(simd_f64x2_gt);
+	gpr_store(op.rt);
+}
+void spu_wasm_recompiler::DFTSV(spu_opcode_t) { bail_to_interpreter(); }
 
 #undef REFUSE
 #undef BINARY_V
@@ -2078,6 +2203,7 @@ namespace
 	atomic_t<u32> g_spu_web_hot_count{0};                 // entries published (release)
 	atomic_t<u32> g_spu_web_hot_compiled{0}, g_spu_web_hot_refused{0}, g_spu_web_hot_bytes{0};
 	atomic_t<u32> g_spu_web_hot_base{0};                  // first hot table index (dispatch hot path reads it)
+	u32 g_spu_web_hot_next = 0;                           // next SPU hot table index under g_spu_web_hot_mutex
 	constexpr u32 spu_web_hot_limit = 65536;              // programs per run
 	// Per hot table slot (index - base): 1 for an LLVM-tier side module, so dispatches count per tier
 	atomic_t<u8> g_spu_web_hot_kinds[spu_web_hot_limit * 2]{};
@@ -2092,15 +2218,34 @@ namespace
 	std::array<spu_web_tier_counts, 8> g_spu_web_tier_counts{};
 }
 
-// The region above the bundles is shared with the PPU runtime tier (PPUWebRecompiler.cpp)
+// The region above the bundles is shared with the PPU runtime tier (PPUWebRecompiler.cpp) when no
+// dedicated SPU hot region is reserved before PPU AOT placement.
 extern void web_hot_table_set_base(u32 base);
 extern u32 web_hot_table_base();
 extern u32 web_hot_table_reserve(u32 count);
 
+namespace
+{
+	u32 spu_web_hot_reserve(u32 count)
+	{
+		if (g_spu_web_hot_next)
+		{
+			const u32 first = g_spu_web_hot_next;
+			g_spu_web_hot_next += count;
+			return first;
+		}
+		return web_hot_table_reserve(count);
+	}
+}
+
 extern void spu_web_set_hot_table_base(u32 base)
 {
 	std::lock_guard lock(g_spu_web_hot_mutex);
-	web_hot_table_set_base(base);
+	if (!web_hot_table_base())
+	{
+		web_hot_table_set_base(base);
+	}
+	g_spu_web_hot_next = base;
 	g_spu_web_hot_base = base;
 }
 
@@ -2203,10 +2348,11 @@ extern void spu_web_llvm_slot_finish(u32 i, u8* bytes, u32 size, u32 memory_size
 }
 
 extern void spu_web_aot_register_front(const u32* pairs, u32 count);
-extern u32 spu_web_llvm_register(const u8* bytes, u32 size, u32 entry, u32 memory_size, u32 memory_align, u32 table_size, u32 imports_table);
+extern void spu_web_aot_register_replace(u32 addr, u32 old_index, u32 new_index);
+extern u32 spu_web_llvm_register(const u8* bytes, u32 size, u32 entry, u32 memory_size, u32 memory_align, u32 table_size, u32 imports_table, u32 fast_index = 0);
 
 // SPU LLVM worker thread: compile the snapshot in a compiler worker and register the side module
-extern bool spu_web_llvm_compile_remote(const be_t<u32>* ls, u32 entry)
+extern bool spu_web_llvm_compile_remote(const be_t<u32>* ls, u32 entry, u32 fast_index = 0)
 {
 	if (!g_spu_web_llvm_enabled) return false;
 
@@ -2254,7 +2400,7 @@ extern bool spu_web_llvm_compile_remote(const be_t<u32>* ls, u32 entry)
 
 	if (ok)
 	{
-		const u32 index = spu_web_llvm_register(slot->result, slot->result_size, entry, slot->memory_size, slot->memory_align, slot->table_size, slot->imports_table);
+		const u32 index = spu_web_llvm_register(slot->result, slot->result_size, entry, slot->memory_size, slot->memory_align, slot->table_size, slot->imports_table, fast_index);
 		spu_log.notice("SPU LLVM tier: 0x%05x registered at table index %u (%u bytes)", entry, index, slot->result_size);
 	}
 	else
@@ -2270,7 +2416,7 @@ extern bool spu_web_llvm_compile_remote(const be_t<u32>* ls, u32 entry)
 }
 
 // Registers a compiled side module as the first dispatch candidate of its entry; returns its table index
-extern u32 spu_web_llvm_register(const u8* bytes, u32 size, u32 entry, u32 memory_size, u32 memory_align, u32 table_size, u32 imports_table)
+extern u32 spu_web_llvm_register(const u8* bytes, u32 size, u32 entry, u32 memory_size, u32 memory_align, u32 table_size, u32 imports_table, u32 fast_index)
 {
 	std::vector<u8> module(bytes, bytes + size);
 	u32 memory_base = 0;
@@ -2286,7 +2432,7 @@ extern u32 spu_web_llvm_register(const u8* bytes, u32 size, u32 entry, u32 memor
 		std::lock_guard lock(g_spu_web_hot_mutex);
 		// Reserved under this lock so the registry stays in index order, which is what lets a worker
 		// decide from the highest index it placed whether a published entry is placed here
-		const u32 elem_base = web_hot_table_reserve(table_size + 1);
+		const u32 elem_base = spu_web_hot_reserve(table_size + 1);
 		index = elem_base + table_size;
 		g_spu_web_hot_entries.push_back({ entry, index, std::move(module), 1, elem_base, table_size, memory_base, imports_table });
 		if (const u32 slot = index - g_spu_web_hot_base.load(); slot < spu_web_hot_limit * 2) g_spu_web_hot_kinds[slot].store(1);
@@ -2335,7 +2481,7 @@ static u32 spu_web_hot_register_module(u32 entry, std::vector<u8> module)
 	u32 index;
 	{
 		std::lock_guard lock(g_spu_web_hot_mutex);
-		index = web_hot_table_reserve(1);
+		index = spu_web_hot_reserve(1);
 		g_spu_web_hot_entries.push_back({ entry, index, std::move(module) });
 		g_spu_web_hot_count.store(::size32(g_spu_web_hot_entries));
 	}
@@ -2346,6 +2492,8 @@ static u32 spu_web_hot_register_module(u32 entry, std::vector<u8> module)
 
 // SPUCommonRecompiler.cpp: hands an item to the SPU LLVM thread (spu_llvm::registered)
 extern void spu_web_llvm_enqueue_item(u64 hash, spu_item* item);
+extern void spu_web_record_miss_program(const spu_program& program);
+extern atomic_t<u32> g_spu_web_fallback_histogram;
 
 spu_function_t spu_wasm_recompiler::compile(spu_program&& _func)
 {
@@ -2365,6 +2513,10 @@ spu_function_t spu_wasm_recompiler::compile(spu_program&& _func)
 	}
 
 	const spu_program& func = add_loc->data;
+	if (g_spu_web_fallback_histogram)
+	{
+		spu_web_record_miss_program(func);
+	}
 
 	if (!build(func))
 	{
@@ -2396,7 +2548,7 @@ spu_function_t spu_wasm_recompiler::compile(spu_program&& _func)
 // Dispatch miss in spu_web_interpreter_loop: the sequence of spu_recompiler_base::dispatch
 extern bool spu_web_try_compile(spu_thread& spu)
 {
-	if (!spu.jit || !web_hot_table_base() || spu._ref<u32>(spu.pc) == 0u)
+	if (!spu.jit || !g_spu_web_hot_base.load() || spu._ref<u32>(spu.pc) == 0u)
 	{
 		return false;
 	}

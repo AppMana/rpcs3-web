@@ -267,6 +267,43 @@ public:
 	// Optimization: precomputed java-mode mask for handling denormals
 	u32 jm_mask = 0x7f80'0000;
 
+	// Last cross-instance AOT branch. Kept in the guest context so the generated
+	// Wasm can record it without crossing another module boundary.
+	u32 web_dispatch_source{};
+	u32 web_dispatch_target{};
+	u32 web_dispatch_index{};
+	u32 web_dispatch_r0{};
+	u32 web_dispatch_r1{};
+	u32 web_dispatch_r2{};
+	u32 web_dispatch_lr{};
+	u32 web_dispatch_kind{};
+	u32 web_dispatch_prev_source{};
+	u32 web_dispatch_prev_target{};
+	u32 web_dispatch_prev_index{};
+	u32 web_dispatch_prev_r0{};
+	u32 web_dispatch_prev_r1{};
+	u32 web_dispatch_prev_r2{};
+	u32 web_dispatch_prev_lr{};
+	u32 web_dispatch_prev_kind{};
+	u32 web_dispatch_r3{};
+	u32 web_dispatch_r4{};
+	u32 web_dispatch_r11{};
+	u32 web_dispatch_r12{};
+	u32 web_dispatch_prev_r3{};
+	u32 web_dispatch_prev_r4{};
+	u32 web_dispatch_prev_r11{};
+	u32 web_dispatch_prev_r12{};
+	u64 web_dispatch_r2_full{};
+	u64 web_dispatch_prev_r2_full{};
+	u32 web_hle_target{};
+	u32 web_hle_fnid{};
+	u32 web_hle_return_pc{};
+	u32 web_hle_lr_before{};
+	u32 web_hle_stack_lr{};
+	u32 web_hle_expected{};
+	u32 web_hle_actual{};
+	u32 web_hle_after{};
+
 	u32 raddr{0}; // Reservation addr
 	u64 rtime{0};
 	alignas(64) std::byte rdata[128]{}; // Reservation data

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 enum CellRescError : u32
 {
 	CELL_RESC_ERROR_NOT_INITIALIZED   = 0x80210301,
@@ -9,7 +11,7 @@ enum CellRescError : u32
 	CELL_RESC_ERROR_LESS_MEMORY       = 0x80210305,
 	CELL_RESC_ERROR_GCM_FLIP_QUE_FULL = 0x80210306,
 	CELL_RESC_ERROR_BAD_COMBINATION   = 0x80210307,
-	CELL_RESC_ERROR_x308              = 0x80210308, // TODO: find proper name
+	CELL_RESC_ERROR_x308              = 0x80210308, // Display mode not configured
 };
 
 enum
@@ -87,7 +89,7 @@ struct CellRescDsts
 
 struct CellRescInitConfig
 {
-	be_t<u32> size; // usz
+	be_t<u32> size;
 	be_t<u32> resourcePolicy;
 	be_t<u32> supportModes;
 	be_t<u32> ratioMode;
@@ -110,6 +112,33 @@ struct cell_resc_manager
 	atomic_t<bool> is_initialized = false;
 
 	u32 buffer_mode{};
+	f32 ratio_adj_x = 1.0f;
+	f32 ratio_adj_y = 1.0f;
+	f32 flex_ratio = 0.0f;
+	s32 register_count = 16;
+
+	u32 color_buffers_ea = 0;
+	u32 vertex_array_ea = 0;
+	u32 fragment_shader_ea = 0;
+
+	struct dst_entry
+	{
+		u32 format = CELL_RESC_SURFACE_A8R8G8B8;
+		u32 pitch = 0;
+		u32 height_align = 8;
+	};
+	std::array<dst_entry, 4> dsts{};
+
+	struct src_entry
+	{
+		bool valid = false;
+		u32 format = 0;
+		u32 pitch = 0;
+		u16 width = 0;
+		u16 height = 0;
+		u32 offset = 0;
+	};
+	std::array<src_entry, SRC_BUFFER_NUM> srcs{};
 
 	struct
 	{

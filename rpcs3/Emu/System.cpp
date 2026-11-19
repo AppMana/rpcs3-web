@@ -426,7 +426,7 @@ extern void dump_executable(std::span<const u8> data, const ppu_module<lv2_obj>*
 }
 
 #ifdef RPCS3_WEB
-u32 g_rpcs3_web_clocks_scale = 10;
+u32 g_rpcs3_web_clocks_scale = 24;
 // The host's SPU decoder choice (rpcs3_web_set_spu_decoder); the config default is asmjit
 spu_decoder_type g_rpcs3_web_spu_decoder = spu_decoder_type::asmjit;
 // The host's SPU block size choice (rpcs3_web_set_spu_block_size)
@@ -505,6 +505,13 @@ void Emulator::Init()
 	g_cfg.core.clocks_scale.set(g_rpcs3_web_clocks_scale);
 	g_cfg.core.spu_decoder.set(g_rpcs3_web_spu_decoder);
 	g_cfg.core.spu_block_size.set(g_rpcs3_web_spu_block_size);
+	// Wasm atomics require natural alignment, while guest lwmutex storage is only
+	// guaranteed four-byte alignment. Keep browser synchronization on C++ HLE.
+	g_cfg.core.hle_lwmutex.set(true);
+	g_cfg.core.rsx_fifo_accuracy.set(rsx_fifo_mode::fast);
+	g_cfg.savestate.compatible_mode.set(true);
+	g_cfg.savestate.suspend_emu.set(false);
+	g_cfg.savestate.start_paused.set(false);
 #endif
 	g_cfg.name.clear();
 
@@ -1077,6 +1084,11 @@ game_boot_result Emulator::BootGame(const std::string& path, const std::string& 
 		return game_boot_result::currently_restricted;
 	}
 
+#ifdef RPCS3_WEB
+	extern void ppu_web_capture_libraries_control();
+	ppu_web_capture_libraries_control();
+#endif
+
 	auto save_args = std::make_tuple(m_path, m_path_original, argv, envp, data, disc, klic, hdd1, m_config_mode, m_config_path, m_db_config);
 
 	auto restore_on_no_boot = [&](game_boot_result result)
@@ -1392,12 +1404,28 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 					fmt::throw_exception("TAR desrialization failed: Invalid size. TAR size: 0x%x, path='%s', ar: %s", size, path, *m_ar);
 				}
 
+#ifdef __EMSCRIPTEN__
+				if (size == 0)
+				{
+					fs::remove_all(path, true);
+				}
+				else
+				{
+					fs::create_path(path);
+				}
+
+				if (!special_file.empty())
+				{
+					fs::write_file<true>(special_file, fs::rewrite);
+				}
+#else
 				fs::remove_all(path, size == 0);
 
 				if (!special_file.empty())
 				{
 					fs::write_file<true>(special_file, fs::write_new);
 				}
+#endif
 
 				if (size)
 				{
@@ -1633,6 +1661,14 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 				sys_log.error("HDD1 has been used to store executable in path redirection!");
 				m_path = rpcs3::utils::get_hdd1_dir();
 				m_path += std::string_view(argv[0]).substr(9);
+			}
+			else if (argv[0].starts_with("/app_home/"sv))
+			{
+				m_path = vfs::get(argv[0]);
+				if (m_path.empty() || !fs::is_file(m_path))
+				{
+					m_path = std::string(std::string_view(argv[0]).substr(9));
+				}
 			}
 			else
 			{
@@ -2045,7 +2081,7 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 					return;
 				}
 
-#if !defined(RPCS3_WEB_INTERPRETER_ONLY) && !defined(RPCS3_PORTABLE_SPU_INTERPRETER)
+#if !defined(RPCS3_WEB_INTERPRETER_ONLY) && !(defined(RPCS3_WEB) && defined(RPCS3_PORTABLE_SPU_INTERPRETER))
 				spu_cache::initialize(false);
 #endif
 
@@ -2852,7 +2888,10 @@ void Emulator::Run(bool start_playtime)
 
 void Emulator::RunPPU()
 {
-	ensure(IsStarting());
+	if (!IsStarting() && !IsRunning())
+	{
+		return;
+	}
 
 	bool signalled_thread = false;
 
@@ -3909,7 +3948,7 @@ void Emulator::Kill(bool allow_autoexit, bool savestate, savestate_stage* save_s
 				ar(std::endian::native == std::endian::little);
 				ar(g_cfg.savestate.state_inspection_mode.get());
 
-				ar(usz{10 + sizeof(usz) + sizeof(u8)}); // Offset of versioning data (fixed to the following data)
+				ar(u64{10 + sizeof(u64) + sizeof(u8)}); // Offset of versioning data (fixed to the following data)
 
 				{
 					// Gather versions because with compressed format going back and patching offset is not efficient

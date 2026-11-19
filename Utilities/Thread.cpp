@@ -2760,7 +2760,7 @@ const bool s_terminate_handler_set = []() -> bool
 thread_local DECLARE(thread_ctrl::g_tls_this_thread) = nullptr;
 
 #ifdef RPCS3_WEB
-volatile u32 g_rpcs3_web_rsx_spawn_pending = 0;
+volatile u32 g_rpcs3_web_spawn_pending[3] = {0, 0, 0};
 
 namespace
 {
@@ -2955,10 +2955,22 @@ void thread_base::start()
 	pthread_t thread_id{};
 #ifdef RPCS3_WEB
 	// The direct WebGPU backend needs the RSX thread on the pool worker that holds the GPU
-	// device; the module's JS reads this flag when it picks a worker for the next thread.
-	if (const auto name = m_tname.load(); name && *name == "rsx::thread")
+	// device; PPU and SPU threads are routed to pre-populated role workers so general service
+	// threads do not deserialize the title's AOT bundles.
+	if (const auto name = m_tname.load())
 	{
-		g_rpcs3_web_rsx_spawn_pending = 1;
+		if (*name == "rsx::thread")
+		{
+			__atomic_store_n(&g_rpcs3_web_spawn_pending[0], 1u, __ATOMIC_SEQ_CST);
+		}
+		else if (name->starts_with("PPU["))
+		{
+			__atomic_add_fetch(&g_rpcs3_web_spawn_pending[1], 1u, __ATOMIC_SEQ_CST);
+		}
+		else if (name->starts_with("SPU[") || name->starts_with("RawSPU[") || name->starts_with("Iso["))
+		{
+			__atomic_add_fetch(&g_rpcs3_web_spawn_pending[2], 1u, __ATOMIC_SEQ_CST);
+		}
 	}
 #endif
 	ensure(pthread_create(&thread_id, nullptr, entry_point, this) == 0);
@@ -3048,6 +3060,7 @@ void thread_base::initialize(void (*error_cb)())
 		}
 	#endif
 
+#ifndef __EMSCRIPTEN__
 		if (attempts == umax)
 		{
 			g_tls_wait_time += utils::get_tsc() - stamp0;
@@ -3056,6 +3069,9 @@ void thread_base::initialize(void (*error_cb)())
 		{
 			g_tls_wait_fail += attempts - 1;
 		}
+#else
+		static_cast<void>(stamp0);
+#endif
 
 		return true;
 	});
@@ -3063,7 +3079,8 @@ void thread_base::initialize(void (*error_cb)())
 	// Web only: narrow the 1 kHz futex polling ceiling to guest CPU threads
 	// that still owe the VM writer a safe-point acknowledgement. The closure
 	// answers at call time on the waiting thread, where g_tls_this_thread is
-	// set during guest execution. Non-guest workers are unknown -> null -> poll.
+	// set during guest execution. Non-guest service threads do not participate
+	// in VM safe-points and must not wake at 1 kHz.
 	atomic_wait_engine::set_interruptible_callback([]() -> bool
 	{
 		if (const auto cpu = cpu_thread::get_current())
@@ -3071,7 +3088,7 @@ void thread_base::initialize(void (*error_cb)())
 			const auto state = +cpu->state;
 			return (state & cpu_flag::memory) || !(state & cpu_flag::wait);
 		}
-		return true;
+		return false;
 	});
 
 	set_name(thread_ctrl::get_name_cached());
@@ -3428,7 +3445,7 @@ void thread_ctrl::wait_for_accurate(u64 usec)
 		fmt::throw_exception("thread_ctrl::wait_for_accurate: unsupported amount");
 	}
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__EMSCRIPTEN__)
 	return wait_for(usec, false);
 #else
 	using namespace std::chrono_literals;
@@ -3728,6 +3745,7 @@ void thread_ctrl::set_name(std::string name)
 		reason = reason_buf;
 	}
 
+	std::fprintf(stderr, "RPCS3 thread fatal error: %.*s\n", static_cast<int>(reason.size()), reason.data());
 	sig_log.fatal("Thread terminated due to fatal error: %s", reason);
 
 	logs::listener::sync_all();

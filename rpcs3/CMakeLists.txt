@@ -7,6 +7,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/git-version.cmake)
 # Check for a sufficient compiler and set build options
 include(ConfigureCompiler)
 include(CheckFunctionExists)
+include(${CMAKE_SOURCE_DIR}/cmake/RecompForks.cmake)
 
 set(CMAKE_CXX_STANDARD 23)
 
@@ -41,8 +42,8 @@ endif()
 gen_git_version(${CMAKE_CURRENT_SOURCE_DIR})
 
 if(RPCS3_WEB)
-	set(RPCS3_WEB_INITIAL_MEMORY "536870912" CACHE STRING
-		"Initial Wasm linear-memory size for the full browser runtime")
+	set(RPCS3_WEB_INITIAL_MEMORY "1073741824" CACHE STRING
+		"Initial Wasm linear-memory size for the full browser runtime" FORCE)
 	option(RPCS3_WEB_ALLOW_MEMORY_GROWTH
 		"Allow the full browser runtime to grow its shared Wasm memory" ON)
 	# The shipped runtime is what Mobile Safari has to download and compile
@@ -51,7 +52,8 @@ if(RPCS3_WEB)
 	option(RPCS3_WEB_PROFILE
 		"Keep function names, assertions, and profiling symbols in the browser runtime" OFF)
 	add_executable(rpcs3_web_runtime
-		${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_main.cpp)
+		${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_main.cpp
+		${CMAKE_SOURCE_DIR}/tools/recomp/ModuleExtractor.cpp)
 	target_link_libraries(rpcs3_web_runtime PRIVATE
 		rpcs3_emu
 		3rdparty::fusion
@@ -64,6 +66,8 @@ if(RPCS3_WEB)
 	target_link_options(rpcs3_web_runtime PRIVATE
 		-pthread
 		"-Wl,--error-limit=0"
+		"-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache"
+		"-Wl,--thinlto-jobs=all"
 		"-sMODULARIZE=1"
 		"-sEXPORT_ES6=1"
 		"-sEXPORT_NAME=createRPCS3"
@@ -128,6 +132,15 @@ if(RPCS3_WEB)
 	else()
 		target_link_options(rpcs3_web_runtime PRIVATE "-sALLOW_MEMORY_GROWTH=0")
 	endif()
+	if(RPCS3_WEB_JSPI)
+		add_custom_command(TARGET rpcs3_web_runtime POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/web/public/core/jspi"
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				"$<TARGET_FILE_DIR:rpcs3_web_runtime>/rpcs3-web.mjs"
+				"$<TARGET_FILE_DIR:rpcs3_web_runtime>/rpcs3-web.wasm"
+				"${CMAKE_SOURCE_DIR}/web/public/core/jspi/"
+			COMMENT "Staging JSPI rpcs3-web.{mjs,wasm} into web/public/core/jspi/")
+	endif()
 
 	# Browser SPU LLVM tier: RPCS3's LLVM SPU recompiler (wasm-IR mode) with LLVM's WebAssembly
 	# backend and wasm-ld as a separate compiler worker module. Needs an Emscripten build tree of
@@ -137,17 +150,53 @@ if(RPCS3_WEB)
 	if(RPCS3_WEB_LLVM_DIR)
 		find_package(LLVM REQUIRED CONFIG PATHS "${RPCS3_WEB_LLVM_DIR}/lib/cmake/llvm" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
 		find_package(LLD REQUIRED CONFIG PATHS "${RPCS3_WEB_LLVM_DIR}/lib/cmake/lld" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
-		# One compiler module hosts both runtime tiers: LLVM and lld are 48 MB of wasm that every
-		# compiler worker instantiates, and a second module of them is not affordable on a phone.
+		set(PS3RECOMP_GHIDRA_HOME "${CMAKE_SOURCE_DIR}/3rdparty/ghidra")
+		set(PS3RECOMP_GHIDRA_CPP_DIR "${PS3RECOMP_GHIDRA_HOME}/Ghidra/Features/Decompiler/src/decompile/cpp")
+		set(PS3RECOMP_GHIDRA_NAMES
+			xml marshal space float address pcoderaw translate opcodes globalcontext
+			capability architecture options graph cover block cast typeop database cpool
+			comment stringmanage modelrules fspec action loadimage grammar varnode op type
+			variable varmap jumptable emulate emulateutil flow userop expression multiprecision
+			funcdata funcdata_block funcdata_op funcdata_varnode unionresolve pcodeinject
+			heritage prefersplit rangeutil ruleaction subflow blockaction merge double
+			transform constseq bitfield coreaction condexe override dynamic crc32 prettyprint
+			printlanguage printc printjava memstate opbehavior paramid signature
+			sleigh pcodeparse pcodecompile sleighbase slghsymbol
+			slghpatexpress slghpattern semantics context slaformat compression filemanage
+			callgraph ifacedecomp ifaceterm inject_sleigh interface
+			libdecomp loadimage_xml raw_arch rulecompile sleigh_arch testfunction unify xml_arch)
+		set(PS3RECOMP_GHIDRA_SRCS)
+		foreach(gname IN LISTS PS3RECOMP_GHIDRA_NAMES)
+			list(APPEND PS3RECOMP_GHIDRA_SRCS "${PS3RECOMP_GHIDRA_CPP_DIR}/${gname}.cc")
+		endforeach()
+		add_library(rpcs3_web_ghidra STATIC ${PS3RECOMP_GHIDRA_SRCS})
+		target_include_directories(rpcs3_web_ghidra SYSTEM PUBLIC "${PS3RECOMP_GHIDRA_CPP_DIR}")
+		target_compile_options(rpcs3_web_ghidra PRIVATE -O2 -w -pthread -fexceptions)
+		target_link_libraries(rpcs3_web_ghidra PUBLIC 3rdparty::zlib)
+
+		# One compiler module hosts both runtime tiers and the whole-module static recompiler:
 		add_executable(rpcs3_web_spu_llvm
 			${CMAKE_SOURCE_DIR}/web/host/rpcs3_spu_llvm_main.cpp
 			${CMAKE_SOURCE_DIR}/web/host/rpcs3_ppu_llvm_main.cpp
+			${CMAKE_SOURCE_DIR}/tools/recomp/ModuleExtractor.cpp
+			${CMAKE_SOURCE_DIR}/tools/recomp/GhidraCppLifter.cpp
+			${CMAKE_SOURCE_DIR}/tools/recomp/ModuleLifter.cpp
+			${CMAKE_SOURCE_DIR}/tools/recomp/ModuleCompiler.cpp
 			${CMAKE_SOURCE_DIR}/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
 			${CMAKE_SOURCE_DIR}/rpcs3/Emu/Cell/PPUTranslator.cpp
 			${CMAKE_SOURCE_DIR}/rpcs3/Emu/CPU/CPUTranslator.cpp
 			${CMAKE_SOURCE_DIR}/Utilities/JITWeb.cpp)
-		set_source_files_properties(${CMAKE_SOURCE_DIR}/rpcs3/Emu/Cell/PPUTranslator.cpp PROPERTIES
+		set_source_files_properties(
+			${CMAKE_SOURCE_DIR}/rpcs3/Emu/Cell/PPUTranslator.cpp
+			${CMAKE_SOURCE_DIR}/tools/recomp/ModuleLifter.cpp
+			${CMAKE_SOURCE_DIR}/tools/recomp/ModuleCompiler.cpp
+			PROPERTIES
 			COMPILE_FLAGS -fno-rtti
+			SKIP_PRECOMPILE_HEADERS ON)
+		set_source_files_properties(
+			${CMAKE_SOURCE_DIR}/tools/recomp/GhidraCppLifter.cpp
+			PROPERTIES
+			COMPILE_FLAGS "-fexceptions -Wno-old-style-cast"
 			SKIP_PRECOMPILE_HEADERS ON)
 		# Compiler-rt's builtins, embedded so wasm-ld can resolve what the WebAssembly backend lowers
 		# to a library call inside the browser, exactly as the offline bundles resolve it
@@ -165,6 +214,7 @@ if(RPCS3_WEB)
 		target_compile_options(rpcs3_web_spu_llvm PRIVATE "--use-port=emdawnwebgpu" -msimd128 -msse4.1)
 		target_link_libraries(rpcs3_web_spu_llvm PRIVATE
 			rpcs3_emu
+			rpcs3_web_ghidra
 			3rdparty::fusion
 			3rdparty::zlib
 			lldWasm
@@ -183,6 +233,7 @@ if(RPCS3_WEB)
 		set_target_properties(rpcs3_web_spu_llvm PROPERTIES
 			OUTPUT_NAME "rpcs3-spu-llvm"
 			SUFFIX ".mjs")
+		set(PS3RECOMP_PPC_LANG_DIR "${PS3RECOMP_GHIDRA_HOME}/Ghidra/Processors/PowerPC/data/languages")
 		target_link_options(rpcs3_web_spu_llvm PRIVATE
 			-pthread
 			"-Wl,--error-limit=0"
@@ -190,11 +241,10 @@ if(RPCS3_WEB)
 			"-sEXPORT_ES6=1"
 			"-sEXPORT_NAME=createRPCS3SpuLlvm"
 			"-sENVIRONMENT=worker"
-			# A shared memory reserves its maximum when it is created, not when it grows, so each
-			# compiler worker costs its maximum in address space for as long as it exists, and a
-			# device hands out only a few gigabytes in total. The pool reports the heap a worker
-			# actually reaches (peakHeapBytes); this is that measurement with one doubling of room.
-			"-sMAXIMUM_MEMORY=536870912"
+			"-sDISABLE_EXCEPTION_CATCHING=0"
+			# Whole-module static recompilation lifts commercial EBOOT.BINs (~25 MB -> ~500k blocks)
+			# in-memory on 1 worker before sharding across the pool; 2 GiB gives ample headroom.
+			"-sMAXIMUM_MEMORY=2147483648"
 			"-sINITIAL_MEMORY=268435456"
 			"-sALLOW_MEMORY_GROWTH=1"
 			"-sSTACK_SIZE=16777216"
@@ -207,7 +257,11 @@ if(RPCS3_WEB)
 			"-sEXPORTED_FUNCTIONS=['_main','_malloc','_free']"
 			"-sASSERTIONS=1"
 			"-sSTACK_OVERFLOW_CHECK=0"
-			"--embed-file" "${RPCS3_WEB_BUILTINS_ARCHIVE}@/lib/libclang_rt.builtins.a"
+			"SHELL:--embed-file ${RPCS3_WEB_BUILTINS_ARCHIVE}@/lib/libclang_rt.builtins.a"
+			"SHELL:--embed-file ${PS3RECOMP_PPC_LANG_DIR}/ppc.ldefs@/ghidra/Ghidra/Processors/PowerPC/data/languages/ppc.ldefs"
+			"SHELL:--embed-file ${PS3RECOMP_PPC_LANG_DIR}/ppc_64_be.sla@/ghidra/Ghidra/Processors/PowerPC/data/languages/ppc_64_be.sla"
+			"SHELL:--embed-file ${PS3RECOMP_PPC_LANG_DIR}/ppc_64.pspec@/ghidra/Ghidra/Processors/PowerPC/data/languages/ppc_64.pspec"
+			"SHELL:--embed-file ${PS3RECOMP_PPC_LANG_DIR}/ppc_64_32.cspec@/ghidra/Ghidra/Processors/PowerPC/data/languages/ppc_64_32.cspec"
 			"SHELL:--js-library ${CMAKE_SOURCE_DIR}/web/host/rpcs3_web_lib.js"
 			"-sWASM_BIGINT=1")
 	endif()
@@ -235,6 +289,8 @@ if(RPCS3_WEB)
 		tests/test_address_range.cpp
 		tests/test_fmt.cpp
 		tests/test_pair.cpp
+		tests/test_function_range_merge.cpp
+		tests/test_ppu_codegen_policy.cpp
 		tests/test_rsx_cfg.cpp
 		tests/test_rsx_fp_asm.cpp
 		tests/test_tuple.cpp
@@ -263,6 +319,9 @@ if(RPCS3_WEB)
 		"-sALLOW_MEMORY_GROWTH=1"
 		"-sINITIAL_MEMORY=33554432"
 		"-sMAXIMUM_MEMORY=536870912"
+		# Dispatch-cache tests intentionally construct the full 256-slot table on
+		# the stack so their layout matches the persistent browser ABI.
+		"-sSTACK_SIZE=4194304"
 		"-sNO_EXIT_RUNTIME=1"
 		"-sASSERTIONS=1"
 		"-sSTACK_OVERFLOW_CHECK=0"
@@ -410,6 +469,72 @@ if (NOT ANDROID)
         install(DIRECTORY ../bin/test
             DESTINATION ${CMAKE_INSTALL_DATADIR}/rpcs3)
     endif()
+
+    # Standalone decomposed PS3 -> IR / Ghidra C++ -> Wasm + HLE static recompiler CLI
+    set(PS3RECOMP_GHIDRA_HOME "${CMAKE_SOURCE_DIR}/3rdparty/ghidra")
+    set(PS3RECOMP_GHIDRA_CPP_DIR "${PS3RECOMP_GHIDRA_HOME}/Ghidra/Features/Decompiler/src/decompile/cpp")
+    if(EXISTS "${PS3RECOMP_GHIDRA_CPP_DIR}/libdecomp.cc")
+        set(PS3RECOMP_GHIDRA_NAMES
+            xml marshal space float address pcoderaw translate opcodes globalcontext
+            capability architecture options graph cover block cast typeop database cpool
+            comment stringmanage modelrules fspec action loadimage grammar varnode op type
+            variable varmap jumptable emulate emulateutil flow userop expression multiprecision
+            funcdata funcdata_block funcdata_op funcdata_varnode unionresolve pcodeinject
+            heritage prefersplit rangeutil ruleaction subflow blockaction merge double
+            transform constseq bitfield coreaction condexe override dynamic crc32 prettyprint
+            printlanguage printc printjava memstate opbehavior paramid signature
+            sleigh pcodeparse pcodecompile sleighbase slghsymbol
+            slghpatexpress slghpattern semantics context slaformat compression filemanage
+            callgraph ifacedecomp ifaceterm inject_sleigh interface
+            libdecomp loadimage_xml raw_arch rulecompile sleigh_arch testfunction unify xml_arch)
+        set(PS3RECOMP_GHIDRA_SRCS)
+        foreach(gname IN LISTS PS3RECOMP_GHIDRA_NAMES)
+            list(APPEND PS3RECOMP_GHIDRA_SRCS "${PS3RECOMP_GHIDRA_CPP_DIR}/${gname}.cc")
+        endforeach()
+        add_library(ps3recomp_ghidra STATIC ${PS3RECOMP_GHIDRA_SRCS})
+        target_include_directories(ps3recomp_ghidra SYSTEM PUBLIC "${PS3RECOMP_GHIDRA_CPP_DIR}")
+        target_compile_options(ps3recomp_ghidra PRIVATE -O2 -w -fexceptions)
+
+        add_executable(ps3recomp
+            ${CMAKE_SOURCE_DIR}/tools/recomp/ps3recomp_main.cpp
+            ${CMAKE_SOURCE_DIR}/tools/recomp/ModuleExtractor.cpp
+            ${CMAKE_SOURCE_DIR}/tools/recomp/GhidraCppLifter.cpp
+            ${CMAKE_SOURCE_DIR}/tools/recomp/ModuleLifter.cpp
+            ${CMAKE_SOURCE_DIR}/tools/recomp/ModuleCompiler.cpp)
+        set_source_files_properties(
+            ${CMAKE_SOURCE_DIR}/tools/recomp/ModuleLifter.cpp
+            ${CMAKE_SOURCE_DIR}/tools/recomp/ModuleCompiler.cpp
+            PROPERTIES
+            COMPILE_FLAGS -fno-rtti
+            SKIP_PRECOMPILE_HEADERS ON)
+        set_source_files_properties(
+            ${CMAKE_SOURCE_DIR}/tools/recomp/GhidraCppLifter.cpp
+            PROPERTIES
+            COMPILE_FLAGS -fexceptions
+            SKIP_PRECOMPILE_HEADERS ON)
+        target_compile_definitions(ps3recomp PRIVATE
+            LLVM_AVAILABLE
+            PS3RECOMP_DEFAULT_GHIDRA_HOME="${PS3RECOMP_GHIDRA_HOME}")
+        target_include_directories(ps3recomp PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/tools/recomp
+            "${PS3RECOMP_GHIDRA_CPP_DIR}")
+        if(TARGET 3rdparty_llvm)
+            target_link_libraries(ps3recomp PRIVATE 3rdparty_llvm)
+        endif()
+        target_link_libraries(ps3recomp PRIVATE
+            rpcs3_lib
+            rpcs3_emu
+            ps3recomp_ghidra
+            3rdparty::wolfssl
+            3rdparty::zlib
+            3rdparty::fusion
+            ${CMAKE_DL_LIBS}
+            pthread
+            rt)
+        set_target_properties(ps3recomp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    endif()
 endif()
 
 # Unit tests
@@ -426,6 +551,7 @@ if(BUILD_RPCS3_TESTS)
             tests/test_bit_set.cpp
             tests/test_fmt.cpp
             tests/test_pair.cpp
+            tests/test_ppu_codegen_policy.cpp
             tests/test_tuple.cpp
             tests/test_simple_array.cpp
             tests/test_address_range.cpp

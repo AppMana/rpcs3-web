@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "target": "/opfs/games/LittleBigPlanet 2 - Special Edition (USA) (En,Fr,Es,Pt).iso",
+  "entries": [
+    { "frame": 1575, "digital1": 8, "digital2": 64, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 1582, "digital1": 0, "digital2": 0, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 1593, "digital1": 8, "digital2": 64, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 1600, "digital1": 0, "digital2": 0, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 2400, "digital1": 0, "digital2": 0, "leftX": 255, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 2425, "digital1": 0, "digital2": 64, "leftX": 255, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 2435, "digital1": 0, "digital2": 0, "leftX": 255, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 2475, "digital1": 0, "digital2": 64, "leftX": 255, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 2485, "digital1": 0, "digital2": 0, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 2700, "digital1": 0, "digital2": 64, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 2715, "digital1": 0, "digital2": 0, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 3000, "digital1": 8, "digital2": 0, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 3015, "digital1": 0, "digital2": 0, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 3300, "digital1": 0, "digital2": 64, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 3315, "digital1": 0, "digital2": 0, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 3600, "digital1": 0, "digital2": 64, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 3615, "digital1": 0, "digital2": 0, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 3900, "digital1": 0, "digital2": 64, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 3915, "digital1": 0, "digital2": 0, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 }
+  ]
+}

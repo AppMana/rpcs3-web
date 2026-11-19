@@ -1556,11 +1556,14 @@ bool lv2_obj::sleep_unlocked(cpu_thread& thread, u64 timeout, u64 current_time)
 			{
 				g_to_sleep.erase(it);
 				ppu->start_time = start_time;
+				ppu->end_time = timeout ? start_time + std::min<u64>(timeout, ~start_time) : u64{umax};
 				on_to_sleep_update();
 				return true;
 			}
 
 			// Already sleeping
+			ppu->start_time = start_time;
+			ppu->end_time = timeout ? start_time + std::min<u64>(timeout, ~start_time) : u64{umax};
 			ppu_log.trace("sleep(): called on already sleeping thread.");
 			return false;
 		}
@@ -2178,7 +2181,7 @@ bool lv2_obj::wait_timeout(u64 usec, ppu_thread* cpu, bool scale, bool is_usleep
 		}
 
 		u64 remaining = usec - passed;
-#ifdef __linux__
+#if defined(__linux__) || defined(__EMSCRIPTEN__)
 		// NOTE: Assumption that timer initialization has succeeded
 		constexpr u64 host_min_quantum = 10;
 #else
@@ -2196,7 +2199,7 @@ bool lv2_obj::wait_timeout(u64 usec, ppu_thread* cpu, bool scale, bool is_usleep
 		{
 			if (remaining > host_min_quantum)
 			{
-#ifdef __linux__
+#if defined(__linux__) || defined(__EMSCRIPTEN__)
 				// With timerslack set low, Linux is precise for all values above
 				wait_for(remaining);
 #else
@@ -2222,8 +2225,14 @@ bool lv2_obj::wait_timeout(u64 usec, ppu_thread* cpu, bool scale, bool is_usleep
 #endif
 			else
 			{
+#ifdef __EMSCRIPTEN__
+				// std::this_thread::yield() is a no-op on WebAssembly pthread workers, so
+				// spinning here burns 100% CPU calling performance.now() and locking task queues.
+				wait_for(remaining);
+#else
 				// Try yielding. May cause long wake latency but helps weaker CPUs a lot by alleviating resource pressure
 				std::this_thread::yield();
+#endif
 			}
 		}
 
@@ -2301,18 +2310,20 @@ void lv2_obj::notify_all() noexcept
 
 	atomic_t<u64, 128>* range_lock = nullptr;
 
-	if (cpu->get_class() == thread_class::spu)
+	if (cpu && cpu->get_class() == thread_class::spu)
 	{
 		range_lock = static_cast<spu_thread*>(cpu)->range_lock;
 	}
 
-	for (usz i = 0, checked = 0; checked < 4 && i < total_waiters; i++)
+	const u32 cpu_id = cpu ? cpu->id : 0;
+
+	for (usz i = 0, checked = 0; checked < total_waiters && i < total_waiters; i++)
 	{
-		auto& waiter = spu_thread::g_spu_waiters_by_value[(i + cpu->id) % total_waiters];
+		auto& waiter = spu_thread::g_spu_waiters_by_value[(i + cpu_id) % total_waiters];
 		const u64 value = waiter.load();
 		u32 raddr = static_cast<u32>(value) & -128;
 
-		if (vm::check_addr(raddr))
+		if (raddr && vm::check_addr(raddr))
 		{
 			if (((raddr >> 28) < 2 || (raddr >> 28) == 0xd))
 			{
@@ -2368,7 +2379,7 @@ void lv2_obj::notify_all() noexcept
 		}
 	}
 
-	if (range_lock && cpu->get_class() != thread_class::spu)
+	if (range_lock && (!cpu || cpu->get_class() != thread_class::spu))
 	{
 		vm::free_range_lock(range_lock);
 	}

@@ -2,6 +2,7 @@ import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "tests/e2e",
+  outputDir: "test-results/playwright",
   // The default/CI lane does not assume a WebGPU adapter. The dedicated GPU
   // config runs both correctness tests (software adapters allowed) and strict
   // hardware gates (software adapters rejected).

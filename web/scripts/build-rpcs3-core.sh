@@ -60,10 +60,10 @@ else
 fi
 
 # The browser LLVM tiers' compiler module builds when an Emscripten LLVM+lld tree is available
-# (RPCS3_WEB_LLVM_DIR, default ~/llvm-wasm/build-wasm; see PLAN.md for the build recipe). It is not
-# part of the suspending build: it runs in its own worker and never suspends, and the LLVM archives
-# are built with Emscripten's own longjmp, which that build's -sSUPPORT_LONGJMP=wasm cannot resolve.
-# The page loads the one module beside the core in either case.
+# (RPCS3_WEB_LLVM_DIR, default ~/llvm-wasm/build-wasm; see PLAN.md for the build recipe). It is never
+# linked into the suspending runtime: it runs in its own worker and the LLVM archives are built with
+# Emscripten's own longjmp, which the JSPI build's -sSUPPORT_LONGJMP=wasm cannot resolve. JSPI builds
+# therefore refresh the compiler through a separate non-JSPI build after staging the core.
 llvm_dir="${RPCS3_WEB_LLVM_DIR:-${HOME}/llvm-wasm/build-wasm}"
 if [[ -f "${llvm_dir}/lib/cmake/llvm/LLVMConfig.cmake" && "${profile_flag}" == "OFF" && "${jspi_flag}" == "OFF" ]]; then
   targets+=(rpcs3_web_spu_llvm)
@@ -164,3 +164,13 @@ if [[ -n "${llvm_dir}" ]]; then
   stage rpcs3-spu-llvm.wasm
 fi
 ls -l "${stage_dir}/rpcs3-web.wasm"
+
+compiler_llvm_dir="${RPCS3_WEB_LLVM_DIR:-${HOME}/llvm-wasm/build-wasm}"
+if [[ "${jspi_flag}" == "ON" && -f "${compiler_llvm_dir}/lib/cmake/llvm/LLVMConfig.cmake" ]]; then
+  echo "Refreshing the non-JSPI compiler worker used by the JSPI runtime" >&2
+  RPCS3_WEB_PROFILE=0 \
+  RPCS3_WEB_JSPI=0 \
+  RPCS3_WEB_TARGETS=rpcs3_web_spu_llvm \
+  RPCS3_WEB_JOBS="${build_jobs}" \
+    "${BASH_SOURCE[0]}"
+fi

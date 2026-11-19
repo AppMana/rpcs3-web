@@ -2,6 +2,8 @@
 
 #ifdef RPCS3_WEB
 #include "JIT.h"
+#include "LLVMOptimization.h"
+#include "PPUCodegenPolicy.h"
 #include "util/logs.hpp"
 #include "WasmRegion.h"
 #include "WasmCallPolicy.h"
@@ -10,8 +12,6 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/MC/TargetRegistry.h"
-#include "llvm/Passes/PassBuilder.h"
-#include "llvm/Passes/OptimizationLevel.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/TargetSelect.h"
@@ -87,20 +87,8 @@ std::vector<u8> jit_compiler::emit_wasm(llvm::Module& module, std::string& error
 		// so live code runs measurably weaker than the AOT bundles. NewPM is linked in
 		// (SPULLVMRecompiler.cpp uses PassBuilder already); the +simd128 feature lets the
 		// LoopVectorizer emit v128 for guest vector loops.
-		LoopAnalysisManager lam;
-		FunctionAnalysisManager fam;
-		CGSCCAnalysisManager cgam;
-		ModuleAnalysisManager mam;
-
-		PassBuilder pb(m_target_machine.get());
-		pb.registerModuleAnalyses(mam);
-		pb.registerCGSCCAnalyses(cgam);
-		pb.registerFunctionAnalyses(fam);
-		pb.registerLoopAnalyses(lam);
-		pb.crossRegisterProxies(lam, fam, cgam, mam);
-
-		ModulePassManager mpm = pb.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
-		mpm.run(module, mam);
+		const ppu_codegen_policy policy = make_ppu_codegen_policy(ppu_backend_kind::jit, ppu_target_kind::wasm);
+		llvm_opt::optimize_module(module, m_target_machine.get(), policy.optimization);
 
 		raw_svector_ostream stream(object);
 		legacy::PassManager passes;

@@ -17,7 +17,12 @@ if (!inputArg || !outputArg) {
   throw new Error("usage: build-ppu-aot-bundle.mjs IR_DIR OUT_DIR [--jobs N]");
 }
 const jobsOption = options.find((option) => option.startsWith("--jobs="));
-const jobs = Math.max(1, Number(jobsOption?.slice("--jobs=".length)) || Math.min(8, availableParallelism()));
+const jobs = Math.max(1, Number(jobsOption?.slice("--jobs=".length)) || availableParallelism());
+const semanticsOption = options.find((option) => option.startsWith("--semantics-version="));
+const semanticsVersion = Number(semanticsOption?.slice("--semantics-version=".length));
+if (!Number.isSafeInteger(semanticsVersion) || semanticsVersion <= 0) {
+  throw new Error("build-ppu-aot-bundle.mjs requires --semantics-version=N");
+}
 const inputDirectory = resolve(inputArg);
 const outputDirectory = resolve(outputArg);
 const compiler = join(dirname(fileURLToPath(import.meta.url)), "compile-ppu-ir-to-wasm.mjs");
@@ -25,6 +30,13 @@ mkdirSync(outputDirectory, { recursive: true });
 
 const sources = readdirSync(inputDirectory).filter((name) => name.endsWith(".wasm.ll")).sort();
 if (!sources.length) throw new Error(`no .wasm.ll parts under ${inputDirectory}`);
+const sourceSemanticsVersions = new Set(sources
+  .map((name) => /-v(\d+)\.obj\.wasm\.ll$/.exec(name)?.[1])
+  .filter(Boolean)
+  .map(Number));
+if (sourceSemanticsVersions.size && (sourceSemanticsVersions.size !== 1 || !sourceSemanticsVersions.has(semanticsVersion))) {
+  throw new Error(`IR semantics version ${[...sourceSemanticsVersions].join(", ")} does not match --semantics-version=${semanticsVersion}`);
+}
 
 async function mapConcurrent(items, limit, worker) {
   const results = new Array(items.length);
@@ -127,7 +139,7 @@ async function describe(wasmPath, group, members) {
 const parts = [];
 for (const [group, members] of groups) {
   const wasmPath = join(outputDirectory, `${group}.wasm`);
-  execFileSync(process.execPath, [compiler, ...members.map((member) => join(inputDirectory, member)), wasmPath, "--pic", `--jobs=${jobs}`, ...(options.includes("--inline-reads") ? ["--inline-reads"] : [])], { stdio: ["ignore", "ignore", "inherit"] });
+  execFileSync(process.execPath, [compiler, ...members.map((member) => join(inputDirectory, member)), wasmPath, "--pic", `--jobs=${jobs}`, ...(options.includes("--regions") ? ["--regions"] : []), ...(options.includes("--direct-exits") ? ["--direct-exits"] : []), ...(options.includes("--unary-swizzles") ? ["--unary-swizzles"] : []), ...(options.includes("--inline-reads") ? ["--inline-reads"] : []), ...(options.includes("--inline-writes") ? ["--inline-writes"] : [])], { stdio: ["ignore", "ignore", "inherit"] });
   parts.push(await describe(wasmPath, group, members));
 }
 
@@ -135,6 +147,17 @@ const manifest = {
   version: 1,
   generatedAt: new Date().toISOString(),
   source: basename(inputDirectory),
+  // The runtime rejects bundles compiled under another branch policy or
+  // translator version. Without this check a stale checked-in bundle silently
+  // shadows the current compiler and can preserve continuation bugs after the
+  // source has already been fixed.
+  codegen: {
+    semanticsVersion,
+    returnDispatch: options.includes("--return-dispatch"),
+    inlineReads: options.includes("--inline-reads"),
+    inlineWrites: options.includes("--inline-writes"),
+    wasmRegions: options.includes("--regions"),
+  },
   parts,
 };
 writeFileSync(join(outputDirectory, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);

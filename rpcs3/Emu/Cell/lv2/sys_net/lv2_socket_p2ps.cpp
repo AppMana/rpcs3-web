@@ -3,6 +3,7 @@
 #include "Utilities/Thread.h"
 #include "util/atomic.hpp"
 #include "lv2_socket_p2ps.h"
+#include "Emu/System.h"
 #include "Emu/NP/np_helpers.h"
 #include "nt_p2p_port.h"
 #include "network_context.h"
@@ -305,6 +306,25 @@ lv2_socket_p2ps::lv2_socket_p2ps(utils::serial& ar, lv2_socket_type type)
 	if (GET_SERIALIZATION_VERSION(lv2_net) < 3 && status == p2ps_stream_status::stream_closed && op_addr)
 	{
 		status = p2ps_stream_status::stream_disconnected;
+	}
+
+	if (port && vport)
+	{
+		Emu.PostponeInitCode([this]()
+		{
+			auto& nc = g_fxo->get<p2p_context>();
+			std::lock_guard list_lock(nc.list_p2p_ports_mutex);
+			nc.create_p2p_port(port);
+			auto& pport = ::at32(nc.list_p2p_ports, port);
+			native_socket = pport.p2p_socket;
+			std::lock_guard lock(pport.bound_p2p_vports_mutex);
+			pport.bound_p2ps_vports[vport].insert(lv2_id);
+			if (op_addr && op_vport)
+			{
+				const u64 key = op_addr | (static_cast<u64>(vport) << 32) | (static_cast<u64>(op_vport) << 48);
+				pport.bound_p2p_streams.emplace(key, lv2_id);
+			}
+		});
 	}
 }
 

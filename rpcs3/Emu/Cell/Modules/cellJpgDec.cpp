@@ -33,15 +33,23 @@ void fmt_class_string<CellJpgDecError>::format(std::string& out, u64 arg)
 	});
 }
 
-error_code cellJpgDecCreate(u32 mainHandle, u32 threadInParam, u32 threadOutParam)
+error_code cellJpgDecCreate(vm::ptr<u32> mainHandle, u32 threadInParam, u32 threadOutParam)
 {
-	cellJpgDec.todo("cellJpgDecCreate(mainHandle=0x%x, threadInParam=0x%x, threadOutParam=0x%x)", mainHandle, threadInParam, threadOutParam);
+	cellJpgDec.todo("cellJpgDecCreate(mainHandle=*0x%x, threadInParam=0x%x, threadOutParam=0x%x)", mainHandle, threadInParam, threadOutParam);
+	if (mainHandle)
+	{
+		*mainHandle = 1;
+	}
 	return CELL_OK;
 }
 
-error_code cellJpgDecExtCreate(u32 mainHandle, u32 threadInParam, u32 threadOutParam, u32 extThreadInParam, u32 extThreadOutParam)
+error_code cellJpgDecExtCreate(vm::ptr<u32> mainHandle, u32 threadInParam, u32 threadOutParam, u32 extThreadInParam, u32 extThreadOutParam)
 {
-	cellJpgDec.todo("cellJpgDecExtCreate(mainHandle=0x%x, threadInParam=0x%x, threadOutParam=0x%x, extThreadInParam=0x%x, extThreadOutParam=0x%x)", mainHandle, threadInParam, threadOutParam, extThreadInParam, extThreadOutParam);
+	cellJpgDec.todo("cellJpgDecExtCreate(mainHandle=*0x%x, threadInParam=0x%x, threadOutParam=0x%x, extThreadInParam=0x%x, extThreadOutParam=0x%x)", mainHandle, threadInParam, threadOutParam, extThreadInParam, extThreadOutParam);
+	if (mainHandle)
+	{
+		*mainHandle = 1;
+	}
 	return CELL_OK;
 }
 
@@ -141,6 +149,17 @@ error_code cellJpgDecReadHeader(u32 mainHandle, u32 subHandle, vm::ptr<CellJpgDe
 		break;
 	}
 	default: break; // TODO
+	}
+
+	int stbi_w = 0, stbi_h = 0, stbi_comp = 0;
+	if (stbi_info_from_memory(buffer.data(), ::narrow<int>(fileSize), &stbi_w, &stbi_h, &stbi_comp))
+	{
+		current_info.imageWidth    = stbi_w;
+		current_info.imageHeight   = stbi_h;
+		current_info.numComponents = stbi_comp > 0 ? stbi_comp : 3;
+		current_info.colorSpace    = stbi_comp == 1 ? CELL_JPG_GRAYSCALE : CELL_JPG_RGB;
+		*info = current_info;
+		return CELL_OK;
 	}
 
 	if (read_from_ptr<le_t<u32>>(buffer, 0) != 0xE0FFD8FF || // Error: Not a valid SOI header

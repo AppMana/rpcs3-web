@@ -16,6 +16,7 @@ addToLibrary({
   // bodies are verbatim the EM_JS bodies they replace; the C++ callers declare
   // them extern "C" and see no difference.
   rpcs3_web_ppu_hot_sync: function() { return rpcs3PpuHotSyncImpl() >>> 0; },
+  rpcs3_web_ppu_hot_ensure: function(targetIndex, outSpanPtr) { return rpcs3PpuHotEnsureImpl(targetIndex >>> 0, outSpanPtr >>> 0) >>> 0; },
   rpcs3_web_spu_hot_sync: function() { return rpcs3SpuHotSyncImpl() >>> 0; },
   rpcs3_web_ppu_aot_worker_ready: function() { if (!self.__rpcs3PpuAotReady && Module["rpcs3EnsureAot"]) Module["rpcs3EnsureAot"]("rpcs3PpuAot"); return self.__rpcs3PpuAotReady ? 1 : 0; },
   rpcs3_web_spu_aot_worker_ready: function() { if (!self.__rpcs3SpuAotReady && Module["rpcs3EnsureAot"]) Module["rpcs3EnsureAot"]("rpcs3SpuAot"); return self.__rpcs3SpuAotReady ? 1 : 0; },

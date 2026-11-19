@@ -81,6 +81,7 @@ struct spu_web_aot_list
 
 // Per local-store word: immutable candidate lists published by the module thread, read by SPU threads
 static std::array<atomic_t<spu_web_aot_list*>, SPU_LS_SIZE / 4> g_spu_web_aot_lists{};
+static atomic_t<u32> g_spu_web_aot_list_epoch{1};
 // Dispatch statistics. Every SPU thread increments these on every block it dispatches, so each
 // thread owns a cache line of its own and the totals are summed when something asks for them.
 struct alignas(128) spu_web_dispatch_stats
@@ -222,8 +223,9 @@ u64 spu_web_aot_fallback_count()
 	return total;
 }
 
-// Misses at an unlisted block start before it is compiled (rpcs3_web_spu_set_hot_threshold)
-atomic_t<u32> g_spu_web_hot_threshold{256};
+// Misses at an unlisted block start before it is compiled (rpcs3_web_spu_set_hot_threshold).
+// Default 1 = compile immediately before executing so SPU code never interprets while warming up.
+atomic_t<u32> g_spu_web_hot_threshold{1};
 
 // Diagnosis: per-pc counts of dispatch attempts whose candidates all failed verification
 // ("listed") and of interpreter iterations at pcs without compiled candidates ("unlisted").
@@ -312,6 +314,7 @@ static void spu_web_aot_register_pairs(const u32* pairs, u32 count, bool front)
 		std::copy(indices.begin(), indices.end(), list->indices);
 		slot.store(list); // copy-on-write; the old list stays valid for readers
 	}
+	g_spu_web_aot_list_epoch++;
 }
 
 extern void spu_web_aot_register(const u32* pairs, u32 count)
@@ -322,6 +325,31 @@ extern void spu_web_aot_register(const u32* pairs, u32 count)
 extern void spu_web_aot_register_front(const u32* pairs, u32 count)
 {
 	spu_web_aot_register_pairs(pairs, count, true);
+}
+
+extern void spu_web_aot_register_replace(u32 addr, u32 old_index, u32 new_index)
+{
+	addr &= 0x3fffc;
+	auto& slot = g_spu_web_aot_lists[addr / 4];
+	std::vector<u32> indices;
+	indices.push_back(new_index);
+	if (const auto old = slot.load())
+	{
+		indices.reserve(old->count + 1);
+		for (u32 i = 0; i < old->count; ++i)
+		{
+			const u32 idx = old->indices[i];
+			if (idx != old_index && idx != new_index)
+			{
+				indices.push_back(idx);
+			}
+		}
+	}
+	const auto list = static_cast<spu_web_aot_list*>(std::malloc(sizeof(spu_web_aot_list) + indices.size() * sizeof(u32)));
+	list->count = ::size32(indices);
+	std::copy(indices.begin(), indices.end(), list->indices);
+	slot.store(list);
+	g_spu_web_aot_list_epoch++;
 }
 atomic_t<u64> g_spu_web_ls_boundary_count{0};
 atomic_t<u64> g_spu_web_ls_boundary_last{0};
@@ -337,7 +365,7 @@ static void spu_web_note_ls_boundary(u32 lsa, u32 size)
 {
 	const u32 offset = lsa & (SPU_LS_SIZE - 1);
 
-	if (lsa >= SPU_LS_SIZE || size > SPU_LS_SIZE - offset)
+	if (lsa >= SPU_LS_SIZE || size > SPU_LS_SIZE - offset) [[unlikely]]
 	{
 		g_spu_web_ls_boundary_last = (u64{lsa} << 32) | size;
 		g_spu_web_ls_boundary_count++;
@@ -348,7 +376,11 @@ static void spu_web_note_ls_boundary(u32 lsa, u32 size)
 #ifdef RPCS3_WEB
 static bool spu_web_dma_is_contiguous(u32 ea, u32 size)
 {
-	if (!size || ea >= RAW_SPU_BASE_ADDR || vm::web_is_contiguous(ea, size))
+	if (!size || ea >= RAW_SPU_BASE_ADDR)
+	{
+		return true;
+	}
+	if (((ea ^ (ea + size - 1)) < 0x1000) ? (vm::g_web_pages[ea >> 12] != nullptr) : vm::web_is_contiguous(ea, size))
 	{
 		return true;
 	}
@@ -503,6 +535,9 @@ static FORCE_INLINE void __movsb(unsigned char * Dst, const unsigned char * Src,
 		"[Dst]" (Dst), "[Src]" (Src), "[Size]" (Size)
 	);
 }
+#elif defined(__wasm__)
+#define s_rep_movsb_threshold 1024u
+#define __movsb std::memcpy
 #else
 #define s_rep_movsb_threshold umax
 #define __movsb std::memcpy
@@ -573,6 +608,10 @@ static FORCE_INLINE int16x8_t cmp16_pair_accum_arm64(
 
 #ifdef _MSC_VER
 __forceinline
+#elif defined(__clang__)
+__attribute__((always_inline))
+#else
+inline
 #endif
 extern bool cmp_rdata(const spu_rdata_t& _lhs, const spu_rdata_t& _rhs)
 {
@@ -668,6 +707,10 @@ static inline usz scan16_rdata(const decltype(spu_thread::rdata)& _lhs, const de
 
 #ifdef _MSC_VER
 __forceinline
+#elif defined(__clang__)
+__attribute__((always_inline))
+#else
+inline
 #endif
 extern void mov_rdata(spu_rdata_t& _dst, const spu_rdata_t& _src)
 {
@@ -706,6 +749,10 @@ extern void mov_rdata(spu_rdata_t& _dst, const spu_rdata_t& _src)
 
 #ifdef _MSC_VER
 __forceinline
+#elif defined(__clang__)
+__attribute__((always_inline))
+#else
+inline
 #endif
 extern u32 compute_rdata_hash32(const spu_rdata_t& _src)
 {
@@ -912,20 +959,24 @@ namespace spu
 			u32 pc = 0;
 			bool active = false;
 
-			concurrent_execution_watchdog(spu_thread& spu)
+			concurrent_execution_watchdog([[maybe_unused]] spu_thread& spu)
 				:pc(spu.pc)
 			{
+#ifndef RPCS3_WEB
 				if (const u32 max_concurrent_instructions = g_cfg.core.preferred_spu_threads)
 				{
 					acquire_pc_address(spu, pc, g_cfg.core.spu_delay_penalty, max_concurrent_instructions);
 					active = true;
 				}
+#endif
 			}
 
 			~concurrent_execution_watchdog()
 			{
+#ifndef RPCS3_WEB
 				if (active)
 					release_pc_address(pc);
+#endif
 			}
 		};
 	}
@@ -1811,7 +1862,7 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 	chain.failure = reinterpret_cast<uptr>(&spu.block_failure);
 	chain.state = reinterpret_cast<uptr>(&spu.state);
 	chain.lists = reinterpret_cast<uptr>(g_spu_web_aot_lists.data());
-	chain.cache = reinterpret_cast<uptr>(candidate_cache.chain_entries());
+	chain.cache = reinterpret_cast<uptr>(candidate_cache.direct_chain_entries());
 	chain.edge_slots = reinterpret_cast<uptr>(stats.edges.data());
 	u32 profile_iterations = 0;
 	u64 attempts = stats.attempts.load(), rejected = stats.rejected.load();
@@ -1911,6 +1962,8 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 				// Compiled code takes interrupts at its own spu_check_interrupts sites, as the native
 				// recompiled path does; cpu_work must not redirect pc underneath it
 				spu.allow_interrupts_in_cpu_work = false;
+				candidate_cache.sync_epoch(g_spu_web_aot_list_epoch.load());
+				u8* const ls_ptr = spu._ptr<u8>(0);
 
 				const u32 selected = candidate_cache.find(pc_before, list, list->count, [&](u32 i)
 				{
@@ -1939,10 +1992,11 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 					{
 						const auto& span = g_spu_web_chain_spans[part];
 						if (index < span.begin || index >= span.end) continue;
+						candidate_cache.set_direct_target(pc_before, index);
 						chain.table_begin = span.begin;
 						chain.table_end = span.end;
 						chain.target = index;
-						chain.budget = web_slice_enabled ? std::min<u32>(64, 65536 - web_slice_iterations) : 64;
+						chain.budget = web_slice_enabled ? std::min<u32>(1024, 65536 - web_slice_iterations) : 1024;
 						u32 runner = span.region_runners ? span.region_runners[index - span.begin] : 0;
 						if (!runner) runner = span.runner;
 						if (span.profile_runner)
@@ -1950,7 +2004,7 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 							chain.profile_clock = chain.profile_clock * 1664525u + 1013904223u;
 							if (((chain.profile_clock >> 16) & 1023) == 0) runner = span.profile_runner;
 						}
-						reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(runner))(&spu, spu._ptr<u8>(0), reinterpret_cast<uptr>(&chain));
+						reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(runner))(&spu, ls_ptr, reinterpret_cast<uptr>(&chain));
 						chained = true;
 						if (profile_dispatch)
 						{
@@ -1964,9 +2018,13 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 						}
 						break;
 					}
-					if (!chained) reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(index))(&spu, spu._ptr<u8>(0), 0);
+					if (!chained) reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(index))(&spu, ls_ptr, 0);
 					// A downstream rejection does not undo earlier completed blocks.
-					ran = chained ? chain.completed != 0 || chain.reason == SPU_CHAIN_STATE : spu.block_failure == failures;
+					ran = chained ? chain.completed != 0 : spu.block_failure == failures;
+					if (cache_dispatch)
+					{
+						candidate_cache.set_direct_target(pc_before, ran ? index : 0);
+					}
 					if (profile_dispatch)
 					{
 						attempts += chained ? chain.completed + (chain.reason == SPU_CHAIN_REJECTED) : 1;
@@ -1974,20 +2032,69 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 					}
 					if (ran && index >= hot_base) spu_web_note_hot_dispatch(index - hot_base, stats_slot);
 					return ran;
-				}, cache_dispatch);
+				}, cache_dispatch, ls_ptr);
 				ran = selected < list->count;
+				if (chained && chain.completed != 0 && chain.reason == SPU_CHAIN_REJECTED && cache_dispatch)
+				{
+					if (const auto rejected_list = g_spu_web_aot_lists[(spu.pc & 0x3fffc) / 4].load())
+					{
+						candidate_cache.note_rejected(spu.pc, rejected_list, rejected_list->count);
+					}
+				}
+				u32 completed_blocks = chained ? chain.completed : 1;
+				bool interpret_tail = chained ? (chain.reason == SPU_CHAIN_INTERPRET) : (spu.pc == pc_before);
+
+				if ((!chained || chain.reason == SPU_CHAIN_OTHER_MODULE) && ran && cache_dispatch && !interpret_tail)
+				{
+					const u32 budget = web_slice_enabled ? std::min<u32>(1024, 65536 - web_slice_iterations) : 1024;
+					for (u32 n = completed_blocks; n < budget; ++n)
+					{
+						if (spu.state) [[unlikely]] break;
+						const u32 step_pc = spu.pc;
+						const auto next_list = g_spu_web_aot_lists[(step_pc & 0x3fffc) / 4].load();
+						u32 cand = 0;
+						if (!next_list || !candidate_cache.cached_candidate(step_pc, next_list, next_list->count, cand)) break;
+						const u32 next_index = next_list->indices[cand];
+						if (chain_spans && next_index < hot_base) break;
+						if (next_index >= hot_base && next_index > hot_placed) [[unlikely]] break;
+						const u64 step_failures = spu.block_failure;
+						reinterpret_cast<spu_web_aot_func_t>(static_cast<uptr>(next_index))(&spu, ls_ptr, 0);
+						if (spu.block_failure != step_failures) [[unlikely]]
+						{
+							candidate_cache.note_rejected(step_pc, next_list, next_list->count);
+							if (profile_dispatch) { attempts++; rejected++; }
+							if constexpr (g_spu_web_cache_profile_enabled) ++candidate_cache.observations.preferred_rejections;
+							break;
+						}
+						if constexpr (g_spu_web_cache_profile_enabled) ++candidate_cache.observations.preferred_hits;
+						completed_blocks++;
+						if (profile_dispatch) attempts++;
+						if (next_index >= hot_base) spu_web_note_hot_dispatch(next_index - hot_base, stats_slot);
+						if (spu.pc == step_pc)
+						{
+							interpret_tail = true;
+							break;
+						}
+					}
+					if (!chained && profile_dispatch && completed_blocks > 1)
+					{
+						stats.chain_calls.raw()++;
+						stats.chain_blocks.raw() += completed_blocks;
+					}
+				}
 
 				spu.allow_interrupts_in_cpu_work = true;
-				if (chained && chain.reason == SPU_CHAIN_STATE && !chain.completed) continue;
+				if (chained && chain.reason == SPU_CHAIN_STATE && !completed_blocks) continue;
 
 				if (ran)
 				{
-					stats.dispatches.raw() += chained ? chain.completed : 1;
-					if (chained && chain.completed > 1) web_slice_iterations += chain.completed - 1;
-					if (profile_dispatch) same_pc += spu.pc == pc_before;
+					const u32 blocks_ran = completed_blocks;
+					stats.dispatches.raw() += blocks_ran;
+					if (blocks_ran > 1) web_slice_iterations += blocks_ran - 1;
+					if (profile_dispatch) same_pc += chained ? (spu.pc == pc_before) : interpret_tail;
 					// A program that returns at its own entry handed this instruction to the interpreter
 					// (stop, halt, interrupt state change): execute exactly one instruction below
-					if (chained ? chain.reason != SPU_CHAIN_INTERPRET : spu.pc != pc_before)
+					if (!interpret_tail)
 					{
 						continue;
 					}
@@ -1996,9 +2103,13 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 				{
 
 				stats.fallbacks.raw()++;
-				spu_web_try_compile(spu);
+				const u32 old_epoch = g_spu_web_aot_list_epoch.load();
+				if (spu_web_try_compile(spu) && g_spu_web_aot_list_epoch.load() != old_epoch)
+				{
+					continue;
+				}
 
-				if (g_spu_web_fallback_histogram)
+				if (g_spu_web_fallback_histogram && !spu.jit)
 				{
 					g_spu_web_fallback_listed[(spu.pc & 0x3fffc) / 4]++;
 					spu_web_note_fallback_sample(spu);
@@ -2008,19 +2119,19 @@ static NEVER_INLINE bool spu_web_interpreter_loop(spu_thread& spu, const spu_int
 			}
 			else
 			{
-				// A pc the bundle has no program for: compile it once it proves hot (block starts recur).
-				// The count only decides that one offer, so it stops rising afterwards: this array is
-				// shared by every SPU worker, and a block that has been offered is a block the guest is
-				// entering constantly, which is a read-modify-write on a contended line per entry for a
-				// number nothing reads again.
+				// A pc the bundle has no program for: compile immediately on first visit (default threshold = 1)
+				// and re-dispatch straight into compiled Wasm without interpreting.
 				auto& visits = g_spu_web_fallback_unlisted[(spu.pc & 0x3fffc) / 4];
 
 				if (visits.load() < g_spu_web_hot_threshold) [[unlikely]]
 				{
 					if (++visits == g_spu_web_hot_threshold.load())
 					{
-						spu_web_try_compile(spu);
-						if (g_spu_web_fallback_histogram) spu_web_record_miss(spu);
+						if (spu_web_try_compile(spu))
+						{
+							continue;
+						}
+						if (g_spu_web_fallback_histogram && !spu.jit) spu_web_record_miss(spu);
 					}
 				}
 			}
@@ -2763,12 +2874,17 @@ void spu_thread::push_snr(u32 number, u32 value)
 	});
 }
 
-void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8* ls)
-{
-	perf_meter<"DMA"_u32> perf_;
 #ifdef RPCS3_WEB
-	if (!spu_web_dma_is_contiguous(args.eal, args.size))
+[[gnu::noinline]] static void spu_web_dma_transfer_slow(spu_thread* _this, const spu_mfc_cmd& args, u8* ls)
+{
+	if (!args.size)
 	{
+		return;
+	}
+
+	if (args.eal < RAW_SPU_BASE_ADDR)
+	{
+		g_spu_web_page_split_dma_count++;
 		for (u32 offset = 0; offset < args.size;)
 		{
 			spu_mfc_cmd fragment = args;
@@ -2778,15 +2894,112 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 
 			if (!spu_web_dma_is_contiguous(fragment.eal, fragment.size))
 			{
-				// A single-page fragment that is still not contiguous is an unmapped guest page: the
-				// desktop build faults here, so stop with the command instead of recursing
 				fmt::throw_exception("SPU DMA to unmapped guest memory: cmd=0x%x eal=0x%x lsa=0x%x size=0x%x tag=%u pc=0x%x", args.cmd, args.eal, args.lsa, args.size, args.tag, _this ? _this->pc : 0);
 			}
 
-			do_dma_transfer(_this, fragment, ls);
+			spu_thread::do_dma_transfer(_this, fragment, ls);
 			offset += fragment.size;
 		}
+		return;
+	}
 
+	const bool is_get = (args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GET_CMD;
+	struct note_put_t { u32 eal; u32 size; bool skip; ~note_put_t() { if (!skip) vm::note_write(eal, size); } } note_put{ args.eal, args.size, is_get };
+
+	const u32 eal = args.eal;
+	const u32 lsa = args.lsa & 0x3ffff;
+	u8* dst = vm::_ptr<u8>(eal);
+	const u8* src = ls + lsa;
+	if (is_get)
+	{
+		std::swap(const_cast<u8*&>(src), dst);
+	}
+
+	if (_this)
+	{
+		const u32 index = (eal - SYS_SPU_THREAD_BASE_LOW) / SYS_SPU_THREAD_OFFSET;
+		const u32 offset = (eal - SYS_SPU_THREAD_BASE_LOW) % SYS_SPU_THREAD_OFFSET;
+
+		if (eal < SYS_SPU_THREAD_BASE_LOW)
+		{
+			auto thread = idm::get_unlocked<named_thread<spu_thread>>(spu_thread::find_raw_spu((eal - RAW_SPU_BASE_ADDR) / RAW_SPU_OFFSET));
+			if (!thread)
+			{
+			}
+			else if ((eal - RAW_SPU_BASE_ADDR) % RAW_SPU_OFFSET + args.size - 1 < SPU_LS_SIZE)
+			{
+			}
+			else if (u32 value; args.size == 4 && is_get && thread->read_reg(eal, value))
+			{
+				_this->_ref<u32>(lsa) = value;
+				return;
+			}
+			else if (args.size == 4 && !is_get && thread->write_reg(eal, args.cmd != MFC_SDCRZ_CMD ? +_this->_ref<u32>(lsa) : 0))
+			{
+				return;
+			}
+			else
+			{
+				fmt::throw_exception("Invalid RawSPU MMIO offset (cmd=[%s])", args);
+			}
+		}
+		else if (_this->get_type() >= spu_type::raw)
+		{
+		}
+		else if (_this->group && _this->group->threads_map[index] != -1)
+		{
+			auto& spu = static_cast<spu_thread&>(*_this->group->threads[_this->group->threads_map[index]]);
+			if (offset + args.size <= SPU_LS_SIZE)
+			{
+				if (auto ptr = spu.ls + offset; is_get)
+					src = ptr;
+				else
+					dst = ptr;
+			}
+			else if (!is_get && args.size == 4 && (offset == SYS_SPU_THREAD_SNR1 || offset == SYS_SPU_THREAD_SNR2))
+			{
+				spu.push_snr(SYS_SPU_THREAD_SNR2 == offset, args.cmd != MFC_SDCRZ_CMD ? +_this->_ref<u32>(lsa) : 0);
+				return;
+			}
+			else
+			{
+				fmt::throw_exception("Invalid MMIO offset (cmd=[%s])", args);
+			}
+		}
+		_this->last_faddr = 0;
+	}
+
+	alignas(64) static constexpr u8 zero_buf[0x10000]{};
+	if (args.cmd == MFC_SDCRZ_CMD)
+	{
+		src = zero_buf;
+	}
+	std::memcpy(dst, src, args.size);
+}
+#endif
+
+void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8* ls)
+{
+	perf_meter<"DMA"_u32> perf_;
+#ifdef RPCS3_WEB
+	u8* guest_ptr = nullptr;
+	if (args.size && args.eal < RAW_SPU_BASE_ADDR) [[likely]]
+	{
+		if (((args.eal ^ (args.eal + args.size - 1)) < 0x1000)) [[likely]]
+		{
+			if (u8* page = vm::g_web_pages[args.eal >> 12]) [[likely]]
+			{
+				guest_ptr = page + (args.eal & 0xfff);
+			}
+		}
+		else if (vm::web_is_contiguous(args.eal, args.size)) [[likely]]
+		{
+			guest_ptr = vm::g_web_pages[args.eal >> 12] + (args.eal & 0xfff);
+		}
+	}
+	if (!guest_ptr) [[unlikely]]
+	{
+		spu_web_dma_transfer_slow(_this, args, ls);
 		return;
 	}
 #endif
@@ -2809,7 +3022,11 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 
 	std::tie(dst, src) = [&]() -> std::pair<u8*, const u8*>
 	{
+#ifdef RPCS3_WEB
+		u8* dst = guest_ptr;
+#else
 		u8* dst = vm::_ptr<u8>(eal);
+#endif
 		u8* src = ls + lsa;
 
 		if (is_get)
@@ -2820,6 +3037,7 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 		return {dst, src};
 	}();
 
+#ifndef RPCS3_WEB
 	// SPU Thread Group MMIO (LS and SNR) and RawSPU MMIO
 	if (_this && eal >= RAW_SPU_BASE_ADDR)
 	{
@@ -2888,6 +3106,7 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 			// Access Violation
 		}
 	}
+#endif
 
 	// Cleanup: if PUT or GET happens after PUTLLC failure, it's too complicated and it's easier to just give up
 	if (_this)
@@ -2898,14 +3117,20 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 	// It is so rare that optimizations are not implemented (TODO)
 	alignas(64) static constexpr u8 zero_buf[0x10000]{};
 
-	if (args.cmd == MFC_SDCRZ_CMD)
+	if (args.cmd == MFC_SDCRZ_CMD) [[unlikely]]
 	{
 		src = zero_buf;
 	}
 
+#ifndef RPCS3_WEB
 	rsx::reservation_lock<false, 1> rsx_lock(eal, args.size, !is_get && (g_cfg.video.strict_rendering_mode || (g_cfg.core.rsx_fifo_accuracy && !g_cfg.core.spu_accurate_dma && eal < rsx::constants::local_mem_base)));
+#endif
 
+#ifdef RPCS3_WEB
+	if constexpr (false)
+#else
 	if (!is_get || g_cfg.core.spu_accurate_dma)  [[unlikely]]
+#endif
 	{
 		perf_meter<"ADMA_GET"_u64> perf_get = perf_;
 		perf_meter<"ADMA_PUT"_u64> perf_put = perf_;
@@ -3482,6 +3707,37 @@ plain_access:
 		*reinterpret_cast<u64*>(dst) = *reinterpret_cast<const u64*>(src);
 		break;
 	}
+	case 16:
+	{
+		*reinterpret_cast<v128*>(dst) = *reinterpret_cast<const v128*>(src);
+		break;
+	}
+	case 32:
+	{
+		reinterpret_cast<v128*>(dst)[0] = reinterpret_cast<const v128*>(src)[0];
+		reinterpret_cast<v128*>(dst)[1] = reinterpret_cast<const v128*>(src)[1];
+		break;
+	}
+	case 48:
+	{
+		reinterpret_cast<v128*>(dst)[0] = reinterpret_cast<const v128*>(src)[0];
+		reinterpret_cast<v128*>(dst)[1] = reinterpret_cast<const v128*>(src)[1];
+		reinterpret_cast<v128*>(dst)[2] = reinterpret_cast<const v128*>(src)[2];
+		break;
+	}
+	case 64:
+	{
+		reinterpret_cast<v128*>(dst)[0] = reinterpret_cast<const v128*>(src)[0];
+		reinterpret_cast<v128*>(dst)[1] = reinterpret_cast<const v128*>(src)[1];
+		reinterpret_cast<v128*>(dst)[2] = reinterpret_cast<const v128*>(src)[2];
+		reinterpret_cast<v128*>(dst)[3] = reinterpret_cast<const v128*>(src)[3];
+		break;
+	}
+	case 128:
+	{
+		mov_rdata(*reinterpret_cast<spu_rdata_t*>(dst), *reinterpret_cast<const spu_rdata_t*>(src));
+		break;
+	}
 	default:
 	{
 		if (size > s_rep_movsb_threshold)
@@ -3523,6 +3779,7 @@ plain_access:
 	}
 	}
 
+#ifndef RPCS3_WEB
 	if (g_cfg.core.mfc_debug && _this)
 	{
 		auto& dump = _this->mfc_history[_this->mfc_dump_idx++ % spu_thread::max_mfc_dump_idx];
@@ -3531,8 +3788,14 @@ plain_access:
 		dump.block_hash = _this->block_hash;
 		std::memcpy(dump.data, is_get ? dst : src, std::min<u32>(args.size, 128));
 	}
+#endif
 }
 
+#ifdef __clang__
+__attribute__((always_inline))
+#else
+inline
+#endif
 bool spu_thread::do_dma_check(const spu_mfc_cmd& args)
 {
 	const u32 mask = std::rotl<u32>(1, args.tag);
@@ -3615,12 +3878,19 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 
 	u8 optimization_compatible = transfer.cmd & (MFC_GET_CMD | MFC_PUT_CMD);
 
+#ifdef RPCS3_WEB
+	if (spu_log.trace) [[unlikely]]
+	{
+		optimization_compatible = 0;
+	}
+#else
 	if (spu_log.trace || g_cfg.core.spu_accurate_dma || g_cfg.core.mfc_debug)
 	{
 		optimization_compatible = 0;
 	}
 
 	rsx::reservation_lock<false, 1> rsx_lock(0, 128, optimization_compatible == MFC_PUT_CMD && (g_cfg.video.strict_rendering_mode || (g_cfg.core.rsx_fifo_accuracy && !g_cfg.core.spu_accurate_dma)));
+#endif
 
 	constexpr u32 ts_mask = 0x7fff;
 
@@ -3654,16 +3924,19 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 				// 2. Equality of transfer size across all 6 elements
 				// 3. Be in the same 512mb region, this is because this case is not expected to be broken usually and we need to ensure MMIO is not involved in any of the transfers (assumes MMIO to be so rare that this is the last check)
 #ifdef RPCS3_WEB
-				// Wasm32 has no flat guest aperture: every element must be host-contiguous so its
-				// chunks translate through the page table (SRC below). Otherwise the generic path
-				// runs, and an unmapped page faults there as it does on native hardware.
-				const auto web_fast_ok = [&](u32 element_size)
+				const auto web_fast_ok = [&](u32 element_size) -> bool
 				{
-					for (const auto& item : items)
+					if (element_size > 512) return false;
+					if (!element_size) return true;
+					for (u32 i = 0; i < fetch_size; ++i)
 					{
-						if (element_size && !vm::web_is_contiguous(item.ea, element_size))
+						const u32 ea = items[i].ea;
+						const u32 first_page = ea >> 12;
+						u8* const p0 = vm::g_web_pages[first_page];
+						if (!p0) [[unlikely]] return false;
+						if (((ea & 0xfff) + element_size) > 0x1000) [[unlikely]]
 						{
-							return false;
+							if (vm::g_web_pages[first_page + 1] != p0 + 0x1000) return false;
 						}
 					}
 
@@ -3685,7 +3958,7 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 #endif
 
 #ifdef RPCS3_WEB
-#define SRC(ea) vm::web_base(static_cast<u32>(ea))
+#define SRC(ea) (vm::g_web_pages[(ea) >> 12] + ((ea) & 0xfff))
 #else
 					u8* src = vm::_ptr<u8>(0);
 #define SRC(ea) (src + (ea))
@@ -3966,7 +4239,23 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 		const u32 size = items[index].ts & ts_mask;
 		const u32 addr = items[index].ea;
 #ifdef RPCS3_WEB
-		const bool host_contiguous = !size || addr >= RAW_SPU_BASE_ADDR || vm::web_is_contiguous(addr, size);
+		u8* host_ptr = nullptr;
+		if (size && addr < RAW_SPU_BASE_ADDR) [[likely]]
+		{
+			const u32 first_page = addr >> 12;
+			if (u8* p0 = vm::g_web_pages[first_page]) [[likely]]
+			{
+				if (((addr & 0xfff) + size) <= 0x1000) [[likely]]
+				{
+					host_ptr = p0 + (addr & 0xfff);
+				}
+				else if (vm::web_is_contiguous(addr, size)) [[likely]]
+				{
+					host_ptr = p0 + (addr & 0xfff);
+				}
+			}
+		}
+		const bool host_contiguous = !size || addr >= RAW_SPU_BASE_ADDR || host_ptr != nullptr;
 #else
 		constexpr bool host_contiguous = true;
 #endif
@@ -3977,7 +4266,11 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
 			spu_web_note_ls_boundary(arg_lsa + (addr & 0xf), size);
 #endif
+#ifdef RPCS3_WEB
+			const u8* src = host_ptr;
+#else
 			const u8* src = vm::_ptr<u8>(addr);
+#endif
 			u8* dst = this->ls + arg_lsa + (addr & 0xf);
 
 			switch (u32 _size = size)
@@ -4000,6 +4293,37 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 			case 8:
 			{
 				*reinterpret_cast<u64*>(dst) = *reinterpret_cast<const u64*>(src);
+				break;
+			}
+			case 16:
+			{
+				*reinterpret_cast<v128*>(dst) = *reinterpret_cast<const v128*>(src);
+				break;
+			}
+			case 32:
+			{
+				reinterpret_cast<v128*>(dst)[0] = reinterpret_cast<const v128*>(src)[0];
+				reinterpret_cast<v128*>(dst)[1] = reinterpret_cast<const v128*>(src)[1];
+				break;
+			}
+			case 48:
+			{
+				reinterpret_cast<v128*>(dst)[0] = reinterpret_cast<const v128*>(src)[0];
+				reinterpret_cast<v128*>(dst)[1] = reinterpret_cast<const v128*>(src)[1];
+				reinterpret_cast<v128*>(dst)[2] = reinterpret_cast<const v128*>(src)[2];
+				break;
+			}
+			case 64:
+			{
+				reinterpret_cast<v128*>(dst)[0] = reinterpret_cast<const v128*>(src)[0];
+				reinterpret_cast<v128*>(dst)[1] = reinterpret_cast<const v128*>(src)[1];
+				reinterpret_cast<v128*>(dst)[2] = reinterpret_cast<const v128*>(src)[2];
+				reinterpret_cast<v128*>(dst)[3] = reinterpret_cast<const v128*>(src)[3];
+				break;
+			}
+			case 128:
+			{
+				mov_rdata(*reinterpret_cast<spu_rdata_t*>(dst), *reinterpret_cast<const spu_rdata_t*>(src));
 				break;
 			}
 			default:
@@ -4051,6 +4375,9 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
 			spu_web_note_ls_boundary(arg_lsa + (addr & 0xf), size);
 #endif
+#ifdef RPCS3_WEB
+			u8* dst = host_ptr;
+#else
 			if (addr >> 28 != rsx::constants::local_mem_base >> 28)
 			{
 				rsx_lock.update_if_enabled(addr, size, range_lock);
@@ -4064,6 +4391,7 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 			}
 
 			u8* dst = vm::_ptr<u8>(addr);
+#endif
 			const u8* src = this->ls + arg_lsa + (addr & 0xf);
 
 			switch (u32 _size = size)
@@ -4086,6 +4414,37 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 			case 8:
 			{
 				*reinterpret_cast<u64*>(dst) = *reinterpret_cast<const u64*>(src);
+				break;
+			}
+			case 16:
+			{
+				*reinterpret_cast<v128*>(dst) = *reinterpret_cast<const v128*>(src);
+				break;
+			}
+			case 32:
+			{
+				reinterpret_cast<v128*>(dst)[0] = reinterpret_cast<const v128*>(src)[0];
+				reinterpret_cast<v128*>(dst)[1] = reinterpret_cast<const v128*>(src)[1];
+				break;
+			}
+			case 48:
+			{
+				reinterpret_cast<v128*>(dst)[0] = reinterpret_cast<const v128*>(src)[0];
+				reinterpret_cast<v128*>(dst)[1] = reinterpret_cast<const v128*>(src)[1];
+				reinterpret_cast<v128*>(dst)[2] = reinterpret_cast<const v128*>(src)[2];
+				break;
+			}
+			case 64:
+			{
+				reinterpret_cast<v128*>(dst)[0] = reinterpret_cast<const v128*>(src)[0];
+				reinterpret_cast<v128*>(dst)[1] = reinterpret_cast<const v128*>(src)[1];
+				reinterpret_cast<v128*>(dst)[2] = reinterpret_cast<const v128*>(src)[2];
+				reinterpret_cast<v128*>(dst)[3] = reinterpret_cast<const v128*>(src)[3];
+				break;
+			}
+			case 128:
+			{
+				mov_rdata(*reinterpret_cast<spu_rdata_t*>(dst), *reinterpret_cast<const spu_rdata_t*>(src));
 				break;
 			}
 			default:
@@ -4129,12 +4488,15 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 			}
 			}
 
+			vm::note_write(addr, size);
 			arg_lsa += utils::align<u32>(size, 16);
 		}
 		else if (size)
 		{
+#ifndef RPCS3_WEB
 			range_lock->release(0);
 			rsx_lock.unlock();
+#endif
 
 			spu_log.trace("LIST: item=0x%016x, lsa=0x%05x", std::bit_cast<be_t<u64>>(items[index]), arg_lsa | (addr & 0xf));
 
@@ -4158,7 +4520,9 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 
 		if (items[index].sb & 0x80) [[unlikely]]
 		{
+#ifndef RPCS3_WEB
 			range_lock->release(0);
+#endif
 
 			ch_stall_mask |= std::rotl<u32>(1, args.tag);
 
@@ -4179,13 +4543,17 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 		index++;
 	}
 
+#ifndef RPCS3_WEB
 	range_lock->release(0);
+#endif
 	return true;
 }
 
 bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 {
+#ifndef RPCS3_WEB
 	struct note_store_t { u32 addr; ~note_store_t() { vm::note_write(addr, 128); } } note_store{ args.eal & -128 };
+#endif
 	perf_meter<"PUTLLC-"_u64> perf0;
 	perf_meter<"PUTLLC+"_u64> perf1 = perf0;
 
@@ -4209,26 +4577,35 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 
 		if (rtime != res)
 		{
+#ifndef RPCS3_WEB
 			if (!g_cfg.core.spu_accurate_reservations && cmp_rdata(to_write, rdata))
 			{
 				raddr = 0;
 				return true;
 			}
+#endif
 
 			return false;
 		}
 
 		if (cmp_rdata(to_write, rdata))
 		{
+#ifndef RPCS3_WEB
 			if (!g_cfg.core.spu_accurate_reservations)
 			{
 				raddr = 0;
 				return true;
 			}
+#endif
 
 			// Writeback of unchanged data. Only check memory change
 			// For the comparison, load twice for atomicity
+#ifdef RPCS3_WEB
+			const auto& cur_data = *reinterpret_cast<const spu_rdata_t*>(vm::g_web_pages[addr >> 12] + (addr & 0xf80));
+			if (cmp_rdata(rdata, cur_data) && res == rtime && cmp_rdata(rdata, cur_data) && res.compare_and_swap_test(rtime, rtime + 128))
+#else
 			if (cmp_rdata(rdata, vm::_ref<spu_rdata_t>(addr)) && res == rtime && cmp_rdata(rdata, vm::_ref<spu_rdata_t>(addr)) && res.compare_and_swap_test(rtime, rtime + 128))
+#endif
 			{
 				raddr = 0; // Disable notification
 				return true;
@@ -4237,10 +4614,12 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			return false;
 		}
 
+#ifndef RPCS3_WEB
 		static const auto cast_as = [](void* ptr, usz pos){ return reinterpret_cast<u128*>(ptr) + pos; };
 		static const auto cast_as_const = [](const void* ptr, usz pos){ return reinterpret_cast<const u128*>(ptr) + pos; };
 
 		const usz diff16_pos = scan16_rdata(to_write, rdata);
+#endif
 
 		auto [_oldd, _ok] = res.fetch_op([&](u64& r)
 		{
@@ -4259,6 +4638,7 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			return false;
 		}
 
+#ifndef RPCS3_WEB
 		if (!g_cfg.core.spu_accurate_reservations)
 		{
 			if (addr - spurs_addr <= 0x80)
@@ -4272,10 +4652,72 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 		{
 			utils::trigger_write_page_fault(vm::base(addr));
 		}
+#endif
 
 		auto& super_data = *vm::get_super_ptr<spu_rdata_t>(addr);
 		const bool success = [&]()
 		{
+#ifdef RPCS3_WEB
+			const auto* rdata64 = reinterpret_cast<const u64*>(&rdata);
+			const auto* write64 = reinterpret_cast<const u64*>(&to_write);
+			auto* super64 = reinterpret_cast<u64*>(&super_data);
+
+			for (usz i = 0; i < 16; ++i)
+			{
+				if (__atomic_load_n(&super64[i], __ATOMIC_ACQUIRE) != rdata64[i])
+				{
+					return false;
+				}
+			}
+
+			usz committed = 0;
+			bool cas_ok = true;
+			for (usz i = 0; i < 16; ++i)
+			{
+				if (write64[i] == rdata64[i])
+				{
+					continue;
+				}
+				u64 expected = rdata64[i];
+				if (!__atomic_compare_exchange_n(&super64[i], &expected, write64[i], false, __ATOMIC_SEQ_CST, __ATOMIC_ACQUIRE))
+				{
+					cas_ok = false;
+					break;
+				}
+				committed = i + 1;
+			}
+
+			if (!cas_ok)
+			{
+				for (usz i = 0; i < committed; ++i)
+				{
+					if (write64[i] != rdata64[i])
+					{
+						u64 cur = write64[i];
+						__atomic_compare_exchange_n(&super64[i], &cur, rdata64[i], false, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED);
+					}
+				}
+				return false;
+			}
+
+			for (usz i = 0; i < 16; ++i)
+			{
+				if (write64[i] == rdata64[i] && __atomic_load_n(&super64[i], __ATOMIC_SEQ_CST) != rdata64[i])
+				{
+					for (usz j = 0; j < 16; ++j)
+					{
+						if (write64[j] != rdata64[j])
+						{
+							u64 cur = write64[j];
+							__atomic_compare_exchange_n(&super64[j], &cur, rdata64[j], false, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED);
+						}
+					}
+					return false;
+				}
+			}
+
+			return true;
+#else
 			// Full lock (heavyweight)
 			// TODO: vm::check_addr
 			vm::writer_lock lock(addr, range_lock);
@@ -4298,6 +4740,7 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			}
 
 			return false;
+#endif
 		}();
 
 		res += success ? 64 : 0 - 64;
@@ -4306,6 +4749,9 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 	{
 		if (raddr)
 		{
+#ifdef RPCS3_WEB
+			vm::web_note_write_page(addr >> 12);
+#endif
 			if (raddr != spurs_addr || pc != 0x11e4)
 			{
 				vm::reservation_notifier_notify(addr, rtime);
@@ -4347,10 +4793,12 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			}
 		}
 
+#ifndef RPCS3_WEB
 		if (!vm::check_addr(addr, vm::page_writable))
 		{
 			utils::trigger_write_page_fault(vm::base(addr));
 		}
+#endif
 
 		raddr = 0;
 		perf1.reset();
@@ -4360,22 +4808,36 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 
 void do_cell_atomic_128_store(u32 addr, const void* to_write)
 {
+#ifdef RPCS3_WEB
+	struct note_store_t { u32 addr; ~note_store_t() { vm::web_note_write_addr(addr); } } note_store{ addr };
+#else
 	struct note_store_t { u32 addr; ~note_store_t() { vm::note_write(addr, 128); } } note_store{ addr };
+#endif
 	perf_meter<"STORE128"_u64> perf0;
 
 	const auto cpu = get_current_cpu_thread();
 	rsx::reservation_lock rsx_lock(addr, 128);
 
+#ifndef ARCH_WASM32
 	u64 shared_mem = vm::g_shmem[addr >> 16];
 
 	if (!shared_mem)
 	{
 		shared_mem = addr;
 	}
+#endif
 
 	{
+#ifdef RPCS3_WEB
+		auto& sdata = *reinterpret_cast<spu_rdata_t*>(vm::g_web_pages[addr >> 12] + (addr & 0xf80));
+#else
 		auto& sdata = *vm::get_super_ptr<spu_rdata_t>(addr);
+#endif
+#ifdef ARCH_WASM32
+		auto& res = vm::reservation_acquire(addr);
+#else
 		auto& res = *utils::bless<atomic_t<u128>>(vm::g_reservations + (addr & 0xff80) / 2);
+#endif
 
 		if (std::memcmp(static_cast<const u8*>(to_write), &sdata, 16) == 0 && std::memcmp(static_cast<const u8*>(to_write) + 64, &sdata[64], 16) == 0)
 		{
@@ -4395,6 +4857,23 @@ void do_cell_atomic_128_store(u32 addr, const void* to_write)
 
 		for (u64 j = 0;; j++)
 		{
+#ifdef ARCH_WASM32
+			auto [_oldd, _ok] = res.fetch_op([&](u64& r)
+			{
+				if (r & 127)
+				{
+					return false;
+				}
+
+				r |= vm::rsrv_unique_lock | vm::rsrv_putunc_flag;
+				return true;
+			});
+
+			if (_ok)
+			{
+				break;
+			}
+#else
 			auto [_oldd, _ok] = res.fetch_op([&](u128& r)
 			{
 				if (r & 127)
@@ -4439,6 +4918,7 @@ void do_cell_atomic_128_store(u32 addr, const void* to_write)
 
 				return static_cast<void>(cpu->test_stopped());
 			}
+#endif
 
 			if (auto cpu = get_current_cpu_thread(); cpu && cpu->state)
 			{
@@ -4467,6 +4947,7 @@ void do_cell_atomic_128_store(u32 addr, const void* to_write)
 		}
 		else
 		{
+#ifndef RPCS3_WEB
 			// Provoke page fault
 			utils::trigger_write_page_fault(vm::base(addr));
 
@@ -4480,6 +4961,7 @@ void do_cell_atomic_128_store(u32 addr, const void* to_write)
 			}
 
 			vm::writer_lock lock(addr, spu ? spu->range_lock : nullptr);
+#endif
 			mov_rdata(sdata, *static_cast<const spu_rdata_t*>(to_write));
 			vm::reservation_acquire(addr) += 32;
 		}
@@ -4492,7 +4974,10 @@ void do_cell_atomic_128_store(u32 addr, const void* to_write)
 			});
 
 			vm::reservation_acquire(addr) += 32;
-			result = utils::get_tsc() - perf0.get();
+			if (g_cfg.core.perf_report) [[unlikely]]
+			{
+				result = utils::get_tsc() - perf0.get();
+			}
 		}
 
 		if (result > 20000 && g_cfg.core.perf_report) [[unlikely]]
@@ -5048,7 +5533,9 @@ bool spu_thread::process_mfc_cmd()
 	}
 
 	spu::scheduler::concurrent_execution_watchdog watchdog(*this);
+#ifndef RPCS3_WEB
 	spu_log.trace("DMAC: (%s)", ch_mfc_cmd);
+#endif
 
 	switch (ch_mfc_cmd.cmd)
 	{
@@ -5060,6 +5547,9 @@ bool spu_thread::process_mfc_cmd()
 		perf_meter<"GETLLAR"_u64> perf0;
 
 		const u32 addr = ch_mfc_cmd.eal & -128;
+#ifdef RPCS3_WEB
+		const auto& data = *reinterpret_cast<const spu_rdata_t*>(vm::g_web_pages[addr >> 12] + (addr & 0xf80));
+#else
 		const auto& data = vm::_ref<spu_rdata_t>(addr);
 
 		if (addr == last_faddr)
@@ -5083,6 +5573,7 @@ bool spu_thread::process_mfc_cmd()
 			// Silent failure
 			last_faddr = 0;
 		}
+#endif
 
 		if (raddr)
 		{
@@ -5120,7 +5611,7 @@ bool spu_thread::process_mfc_cmd()
 						if ([&]() -> bool
 						{
 							// Validation that it is indeed GETLLAR spinning (large time window is intentional)
-							if (last_getllar_addr != addr || last_getllar_gpr1 != gpr[1]._u32[3] || perf0.get() - last_gtsc >= 5'000 || (interrupts_enabled && ch_events.load().mask))
+							if (last_getllar != pc || last_getllar_lsa != ch_mfc_cmd.lsa || last_getllar_addr != addr || last_getllar_gpr1 != gpr[1]._u32[3] || (interrupts_enabled && ch_events.load().mask))
 							{
 								// Seemingly not
 								getllar_busy_waiting_switch = umax;
@@ -5128,12 +5619,27 @@ bool spu_thread::process_mfc_cmd()
 								return true;
 							}
 
-							if (last_getllar != pc || last_getllar_lsa != ch_mfc_cmd.lsa)
+#ifdef RPCS3_WEB
+							if (block_counter - last_gtsc >= 64)
 							{
 								getllar_busy_waiting_switch = umax;
 								getllar_spin_count = 0;
 								return true;
 							}
+#else
+#ifdef __EMSCRIPTEN__
+							constexpr u64 getllar_spin_window = 500'000;
+#else
+							constexpr u64 getllar_spin_window = 5'000;
+#endif
+							if (perf0.get() - last_gtsc >= getllar_spin_window)
+							{
+								// Seemingly not
+								getllar_busy_waiting_switch = umax;
+								getllar_spin_count = 0;
+								return true;
+							}
+#endif
 
 							// Check if LSA points to an OUT buffer on the stack from a caller - unlikely to be a loop
 							if (last_getllar_lsa >= SPU_LS_SIZE - 0x10000 && last_getllar_lsa > last_getllar_gpr1)
@@ -5152,6 +5658,11 @@ bool spu_thread::process_mfc_cmd()
 
 							if (getllar_busy_waiting_switch == umax && getllar_spin_count == 4)
 							{
+#ifdef __EMSCRIPTEN__
+								// In browser workers, busy-spinning 6 SPURS SPU threads for 400us starves
+								// PPU and RSX workers; sleep on the reservation notifier after 4 spins.
+								getllar_busy_waiting_switch = g_cfg.core.spu_getllar_spin_optimization_disabled ? 1 : 0;
+#else
 								// Hidden value to force busy waiting (100 to 1 are dynamically adjusted, 0 is not)
 								if (!g_cfg.core.spu_getllar_spin_optimization_disabled)
 								{
@@ -5165,7 +5676,9 @@ bool spu_thread::process_mfc_cmd()
 								{
 									getllar_busy_waiting_switch = 1;
 								}
+#endif
 							}
+#ifndef __EMSCRIPTEN__
 							// Don't be stubborn, force operating sleep if too much time has passed
 							else if (getllar_busy_waiting_switch == 1 && perf0.get() > getllar_evaluate_time && perf0.get() - getllar_evaluate_time >= 400'000)
 							{
@@ -5177,6 +5690,7 @@ bool spu_thread::process_mfc_cmd()
 									getllar_busy_waiting_switch = 0;
 								}
 							}
+#endif
 
 							// Either 1 or umax
 							return getllar_busy_waiting_switch != 0;
@@ -5236,7 +5750,11 @@ bool spu_thread::process_mfc_cmd()
 								perf0.restart();
 							}
 
+#ifdef RPCS3_WEB
+							last_gtsc = block_counter;
+#else
 							last_gtsc = perf0.get();
+#endif
 							return true;
 						}
 
@@ -5282,7 +5800,11 @@ bool spu_thread::process_mfc_cmd()
 
 							// Reset perf
 							perf0.restart();
+#ifdef RPCS3_WEB
+							last_gtsc = block_counter;
+#else
 							last_gtsc = perf0.get();
+#endif
 							return true;
 						}
 
@@ -5330,7 +5852,11 @@ bool spu_thread::process_mfc_cmd()
 			}
 
 			last_getllar = pc;
+#ifdef RPCS3_WEB
+			last_gtsc = block_counter;
+#else
 			last_gtsc = perf0.get();
+#endif
 		}
 
 		last_getllar_addr = addr;
@@ -5362,7 +5888,11 @@ bool spu_thread::process_mfc_cmd()
 				}
 			}
 
+#ifdef __EMSCRIPTEN__
+			if (i < 2) [[likely]]
+#else
 			if (i < 24) [[likely]]
+#endif
 			{
 				i++;
 				busy_wait(300);
@@ -5570,6 +6100,7 @@ bool spu_thread::process_mfc_cmd()
 				else if (was_idle && !is_idle)
 				{
 					// Cleanup
+#ifndef RPCS3_WEB
 					const u64 current = get_system_time();
 
 					if (spurs_last_task_timestamp)
@@ -5582,6 +6113,7 @@ bool spu_thread::process_mfc_cmd()
 					}
 
 					spurs_last_task_timestamp = current;
+#endif
 					spurs_waited = false;
 					spurs_entered_wait = false;
 				}
@@ -5798,6 +6330,14 @@ bool spu_thread::reservation_check(u32 addr, const decltype(rdata)& data, u32 cu
 		return true;
 	}
 
+#ifdef RPCS3_WEB
+	(void)current_eal;
+	if (u8* page = vm::g_web_pages[addr >> 12]) [[likely]]
+	{
+		return !cmp_rdata(data, *reinterpret_cast<const decltype(rdata)*>(page + (addr & 0xfff)));
+	}
+	return true;
+#else
 	if ((addr >> 28) < 2 || (addr >> 28) == 0xd)
 	{
 		// Always-allocated memory does not need strict checking (vm::main or vm::stack)
@@ -5890,10 +6430,19 @@ bool spu_thread::reservation_check(u32 addr, const decltype(rdata)& data, u32 cu
 
 	range_lock->release(0);
 	return !res;
+#endif
 }
 
 bool spu_thread::reservation_check(u32 addr, u32 hash, atomic_t<u64, 128>* range_lock)
 {
+#ifdef RPCS3_WEB
+	(void)range_lock;
+	if (u8* page = vm::g_web_pages[addr >> 12]) [[likely]]
+	{
+		return compute_rdata_hash32(*reinterpret_cast<const decltype(rdata)*>(page + (addr & 0xfff))) != hash;
+	}
+	return true;
+#else
 	if ((addr >> 28) < 2 || (addr >> 28) == 0xd)
 	{
 		// Always-allocated memory does not need strict checking (vm::main or vm::stack)
@@ -5971,6 +6520,7 @@ bool spu_thread::reservation_check(u32 addr, u32 hash, atomic_t<u64, 128>* range
 
 	range_lock->release(0);
 	return !res;
+#endif
 }
 
 usz spu_thread::register_cache_line_waiter(u32 addr)
@@ -6432,7 +6982,11 @@ s64 spu_thread::get_ch_value_impl(u32 ch)
 			}
 		}
 
+#ifdef RPCS3_WEB
+		const usz seed = (block_counter >> 2) % 100;
+#else
 		const usz seed = (utils::get_tsc() >> 8) % 100;
+#endif
 
 		usz cache_line_waiter_index = umax;
 
@@ -6458,6 +7012,30 @@ s64 spu_thread::get_ch_value_impl(u32 ch)
 
 		const bool is_LR_wait = raddr && mask1 & SPU_EVENT_LR;
 
+#ifdef RPCS3_WEB
+		struct web_spu_waiter_guard
+		{
+			u32 slot = umax;
+
+			explicit web_spu_waiter_guard(u32 addr) noexcept
+			{
+				if (addr)
+				{
+					slot = vm::web_spu_waiter_slot(addr);
+					vm::g_web_spu_waiter_addr[slot].fetch_add(1, std::memory_order_seq_cst);
+				}
+			}
+
+			~web_spu_waiter_guard() noexcept
+			{
+				if (slot != umax)
+				{
+					vm::g_web_spu_waiter_addr[slot].fetch_sub(1, std::memory_order_release);
+				}
+			}
+		} const web_waiter_guard{is_LR_wait ? raddr : 0u};
+#endif
+
 		auto& history = eventstat_wait_time[(raddr % SPU_LS_SIZE) / 128];
 
 		if (is_LR_wait)
@@ -6472,7 +7050,9 @@ s64 spu_thread::get_ch_value_impl(u32 ch)
 				eventstat_getllar = last_getllar;
 				eventstat_spu_group_restart = spu_group_restart;
 				eventstat_spin_count = 0;
+#ifndef RPCS3_WEB
 				eventstat_evaluate_time = get_system_time();
+#endif
 				eventstat_busy_waiting_switch = umax;
 			}
 			else
@@ -6481,6 +7061,7 @@ s64 spu_thread::get_ch_value_impl(u32 ch)
 				val = static_cast<u8>(std::min<u32>(val + 1, u8{umax}));
 			}
 
+#ifndef RPCS3_WEB
 			if (!s_is_reservation_data_checking_thread && utils::get_thread_count() >= 12)// && std::find(raddr_busy_wait_addr.begin(), raddr_busy_wait_addr.end(), raddr) != raddr_busy_wait_addr.end())
 			{
 				if (s_is_reservation_data_checking_thread.compare_and_swap_test(0, 1))
@@ -6491,6 +7072,7 @@ s64 spu_thread::get_ch_value_impl(u32 ch)
 					eventstat_spin_count = 0;
 				}
 			}
+#endif
 
 			lv2_obj::notify_all();
 		}
@@ -6505,11 +7087,13 @@ s64 spu_thread::get_ch_value_impl(u32 ch)
 		{
 			bool value = false;
 
+#ifndef RPCS3_WEB
 			if (is_LR_wait && g_cfg.core.spu_reservation_busy_waiting_enabled)
 			{
 				// Make single-threaded groups inclined for busy-waiting
 				value = evaluate_spin_optimization({ history.data(), history.size() }, eventstat_evaluate_time, g_cfg.core.spu_reservation_busy_waiting_percentage, group && group->max_num == 1) != 0;
 			}
+#endif
 
 			eventstat_busy_waiting_switch = value ? 1 : 0;
 		}
@@ -6697,7 +7281,7 @@ s64 spu_thread::get_ch_value_impl(u32 ch)
 					}
 
 					const u32 _raddr = this->raddr;
-#ifdef __linux__
+#if defined(__linux__) || defined(RPCS3_WEB)
 					if (auto [wait_var, flag_val] = vm::reservation_notifier_begin_wait(_raddr, rtime); wait_var)
 					{
 						if (!cmp_rdata(rdata, *resrv_mem))
@@ -6707,7 +7291,11 @@ s64 spu_thread::get_ch_value_impl(u32 ch)
 						}
 						else if (check_cache_line_waiter())
 						{
+#ifdef RPCS3_WEB
+							utils::bless<atomic_t<u32>>(&wait_var->raw().wait_flag)->wait(flag_val, atomic_wait_timeout{500'000});
+#else
 							utils::bless<atomic_t<u32>>(&wait_var->raw().wait_flag)->wait(flag_val, atomic_wait_timeout{50'000});
+#endif
 						}
 
 						vm::reservation_notifier_end_wait(*wait_var);

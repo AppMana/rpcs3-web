@@ -179,13 +179,15 @@ target_sources(rpcs3_emu PRIVATE
     ../Loader/TRP.cpp
 )
 
-# Audio
+# Audio & Host Platform Services
 target_sources(rpcs3_emu PRIVATE
+    Host/HostPlatform.cpp
     Audio/audio_resampler.cpp
     Audio/audio_utils.cpp
     Audio/AudioDumper.cpp
     Audio/AudioBackend.cpp
     Audio/Null/NullAudioBackend.cpp
+    Audio/WebAudio/WebAudioBackend.cpp
 )
 
 if(NOT RPCS3_WEB)

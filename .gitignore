@@ -153,6 +153,16 @@ CLAUDE.md
 
 # Title-specific PPU AOT bundles built from commercial code, and the IR dumps they are built from
 web/public/local-aot/
+web/public/firmware-wasm/
+web/public/rpcs3-spu-llvm.wasm
+web/public/rpcs3-web.mjs
+web/public/rpcs3-web.wasm
+web/profile-results/
+web/--frames=*/
+performance-evidence/
+node_modules/
+tools/libghidra/build/
+https:/
 web/local-aot-ir-*/
 /web/*.cpuprofile
 /web/*.cpuprofile.*

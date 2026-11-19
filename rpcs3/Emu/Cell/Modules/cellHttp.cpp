@@ -1552,6 +1552,7 @@ error_code cellHttpCreateClient(vm::ptr<CellHttpClientId> clientId)
 		return CELL_HTTP_ERROR_NO_BUFFER;
 	}
 
+	*clientId = 1;
 	return CELL_OK;
 }
 
@@ -2873,6 +2874,11 @@ error_code cellHttpCreateTransaction(vm::ptr<CellHttpTransId> transId, CellHttpC
 	if (!uri || !uri->hostname || !uri->hostname[0])
 	{
 		return CELL_HTTP_ERROR_INVALID_URI;
+	}
+
+	if (transId)
+	{
+		*transId = 1;
 	}
 
 	return CELL_OK;

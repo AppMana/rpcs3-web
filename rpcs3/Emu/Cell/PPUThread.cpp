@@ -15,6 +15,7 @@
 #include "Emu/system_progress.hpp"
 #include "Emu/system_utils.hpp"
 #include "Emu/System.h"
+#include "Utilities/PPUCodegenPolicy.h"
 #include "PPUThread.h"
 #include "PPUWasmDispatch.h"
 #include "PPUInterpreter.h"
@@ -42,9 +43,6 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Analysis/CGSCCPassManager.h>
-#include <llvm/Analysis/LoopAnalysisManager.h>
-#include <llvm/Passes/PassBuilder.h>
-#include <llvm/Transforms/Scalar/EarlyCSE.h>
 #ifdef _MSC_VER
 #pragma warning(pop)
 #else
@@ -52,6 +50,7 @@
 #endif
 
 #include "PPUTranslator.h"
+#include "Utilities/LLVMOptimization.h"
 #endif
 
 #include <cfenv>
@@ -165,9 +164,12 @@ extern const ppu_decoder<ppu_iname> g_ppu_iname{};
 atomic_t<u64> g_ppu_web_instruction_count{0};
 extern "C" int rpcs3_web_ppu_aot_worker_ready();
 extern "C" u32 rpcs3_web_ppu_hot_sync();
+extern "C" u32 rpcs3_web_ppu_hot_ensure(u32 target_index, u32* out_span);
 extern u32 web_hot_table_base();
 atomic_t<u32> g_ppu_web_last_pc{0};
 atomic_t<u32> g_ppu_web_trace_pc{0};
+atomic_t<u32> g_ppu_web_trace_extra_pcs[7]{};
+atomic_t<u32> g_ppu_web_trace_extra_count{0};
 atomic_t<u32> g_ppu_web_trace_hits{0};
 atomic_t<u32> g_ppu_web_trace_delay_pc{0};
 atomic_t<u32> g_ppu_web_trace_delay_hits{0};
@@ -193,6 +195,10 @@ bool serialize<ppu_thread::cr_bits>(utils::serial& ar, typename ppu_thread::cr_b
 extern void ppu_initialize();
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
 extern void ppu_web_jit_register_module(const ppu_module<lv2_obj>& info);
+extern void ppu_web_recomp_module_sync(const ppu_module<lv2_obj>& info);
+extern bool ppu_web_jit_compile_sync(u32 addr);
+extern u32 ppu_web_codegen_fail_closed();
+extern u32 ppu_web_auto_recomp_enabled();
 #endif
 extern void ppu_finalize(const ppu_module<lv2_obj>& info, bool force_mem_release = false);
 extern bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only = false, u64 file_size = 0);
@@ -544,17 +550,42 @@ namespace
 		std::atomic<u32> jit[0x10000 / sizeof(u32)]{};
 		std::atomic<ppu_intrp_func_t> hooks[0x10000 / sizeof(u32)]{};
 		std::atomic<u64> decoded[0x10000 / sizeof(u32)]{};
+
+		ppu_intrp_func_t hook_raw(u32 slot) const noexcept { return *reinterpret_cast<const ppu_intrp_func_t*>(&hooks[slot]); }
+		u32 aot_raw(u32 slot) const noexcept { return *reinterpret_cast<const u32*>(&aot[slot]); }
+		u32 jit_raw(u32 slot) const noexcept { return *reinterpret_cast<const u32*>(&jit[slot]); }
 	};
 
 	static_assert(offsetof(ppu_web_dispatch_page, jit) == 0x10000, "compiled blocks read the tier's slots at this offset from the page");
 
-	std::array<std::atomic<ppu_web_dispatch_page*>, 0x10000> s_ppu_web_dispatch_pages{};
+	struct ppu_web_dispatch_directory
+	{
+		std::array<std::atomic<ppu_web_dispatch_page*>, 0x10000> pages{};
+		// Runtime seg0 base address (0 for fixed EBOOT/ELF, prx.segs[0].addr for relocatable shared .wasm .sprx)
+		// per 64 KiB guest page; compiled blocks load next_seg0 at m_exec + 0x40000 + ((pc >> 16) * 4).
+		std::array<std::atomic<u32>, 0x10000> page_seg0{};
+	};
+#ifdef __wasm32__
+	static_assert(offsetof(ppu_web_dispatch_directory, page_seg0) == 0x40000, "compiled blocks read page_seg0 at +0x40000 from m_exec");
+#endif
+
+	ppu_web_dispatch_directory s_ppu_web_dispatch_dir{};
 	std::mutex s_ppu_web_dispatch_mutex;
+
+	inline ppu_web_dispatch_page* ppu_web_dispatch_page_fast(u32 page_idx) noexcept
+	{
+		return *reinterpret_cast<ppu_web_dispatch_page* const*>(&s_ppu_web_dispatch_dir.pages[page_idx]);
+	}
+
+	inline u32 ppu_web_dispatch_seg0_fast(u32 page_idx) noexcept
+	{
+		return *reinterpret_cast<const u32*>(&s_ppu_web_dispatch_dir.page_seg0[page_idx]);
+	}
 
 	ppu_web_dispatch_page* ppu_web_dispatch_page_for(u32 addr, bool create)
 	{
-		auto& page_slot = s_ppu_web_dispatch_pages[addr >> 16];
-		auto page = page_slot.load(std::memory_order_acquire);
+		auto& page_slot = s_ppu_web_dispatch_dir.pages[addr >> 16];
+		auto page = *reinterpret_cast<ppu_web_dispatch_page* const*>(&page_slot);
 		if (!page && create)
 		{
 			std::lock_guard lock(s_ppu_web_dispatch_mutex);
@@ -616,19 +647,166 @@ static inline void ppu_write(u32 addr, ppu_intrp_func_t function)
 using ppu_web_aot_func_t = void (*)(void* exec, ppu_thread* thread, u64 seg0, void* base, u64 r0, u64 r1, u64 r2);
 
 atomic_t<u64> g_ppu_web_aot_dispatch_count{0};
+atomic_t<u64> g_ppu_web_hle_hook_count{0};
 static atomic_t<bool> g_ppu_web_batched_diagnostics{true};
-// Registered by the bundle loader before guest threads start; immutable during execution.
+static std::mutex g_ppu_web_instance_spans_mutex;
 static std::vector<ppu_wasm_dispatch_context> g_ppu_web_instance_spans;
+
+enum class ppu_web_boundary_kind : u8
+{
+	compiled,
+	hook_enter,
+	hook_return,
+	direct_enter,
+	direct_return,
+	fast_call,
+	fast_return,
+};
+
+struct ppu_web_boundary_entry
+{
+	u64 sequence = 0;
+	u32 kind = 0;
+	u32 id = 0;
+	u32 pc = 0;
+	u32 aot_index = 0;
+	u32 target = 0;
+	u32 fnid = 0;
+	u32 cia = 0;
+	u32 lr = 0;
+	u32 r1 = 0;
+	u32 r29 = 0;
+	u32 ctr = 0;
+	u32 r0 = 0;
+	u32 r2 = 0;
+	u32 r3 = 0;
+	u32 r4 = 0;
+	u32 r5 = 0;
+	u32 r11 = 0;
+	u32 r12 = 0;
+	u32 expected = 0;
+	u32 actual = 0;
+	u32 state = 0;
+};
+
+thread_local std::array<ppu_web_boundary_entry, 32> tl_ppu_web_boundaries{};
+thread_local u64 tl_ppu_web_boundary_sequence = 0;
+thread_local u32 tl_ppu_web_watch_value = 0;
+thread_local bool tl_ppu_web_watch_initialized = false;
+
+struct ppu_web_direct_hle_trace_t
+{
+	u32 target = 0;
+	u32 fnid = 0;
+	u32 lr = 0;
+	u32 cia = 0;
+	u64 frame_lr = 0;
+	u64 r2_before = 0;
+	u64 r1_before = 0;
+	u64 r3_before = 0;
+	u64 r4_before = 0;
+	u64 r29_before = 0;
+	u64 r30_before = 0;
+	u64 r31_before = 0;
+	u64 toc_slot_before = 0;
+	u64 r2_after = 0;
+	u64 r1_after = 0;
+	u64 r29_after = 0;
+	u64 r30_after = 0;
+	u64 r31_after = 0;
+	u64 toc_slot_after = 0;
+};
+
+thread_local ppu_web_direct_hle_trace_t tl_ppu_web_direct_hle_trace{};
+
+void ppu_web_record_boundary(const ppu_thread& ppu, ppu_web_boundary_kind kind, u32 pc, u32 aot_index = 0,
+	u32 target = 0, u32 fnid = 0, u32 expected = 0, u32 actual = 0)
+{
+	const u64 sequence = ++tl_ppu_web_boundary_sequence;
+	if (const u32 watch = g_ppu_web_watch_address; watch && vm::check_addr<4>(watch))
+	{
+		const u32 value = vm::read32(watch);
+		if (!tl_ppu_web_watch_initialized || value != tl_ppu_web_watch_value)
+		{
+			std::fprintf(stderr,
+				"RPCS3 Web PPU boundary watch: seq=%llu address=0x%08x old=%s0x%08x value=0x%08x kind=%u pc=0x%08x aot=%u target=0x%08x fnid=0x%08x id=0x%x lr=0x%08x r3=0x%08x r11=0x%08x r12=0x%08x\n",
+				static_cast<unsigned long long>(sequence), watch,
+				tl_ppu_web_watch_initialized ? "" : "uninitialized:", tl_ppu_web_watch_value, value,
+				static_cast<u32>(kind), pc, aot_index, target, fnid, ppu.id, static_cast<u32>(ppu.lr),
+				static_cast<u32>(ppu.gpr[3]), static_cast<u32>(ppu.gpr[11]), static_cast<u32>(ppu.gpr[12]));
+			tl_ppu_web_watch_value = value;
+			tl_ppu_web_watch_initialized = true;
+		}
+	}
+	auto& entry = tl_ppu_web_boundaries[sequence & 31u];
+	entry = {
+		.sequence = sequence,
+		.kind = static_cast<u32>(kind),
+		.id = ppu.id,
+		.pc = pc,
+		.aot_index = aot_index,
+		.target = target,
+		.fnid = fnid,
+		.cia = ppu.cia,
+		.lr = static_cast<u32>(ppu.lr),
+		.r1 = static_cast<u32>(ppu.gpr[1]),
+		.r29 = static_cast<u32>(ppu.gpr[29]),
+		.ctr = static_cast<u32>(ppu.ctr),
+		.r0 = static_cast<u32>(ppu.gpr[0]),
+		.r2 = static_cast<u32>(ppu.gpr[2]),
+		.r3 = static_cast<u32>(ppu.gpr[3]),
+		.r4 = static_cast<u32>(ppu.gpr[4]),
+		.r5 = static_cast<u32>(ppu.gpr[5]),
+		.r11 = static_cast<u32>(ppu.gpr[11]),
+		.r12 = static_cast<u32>(ppu.gpr[12]),
+		.expected = expected,
+		.actual = actual,
+		.state = static_cast<u32>(ppu.state.load()),
+	};
+}
+
+static void ppu_web_record_dispatch_state(ppu_thread& ppu, u32 kind, u32 source, u32 target, u32 index)
+{
+	ppu.web_dispatch_prev_source = ppu.web_dispatch_source;
+	ppu.web_dispatch_prev_target = ppu.web_dispatch_target;
+	ppu.web_dispatch_prev_index = ppu.web_dispatch_index;
+	ppu.web_dispatch_prev_r0 = ppu.web_dispatch_r0;
+	ppu.web_dispatch_prev_r1 = ppu.web_dispatch_r1;
+	ppu.web_dispatch_prev_r2 = ppu.web_dispatch_r2;
+	ppu.web_dispatch_prev_lr = ppu.web_dispatch_lr;
+	ppu.web_dispatch_prev_kind = ppu.web_dispatch_kind;
+	ppu.web_dispatch_prev_r3 = ppu.web_dispatch_r3;
+	ppu.web_dispatch_prev_r4 = ppu.web_dispatch_r4;
+	ppu.web_dispatch_prev_r11 = ppu.web_dispatch_r11;
+	ppu.web_dispatch_prev_r12 = ppu.web_dispatch_r12;
+	ppu.web_dispatch_prev_r2_full = ppu.web_dispatch_r2_full;
+	ppu.web_dispatch_source = source;
+	ppu.web_dispatch_target = target;
+	ppu.web_dispatch_index = index;
+	ppu.web_dispatch_r0 = static_cast<u32>(ppu.gpr[0]);
+	ppu.web_dispatch_r1 = static_cast<u32>(ppu.gpr[1]);
+	ppu.web_dispatch_r2 = static_cast<u32>(ppu.gpr[2]);
+	ppu.web_dispatch_lr = static_cast<u32>(ppu.lr);
+	ppu.web_dispatch_kind = kind;
+	ppu.web_dispatch_r3 = static_cast<u32>(ppu.gpr[3]);
+	ppu.web_dispatch_r4 = static_cast<u32>(ppu.gpr[4]);
+	ppu.web_dispatch_r11 = static_cast<u32>(ppu.gpr[11]);
+	ppu.web_dispatch_r12 = static_cast<u32>(ppu.gpr[12]);
+	ppu.web_dispatch_r2_full = ppu.gpr[2];
+}
 
 void ppu_web_register_instance_span(u32 begin, u32 end)
 {
 	ensure(begin < end);
-	ensure(g_ppu_web_instance_spans.empty() || begin >= g_ppu_web_instance_spans.back().table_end);
-	g_ppu_web_instance_spans.push_back({begin, end});
+	std::lock_guard lock(g_ppu_web_instance_spans_mutex);
+	const auto pos = std::lower_bound(g_ppu_web_instance_spans.begin(), g_ppu_web_instance_spans.end(), begin,
+		[](const ppu_wasm_dispatch_context& span, u32 b) { return span.table_begin < b; });
+	g_ppu_web_instance_spans.insert(pos, {begin, end});
 }
 
 static ppu_wasm_dispatch_context ppu_web_instance_span(u32 index)
 {
+	std::lock_guard lock(g_ppu_web_instance_spans_mutex);
 	const auto found = std::upper_bound(g_ppu_web_instance_spans.begin(), g_ppu_web_instance_spans.end(), index,
 		[](u32 slot, const ppu_wasm_dispatch_context& span) { return slot < span.table_begin; });
 	if (found != g_ppu_web_instance_spans.begin() && std::prev(found)->contains(index)) return *std::prev(found);
@@ -649,6 +827,7 @@ class ppu_web_execution_counters
 	u32 entries = 0;
 	u32 interpreted = 0;
 	u32 compiled = 0;
+	u32 hle = 0;
 	u32 last_pc = 0;
 
 public:
@@ -658,6 +837,7 @@ public:
 	{
 		if (interpreted) g_ppu_web_instruction_count += std::exchange(interpreted, 0);
 		if (compiled) g_ppu_web_aot_dispatch_count += std::exchange(compiled, 0);
+		if (hle) g_ppu_web_hle_hook_count += std::exchange(hle, 0);
 		if (entries) g_ppu_web_last_pc = last_pc;
 		entries = 0;
 	}
@@ -676,6 +856,12 @@ public:
 		else g_ppu_web_aot_dispatch_count++;
 	}
 
+	void hle_entry()
+	{
+		if (batched) ++hle;
+		else g_ppu_web_hle_hook_count++;
+	}
+
 	void interpreted_entry() { ++interpreted; }
 };
 
@@ -684,6 +870,7 @@ public:
 // analyser found, and every worker running a PPU thread has to hold all of them in its function
 // table, so knowing how many are ever entered says what a bundle built from a profile would cost.
 static std::array<atomic_t<u64>, (1u << 20) / 64> g_ppu_web_block_used{};
+static atomic_t<u64> g_ppu_web_block_used_count{0};
 static atomic_t<u32> g_ppu_web_block_base{0};
 
 extern void ppu_web_set_block_base(u32 base)
@@ -693,9 +880,7 @@ extern void ppu_web_set_block_base(u32 base)
 
 extern u64 ppu_web_blocks_used()
 {
-	u64 used = 0;
-	for (const auto& word : g_ppu_web_block_used) used += std::popcount(word.load());
-	return used;
+	return g_ppu_web_block_used_count.load();
 }
 
 // Guest addresses entered, one bit per instruction slot over the first 32 MB, which covers a
@@ -728,20 +913,27 @@ extern u32 ppu_web_copy_used(u32* out, u32 max)
 
 static inline void ppu_web_note_block(u32 index, u32 address)
 {
-	const u32 slot = index - g_ppu_web_block_base.load();
+	const u32 slot = index - g_ppu_web_block_base.raw();
 
 	if (slot < (1u << 20))
 	{
 		auto& word = g_ppu_web_block_used[slot / 64];
 		const u64 bit = 1ull << (slot % 64);
-		if (!(word.load() & bit)) word |= bit;
+		if (word.raw() & bit) [[likely]]
+		{
+			return;
+		}
+		if (!(word.fetch_or(bit) & bit))
+		{
+			g_ppu_web_block_used_count++;
+		}
 	}
 
 	if (address < ppu_web_used_span)
 	{
 		auto& word = g_ppu_web_address_used[(address / 4) / 64];
 		const u64 bit = 1ull << ((address / 4) % 64);
-		if (!(word.load() & bit)) word |= bit;
+		if (!(word.raw() & bit)) word |= bit;
 	}
 }
 
@@ -768,7 +960,7 @@ static inline u32 ppu_web_aot_lookup(u32 addr)
 static constexpr u32 ppu_web_jit_tag = 0x8000'0000;
 static constexpr u32 ppu_web_jit_queued = 0x4000'0000;
 
-u32 g_ppu_web_jit_threshold = 64;
+u32 g_ppu_web_jit_threshold = 1;
 
 // A block this worker's table does not hold yet stays on the interpreter, which is silent otherwise
 atomic_t<u32> g_ppu_web_jit_unplaced{0};
@@ -837,9 +1029,17 @@ static NEVER_INLINE void ppu_web_jit_note(ppu_web_dispatch_page* page, u32 index
 	page->jit[index].store(ppu_web_jit_tag | count, std::memory_order_relaxed);
 }
 
+static atomic_t<u32> g_ppu_web_aot_registered_count{0};
+
+extern u32 ppu_web_aot_blocks()
+{
+	return g_ppu_web_aot_registered_count.load();
+}
+
 // (guest address, table index) pairs; hooked addresses stay with the hook
 extern void ppu_web_aot_register(const u32* pairs, u32 count)
 {
+	g_ppu_web_aot_registered_count += count;
 	for (u32 i = 0; i < count; i++)
 	{
 		const u32 addr = pairs[i * 2];
@@ -857,7 +1057,40 @@ extern void ppu_web_aot_register(const u32* pairs, u32 count)
 
 extern void* ppu_web_aot_exec_base()
 {
-	return s_ppu_web_dispatch_pages.data();
+	return s_ppu_web_dispatch_dir.pages.data();
+}
+
+extern void ppu_web_set_page_seg0(u32 page_idx, u32 seg0)
+{
+	if (page_idx < 0x10000u)
+	{
+		s_ppu_web_dispatch_dir.page_seg0[page_idx].store(seg0, std::memory_order_release);
+	}
+}
+
+extern void ppu_web_clear_prx_range(u32 addr, u32 size)
+{
+	if (!size)
+	{
+		return;
+	}
+	const u32 end = addr + size;
+	for (u32 p = (addr >> 16), last_p = ((end - 1) >> 16); p <= last_p && p < 0x10000u; ++p)
+	{
+		s_ppu_web_dispatch_dir.page_seg0[p].store(0, std::memory_order_release);
+		if (auto* page = s_ppu_web_dispatch_dir.pages[p].load(std::memory_order_acquire))
+		{
+			const u32 page_start = std::max<u32>(addr, p << 16);
+			const u32 page_end = std::min<u32>(end, (p + 1u) << 16);
+			for (u32 a = page_start; a < page_end; a += 4)
+			{
+				const u32 slot = (a & 0xffffu) >> 2;
+				page->aot[slot].store(0, std::memory_order_release);
+				page->jit[slot].store(0, std::memory_order_release);
+				page->decoded[slot].store(0, std::memory_order_release);
+			}
+		}
+	}
 }
 
 extern u32 ppu_web_aot_registered(u32 addr)
@@ -908,6 +1141,110 @@ u32 ppu_web_interpreter_step(ppu_thread& ppu)
 	ppu_read(pc, opcode)(ppu, {opcode}, op, &ppu_ret);
 	return ppu.cia;
 }
+
+extern u32 ppu_web_direct_hle_bridge(ppu_thread& ppu, const void* base_ptr)
+{
+	static thread_local u32 tl_bridge_calls = 0;
+	static thread_local u32 tl_bridge_interpreted = 0;
+	static thread_local u32 tl_bridge_compiled = 0;
+	static thread_local u32 tl_bridge_hle = 0;
+
+	const u32 calls = ++tl_bridge_calls;
+	if ((calls & 255u) == 0) [[unlikely]]
+	{
+		if (tl_bridge_interpreted) g_ppu_web_instruction_count += std::exchange(tl_bridge_interpreted, 0);
+		if (tl_bridge_compiled) g_ppu_web_aot_dispatch_count += std::exchange(tl_bridge_compiled, 0);
+		if (tl_bridge_hle) g_ppu_web_hle_hook_count += std::exchange(tl_bridge_hle, 0);
+		g_ppu_web_last_pc = ppu.cia;
+	}
+
+	if (ppu.state.load() || !base_ptr || ((calls & 1023u) == 0)) [[unlikely]]
+	{
+		return 0;
+	}
+
+	const auto* web_context = static_cast<const ppu_wasm_dispatch_context*>(base_ptr);
+	u32 cached_page_idx = 0xffff'ffffu;
+	ppu_web_dispatch_page* cached_page = nullptr;
+
+	for (u32 step = 0; step < 64; ++step)
+	{
+		const u32 pc = ppu.cia;
+		if (!pc) [[unlikely]]
+		{
+			return 0;
+		}
+
+		const u32 page_idx = pc >> 16;
+		if (page_idx != cached_page_idx || !cached_page)
+		{
+			cached_page_idx = page_idx;
+			cached_page = ppu_web_dispatch_page_for(pc, false);
+			if (!cached_page) [[unlikely]]
+			{
+				return 0;
+			}
+		}
+
+		const u32 slot = (pc & 0xffff) / sizeof(u32);
+		if (const auto hook = cached_page->hooks[slot].load(std::memory_order_acquire))
+		{
+			const auto op = vm::_ptr<u32>(pc);
+			const u32 opcode = *op;
+			ppu_web_record_dispatch_state(ppu, 5, pc, pc, 0);
+			ppu_web_record_boundary(ppu, ppu_web_boundary_kind::hook_enter, pc);
+			hook(ppu, {opcode}, op, &ppu_ret);
+			ppu_web_record_boundary(ppu, ppu_web_boundary_kind::hook_return, pc, 0, 0, 0, pc, ppu.cia);
+			++tl_bridge_hle;
+			if (ppu.state.load()) [[unlikely]]
+			{
+				return 0;
+			}
+			continue;
+		}
+
+		u32 aot_index = cached_page->aot[slot].load(std::memory_order_acquire);
+		if (!aot_index)
+		{
+			const u32 jit_val = cached_page->jit[slot].load(std::memory_order_acquire);
+			if (jit_val && !(jit_val & ppu_web_jit_tag))
+			{
+				aot_index = jit_val;
+			}
+		}
+		if (aot_index)
+		{
+			if (web_context->contains(aot_index))
+			{
+				++tl_bridge_compiled;
+				return aot_index;
+			}
+			return 0;
+		}
+
+		if (!vm::check_addr<4>(pc, vm::page_executable)) [[unlikely]]
+		{
+			return 0;
+		}
+
+		if (ppu_web_codegen_fail_closed())
+		{
+			fmt::throw_exception("PPU AOT fail-closed: no compiled bridge target for guest PC 0x%08x", pc);
+		}
+
+		const auto op = vm::_ptr<u32>(pc);
+		const u32 opcode = *op;
+		const auto fn = ppu_read(pc, opcode);
+		fn(ppu, {opcode}, op, &ppu_ret);
+		++tl_bridge_interpreted;
+		if (ppu.state.load()) [[unlikely]]
+		{
+			return 0;
+		}
+	}
+
+	return 0;
+}
 #endif
 
 static void ppu_fallback(ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, ppu_intrp_func* next_fn)
@@ -922,6 +1259,12 @@ static void ppu_fallback(ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, p
 void ppu_recompiler_fallback(ppu_thread& ppu)
 {
 	perf_meter<"PPUFALL1"_u64> perf0;
+
+	const ppu_codegen_policy policy = make_ppu_codegen_policy(ppu_backend_kind::jit, ppu_target_kind::native);
+	if (policy.fail_closed)
+	{
+		fmt::throw_exception("PPU AOT fail-closed: unregistered native PPU target at 0x%08x (LR=0x%08x)", ppu.cia, static_cast<u32>(ppu.lr));
+	}
 
 	if (g_cfg.core.ppu_debug)
 	{
@@ -1299,6 +1642,8 @@ static const bool s_init_return_far_jump_func = []
 	return true;
 }();
 
+atomic_t<u32> g_ppu_far_jump_generation{1};
+
 struct ppu_far_jumps_t
 {
 	struct all_info_t
@@ -1371,6 +1716,7 @@ struct ppu_far_jumps_t
 	void add_value(u32 addr, all_info_t info)
 	{
 		vals.insert_or_assign(addr, std::move(info));
+		g_ppu_far_jump_generation.fetch_add(1);
 
 		if (vals.size() == 1)
 		{
@@ -1382,6 +1728,33 @@ struct ppu_far_jumps_t
 			vals_range.first = std::min<u32>(vals_range.first, addr);
 			vals_range.second = std::max<u32>(vals_range.second, addr);
 		}
+	}
+
+	bool resolve_entry(u32 pc, u32& out_target, bool& out_link, bool& out_from_opd) const
+	{
+		if (vals_range.first > pc || vals_range.second < pc)
+		{
+			return false;
+		}
+
+		reader_lock lock(mutex);
+
+		const auto it = vals.find(pc);
+		if (it == vals.end())
+		{
+			return false;
+		}
+
+		const all_info_t& info = it->second;
+		u32 direct_target = info.target;
+		if (!info.module_name.empty())
+		{
+			direct_target = ppu_get_exported_func_addr(direct_target, info.module_name);
+		}
+		out_target = direct_target;
+		out_link = info.link;
+		out_from_opd = info.with_toc;
+		return true;
 	}
 
 	// Get target address, 'ppu' is used in ppu_far_jump in order to modify registers
@@ -1508,9 +1881,90 @@ u32 ppu_get_far_jump(u32 pc)
 	return g_fxo->get<ppu_far_jumps_t>().get_target(pc);
 }
 
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+namespace
+{
+	struct ppu_far_jump_cache_entry_t
+	{
+		u32 pc = umax;
+		u32 generation = 0;
+		u32 target = 0;
+		bool link = false;
+		bool from_opd = false;
+		u32 return_from_far_jump_addr = 0;
+	};
+
+	thread_local std::array<ppu_far_jump_cache_entry_t, 1024> tl_ppu_far_jump_cache{};
+
+	struct ppu_hle_target_cache_entry_t
+	{
+		u32 target_pc = umax;
+		u32 fnid = 0;
+		u32 opd_addr = 0;
+		u32 generation = 0;
+		u32 exec_pc = 0;
+		u32 lle_r2 = 0;
+		u32 opcode = 0;
+		be_t<u32>* op = nullptr;
+		ppu_intrp_func_t hle_hook = nullptr;
+		bool logged_unresolved = false;
+		bool logged_return_mismatch = false;
+		bool logged_state_abort = false;
+		bool logged_continuation_mismatch = false;
+	};
+
+	thread_local std::array<ppu_hle_target_cache_entry_t, 2048> tl_ppu_hle_target_cache{};
+}
+#endif
+
 static void ppu_far_jump(ppu_thread& ppu, ppu_opcode_t, be_t<u32>* this_op, ppu_intrp_func*)
 {
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+	const u32 pc = vm::get_addr(this_op);
+	const u32 gen = g_ppu_far_jump_generation.load();
+	auto& entry = tl_ppu_far_jump_cache[(pc >> 2) & 1023];
+	if (entry.pc != pc || entry.generation != gen) [[unlikely]]
+	{
+		u32 resolved_target = 0;
+		bool resolved_link = false;
+		bool resolved_from_opd = false;
+		if (!g_fxo->get<ppu_far_jumps_t>().resolve_entry(pc, resolved_target, resolved_link, resolved_from_opd))
+		{
+			fmt::throw_exception("PPU far jump failed! (unregistered pc = 0x%08x)", pc);
+		}
+		entry.pc = pc;
+		entry.generation = gen;
+		entry.target = resolved_target;
+		entry.link = resolved_link;
+		entry.from_opd = resolved_from_opd;
+		entry.return_from_far_jump_addr = resolved_from_opd
+			? g_fxo->get<ppu_function_manager>().func_addr(FIND_FUNC(ppu_return_from_far_jump), true)
+			: 0;
+	}
+
+	u32 cia = entry.target;
+	bool to_link = entry.link;
+	if (entry.from_opd && vm::check_addr<sizeof(ppu_func_opd_t)>(cia)) [[likely]]
+	{
+		const auto& opd = vm::_ref<ppu_func_opd_t>(cia);
+		const u32 opd_addr = opd.addr;
+		const u32 opd_rtoc = opd.rtoc;
+		cia = opd_addr;
+		to_link = false;
+
+		auto& saved_info = ppu.hle_func_calls_with_toc_info.emplace_back();
+		saved_info.cia = pc;
+		saved_info.saved_lr = std::exchange(ppu.lr, entry.return_from_far_jump_addr);
+		saved_info.saved_r2 = std::exchange(ppu.gpr[2], opd_rtoc);
+	}
+
+	if (to_link)
+	{
+		ppu.lr = pc + 4;
+	}
+#else
 	const u32 cia = g_fxo->get<ppu_far_jumps_t>().get_target(vm::get_addr(this_op), &ppu);
+#endif
 
 	if (!vm::check_addr(cia, vm::page_executable))
 	{
@@ -1519,6 +1973,280 @@ static void ppu_far_jump(ppu_thread& ppu, ppu_opcode_t, be_t<u32>* this_op, ppu_
 
 	ppu.cia = cia;
 }
+
+#ifdef RPCS3_WEB
+extern u32 ppu_web_direct_hle_fnid(ppu_thread& ppu, u32 target_pc, u32 fnid, u32 return_pc)
+{
+	auto& entry = tl_ppu_hle_target_cache[((target_pc >> 2) ^ (fnid * 2654435761u)) & 2047];
+	if (entry.target_pc != target_pc || entry.fnid != fnid) [[unlikely]]
+	{
+		entry.target_pc = target_pc;
+		entry.fnid = fnid;
+		entry.logged_state_abort = false;
+	}
+
+	if (!target_pc || ppu.state.load()) [[unlikely]]
+	{
+		if (!entry.logged_state_abort)
+		{
+			const u64 saved_r1 = ppu.gpr[1];
+			u64 frame_lr = 0;
+			u32 stack_lr = 0;
+			if (saved_r1 <= u32{umax})
+			{
+				vm::try_access(static_cast<u32>(saved_r1) + 128, &frame_lr, sizeof(frame_lr), false);
+				vm::try_access(static_cast<u32>(saved_r1) + 16, &stack_lr, sizeof(stack_lr), false);
+			}
+			std::fprintf(stderr,
+				"RPCS3 Web PPU direct HLE state abort: target=0x%08x fnid=0x%08x return_pc=0x%08x state=0x%x lr=0x%08x cia=0x%08x r1=0x%08x r2=0x%08x frame_lr=0x%016llx stack_lr=0x%08x\n",
+				target_pc, fnid, return_pc, static_cast<u32>(+ppu.state), static_cast<u32>(ppu.lr), ppu.cia,
+				static_cast<u32>(saved_r1), static_cast<u32>(ppu.gpr[2]), static_cast<unsigned long long>(std::byteswap(frame_lr)), stack_lr);
+			entry.logged_state_abort = true;
+		}
+		return 0;
+	}
+
+	const bool is_faddr = (target_pc & 0x80000000u) != 0;
+	const u32 faddr = target_pc & 0x7fffffffu;
+	const u32 live_opd = (is_faddr && vm::check_addr(faddr, vm::page_readable)) ? static_cast<u32>(vm::read32(faddr)) : 0;
+	const u32 gen = g_ppu_far_jump_generation.load();
+	if (entry.target_pc != target_pc || entry.fnid != fnid || entry.opd_addr != live_opd || entry.generation != gen) [[unlikely]]
+	{
+		const u32 hle_base = g_fxo->is_init<ppu_function_manager>() ? g_fxo->get<ppu_function_manager>().addr : 0;
+		const auto& funcs = ppu_function_manager::get();
+		ppu_intrp_func_t hle_hook = nullptr;
+		be_t<u32>* op = nullptr;
+		u32 opcode = 0;
+		u32 exec_pc = is_faddr ? 0 : target_pc;
+		u32 lle_r2 = 0;
+		bool logged_unresolved = false;
+		bool logged_return_mismatch = false;
+
+		if (is_faddr && live_opd && vm::check_addr(live_opd + 4, vm::page_readable))
+		{
+			exec_pc = vm::read32(live_opd);
+			lle_r2 = vm::read32(live_opd + 4);
+		}
+		if (!hle_hook && hle_base && fnid)
+		{
+			for (const auto& [mod_name, sm] : ppu_module_manager::get())
+			{
+				if (!sm) continue;
+				const auto it = sm->functions.find(fnid);
+				if (it != sm->functions.end() && (it->second.flags & (MFF_FORCED_HLE | MFF_PERFECT)))
+				{
+					const u32 index = it->second.index;
+					if (index < funcs.size() && funcs[index])
+					{
+						exec_pc = hle_base + index * 8 + 4;
+						hle_hook = funcs[index];
+						op = vm::_ptr<u32>(exec_pc);
+						opcode = *op;
+						break;
+					}
+				}
+			}
+		}
+
+		if (!hle_hook)
+		{
+			if (hle_base && exec_pc && exec_pc < hle_base)
+			{
+				if (const auto page = ppu_web_dispatch_page_for(exec_pc, false))
+				{
+					const auto hook = page->hooks[(exec_pc & 0xffff) / sizeof(u32)].load(std::memory_order_acquire);
+					if (hook == &ppu_far_jump && g_fxo->is_init<ppu_far_jumps_t>())
+					{
+						u32 resolved_target = 0;
+						bool resolved_link = false;
+						bool resolved_from_opd = false;
+						if (g_fxo->get<ppu_far_jumps_t>().resolve_entry(exec_pc, resolved_target, resolved_link, resolved_from_opd) && !resolved_link && !resolved_from_opd)
+						{
+							exec_pc = resolved_target;
+						}
+					}
+				}
+			}
+			if (hle_base && exec_pc >= hle_base && (exec_pc & 7) == 4)
+			{
+				const u32 index = (exec_pc - hle_base) >> 3;
+				if (index < funcs.size() && funcs[index])
+				{
+					hle_hook = funcs[index];
+					op = vm::_ptr<u32>(exec_pc);
+					opcode = *op;
+				}
+			}
+		}
+
+		entry.target_pc = target_pc;
+		entry.fnid = fnid;
+		entry.opd_addr = live_opd;
+		entry.generation = gen;
+		entry.exec_pc = exec_pc;
+		entry.lle_r2 = lle_r2;
+		entry.opcode = opcode;
+		entry.op = op;
+		entry.hle_hook = hle_hook;
+		entry.logged_unresolved = logged_unresolved;
+		entry.logged_return_mismatch = logged_return_mismatch;
+	}
+
+	if (!entry.hle_hook) [[unlikely]]
+	{
+		if (is_faddr && !entry.opd_addr && !entry.logged_unresolved)
+		{
+			entry.logged_unresolved = true;
+			std::fprintf(stderr, "PPU direct HLE unresolved: target=0x%08x fnid=0x%08x lr=0x%08x\n",
+				target_pc, fnid, static_cast<u32>(ppu.lr));
+		}
+		if (is_faddr && entry.opd_addr && entry.exec_pc)
+		{
+			ppu.gpr[12] = entry.opd_addr;
+			ppu.gpr[0] = entry.exec_pc;
+			ppu.gpr[2] = entry.lle_r2;
+			ppu.ctr = entry.exec_pc;
+			ppu.cia = entry.exec_pc;
+			return !ppu.state.load() ? entry.exec_pc : 0;
+		}
+		return 0;
+	}
+
+	const u32 caller_lr = static_cast<u32>(ppu.lr) & ~3u;
+	const u32 compiled_ret = return_pc & ~3u;
+	const auto is_guest_continuation = [](u32 pc)
+	{
+		if (!pc || (pc & 3u) || !vm::check_addr<4>(pc, vm::page_executable)) return false;
+		const auto* page = ppu_web_dispatch_page_fast(pc >> 16);
+		if (!page) return true;
+		return !page->hook_raw((pc & 0xffff) / sizeof(u32));
+	};
+	const bool caller_lr_valid = is_guest_continuation(caller_lr);
+	const bool compiled_ret_valid = is_guest_continuation(compiled_ret);
+	// The live LR is the guest continuation for a direct call. Compiled call-site
+	// metadata is a fallback when LR is absent or points back into an HLE hook.
+	const u32 expected_ret = caller_lr_valid ? caller_lr : compiled_ret_valid ? compiled_ret : caller_lr ? caller_lr : compiled_ret;
+	if (return_pc && caller_lr && (return_pc & ~3u) != expected_ret && !entry.logged_continuation_mismatch) [[unlikely]]
+	{
+		entry.logged_continuation_mismatch = true;
+		std::fprintf(stderr,
+			"RPCS3 Web PPU direct HLE continuation mismatch: target=0x%08x fnid=0x%08x compiled=0x%08x caller=0x%08x cia=0x%08x\n",
+			target_pc, fnid, return_pc & ~3u, caller_lr, ppu.cia);
+	}
+	const u32 saved_lr = static_cast<u32>(ppu.lr);
+	const u64 saved_r2 = ppu.gpr[2];
+	const u64 saved_r1 = ppu.gpr[1];
+	u64 frame_lr = 0;
+	u32 stack_lr = 0;
+	if (saved_r1 <= u32{umax})
+	{
+		vm::try_access(static_cast<u32>(saved_r1) + 128, &frame_lr, sizeof(frame_lr), false);
+		vm::try_access(static_cast<u32>(saved_r1) + 16, &stack_lr, sizeof(stack_lr), false);
+	}
+	ppu.web_hle_target = target_pc;
+	ppu.web_hle_fnid = fnid;
+	ppu.web_hle_return_pc = return_pc;
+	ppu.web_hle_lr_before = saved_lr;
+	ppu.web_hle_stack_lr = stack_lr;
+	ppu.web_hle_expected = expected_ret;
+	if (!expected_ret) [[unlikely]]
+	{
+		std::fprintf(stderr, "PPU direct HLE missing continuation: target=0x%08x fnid=0x%08x return_pc=0x%08x lr=0x%08x r1=0x%08x stack_lr=0x%08x\n",
+			target_pc, fnid, return_pc, static_cast<u32>(ppu.lr), static_cast<u32>(saved_r1), stack_lr);
+	}
+	std::array<u64, 19> saved_nonvolatile_gprs{};
+	for (u32 reg = 13; reg < 32; ++reg)
+	{
+		saved_nonvolatile_gprs[reg - 13] = ppu.gpr[reg];
+	}
+	tl_ppu_web_direct_hle_trace = {
+		.target = target_pc,
+		.fnid = fnid,
+		.lr = expected_ret,
+		.cia = ppu.cia,
+		.frame_lr = std::byteswap(frame_lr),
+		.r2_before = ppu.gpr[2],
+		.r1_before = ppu.gpr[1],
+		.r3_before = ppu.gpr[3],
+		.r4_before = ppu.gpr[4],
+		.r29_before = ppu.gpr[29],
+		.r30_before = ppu.gpr[30],
+		.r31_before = ppu.gpr[31],
+	};
+	if (saved_r1 <= u32{umax})
+	{
+		be_t<u64> toc_slot{};
+		if (vm::try_access(static_cast<u32>(saved_r1) + 40, &toc_slot, sizeof(toc_slot), false))
+		{
+			tl_ppu_web_direct_hle_trace.toc_slot_before = std::bit_cast<u64>(toc_slot);
+		}
+	}
+	ppu_web_record_boundary(ppu, ppu_web_boundary_kind::direct_enter, target_pc, 0, entry.exec_pc, fnid, expected_ret);
+	ppu.cia = entry.exec_pc;
+	entry.hle_hook(ppu, {entry.opcode}, entry.op, &ppu_ret);
+	ppu.gpr[1] = saved_r1;
+	ppu.gpr[2] = saved_r2;
+	for (u32 reg = 13; reg < 32; ++reg)
+	{
+		ppu.gpr[reg] = saved_nonvolatile_gprs[reg - 13];
+	}
+	ppu.lr = saved_lr;
+	tl_ppu_web_direct_hle_trace.r2_after = ppu.gpr[2];
+	tl_ppu_web_direct_hle_trace.r1_after = ppu.gpr[1];
+	tl_ppu_web_direct_hle_trace.r29_after = ppu.gpr[29];
+	tl_ppu_web_direct_hle_trace.r30_after = ppu.gpr[30];
+	tl_ppu_web_direct_hle_trace.r31_after = ppu.gpr[31];
+	if (saved_r1 <= u32{umax})
+	{
+		be_t<u64> toc_slot{};
+		if (vm::try_access(static_cast<u32>(saved_r1) + 40, &toc_slot, sizeof(toc_slot), false))
+		{
+			tl_ppu_web_direct_hle_trace.toc_slot_after = std::bit_cast<u64>(toc_slot);
+		}
+	}
+	if (tl_ppu_web_direct_hle_trace.r29_after != tl_ppu_web_direct_hle_trace.r29_before) [[unlikely]]
+	{
+		std::fprintf(stderr, "PPU direct HLE changed r29: target=0x%08x fnid=0x%08x lr=0x%08x before=0x%016llx after=0x%016llx cia=0x%08x\n",
+			target_pc, fnid, expected_ret,
+			static_cast<unsigned long long>(tl_ppu_web_direct_hle_trace.r29_before),
+			static_cast<unsigned long long>(tl_ppu_web_direct_hle_trace.r29_after), ppu.cia);
+	}
+	ppu_web_record_boundary(ppu, ppu_web_boundary_kind::direct_return, target_pc, 0, entry.exec_pc, fnid, expected_ret, ppu.cia);
+	// A JSPI-capable HLE hook may request a suspension while still returning
+	// through this synchronous boundary. Commit the caller continuation before
+	// unwinding so resumption cannot dispatch from the HLE trampoline or PC 0.
+	const u32 actual_cia = ppu.cia;
+	ppu.web_hle_actual = actual_cia;
+	ppu.cia = expected_ret;
+	ppu.web_hle_after = ppu.cia;
+	const u32 final_state = static_cast<u32>(+ppu.state);
+	if (!final_state)
+	{
+		if (expected_ret && actual_cia != expected_ret) [[unlikely]]
+		{
+			if (!entry.logged_return_mismatch)
+			{
+				entry.logged_return_mismatch = true;
+				std::fprintf(stderr, "PPU direct HLE return mismatch: target=0x%08x fnid=0x%08x exec=0x%08x expected=0x%08x actual=0x%08x\n",
+				target_pc, fnid, entry.exec_pc, expected_ret, actual_cia);
+			}
+			// A synchronous HLE hook may leave cia at its trampoline when it
+			// re-enters guest code. The direct-call lowering still continues at
+			// the caller's LR; returning zero here would dispatch guest PC 0.
+		}
+
+		return expected_ret;
+	}
+	if (!entry.logged_return_mismatch)
+	{
+		entry.logged_return_mismatch = true;
+		std::fprintf(stderr,
+			"RPCS3 Web PPU direct HLE unwind: target=0x%08x fnid=0x%08x exec=0x%08x expected=0x%08x actual=0x%08x state=0x%x\n",
+			target_pc, fnid, entry.exec_pc, expected_ret, actual_cia, final_state);
+	}
+	return 0;
+}
+#endif
 
 bool ppu_form_branch_to_code(u32 entry, u32 target, bool link, bool with_toc, std::string module_name)
 {
@@ -1621,6 +2349,7 @@ void ppu_remove_hle_instructions(u32 addr, u32 size)
 
 		it++;
 	}
+	g_ppu_far_jump_generation.fetch_add(1);
 }
 
 atomic_t<bool> g_debugger_pause_all_threads_on_bp = false;
@@ -3049,7 +3778,7 @@ void ppu_thread::cpu_task()
 				return;
 			}
 
-#if !defined(RPCS3_WEB_INTERPRETER_ONLY) && !defined(RPCS3_PORTABLE_SPU_INTERPRETER)
+#if !defined(RPCS3_WEB_INTERPRETER_ONLY) && !(defined(RPCS3_WEB) && defined(RPCS3_PORTABLE_SPU_INTERPRETER))
 			spu_cache::initialize();
 #endif
 
@@ -3198,6 +3927,122 @@ void ppu_thread::cpu_wait(bs_t<cpu_flag> old)
 }
 
 #ifdef RPCS3_WEB
+namespace
+{
+	thread_local std::array<u64, (1u << 21) / 64> tl_ppu_web_hot_placed_bits{};
+
+	inline bool ppu_web_is_hot_placed_here(u32 tier)
+	{
+		if (tier >= (1u << 21)) return false;
+		return (tl_ppu_web_hot_placed_bits[tier >> 6] & (1ull << (tier & 63))) != 0;
+	}
+
+	bool ppu_web_ensure_hot_placed_here(u32 tier)
+	{
+		if (ppu_web_is_hot_placed_here(tier)) return true;
+		u32 span[2]{0, 0};
+		g_ppu_web_jit_syncs.raw()++;
+		if (!rpcs3_web_ppu_hot_ensure(tier, span) || span[0] >= span[1])
+		{
+			g_ppu_web_jit_unplaced.raw()++;
+			return false;
+		}
+		const u32 begin = std::min<u32>(span[0], (1u << 21));
+		const u32 end = std::min<u32>(span[1], (1u << 21));
+		for (u32 idx = begin; idx < end;)
+		{
+			if ((idx & 63) == 0 && idx + 64 <= end)
+			{
+				tl_ppu_web_hot_placed_bits[idx >> 6] = ~0ull;
+				idx += 64;
+			}
+			else
+			{
+				tl_ppu_web_hot_placed_bits[idx >> 6] |= (1ull << (idx & 63));
+				idx++;
+			}
+		}
+		return ppu_web_is_hot_placed_here(tier);
+	}
+}
+
+extern void ppu_web_dump_last_blocks(const ppu_thread& ppu)
+{
+		std::fprintf(stderr, "RPCS3 Web PPU fatal state: id=0x%x cia=0x%08x lr=0x%08llx ctr=0x%08llx r0=0x%08llx r1=0x%08llx r2=0x%08llx r3=0x%08llx r4=0x%08llx r11=0x%08llx r12=0x%08llx r17=0x%08llx r29=0x%08llx r30=0x%08llx r31=0x%08llx\n",
+			ppu.id, ppu.cia, ppu.lr, ppu.ctr, ppu.gpr[0], ppu.gpr[1], ppu.gpr[2], ppu.gpr[3], ppu.gpr[4], ppu.gpr[11], ppu.gpr[12], ppu.gpr[17], ppu.gpr[29], ppu.gpr[30], ppu.gpr[31]);
+	extern std::string ppu_web_describe_import(u32 stub, u32 descriptor);
+	if (const std::string import = ppu_web_describe_import(ppu.web_dispatch_source, ppu.web_dispatch_r12); !import.empty())
+	{
+		std::fprintf(stderr, "RPCS3 Web PPU last import stub: pc=0x%08x %s\n", ppu.web_dispatch_source, import.c_str());
+	}
+		std::fprintf(stderr,
+			"RPCS3 Web PPU fatal registers: r5=0x%016llx r6=0x%016llx r7=0x%016llx r8=0x%016llx r9=0x%016llx r10=0x%016llx r13=0x%016llx r14=0x%016llx r15=0x%016llx r16=0x%016llx r18=0x%016llx r19=0x%016llx r20=0x%016llx r21=0x%016llx r22=0x%016llx r23=0x%016llx r24=0x%016llx r25=0x%016llx r26=0x%016llx r27=0x%016llx r28=0x%016llx\n",
+			ppu.gpr[5], ppu.gpr[6], ppu.gpr[7], ppu.gpr[8], ppu.gpr[9], ppu.gpr[10], ppu.gpr[13], ppu.gpr[14],
+			ppu.gpr[15], ppu.gpr[16], ppu.gpr[18], ppu.gpr[19], ppu.gpr[20], ppu.gpr[21], ppu.gpr[22], ppu.gpr[23],
+			ppu.gpr[24], ppu.gpr[25], ppu.gpr[26], ppu.gpr[27], ppu.gpr[28]);
+	const auto& direct_hle = tl_ppu_web_direct_hle_trace;
+	if (direct_hle.target)
+	{
+		std::fprintf(stderr,
+			"RPCS3 Web PPU last direct HLE: target=0x%08x fnid=0x%08x lr=0x%08x frame_lr=0x%016llx cia=0x%08x r2=0x%016llx->0x%016llx r1=0x%016llx->0x%016llx r3=0x%016llx r4=0x%016llx r29=0x%016llx->0x%016llx r30=0x%016llx->0x%016llx r31=0x%016llx->0x%016llx toc40=0x%016llx->0x%016llx\n",
+			direct_hle.target, direct_hle.fnid, direct_hle.lr, static_cast<unsigned long long>(direct_hle.frame_lr), direct_hle.cia,
+			static_cast<unsigned long long>(direct_hle.r2_before), static_cast<unsigned long long>(direct_hle.r2_after),
+			static_cast<unsigned long long>(direct_hle.r1_before), static_cast<unsigned long long>(direct_hle.r1_after),
+			static_cast<unsigned long long>(direct_hle.r3_before), static_cast<unsigned long long>(direct_hle.r4_before),
+			static_cast<unsigned long long>(direct_hle.r29_before), static_cast<unsigned long long>(direct_hle.r29_after),
+			static_cast<unsigned long long>(direct_hle.r30_before), static_cast<unsigned long long>(direct_hle.r30_after),
+			static_cast<unsigned long long>(direct_hle.r31_before), static_cast<unsigned long long>(direct_hle.r31_after),
+			static_cast<unsigned long long>(direct_hle.toc_slot_before), static_cast<unsigned long long>(direct_hle.toc_slot_after));
+	}
+	if (ppu.web_dispatch_source || ppu.web_dispatch_kind)
+	{
+		std::fprintf(stderr,
+			"RPCS3 Web PPU last AOT dispatch: source=0x%08x target=0x%08x index=%u kind=%u r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x r4=0x%08x r11=0x%08x r12=0x%08x lr=0x%08x\n",
+			ppu.web_dispatch_source, ppu.web_dispatch_target, ppu.web_dispatch_index, ppu.web_dispatch_kind,
+			ppu.web_dispatch_r0, ppu.web_dispatch_r1, ppu.web_dispatch_r2, ppu.web_dispatch_r3, ppu.web_dispatch_r4,
+			ppu.web_dispatch_r11, ppu.web_dispatch_r12, ppu.web_dispatch_lr);
+		std::fprintf(stderr, "RPCS3 Web PPU last AOT dispatch full r2=0x%016llx\n", static_cast<unsigned long long>(ppu.web_dispatch_r2_full));
+		std::fprintf(stderr,
+			"RPCS3 Web PPU previous AOT dispatch: source=0x%08x target=0x%08x index=%u kind=%u r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x r4=0x%08x r11=0x%08x r12=0x%08x lr=0x%08x\n",
+			ppu.web_dispatch_prev_source, ppu.web_dispatch_prev_target, ppu.web_dispatch_prev_index, ppu.web_dispatch_prev_kind,
+			ppu.web_dispatch_prev_r0, ppu.web_dispatch_prev_r1, ppu.web_dispatch_prev_r2, ppu.web_dispatch_prev_r3,
+			ppu.web_dispatch_prev_r4, ppu.web_dispatch_prev_r11, ppu.web_dispatch_prev_r12, ppu.web_dispatch_prev_lr);
+		std::fprintf(stderr, "RPCS3 Web PPU previous AOT dispatch full r2=0x%016llx\n", static_cast<unsigned long long>(ppu.web_dispatch_prev_r2_full));
+	}
+	static constexpr const char* names[] = {"compiled", "hook-enter", "hook-return", "direct-enter", "direct-return", "fast-call", "fast-return"};
+	std::array<const ppu_web_boundary_entry*, 32> ordered{};
+	u32 count = 0;
+	for (const auto& entry : tl_ppu_web_boundaries)
+	{
+		if (entry.sequence) ordered[count++] = &entry;
+	}
+	std::sort(ordered.begin(), ordered.begin() + count, [](const auto* lhs, const auto* rhs)
+	{
+		return lhs->sequence < rhs->sequence;
+	});
+	for (u32 i = 0; i < count; ++i)
+	{
+		const auto& e = *ordered[i];
+		{
+			const char* name = e.kind < std::size(names) ? names[e.kind] : "unknown";
+			std::fprintf(stderr,
+				"  [boundary %llu] %s id=0x%x pc=0x%08x aot=%u target=0x%08x fnid=0x%08x cia=0x%08x lr=0x%08x r1=0x%08x r29=0x%08x ctr=0x%08x r2=0x%08x r3=0x%08x r4=0x%08x r5=0x%08x r12=0x%08x expected=0x%08x actual=0x%08x state=0x%x\n",
+				e.sequence, name, e.id, e.pc, e.aot_index, e.target, e.fnid, e.cia, e.lr, e.r1, e.r29, e.ctr,
+				e.r2, e.r3, e.r4, e.r5, e.r12, e.expected, e.actual, e.state);
+		}
+	}
+	std::fflush(stderr);
+}
+
+extern void ppu_web_dump_current_state(const char* reason)
+{
+	if (auto cpu = get_current_cpu_thread<ppu_thread>())
+	{
+		std::fprintf(stderr, "RPCS3 Web PPU boundary dump: %s\n", reason);
+		ppu_web_dump_last_blocks(static_cast<ppu_thread&>(*cpu));
+	}
+}
+
 void ppu_thread::exec_task()
 {
 	// Keep the execution boundary visible after Binaryen optimization. A long-lived
@@ -3244,25 +4089,48 @@ void ppu_thread::exec_task()
 	const auto mem_ = vm::g_base_addr;
 
 #ifdef RPCS3_WEB
+	thread_local bool tl_web_aot_ready = false;
+	thread_local bool tl_web_aot_checked = false;
+	thread_local u32 tl_web_jit_placed = 0;
+	thread_local u32 tl_web_aot_warmup = 0;
+
 	ppu_web_execution_counters web_counters;
 	ppu_wasm_dispatch_context web_context;
 	bool web_reported_zero_pc = false;
-	// The first function table index the runtime tier may use; the host installs it before any guest
-	// code runs and the registry only grows from there
-	const u32 web_jit_base = ppu_web_jit_enabled() ? web_hot_table_base() : 0;
-	// Compiled blocks are only callable once this worker's function table holds them (see
-	// rpcs3_web_pre.js): the bundle is placed as a whole, the runtime tier's entries one at a time
-	const bool web_aot_ready = rpcs3_web_ppu_aot_worker_ready() != 0 || web_jit_base != 0;
-	// The tier's region has to exist on this worker before any compiled block runs here, not when the
-	// interpreter first meets one of its indices: a bundle block reaches another through the table
-	// too, so it can branch into an address the tier registered while this thread was inside compiled
-	// code, and a table this worker never grew faults there instead of falling back.
-	u32 web_jit_placed = web_jit_base ? rpcs3_web_ppu_hot_sync() : 0;
+	const bool web_fail_closed = ppu_web_codegen_fail_closed() != 0;
+	// The first function table index the runtime tier / whole-module recompiler may use; the host
+	// installs it before any guest code runs and the registry only grows from there.
+	const u32 web_jit_base = (ppu_web_jit_enabled() || ppu_web_auto_recomp_enabled()) ? web_hot_table_base() : 0;
+	bool web_aot_checked = tl_web_aot_checked;
+	u32 web_jit_placed = tl_web_jit_placed;
+	void* const web_exec_base = ppu_web_aot_exec_base();
+	const u32 web_delay_pc = g_ppu_web_trace_delay_pc;
+	const u32 web_trace_pc = g_ppu_web_trace_pc;
+	const u32 web_trace_extra_count = std::min<u32>(g_ppu_web_trace_extra_count, std::size(g_ppu_web_trace_extra_pcs));
+	u32 web_trace_extra_pcs[std::size(g_ppu_web_trace_extra_pcs)]{};
+	for (u32 i = 0; i < web_trace_extra_count; ++i)
+	{
+		web_trace_extra_pcs[i] = g_ppu_web_trace_extra_pcs[i];
+	}
+	const u32 web_trace_match = g_ppu_web_watch_address;
+	const auto web_is_trace_pc = [&](u32 pc)
+	{
+		return web_trace_pc == pc || std::find(std::begin(web_trace_extra_pcs), std::end(web_trace_extra_pcs), pc) != std::end(web_trace_extra_pcs);
+	};
+	const auto web_trace_read32 = [](u64 addr) -> u32
+	{
+		return addr <= 0xffff'ffffull && vm::check_addr<4>(static_cast<u32>(addr))
+			? static_cast<u32>(vm::read32(static_cast<u32>(addr))) : 0;
+	};
+	const bool web_has_trace = web_delay_pc || web_trace_pc || web_trace_extra_count;
+	u32 cached_page_idx = 0xffff'ffffu;
+	ppu_web_dispatch_page* cached_page = nullptr;
 	g_ppu_web_last_pc = cia;
 #endif
 
 #ifdef RPCS3_WEB
-	u32 remaining_entries = 65536;
+	thread_local u32 tl_web_slice_count = 0;
+	u32 remaining_entries = (tl_web_slice_count < 16) ? (++tl_web_slice_count, 64u) : 4096u;
 #endif
 	while (true)
 	{
@@ -3287,61 +4155,108 @@ void ppu_thread::exec_task()
 		// Decode through the existing interpreter table and return after one
 		// instruction, keeping host stack usage bounded and guest addressing u32.
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
-		const u32 web_instruction_pc = cia;
+		u32 web_instruction_pc = cia;
 		web_counters.enter(web_instruction_pc);
-		if (const u32 delay_pc = g_ppu_web_trace_delay_pc; delay_pc && delay_pc == web_instruction_pc)
+		if (web_has_trace) [[unlikely]]
 		{
-			if (g_ppu_web_trace_delay_hits.fetch_add(1) == 0)
+			if (web_delay_pc && web_delay_pc == web_instruction_pc)
 			{
-				if (const u32 delay_ms = g_ppu_web_trace_delay_ms)
+				if (g_ppu_web_trace_delay_hits.fetch_add(1) == 0)
 				{
-					std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+					if (const u32 delay_ms = g_ppu_web_trace_delay_ms)
+					{
+						std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+					}
+				}
+			}
+			if (web_is_trace_pc(web_instruction_pc) && (!web_trace_match || static_cast<u32>(gpr[25]) == web_trace_match || static_cast<u32>(gpr[29]) == web_trace_match))
+			{
+				const u32 hit = g_ppu_web_trace_hits.fetch_add(1);
+				if (hit < 64)
+				{
+					const auto read32 = [](u64 addr) -> u32
+					{
+						return addr <= 0xffff'ffffull && vm::check_addr<4>(static_cast<u32>(addr))
+							? static_cast<u32>(vm::read32(static_cast<u32>(addr))) : 0;
+					};
+					std::fprintf(stderr,
+						"RPCS3 Web PPU trace: pc=0x%08x id=0x%08x lr=0x%08llx ctr=0x%08llx r0=0x%08llx "
+						"r1=0x%08llx r2=0x%08llx r3=0x%08llx r4=0x%08llx r5=0x%08llx "
+						"r6=0x%08llx r7=0x%08llx r8=0x%08llx r9=0x%08llx r10=0x%08llx r11=0x%08llx r12=0x%08llx "
+						"r22=0x%08llx r23=0x%08llx r24=0x%08llx r25=0x%08llx r26=0x%08llx "
+						"r27=0x%08llx r28=0x%08llx r29=0x%08llx r30=0x%08llx r31=0x%08llx stack84=0x%08x "
+						"mem29=0x%08x mem3_18=0x%08x mem3_104=0x%08x mem3_108=0x%08x mem3_110=0x%08x "
+						"mem24_48=0x%08x mem24_5c=0x%08x mem24_60=0x%08x mem24_64=0x%08x mem25_18=0x%08x mem25_38=0x%08x\n",
+						web_instruction_pc, id, lr, ctr, gpr[0], gpr[1], gpr[2], gpr[3], gpr[4], gpr[5],
+						gpr[6], gpr[7], gpr[8], gpr[9], gpr[10], gpr[11], gpr[12], gpr[22], gpr[23],
+						gpr[24], gpr[25], gpr[26], gpr[27], gpr[28], gpr[29], gpr[30], gpr[31],
+						static_cast<u32>(vm::_ref<u32>(static_cast<u32>(gpr[1]) + 0x84)),
+						read32(gpr[29]), read32(gpr[3] + 0x18), read32(gpr[3] + 0x104), read32(gpr[3] + 0x108), read32(gpr[3] + 0x110),
+						read32(gpr[24] + 0x48), read32(gpr[24] + 0x5c), read32(gpr[24] + 0x60), read32(gpr[24] + 0x64),
+						read32(gpr[25] + 0x18), read32(gpr[25] + 0x38));
+					if (hit == 0)
+					{
+						PPUDisAsm disasm(cpu_disasm_mode::normal, vm::g_sudo_addr);
+						const u32 begin = web_instruction_pc > 0x20 ? web_instruction_pc - 0x20 : web_instruction_pc;
+						std::fprintf(stderr, "RPCS3 Web PPU trace code:");
+						for (u32 pc = begin; pc <= web_instruction_pc + 0x20; pc += 4)
+						{
+							disasm.disasm(pc);
+							std::fprintf(stderr, " [0x%08x: %s]", pc, disasm.last_opcode.c_str());
+						}
+						std::fputc('\n', stderr);
+					}
 				}
 			}
 		}
-		const u32 web_trace_match = g_ppu_web_watch_address;
-		if (const u32 trace_pc = g_ppu_web_trace_pc;
-			trace_pc && trace_pc == web_instruction_pc && (!web_trace_match || static_cast<u32>(gpr[25]) == web_trace_match || static_cast<u32>(gpr[29]) == web_trace_match))
+		const u32 page_idx = web_instruction_pc >> 16;
+		if (page_idx != cached_page_idx || !cached_page)
 		{
-			const u32 hit = g_ppu_web_trace_hits.fetch_add(1);
-			if (hit < 64)
-			{
-				const auto read32 = [](u64 addr) -> u32
-				{
-					return addr <= 0xffff'ffffull && vm::check_addr<4>(static_cast<u32>(addr))
-						? static_cast<u32>(vm::read32(static_cast<u32>(addr))) : 0;
-				};
-				std::fprintf(stderr,
-					"RPCS3 Web PPU trace: pc=0x%08x id=0x%08x lr=0x%08llx ctr=0x%08llx r0=0x%08llx "
-					"r1=0x%08llx r2=0x%08llx r3=0x%08llx r4=0x%08llx r5=0x%08llx "
-					"r6=0x%08llx r7=0x%08llx r8=0x%08llx r9=0x%08llx r10=0x%08llx r11=0x%08llx r12=0x%08llx "
-					"r22=0x%08llx r23=0x%08llx r24=0x%08llx r25=0x%08llx r26=0x%08llx "
-					"r27=0x%08llx r28=0x%08llx r29=0x%08llx r30=0x%08llx r31=0x%08llx stack84=0x%08x "
-					"mem29=0x%08x mem3_18=0x%08x mem3_104=0x%08x mem3_108=0x%08x mem3_110=0x%08x "
-					"mem24_48=0x%08x mem24_5c=0x%08x mem24_60=0x%08x mem24_64=0x%08x mem25_18=0x%08x mem25_38=0x%08x\n",
-					web_instruction_pc, id, lr, ctr, gpr[0], gpr[1], gpr[2], gpr[3], gpr[4], gpr[5],
-					gpr[6], gpr[7], gpr[8], gpr[9], gpr[10], gpr[11], gpr[12], gpr[22], gpr[23],
-					gpr[24], gpr[25], gpr[26], gpr[27], gpr[28], gpr[29], gpr[30], gpr[31],
-					static_cast<u32>(vm::_ref<u32>(static_cast<u32>(gpr[1]) + 0x84)),
-					read32(gpr[29]), read32(gpr[3] + 0x18), read32(gpr[3] + 0x104), read32(gpr[3] + 0x108), read32(gpr[3] + 0x110),
-					read32(gpr[24] + 0x48), read32(gpr[24] + 0x5c), read32(gpr[24] + 0x60), read32(gpr[24] + 0x64),
-					read32(gpr[25] + 0x18), read32(gpr[25] + 0x38));
-			}
+			cached_page_idx = page_idx;
+			cached_page = ppu_web_dispatch_page_fast(page_idx);
 		}
-		if (const auto web_page = web_aot_ready ? ppu_web_dispatch_page_for(web_instruction_pc, false) : nullptr)
+		if (const auto web_page = cached_page)
 		{
 			const u32 web_slot = (web_instruction_pc & 0xffff) / sizeof(u32);
 
-			if (!web_page->hooks[web_slot].load(std::memory_order_acquire))
+			if (const auto hook = web_page->hook_raw(web_slot))
+			{
+				const auto op = vm::_ptr<u32>(web_instruction_pc);
+				const u32 opcode = *op;
+				ppu_web_record_dispatch_state(*this, 5, web_instruction_pc, web_instruction_pc, 0);
+				ppu_web_record_boundary(*this, ppu_web_boundary_kind::hook_enter, web_instruction_pc);
+				hook(*this, {opcode}, op, &ppu_ret);
+				ppu_web_record_boundary(*this, ppu_web_boundary_kind::hook_return, web_instruction_pc, 0, 0, 0, web_instruction_pc, cia);
+				if (!web_reported_zero_pc && cia == 0 && web_instruction_pc != 0) [[unlikely]]
+				{
+					web_reported_zero_pc = true;
+					std::fprintf(stderr,
+						"RPCS3 Web PPU reached zero: from=0x%08x op=0x%08x lr=0x%08llx ctr=0x%08llx r2=0x%08llx r12=0x%08llx\n",
+						web_instruction_pc, opcode, lr, ctr, gpr[2], gpr[12]);
+				}
+				web_counters.hle_entry();
+				continue;
+			}
 			{
 				// The bundle first: its blocks are placed on this worker as a whole, so an index here is
-				// always callable
-				u32 aot_index = web_page->aot[web_slot].load(std::memory_order_acquire);
+				// always callable. Check aot_index before initializing the worker's 575k-entry AOT table
+				// so parked threads at 0x30e18 (which shares 64k page 3 with game code) never instantiate it.
+				u32 aot_index = web_page->aot_raw(web_slot);
+				if (aot_index && !web_aot_checked) [[unlikely]]
+				{
+					if (++tl_web_aot_warmup >= 1u)
+					{
+						web_aot_checked = true;
+						tl_web_aot_checked = true;
+						tl_web_aot_ready = rpcs3_web_ppu_aot_worker_ready() != 0;
+					}
+				}
+				if (!tl_web_aot_ready) aot_index = 0;
 				bool placed = aot_index != 0;
 
 				if (!placed && web_jit_base)
 				{
-					const u32 tier = web_page->jit[web_slot].load(std::memory_order_acquire);
+					const u32 tier = web_page->jit_raw(web_slot);
 
 					if (tier & ppu_web_jit_tag)
 					{
@@ -3349,31 +4264,216 @@ void ppu_thread::exec_task()
 					}
 					else if (tier)
 					{
-						// A tier index is callable here only once this worker placed its module; the
-						// registry is in index order, so one number decides that
-						aot_index = tier;
-						placed = tier <= web_jit_placed;
-
-						if (!placed) [[unlikely]]
+						if (!web_aot_checked) [[unlikely]]
 						{
-							g_ppu_web_jit_syncs.raw()++;
-							web_jit_placed = rpcs3_web_ppu_hot_sync();
-							placed = tier <= web_jit_placed;
-							if (!placed) g_ppu_web_jit_unplaced.raw()++;
+							web_aot_checked = true;
+							tl_web_aot_checked = true;
+							tl_web_aot_ready = rpcs3_web_ppu_aot_worker_ready() != 0;
 						}
+						aot_index = tier;
+						placed = ppu_web_is_hot_placed_here(tier) || ppu_web_ensure_hot_placed_here(tier);
 					}
 				}
 
 				if (placed)
 				{
 					// Run the compiled block on this thread; it tail-calls through the table and returns with cia set at a boundary
-					web_counters.compiled_entry();
-					if (!web_context.contains(aot_index)) web_context = ppu_web_instance_span(aot_index);
-					ppu_web_note_block(aot_index, web_instruction_pc);
-					reinterpret_cast<ppu_web_aot_func_t>(static_cast<uptr>(aot_index))(ppu_web_aot_exec_base(), this, 0, &web_context, gpr[0], gpr[1], gpr[2]);
+					while (true)
+					{
+						web_counters.compiled_entry();
+						if (!web_context.contains(aot_index))
+						{
+							ppu_wasm_dispatch_context next_context = ppu_web_instance_span(aot_index);
+							next_context.lr_write_pc = web_context.lr_write_pc;
+							next_context.lr_write_value = web_context.lr_write_value;
+							next_context.gpr11_write_pc = web_context.gpr11_write_pc;
+							next_context.gpr11_write_value = web_context.gpr11_write_value;
+							web_context = next_context;
+						}
+						ppu_web_note_block(aot_index, web_instruction_pc);
+						ppu_web_record_dispatch_state(*this, 4, web_instruction_pc, web_instruction_pc, aot_index);
+						ppu_web_record_boundary(*this, ppu_web_boundary_kind::compiled, web_instruction_pc, aot_index, web_dispatch_source);
+						const u64 entry_seg0 = ppu_web_dispatch_seg0_fast(web_instruction_pc >> 16);
+						if (web_is_trace_pc(web_instruction_pc))
+						{
+							const u32 hit = g_ppu_web_trace_hits.fetch_add(1);
+							if (hit < 64)
+							{
+								std::fprintf(stderr,
+									"RPCS3 Web PPU compiled trace: pc=0x%08x aot=%u span=%u..%u seg0=0x%08x r1=0x%08llx r2=0x%08llx r3=0x%08llx r4=0x%08llx r11=0x%08llx r12=0x%08llx r17=0x%08llx r29=0x%08llx r30=0x%08llx r31=0x%08llx lr=0x%08llx cia=0x%08x saved_lr=0x%08x lr_writer=0x%08x lr_value=0x%08x\n",
+									web_instruction_pc, aot_index, web_context.table_begin, web_context.table_end, static_cast<u32>(entry_seg0), gpr[1],
+									gpr[2], gpr[3], gpr[4], gpr[11], gpr[12], gpr[17], gpr[29], gpr[30], gpr[31], lr, cia,
+									web_trace_read32(gpr[1] + 128), web_context.lr_write_pc, web_context.lr_write_value);
+								if (hit == 0)
+								{
+									PPUDisAsm disasm(cpu_disasm_mode::normal, vm::g_sudo_addr);
+									const u32 begin = web_instruction_pc > 0x20 ? web_instruction_pc - 0x20 : web_instruction_pc;
+									std::fprintf(stderr, "RPCS3 Web PPU compiled trace code:");
+									for (u32 pc = begin; pc <= web_instruction_pc + 0x20; pc += 4)
+									{
+										disasm.disasm(pc);
+										std::fprintf(stderr, " [0x%08x: %s]", pc, disasm.last_opcode.c_str());
+									}
+									std::fputc('\n', stderr);
+									std::fprintf(stderr, "RPCS3 Web PPU compiled trace stack:");
+									for (u32 offset = 0; offset <= 0x180; offset += 4)
+									{
+										std::fprintf(stderr, " %03x=%08x", offset, web_trace_read32(gpr[1] + offset));
+									}
+									std::fputc('\n', stderr);
+								}
+							}
+						}
+						reinterpret_cast<ppu_web_aot_func_t>(static_cast<uptr>(aot_index))(web_exec_base, this, entry_seg0, &web_context, gpr[0], gpr[1], gpr[2]);
+						if (cia == 0 && web_instruction_pc && !web_reported_zero_pc) [[unlikely]]
+						{
+							web_reported_zero_pc = true;
+							std::fprintf(stderr,
+								"RPCS3 Web PPU compiled block reached zero: from=0x%08x source=0x%08x aot=%u lr=0x%08llx lr_writer=0x%08x lr_value=0x%08x gpr11_writer=0x%08x gpr11_value=0x%08x ctr=0x%08llx r0=0x%08llx r2=0x%08llx r3=0x%08llx r4=0x%08llx r5=0x%08llx r6=0x%08llx r7=0x%08llx r8=0x%08llx r9=0x%08llx r10=0x%08llx r11=0x%08llx r12=0x%08llx r13=0x%08llx r17=0x%08llx r29=0x%08llx r30=0x%08llx r31=0x%08llx\n",
+								web_instruction_pc, web_dispatch_source, aot_index, lr, web_context.lr_write_pc, web_context.lr_write_value, web_context.gpr11_write_pc, web_context.gpr11_write_value, ctr, gpr[0], gpr[2], gpr[3], gpr[4], gpr[5], gpr[6], gpr[7], gpr[8], gpr[9], gpr[10], gpr[11], gpr[12], gpr[13], gpr[17], gpr[29], gpr[30], gpr[31]);
+							PPUDisAsm disasm(cpu_disasm_mode::normal, vm::g_sudo_addr);
+							std::fprintf(stderr, "RPCS3 Web PPU compiled block code:");
+							const u32 begin = web_instruction_pc > 0x200 ? web_instruction_pc - 0x200 : web_instruction_pc;
+							for (u32 pc = begin; pc <= web_instruction_pc + 0x180; pc += 4)
+							{
+								disasm.disasm(pc);
+								std::fprintf(stderr, " [0x%08x: %s]", pc, disasm.last_opcode.c_str());
+							}
+							std::fputc('\n', stderr);
+							if (web_dispatch_source && web_dispatch_source != web_instruction_pc)
+							{
+								const u32 source_begin = web_dispatch_source > 0x20 ? web_dispatch_source - 0x20 : web_dispatch_source;
+								std::fprintf(stderr, "RPCS3 Web PPU compiled zero source code:");
+								for (u32 pc = source_begin; pc <= web_dispatch_source + 0x20; pc += 4)
+								{
+									disasm.disasm(pc);
+									std::fprintf(stderr, " [0x%08x: %s]", pc, disasm.last_opcode.c_str());
+								}
+								std::fputc('\n', stderr);
+							}
+							std::fprintf(stderr, "RPCS3 Web PPU recent boundaries:");
+							for (u32 back = 0; back < 16; ++back)
+							{
+								const auto& boundary = tl_ppu_web_boundaries[(tl_ppu_web_boundary_sequence - back) & 31u];
+								if (!boundary.sequence) continue;
+								std::fprintf(stderr,
+									" [seq=%llu kind=%u pc=0x%08x aot=%u source=0x%08x fnid=0x%08x cia=0x%08x lr=0x%08x r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x r4=0x%08x r11=0x%08x r12=0x%08x state=0x%x]",
+									static_cast<unsigned long long>(boundary.sequence), boundary.kind, boundary.pc, boundary.aot_index,
+									boundary.target, boundary.fnid, boundary.cia, boundary.lr, boundary.r0, boundary.r1,
+									boundary.r2, boundary.r3, boundary.r4, boundary.r11, boundary.r12, boundary.state);
+							}
+							std::fputc('\n', stderr);
+						}
+						// Only return to the scheduler after the requested trace point. Breaking on
+						// every compiled block while tracing changes dispatch cadence and can expose
+						// unrelated failures, making focused traces unreliable.
+						if (web_is_trace_pc(web_instruction_pc)) [[unlikely]]
+						{
+							if (web_trace_pc && web_trace_pc == web_instruction_pc)
+							{
+								std::fprintf(stderr,
+									"RPCS3 Web PPU compiled return trace: pc=0x%08x aot=%u cia=0x%08x lr=0x%08llx r0=0x%08llx r2=0x%08llx state=0x%x\n",
+									web_instruction_pc, aot_index, cia, lr, gpr[0], gpr[2], static_cast<u32>(+state));
+							}
+							break;
+						}
+						aot_index = 0;
+						while (!aot_index)
+						{
+							if (!remaining_entries || state.raw() || cia == 0) [[unlikely]]
+							{
+								break;
+							}
+							--remaining_entries;
+							web_instruction_pc = cia;
+							web_counters.enter(web_instruction_pc);
+							const u32 next_page_idx = web_instruction_pc >> 16;
+							if (next_page_idx != cached_page_idx || !cached_page)
+							{
+								cached_page_idx = next_page_idx;
+								cached_page = ppu_web_dispatch_page_fast(next_page_idx);
+								if (!cached_page) break;
+							}
+							const u32 next_slot = (web_instruction_pc & 0xffff) / sizeof(u32);
+							if (const auto next_hook = cached_page->hook_raw(next_slot))
+							{
+								const auto op = vm::_ptr<u32>(web_instruction_pc);
+								const u32 opcode = *op;
+								ppu_web_record_dispatch_state(*this, 5, web_instruction_pc, web_instruction_pc, 0);
+								ppu_web_record_boundary(*this, ppu_web_boundary_kind::hook_enter, web_instruction_pc);
+								next_hook(*this, {opcode}, op, &ppu_ret);
+								ppu_web_record_boundary(*this, ppu_web_boundary_kind::hook_return, web_instruction_pc, 0, 0, 0, web_instruction_pc, cia);
+								web_counters.hle_entry();
+								continue;
+							}
+							aot_index = cached_page->aot_raw(next_slot);
+							if (!aot_index && web_jit_base)
+							{
+								const u32 tier = cached_page->jit_raw(next_slot);
+								if (tier && !(tier & ppu_web_jit_tag))
+								{
+									if (ppu_web_is_hot_placed_here(tier) || ppu_web_ensure_hot_placed_here(tier))
+									{
+										aot_index = tier;
+									}
+								}
+							}
+							if (aot_index) break;
+							if (!vm::check_addr<4>(web_instruction_pc, vm::page_executable)) [[unlikely]] break;
+							if (web_instruction_pc < ppu_web_used_span)
+							{
+								auto& word = g_ppu_web_address_used[(web_instruction_pc / 4) / 64];
+								const u64 bit = 1ull << ((web_instruction_pc / 4) % 64);
+								if (!(word.raw() & bit)) [[unlikely]] word |= bit;
+							}
+							if (web_jit_base)
+							{
+								const u32 tier = cached_page->jit[next_slot].load(std::memory_order_acquire);
+								if (tier & ppu_web_jit_tag) ppu_web_jit_note(cached_page, next_slot, web_instruction_pc, tier);
+							}
+							if (web_fail_closed)
+							{
+								if (ppu_web_jit_compile_sync(web_instruction_pc))
+								{
+									aot_index = cached_page->jit_raw(next_slot);
+									if (aot_index && !(aot_index & ppu_web_jit_tag))
+									{
+										break;
+									}
+								}
+
+								ppu_web_dump_last_blocks(*this);
+								fmt::throw_exception("PPU AOT fail-closed: no compiled block for guest PC 0x%08x (last=0x%08x LR=0x%08x CTR=0x%08x r2=0x%08x r12=0x%08x)",
+									web_instruction_pc, g_ppu_web_last_pc.load(), static_cast<u32>(lr), static_cast<u32>(ctr), static_cast<u32>(gpr[2]), static_cast<u32>(gpr[12]));
+							}
+							const auto op = vm::_ptr<u32>(web_instruction_pc);
+							const u32 opcode = *op;
+							const auto fn = ppu_read(web_instruction_pc, opcode);
+							fn(*this, {opcode}, op, &ppu_ret);
+							web_counters.interpreted_entry();
+						}
+						if (!aot_index) break;
+					}
 					continue;
 				}
 			}
+		}
+		if (web_instruction_pc < ppu_web_used_span)
+		{
+			auto& word = g_ppu_web_address_used[(web_instruction_pc / 4) / 64];
+			const u64 bit = 1ull << ((web_instruction_pc / 4) % 64);
+			if (!(word.raw() & bit)) [[unlikely]] word |= bit;
+		}
+		if (web_fail_closed)
+		{
+			if (ppu_web_jit_compile_sync(web_instruction_pc))
+			{
+				continue;
+			}
+
+			ppu_web_dump_last_blocks(*this);
+			fmt::throw_exception("PPU AOT fail-closed: no compiled block for guest PC 0x%08x (last=0x%08x LR=0x%08x CTR=0x%08x r2=0x%08x r12=0x%08x)",
+				web_instruction_pc, g_ppu_web_last_pc.load(), static_cast<u32>(lr), static_cast<u32>(ctr), static_cast<u32>(gpr[2]), static_cast<u32>(gpr[12]));
 		}
 		const auto op = vm::_ptr<u32>(web_instruction_pc);
 		const u32 opcode = *op;
@@ -3859,6 +4959,9 @@ void ppu_thread::fast_call(u32 addr, u64 rtoc, bool is_thread_entry)
 	const auto old_lr = lr;
 	const auto old_func = current_function;
 	const auto old_fmt = g_tls_log_prefix;
+#ifdef RPCS3_WEB
+	ppu_web_record_boundary(*this, ppu_web_boundary_kind::fast_call, old_cia, 0, addr, 0, 0, 0);
+#endif
 
 	interrupt_thread_executing = true;
 	cia = addr;
@@ -3907,6 +5010,9 @@ void ppu_thread::fast_call(u32 addr, u64 rtoc, bool is_thread_entry)
 
 	auto at_ret = [&]()
 	{
+#ifdef RPCS3_WEB
+		ppu_web_record_boundary(*this, ppu_web_boundary_kind::fast_return, old_cia, 0, addr, 0, old_cia, cia);
+#endif
 		if (old_cia)
 		{
 			if (state & cpu_flag::again)
@@ -4040,7 +5146,7 @@ static void ppu_trace(u64 addr)
 }
 
 template <typename T>
-static T ppu_load_acquire_reservation(ppu_thread& ppu, u32 addr)
+static T ppu_load_acquire_reservation(ppu_thread& ppu, u32 addr, u32 source_pc = 0)
 {
 	perf_meter<"LARX"_u32> perf0;
 
@@ -4049,7 +5155,26 @@ static T ppu_load_acquire_reservation(ppu_thread& ppu, u32 addr)
 
 	if (addr % sizeof(T))
 	{
-		fmt::throw_exception("PPU %s: Unaligned address: 0x%08x", sizeof(T) == 4 ? "LWARX" : "LDARX", addr);
+#ifdef RPCS3_WEB
+		ppu_web_dump_last_blocks(ppu);
+		PPUDisAsm disasm(cpu_disasm_mode::normal, vm::g_sudo_addr);
+		for (const u32 center : {source_pc, static_cast<u32>(ppu.cia)})
+		{
+			const u32 begin = center > 0x20 ? center - 0x20 : center;
+			std::fprintf(stderr, "RPCS3 Web PPU acquire code:");
+			for (u32 pc = begin; pc <= center + 0x20; pc += 4)
+			{
+				if (vm::check_addr<4>(pc))
+				{
+					disasm.disasm(pc);
+					std::fprintf(stderr, " [0x%08x: %s]", pc, disasm.last_opcode.c_str());
+				}
+			}
+			std::fputc('\n', stderr);
+		}
+#endif
+		fmt::throw_exception("PPU %s: Unaligned address: 0x%08x source=0x%08x cia=0x%08x lr=0x%08x ctr=0x%08x",
+			sizeof(T) == 4 ? "LWARX" : "LDARX", addr, source_pc, ppu.cia, static_cast<u32>(ppu.lr), static_cast<u32>(ppu.ctr));
 	}
 
 	// Always load aligned 64-bit value
@@ -4061,6 +5186,11 @@ static T ppu_load_acquire_reservation(ppu_thread& ppu, u32 addr)
 
 	u32 addr_mask = -1;
 
+#ifdef RPCS3_WEB
+	// In Web PPU AOT blocks, ppu.cia is not updated before direct lwarx/ldarx calls, so scanning from
+	// ppu.cia reads the block entry instead of the larx site and falsely triggers 128-byte writer_lock.
+	ppu.use_full_rdata = false;
+#else
 	if (const s32 max = g_cfg.core.ppu_128_reservations_loop_max_length)
 	{
 		// If we use it in HLE it means we want the accurate version
@@ -4117,13 +5247,18 @@ static T ppu_load_acquire_reservation(ppu_thread& ppu, u32 addr)
 	{
 		ppu.use_full_rdata = false;
 	}
+#endif
 
+#ifndef __EMSCRIPTEN__
 	if (ppu_log.trace && (addr & addr_mask) == (ppu.last_faddr & addr_mask))
 	{
 		ppu_log.trace(u8"LARX after fail: addr=0x%x, faddr=0x%x, time=%u c", addr, ppu.last_faddr, (perf0.get() - ppu.last_ftsc));
 	}
 
 	if ((addr & addr_mask) == (ppu.last_faddr & addr_mask) && (perf0.get() - ppu.last_ftsc) < 600 && (vm::reservation_acquire(addr) & -128) == ppu.last_ftime)
+#else
+	if ((addr & addr_mask) == (ppu.last_faddr & addr_mask) && (vm::reservation_acquire(addr) & -128) == ppu.last_ftime)
+#endif
 	{
 		be_t<u64> rdata;
 		std::memcpy(&rdata, &ppu.rdata[addr & 0x78], 8);
@@ -4188,11 +5323,23 @@ extern u64 ppu_ldarx(ppu_thread& ppu, u32 addr)
 	return ppu_load_acquire_reservation<u64>(ppu, addr);
 }
 
+extern u32 ppu_lwarx_at(ppu_thread& ppu, u32 addr, u32 source_pc)
+{
+	return ppu_load_acquire_reservation<u32>(ppu, addr, source_pc);
+}
+
+extern u64 ppu_ldarx_at(ppu_thread& ppu, u32 addr, u32 source_pc)
+{
+	return ppu_load_acquire_reservation<u64>(ppu, addr, source_pc);
+}
+
 template <typename T>
 static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 {
 	perf_meter<"STCX"_u32> perf0;
+#ifndef RPCS3_WEB
 	struct note_store_t { u32 addr; ~note_store_t() { vm::note_write(addr, sizeof(T)); } } note_store{ addr };
+#endif
 
 	if (addr % sizeof(T))
 	{
@@ -4355,19 +5502,26 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 
 			ppu.last_faddr = addr;
 			ppu.last_ftime = old_rtime & -128;
+#ifndef __EMSCRIPTEN__
 			ppu.last_ftsc = utils::get_tsc();
+#endif
 			std::memcpy(&ppu.rdata[addr & 0x78], &old_data, 8);
 		}
 
 		return false;
 	}())
 	{
+#ifdef RPCS3_WEB
+		vm::web_note_write_page(addr >> 12);
+		if (vm::g_web_rsx_wait_raddr.load(std::memory_order_relaxed) == (addr & -128u)) [[unlikely]]
+		{
+			vm::web_notify_rsx_waiter();
+		}
+#endif
 		extern atomic_t<u32> liblv2_begin, liblv2_end;
+		const bool is_liblv2_or_null = (ppu.cia >= liblv2_begin && ppu.cia < liblv2_end);
 
 		u32 notify = ppu.res_notify;
-
-		// Avoid notifications from lwmutex or sys_spinlock
-		const bool is_liblv2_or_null = (ppu.cia >= liblv2_begin && ppu.cia < liblv2_end);
 
 		if (!is_liblv2_or_null)
 		{
@@ -5339,7 +6493,7 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 					_main.name = ' '; // Make ppu_finalize work
 					Emu.ConfigurePPUCache();
 					ppu_initialize(_main, false, file_size);
-#if !defined(RPCS3_WEB_INTERPRETER_ONLY) && !defined(RPCS3_PORTABLE_SPU_INTERPRETER)
+#if !defined(RPCS3_WEB_INTERPRETER_ONLY) && !(defined(RPCS3_WEB) && defined(RPCS3_PORTABLE_SPU_INTERPRETER))
 					spu_cache::initialize(false);
 #endif
 					ppu_finalize(_main, true);
@@ -5381,7 +6535,10 @@ extern void ppu_initialize()
 
 	std::optional<scoped_progress_dialog> progress_dialog(std::in_place, get_localized_string(localized_string_id::PROGRESS_DIALOG_ANALYZING_PPU_EXECUTABLE));
 
-	// Analyse executable
+	// Analyse executable. The analyser remains the semantic source for both
+	// whole-module AOT bundles and the fail-closed synchronous fallback, so a
+	// precompiled bundle must not suppress this pass.
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
 	if (!_main.analyse(0, _main.elf_entry, _main.seg0_code_end, _main.applied_patches, std::vector<u32>{}, [](){ return Emu.IsStopped(); }))
 	{
 		return;
@@ -5389,6 +6546,15 @@ extern void ppu_initialize()
 
 	// Validate analyser results (not required)
 	_main.validate(0);
+#else
+	if (!_main.analyse(0, _main.elf_entry, _main.seg0_code_end, _main.applied_patches, std::vector<u32>{}, [](){ return Emu.IsStopped(); }))
+	{
+		return;
+	}
+
+	// Validate analyser results (not required)
+	_main.validate(0);
+#endif
 
 	*progress_dialog = get_localized_string(localized_string_id::PROGRESS_DIALOG_SCANNING_PPU_MODULES);
 
@@ -5410,7 +6576,11 @@ extern void ppu_initialize()
 
 	idm::select<lv2_obj, lv2_prx>([&](u32, lv2_prx& _module)
 	{
+#if defined(RPCS3_WEB_INTERPRETER_ONLY)
+		if (_module.get_funcs().empty() && !(ppu_web_auto_recomp_enabled() && !_module.segs.empty()))
+#else
 		if (_module.get_funcs().empty())
+#endif
 		{
 			return;
 		}
@@ -5509,6 +6679,16 @@ extern void ppu_initialize()
 bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_size)
 {
 	ppu_log.notice("Entering ppu_initialize(const ppu_module&..)");
+	const ppu_codegen_policy codegen_policy = make_ppu_codegen_policy(ppu_backend_kind::jit, ppu_target_kind::native);
+
+	// The AOT backend is backed by the native LLVM object cache. Select that
+	// compiler even when the saved configuration still names the interpreter:
+	// the backend choice itself is what guarantees that guest instructions are
+	// never executed by the interpreter.
+	if (codegen_policy.backend == ppu_backend_kind::aot && g_cfg.core.ppu_decoder != ppu_decoder_type::llvm)
+	{
+		g_cfg.core.ppu_decoder.set(ppu_decoder_type::llvm);
+	}
 
 	struct log_guard
 	{
@@ -5525,44 +6705,45 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 			return false;
 		}
 
-		auto& toc_manager = g_fxo->get<ppu_toc_manager>();
-
-		std::lock_guard lock(toc_manager.mutex);
-
-		auto& ppu_toc = toc_manager.toc_map;
-
-		for (const auto& func : info.get_funcs())
 		{
-			if (func.size && func.blocks.empty())
-			{
-				ppu_register_function_at(func.addr, func.size);
-			}
+			auto& toc_manager = g_fxo->get<ppu_toc_manager>();
+			std::lock_guard lock(toc_manager.mutex);
+			auto& ppu_toc = toc_manager.toc_map;
 
-			for (auto& block : func.blocks)
+			for (const auto& func : info.get_funcs())
 			{
-				if (!block.second)
+				if (func.size && func.blocks.empty())
 				{
-					continue;
+					ppu_register_function_at(func.addr, func.size);
 				}
 
-				if (g_fxo->is_init<ppu_far_jumps_t>() && !g_fxo->get<ppu_far_jumps_t>().get_targets(block.first, block.second).empty())
+				for (auto& block : func.blocks)
 				{
-					// Replace the block with ppu_far_jump
-					continue;
+					if (!block.second)
+					{
+						continue;
+					}
+
+					if (g_fxo->is_init<ppu_far_jumps_t>() && !g_fxo->get<ppu_far_jumps_t>().get_targets(block.first, block.second).empty())
+					{
+						// Replace the block with ppu_far_jump
+						continue;
+					}
+
+					ppu_register_function_at(block.first, block.second);
 				}
 
-				ppu_register_function_at(block.first, block.second);
-			}
-
-			if (g_cfg.core.ppu_debug && func.size && func.toc != umax && !ppu_get_far_jump(func.addr))
-			{
-				ppu_toc[func.addr] = func.toc;
-				ppu_write(func.addr, &ppu_check_toc);
+				if (g_cfg.core.ppu_debug && func.size && func.toc != umax && !ppu_get_far_jump(func.addr))
+				{
+					ppu_toc[func.addr] = func.toc;
+					ppu_write(func.addr, &ppu_check_toc);
+				}
 			}
 		}
 
 #if defined(RPCS3_WEB_INTERPRETER_ONLY)
-		// The runtime tier compiles what the analyser just described, nothing else
+		// Whole-module static recompilation (when enabled) + dynamic block-JIT registration
+		ppu_web_recomp_module_sync(info);
 		ppu_web_jit_register_module(info);
 #endif
 
@@ -5583,6 +6764,8 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 			{ "__get_tb", reinterpret_cast<u64>(get_timebased_time) },
 			{ "__lwarx", reinterpret_cast<u64>(ppu_lwarx) },
 			{ "__ldarx", reinterpret_cast<u64>(ppu_ldarx) },
+			{ "__lwarx_at", reinterpret_cast<u64>(ppu_lwarx_at) },
+			{ "__ldarx_at", reinterpret_cast<u64>(ppu_ldarx_at) },
 			{ "__stwcx", reinterpret_cast<u64>(ppu_stwcx) },
 			{ "__stdcx", reinterpret_cast<u64>(ppu_stdcx) },
 			{ "__dcbz", reinterpret_cast<u64>(+[](u32 addr){ alignas(64) static constexpr u8 z[128]{}; do_cell_atomic_128_store(addr, z); }) },
@@ -5662,12 +6845,16 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 
 	bool has_mfvscr = false;
 	const bool wasm_aot = !check_only && std::getenv("RPCS3_PPU_WASM_AOT_IR");
+	const auto flattened_functions = info.get_funcs();
+	const std::span<const ppu_function> function_source = wasm_aot && !info.functions.empty()
+		? std::span<const ppu_function>(info.functions)
+		: flattened_functions;
 
 	const bool is_being_used_in_emulation = vm::base(info.segs[0].addr) == info.segs[0].ptr;
 
 	const cpu_thread* cpu = cpu_thread::get_current();
 
-	for (auto& func : info.get_funcs())
+	for (const auto& func : function_source)
 	{
 		if (func.size == 0)
 		{
@@ -5951,19 +7138,20 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		info.attr += ppu_attr::has_mfvscr;
 	}
 
-	while (!jit_mod.init && fpos < info.get_funcs().size())
+	while (!jit_mod.init && fpos < function_source.size())
 	{
 		// Copy module information
 		ppu_module<lv2_obj> part;
 		part.copy_part(info);
+		std::vector<ppu_function> selected_functions;
 
 		// Overall block size in bytes
 		usz bsize = 0;
 		usz bcount = 0;
 
-		while (fpos < info.get_funcs().size())
+		while (fpos < function_source.size())
 		{
-			auto& func = info.get_funcs()[fpos];
+			const auto& func = function_source[fpos];
 
 			if (!func.size)
 			{
@@ -6010,10 +7198,21 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 			part.local_bounds.first = std::min<u32>(part.local_bounds.first, func.addr);
 			part.local_bounds.second = std::max<u32>(part.local_bounds.second, func.addr + func.size);
 
+			if (wasm_aot)
+			{
+				selected_functions.push_back(func);
+			}
+
 			bsize += func.size;
 
 			fpos++;
 			bcount++;
+		}
+
+		if (wasm_aot)
+		{
+			part.parent = nullptr;
+			part.funcs = std::move(selected_functions);
 		}
 
 		// Compute module hash to generate (hopefully) unique object name
@@ -6113,7 +7312,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 				sha1_update(&ctx, ensure(info.get_ptr<const u8>(func.addr)), func.size);
 			}
 
-			if (fpos >= info.get_funcs().size() || (module_counter % c_modules_per_jit) == (c_modules_per_jit - 1))
+			if (fpos >= function_source.size() || (module_counter % c_modules_per_jit) == (c_modules_per_jit - 1))
 			{
 				// Hash the entire function grouped addresses for the integrity of the symbol resolver function
 				// Potentially occuring during patches
@@ -6123,9 +7322,9 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 
 				constexpr auto compare = [](const ppu_function& a, u32 addr) { return a.addr < addr; };
 
-				const auto start = std::lower_bound(info.funcs.begin(), info.funcs.end(), local_jit_bounds->first, compare);
+				const auto start = std::lower_bound(function_source.begin(), function_source.end(), local_jit_bounds->first, compare);
 
-				std::span<const ppu_function> span_range{ start, std::lower_bound(start, info.funcs.end(), local_jit_bounds->second, compare) };
+				std::span<const ppu_function> span_range{ start, std::lower_bound(start, function_source.end(), local_jit_bounds->second, compare) };
 
 				for (const ppu_function& func : span_range)
 				{
@@ -6211,8 +7410,16 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 			if (g_cfg.core.set_daz_and_ftz)
 				settings += ppu_settings::daz_and_ftz;
 
-			// Write version, hash, CPU, settings
-			fmt::append(obj_name, "v8-kusa-%s-%s-%s.obj", fmt::base57(output, 16), fmt::base57(settings), jit_compiler::cpu(g_cfg.core.llvm_cpu.to_string()));
+			// Write the codegen policy, guest hash, CPU, and settings. The semantics
+			// version and optimization level are part of the object identity because
+			// either can change the generated machine code without changing guest bytes.
+			fmt::append(obj_name, "v9-kusa-%s-%s-%s-%s-%s-v%u.obj",
+				ppu_codegen_policy::cache_schema,
+				fmt::base57(output, 16),
+				fmt::base57(settings),
+				jit_compiler::cpu(g_cfg.core.llvm_cpu.to_string()),
+				codegen_policy.cache_tag(),
+				ppu_codegen_policy::semantics_version);
 		}
 
 		if (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped())
@@ -6612,6 +7819,7 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 #ifdef LLVM_AVAILABLE
 	using namespace llvm;
 	const bool wasm_aot = std::getenv("RPCS3_PPU_WASM_AOT_IR");
+	const ppu_codegen_policy codegen_policy = make_ppu_codegen_policy(ppu_backend_kind::jit, ppu_target_kind::native);
 
 	// Create LLVM module
 	std::unique_ptr<Module> _module = std::make_unique<Module>(obj_name, jit.get_context());
@@ -6671,31 +7879,6 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 			translator.build_interpreter();
 		}
 
-		// Create the analysis managers.
-		// These must be declared in this order so that they are destroyed in the
-		// correct order due to inter-analysis-manager references.
-		LoopAnalysisManager lam;
-		FunctionAnalysisManager fam;
-		CGSCCAnalysisManager cgam;
-		ModuleAnalysisManager mam;
-
-		// Create the new pass manager builder.
-		// Take a look at the PassBuilder constructor parameters for more
-		// customization, e.g. specifying a TargetMachine or various debugging
-		// options.
-		PassBuilder pb;
-
-		// Register all the basic analyses with the managers.
-		pb.registerModuleAnalyses(mam);
-		pb.registerCGSCCAnalyses(cgam);
-		pb.registerFunctionAnalyses(fam);
-		pb.registerLoopAnalyses(lam);
-		pb.crossRegisterProxies(lam, fam, cgam, mam);
-
-		FunctionPassManager fpm;
-		// Basic optimizations
-		fpm.addPass(EarlyCSEPass());
-
 		u32 guest_code_size = 0;
 		u32 min_addr = umax;
 		u32 max_addr = 0;
@@ -6724,14 +7907,7 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 				min_addr = std::min<u32>(min_addr, mod_func.addr);
 
 				// Translate
-				if ([[maybe_unused]] const auto func = translator.Translate(mod_func))
-				{
-#ifdef ARCH_X64 // TODO
-					// Run optimization passes
-					fpm.run(*func, fam);
-#endif // ARCH_X64
-				}
-				else
+				if (!translator.Translate(mod_func))
 				{
 					Emu.Pause();
 					return;
@@ -6742,18 +7918,19 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 		// Run this only in one module for all functions compiled
 		if (module_part.jit_bounds && !wasm_aot)
 		{
-			if ([[maybe_unused]] const auto func = translator.GetSymbolResolver(module_part))
-			{
-#ifdef ARCH_X64 // TODO
-				// Run optimization passes
-				fpm.run(*func, fam);
-#endif // ARCH_X64
-			}
-			else
+			if (!translator.GetSymbolResolver(module_part))
 			{
 				Emu.Pause();
 				return;
 			}
+		}
+
+		// Match the AOT frontend's optimization policy. The old native path ran
+		// only EarlyCSE per function, leaving the JIT substantially below the
+		// quality of both the Wasm compiler and RPCS3's LLVM backend.
+		if (!wasm_aot)
+		{
+			llvm_opt::optimize_module(*_module, jit.get_engine().getTargetMachine(), codegen_policy.optimization);
 		}
 
 		//legacy::PassManager mpm;
@@ -6791,7 +7968,7 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 		// block i's function table index. Materializing the address in code needs no data relocation, so a
 		// title with hundreds of thousands of blocks links without one giant relocation function.
 		{
-			std::vector<std::pair<u32, Function*>> blocks;
+			std::map<u32, Function*> blocks;
 
 			for (const auto& func : module_part.get_funcs())
 			{
@@ -6802,7 +7979,15 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 
 				if (const auto f = _module->getFunction(fmt::format("__0x%x", func.addr - reloc)); f && !f->isDeclaration())
 				{
-					blocks.emplace_back(static_cast<u32>(func.addr - reloc), f);
+					blocks.emplace(static_cast<u32>(func.addr - reloc), f);
+
+					for (const auto& [block_addr, block_size] : func.blocks)
+					{
+						if (block_size)
+						{
+							blocks.emplace(static_cast<u32>(block_addr - reloc), f);
+						}
+					}
 				}
 			}
 
@@ -6834,12 +8019,14 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 			const auto exit = BasicBlock::Create(jit.get_context(), "none", index_fn);
 			const auto sw = irb.CreateSwitch(index_fn->getArg(0), exit, ::size32(blocks));
 
-			for (u32 i = 0; i < blocks.size(); i++)
+			u32 i = 0;
+			for (const auto& [_, f] : blocks)
 			{
 				const auto bb = BasicBlock::Create(jit.get_context(), "", index_fn);
 				sw->addCase(irb.getInt32(i), bb);
 				irb.SetInsertPoint(bb);
-				irb.CreateRet(irb.CreatePtrToInt(blocks[i].second, translator.get_type<u32>()));
+				irb.CreateRet(irb.CreatePtrToInt(f, translator.get_type<u32>()));
+				++i;
 			}
 
 			irb.SetInsertPoint(exit);

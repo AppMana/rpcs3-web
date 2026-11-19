@@ -672,7 +672,16 @@ namespace rsx
 				}
 				else
 				{
-					std::this_thread::yield();
+#ifdef __EMSCRIPTEN__
+					if (!m_eng_interrupt_mask && !(async_flip_requested & flip_request::any))
+					{
+						thread_ctrl::wait_for(50);
+					}
+					else
+#endif
+					{
+						std::this_thread::yield();
+					}
 				}
 
 				return;

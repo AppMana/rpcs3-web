@@ -70,7 +70,7 @@ error_code cellKey2CharOpen(vm::ptr<CellKey2CharHandle> handle)
 	if (handle->data[8] != 0)
 		return CELL_K2C_ERROR_ALREADY_INITIALIZED;
 
-	// TODO
+	handle->data[8] = 1;
 
 	return CELL_OK;
 }
@@ -85,7 +85,7 @@ error_code cellKey2CharClose(vm::ptr<CellKey2CharHandle> handle)
 	if (handle->data[8] == 0)
 		return CELL_K2C_ERROR_UNINITIALIZED;
 
-	// TODO
+	handle->data[8] = 0;
 
 	return CELL_OK;
 }

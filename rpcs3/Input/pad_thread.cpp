@@ -75,9 +75,25 @@ namespace injected_pad
 	static std::atomic<u32> s_digital1{0};
 	static std::atomic<u32> s_digital2{0};
 	static std::atomic<u32> s_sticks{0x80808080u};
+	static std::atomic<bool> s_active{false};
+
+	bool active()
+	{
+#ifdef RPCS3_WEB
+		return true;
+#else
+		return s_active.load(std::memory_order_acquire);
+#endif
+	}
+
+	void enable()
+	{
+		s_active.store(true, std::memory_order_release);
+	}
 
 	void set_state(u32 digital1, u32 digital2, u32 left_x, u32 left_y, u32 right_x, u32 right_y)
 	{
+		s_active.store(true, std::memory_order_release);
 		std::lock_guard lock(s_writer_mutex);
 		s_sequence.fetch_add(1, std::memory_order_acq_rel);
 		s_digital1.store(digital1, std::memory_order_relaxed);
@@ -90,34 +106,48 @@ namespace injected_pad
 	static std::mutex s_schedule_mutex;
 	static std::vector<scheduled_state> s_schedule;
 	static usz s_cursor = 0;
-	static u32 s_frame = 0;
+	static std::atomic<u32> s_frame{0};
 	static std::atomic<bool> s_replaying{false};
 	static std::atomic<u32> s_applied{0};
 
 	bool replaying() { return s_replaying.load(std::memory_order_acquire); }
 	u32 applied() { return s_applied.load(std::memory_order_relaxed); }
+	u32 frame() { return s_frame.load(std::memory_order_relaxed); }
+	u32 sequence() { return s_sequence.load(std::memory_order_acquire); }
+	void reset_frame()
+	{
+		std::lock_guard lock(s_schedule_mutex);
+		s_frame.store(0, std::memory_order_relaxed);
+		s_cursor = 0;
+		s_applied.store(0, std::memory_order_relaxed);
+	}
 
 	void clear_schedule()
 	{
 		std::lock_guard lock(s_schedule_mutex);
 		s_schedule.clear();
-		s_cursor = s_frame = 0;
+		s_cursor = 0;
+		s_frame.store(0, std::memory_order_relaxed);
 		s_applied = 0;
-		s_replaying.store(true, std::memory_order_release);
+		s_replaying.store(false, std::memory_order_release);
+		s_active.store(true, std::memory_order_release);
+		set_state(0, 0, 128, 128, 128, 128);
 	}
 
 	void add_schedule(scheduled_state entry)
 	{
 		std::lock_guard lock(s_schedule_mutex);
 		s_schedule.push_back(entry);
+		s_replaying.store(true, std::memory_order_release);
+		s_active.store(true, std::memory_order_release);
 	}
 
 	void advance_replay()
 	{
+		const u32 cur_frame = s_frame.fetch_add(1, std::memory_order_acq_rel) + 1;
 		if (!replaying()) return;
 		std::lock_guard lock(s_schedule_mutex);
-		++s_frame;
-		while (s_cursor < s_schedule.size() && s_schedule[s_cursor].frame <= s_frame)
+		while (s_cursor < s_schedule.size() && s_schedule[s_cursor].frame <= cur_frame)
 		{
 			const auto& e = s_schedule[s_cursor++];
 			set_state(e.digital1, e.digital2, e.left_x, e.left_y, e.right_x, e.right_y);
@@ -186,7 +216,7 @@ public:
 			return false;
 		}
 
-		pad->Init(CELL_PAD_STATUS_DISCONNECTED,
+		pad->Init(CELL_PAD_STATUS_CONNECTED | CELL_PAD_STATUS_ASSIGN_CHANGES,
 			CELL_PAD_CAPABILITY_PS3_CONFORMITY | CELL_PAD_CAPABILITY_PRESS_MODE | CELL_PAD_CAPABILITY_HP_ANALOG_STICK,
 			CELL_PAD_DEV_TYPE_STANDARD, CELL_PAD_PCLASS_TYPE_STANDARD, 0, 0, 0, 100);
 
@@ -223,6 +253,7 @@ public:
 		pad->m_sensors[3] = AnalogSensor(CELL_PAD_BTN_OFFSET_SENSOR_G, 0, false, 0, DEFAULT_MOTION_G);
 
 		m_bindings.emplace_back(std::move(pad), nullptr, nullptr);
+		process();
 		return true;
 	}
 
@@ -270,6 +301,11 @@ pad_thread::pad_thread(void* curthread, void* curwindow, std::string_view title_
 	pad::g_title_id = title_id;
 	pad::g_pad_thread = this;
 	pad::g_started = false;
+	if (injected_pad::active())
+	{
+		Init();
+		pad::g_started = true;
+	}
 }
 
 pad_thread::~pad_thread()
@@ -367,7 +403,7 @@ void pad_thread::Init()
 		cfg_player* cfg = g_cfg_input.player[i];
 		std::shared_ptr<PadHandlerBase> cur_pad_handler;
 
-		const pad_handler handler_type = (i == 0 && injected_pad::replaying()) ? pad_handler::keyboard : pad_settings[i].is_ldd_pad ? pad_handler::null : cfg->handler.get();
+		const pad_handler handler_type = (i == 0 && injected_pad::active()) ? pad_handler::keyboard : pad_settings[i].is_ldd_pad ? pad_handler::null : cfg->handler.get();
 
 		if (m_handlers.contains(handler_type))
 		{
@@ -375,7 +411,7 @@ void pad_thread::Init()
 		}
 		else
 		{
-			if (handler_type == pad_handler::keyboard && injected_pad::replaying())
+			if (handler_type == pad_handler::keyboard && injected_pad::active())
 			{
 				cur_pad_handler = std::make_shared<injected_pad_handler>();
 			}
@@ -458,8 +494,21 @@ void pad_thread::Init()
 		}
 	}
 
+	apply_copilots_locked();
+
+	u32 connected_devices = 0;
+	for (const auto& [_, handler] : m_handlers)
+	{
+		connected_devices += handler->connected_devices;
+	}
+	m_info.now_connect = connected_devices + num_ldd_pad;
+	m_inited = true;
+	m_last_injected_sequence = umax;
+	sync_injected_pad_locked();
+
 	// Initialize active mouse and keyboard. Activate pad handler if one exists.
-	input::set_mouse_and_keyboard(m_handlers.contains(pad_handler::keyboard) ? input::active_mouse_and_keyboard::pad : input::active_mouse_and_keyboard::emulated);
+	const bool has_real_kb_pad = m_handlers.contains(pad_handler::keyboard) && !injected_pad::active();
+	input::set_mouse_and_keyboard(has_real_kb_pad ? input::active_mouse_and_keyboard::pad : input::active_mouse_and_keyboard::emulated);
 }
 
 void pad_thread::SetRumble(u32 pad, u8 large_motor, u8 small_motor)
@@ -500,12 +549,16 @@ void pad_thread::SetIntercepted(bool intercepted)
 
 void pad_thread::apply_copilots()
 {
+	std::lock_guard lock(pad::g_pad_mutex);
+	apply_copilots_locked();
+}
+
+void pad_thread::apply_copilots_locked()
+{
 	const auto normalize = [](s32 value)
 	{
 		return (value - 128) / 127.0f;
 	};
-
-	std::lock_guard lock(pad::g_pad_mutex);
 
 	for (auto& pad : m_pads)
 	{
@@ -633,9 +686,44 @@ void pad_thread::update_pad_states()
 	}
 }
 
+void pad_thread::sync_injected_pad_locked()
+{
+	if (!injected_pad::active() || !m_inited)
+	{
+		return;
+	}
+
+	const u32 seq = injected_pad::sequence();
+	if ((seq & 1) == 0 && seq == m_last_injected_sequence && m_pads[0] && !m_pads[0]->m_buttons_external.empty())
+	{
+		return;
+	}
+
+	if (const auto it = m_handlers.find(pad_handler::keyboard); it != m_handlers.end() && it->second)
+	{
+		it->second->process();
+	}
+
+	apply_copilots_locked();
+
+	u32 connected_devices = 0;
+	for (const auto& [_, handler] : m_handlers)
+	{
+		connected_devices += handler->connected_devices;
+	}
+	m_info.now_connect = connected_devices + num_ldd_pad;
+	if ((seq & 1) == 0)
+	{
+		m_last_injected_sequence = seq;
+	}
+}
+
 void pad_thread::operator()()
 {
-	Init();
+	if (!m_inited)
+	{
+		Init();
+	}
 
 	const bool is_vsh = Emu.IsVsh();
 
@@ -1035,6 +1123,10 @@ s32 pad_thread::AddLddPad()
 	// Look for first null pad
 	for (u32 i = 0; i < CELL_PAD_MAX_PORT_NUM; i++)
 	{
+		if (i == 0 && injected_pad::active())
+		{
+			continue;
+		}
 		if (g_cfg_input.player[i]->handler == pad_handler::null && !m_pads[i]->ldd)
 		{
 			InitLddPad(i, nullptr);
@@ -1058,7 +1150,7 @@ void pad_thread::UnregisterLddPad(u32 handle)
 
 std::shared_ptr<PadHandlerBase> pad_thread::GetHandler(pad_handler type)
 {
-	if (type == pad_handler::keyboard && injected_pad::replaying()) return std::make_shared<injected_pad_handler>();
+	if (type == pad_handler::keyboard && injected_pad::active()) return std::make_shared<injected_pad_handler>();
 	switch (type)
 	{
 	case pad_handler::null:

@@ -15,6 +15,7 @@
     "ppu:aot": "node scripts/compile-ppu-ir-to-wasm.mjs",
     "ppu:aot:fixture": "node scripts/build-ppu-aot-fixture.mjs",
     "ppu:aot:bundle": "node scripts/build-ppu-aot-bundle.mjs",
+    "ppu:aot:index": "node scripts/update-local-aot-index.mjs",
     "spu:aot:bundle": "node scripts/build-spu-aot-bundle.mjs",
     "spu:aot:fixture": "node scripts/build-spu-aot-fixture.mjs",
     "dispatch:build": "node scripts/build-dispatch-fixture.mjs",
@@ -49,7 +50,8 @@
     "pngjs": "^7.0.0",
     "typescript": "5.9.2",
     "vite": "7.3.6",
-    "vitest": "3.2.7"
+    "vitest": "3.2.7",
+    "webgpu": "^0.6.2"
   },
   "engines": {
     "node": ">=22"

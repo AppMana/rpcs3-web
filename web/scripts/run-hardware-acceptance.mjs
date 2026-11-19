@@ -39,7 +39,7 @@ const outputPath = process.argv[3] ? path.resolve(process.argv[3]) : undefined;
 const env = process.env;
 const profilePath = env.RPCS3_CHROME_PROFILE || path.join(homedir(), ".cache", "rpcs3-web-chrome-profile");
 const baseURL = env.RPCS3_WEB_URL || "https://rpcs3.appmana.com";
-const headed = env.RPCS3_HEADED !== "0";
+const headed = env.RPCS3_HEADED === "1";
 const untilDraw = env.RPCS3_UNTIL_DRAW === "1";
 // Until-draw runs keep going up to the cap unless a smaller frame budget is given explicitly. A
 // commercial title spends thousands of flips on its logos, boot and intro before it reaches
@@ -59,13 +59,19 @@ const cpuSamplingIntervalUs = Math.max(1_000, Math.min(100_000, Number(env.RPCS3
 const tracePath = env.RPCS3_TRACE ? path.resolve(env.RPCS3_TRACE) : undefined;
 const coreVariant = ["release", "profile", "jspi", "profile-jspi"].includes(env.RPCS3_CORE) ? env.RPCS3_CORE : "auto";
 const inputTrace = env.RPCS3_INPUT_TRACE ? JSON.parse(await readFile(path.resolve(env.RPCS3_INPUT_TRACE), "utf8")).entries : undefined;
+const completion = env.RPCS3_COMPLETION || (target.endsWith("web_dispatch_conformance.self") ? "dispatch" : "frame");
+const expectedVerdict = env.RPCS3_EXPECTED_VERDICT || (target.endsWith("web_dispatch_conformance.self") ? "76ec98ba0e352b1c" : undefined);
+const isDispatch = completion === "dispatch";
 const runOptions = {
+  completion,
+  expectedVerdict,
+  dispatchTimeoutMs: timeoutMs,
   frames,
   untilDraw,
   renderEvery,
   timeoutMs,
-  render: env.RPCS3_RENDERER !== "null",
-  renderer: env.RPCS3_RENDERER === "null" ? "null" : "webgpu",
+  render: !isDispatch && env.RPCS3_RENDERER !== "null",
+  renderer: (isDispatch || env.RPCS3_RENDERER === "null") ? "null" : "webgpu",
   directRenderer: env.RPCS3_DIRECT_RENDERER === undefined ? undefined : env.RPCS3_DIRECT_RENDERER === "1",
   captureEvery: env.RPCS3_CAPTURE_EVERY ? Number(env.RPCS3_CAPTURE_EVERY) : undefined,
   width,
@@ -74,7 +80,11 @@ const runOptions = {
   captureRgba,
   captureShaders,
   capturePacketFixture: Boolean(packetFixturePath),
-  ppuAotBundle: process.env.RPCS3_PPU_AOT_BUNDLE || undefined,
+  ppuAotBundle: env.RPCS3_NO_PPU_AOT === "1" ? null : env.RPCS3_PPU_AOT_BUNDLE || undefined,
+  ppuBackend: process.env.RPCS3_PPU_BACKEND || undefined,
+  ppuFailClosed: process.env.RPCS3_PPU_FAIL_CLOSED === undefined ? undefined : process.env.RPCS3_PPU_FAIL_CLOSED === "1",
+  ppuReturnDispatch: env.RPCS3_PPU_RETURN_DISPATCH === undefined ? undefined : env.RPCS3_PPU_RETURN_DISPATCH === "1",
+  autoRecomp: env.RPCS3_AUTO_RECOMP === undefined ? undefined : env.RPCS3_AUTO_RECOMP === "1",
   spuAotBundle: process.env.RPCS3_SPU_AOT_BUNDLE || undefined,
   spuFallbackHistogram: env.RPCS3_SPU_FALLBACK_HIST === "1",
   spuDecoder: env.RPCS3_SPU_DECODER || undefined,
@@ -84,6 +94,7 @@ const runOptions = {
   ppuJitCapacity: Number(env.RPCS3_PPU_JIT_CAPACITY) || undefined,
   spuBlockSize: env.RPCS3_SPU_BLOCK_SIZE || undefined,
   spuLlvmWorkers: Number(env.RPCS3_SPU_LLVM_WORKERS) || undefined,
+  recompMaxBlocksPerShard: Number(env.RPCS3_RECOMP_MAX_BLOCKS_PER_SHARD) || undefined,
   spuHotThreshold: Number(env.RPCS3_SPU_HOT_THRESHOLD) || undefined,
   spuWasmSelftestBase64: env.RPCS3_SPU_WASM_SELFTEST ? readFileSync(path.resolve(env.RPCS3_SPU_WASM_SELFTEST)).toString("base64") : undefined,
   diagnostics: env.RPCS3_DIAGNOSTICS === "1",
@@ -100,7 +111,7 @@ const runOptions = {
   pthreadPoolSize: env.RPCS3_POOL_SIZE ? Number(env.RPCS3_POOL_SIZE) : undefined,
   coreUrl: env.RPCS3_CORE_URL || (coreVariant === "auto" ? undefined : `./core/${coreVariant === "release" ? "" : coreVariant + "/"}rpcs3-web.mjs`),
   suspending: coreVariant === "auto" ? undefined : coreVariant.endsWith("jspi"),
-  tracePc: env.RPCS3_TRACE_PC ? Number(env.RPCS3_TRACE_PC) : undefined,
+  tracePc: env.RPCS3_TRACE_PC || undefined,
   traceDelayPc: env.RPCS3_TRACE_DELAY_PC ? Number(env.RPCS3_TRACE_DELAY_PC) : undefined,
   traceDelayMs: env.RPCS3_TRACE_DELAY_MS ? Number(env.RPCS3_TRACE_DELAY_MS) : undefined,
   watchAddress: env.RPCS3_WATCH_ADDRESS ? Number(env.RPCS3_WATCH_ADDRESS) : undefined,
@@ -109,6 +120,12 @@ const runOptions = {
 };
 // Same flags and rejection rule as playwright.gpu.config.ts / the GPU specs.
 const chromeArgs = hardwareChromeArgs();
+if (env.RPCS3_CHROME_HOST_RESOLVER_RULES) {
+  chromeArgs.push(
+    `--host-resolver-rules=${env.RPCS3_CHROME_HOST_RESOLVER_RULES}`,
+    "--ignore-certificate-errors",
+  );
+}
 const softwareAdapterPattern = /SwiftShader|llvmpipe|software|CPU/i;
 
 const context = await chromium.launchPersistentContext(profilePath, {
@@ -140,6 +157,12 @@ async function stopTrace() {
 try {
   const page = context.pages()[0] ?? await context.newPage();
   const browserConsole = [];
+  page.on("response", (response) => {
+    if (response.status() < 400) return;
+    const line = `[http ${response.status()}] ${response.url()}`;
+    if (browserConsole.length < 2_000) browserConsole.push(line);
+    process.stderr.write(`${line}\n`);
+  });
   page.on("console", (message) => {
     const line = `[${message.type()}] ${message.text()}`;
     if (browserConsole.length < 2_000) browserConsole.push(line);
@@ -208,6 +231,34 @@ try {
 
   const startedAt = Date.now();
   const result = await page.evaluate(async ({ target, options }) => {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const getSubDir = async (dir, parts) => {
+        let cur = dir;
+        for (const p of parts) {
+          cur = await cur.getDirectoryHandle(p);
+        }
+        return cur;
+      };
+      try {
+        const trophyDir = await getSubDir(root, ["rpcs3", "dev_hdd0", "home", "00000001", "trophy"]);
+        const names = [];
+        for await (const [name] of trophyDir.entries()) names.push(name);
+        for (const name of names) {
+          await trophyDir.removeEntry(name, { recursive: true });
+        }
+      } catch {}
+      try {
+        const gameDir = await getSubDir(root, ["rpcs3", "dev_hdd0", "game"]);
+        const names = [];
+        for await (const [name] of gameDir.entries()) {
+          if (name.startsWith("_GDATA_") || name.includes("temp")) names.push(name);
+        }
+        for (const name of names) {
+          await gameDir.removeEntry(name, { recursive: true });
+        }
+      } catch {}
+    } catch {}
     const runtime = window.__rpcs3Runtime;
     if (!runtime) throw new Error("runtime acceptance API is unavailable");
     try { return await runtime.run(target, options); }
@@ -226,7 +277,7 @@ try {
 
   const frameList = result.frames ?? [result];
   const completed = Boolean(result.ok) && !result.renderError
-    && (untilDraw ? frameList.some((frame) => (frame.drawPacketCount ?? 0) > 0) : (result.emuFlipId ?? result.workingSet?.flipCounter ?? frameList.length) >= frames);
+    && (isDispatch ? true : (untilDraw ? frameList.some((frame) => (frame.drawPacketCount ?? 0) > 0) : (result.emuFlipId ?? result.workingSet?.flipCounter ?? frameList.length) >= frames));
   const { packetFixture, ...resultWithoutFixture } = result;
   const rgbaBase64 = result.gpu?.rgbaBase64;
   if (result.spuMissBase64) {

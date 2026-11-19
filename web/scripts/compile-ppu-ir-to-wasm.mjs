@@ -71,106 +71,51 @@ function findRuntimeArchives() {
 const inputs = inputArgs.map((argument) => resolve(argument));
 const output = resolve(outputArg);
 const jobsOption = options.find((option) => option.startsWith("--jobs="));
-const jobs = Math.max(1, Number(jobsOption?.slice("--jobs=".length)) || Math.min(8, availableParallelism()));
+const jobs = Math.max(1, Number(jobsOption?.slice("--jobs=".length)) || availableParallelism());
 const exports = options.filter((option) => option.startsWith("--export="));
 // Shared (PIC) modules export their visible symbols by default: the per-part block tables. Named
 // block exports are only for the JS dispatcher fixtures (--export-all).
 const exportAll = options.includes("--export-all") || (!options.includes("--pic") && exports.length === 0);
 const pic = options.includes("--pic");
-const llvmAs = findTool("RPCS3_LLVM_AS", "llvm-as");
-const llc = findTool("RPCS3_LLC", "llc");
 const wasmLd = findTool("RPCS3_WASM_LD", "wasm-ld");
 const runtimeArchives = findRuntimeArchives();
 const scratch = mkdtempSync(join(tmpdir(), "rpcs3-ppu-aot-"));
-const regionTool = (options.includes("--regions") || options.includes("--direct-exits") || options.includes("--unary-swizzles")) ? ensureWasmRegionTool() : null;
 const inlineReads = options.includes("--inline-reads");
+const inlineWrites = options.includes("--inline-writes");
+const useRegionTool = options.includes("--regions") || options.includes("--direct-exits") || options.includes("--unary-swizzles") || inlineReads || inlineWrites;
+const regionTool = ensureWasmRegionTool();
 const regionReports = new Array(inputs.length);
 
-// Inline the AOT bundle's host-VM-helper reads into wasm (mirrors PPUTranslator.cpp:1036):
-// page-table load over @__rpcs3_guest_pages + bounds check + volatile aligned load + a
-// fallback to the raw helper for unmapped pages. Register index = unique suffix.
-function inlineVmReads(text) {
-  if (!text.includes("rpcs3_web_vm_read")) return text;
-  const re = /^  %(\d+) = call (i\d+) @rpcs3_web_vm_read(\d+)_raw\(i32 %(\d+)\)$/gm;
-  const t = [];
-  let last = 0, m;
-  while ((m = re.exec(text))) {
-    const reg = m[1], ty = m[2], w = Number(m[3]), addr = m[4];
-    const lim = (4096 - (w / 8)) | 0;
-    t.push(text.slice(last, m.index));
-    t.push(`  %vmrpi_${reg} = lshr i32 %${addr}, 12\n`);
-    t.push(`  %vmrp_${reg} = getelementptr [1048576 x i32], ptr @__rpcs3_guest_pages, i32 0, i32 %vmrpi_${reg}\n`);
-    t.push(`  %vmrpv_${reg} = load i32, ptr %vmrp_${reg}, align 4\n`);
-    t.push(`  %vmro_${reg} = and i32 %${addr}, 4095\n`);
-    t.push(`  %vmrin_${reg} = icmp ule i32 %vmro_${reg}, ${lim}\n`);
-    t.push(`  %vmrm_${reg} = icmp ne i32 %vmrpv_${reg}, 0\n`);
-    t.push(`  %vmrgo_${reg} = and i1 %vmrin_${reg}, %vmrm_${reg}\n`);
-    t.push(`  br i1 %vmrgo_${reg}, label %vmr_d_${reg}, label %vmr_f_${reg}\n`);
-    t.push(`vmr_d_${reg}:\n`);
-    t.push(`  %vmra_${reg} = add i32 %vmrpv_${reg}, %vmro_${reg}\n`);
-    t.push(`  %vmrpt_${reg} = inttoptr i32 %vmra_${reg} to ptr\n`);
-    t.push(`  %vmrv_${reg} = load volatile ${ty}, ptr %vmrpt_${reg}, align 1\n`);
-    t.push(`  br label %vmr_m_${reg}\n`);
-    t.push(`vmr_f_${reg}:\n`);
-    t.push(`  %vmrs_${reg} = call ${ty} @rpcs3_web_vm_read${w}_raw(i32 %${addr})\n`);
-    t.push(`  br label %vmr_m_${reg}\n`);
-    t.push(`vmr_m_${reg}:\n`);
-    t.push(`  %${reg} = phi ${ty} [ %vmrv_${reg}, %vmr_d_${reg} ], [ %vmrs_${reg}, %vmr_f_${reg} ]\n`);
-    last = re.lastIndex;
-  }
-  t.push(text.slice(last));
-  let out = t.join("");
-  // Inject the @__rpcs3_guest_pages declaration only if the ORIGINAL input lacked
-  // it (the transformed bodies reference it as a global, not a declaration).
-  if (!text.includes("@__rpcs3_guest_pages = external")) {
-    const decl = `@__rpcs3_guest_pages = external global [1048576 x i32]\n`;
-    const idx = out.indexOf("define ");
-    out = idx > 0 ? out.slice(0, idx) + decl + out.slice(idx) : decl + out;
-  }
-  return out;
-}
-
-async function lower(input, index) {
-  const bitcode = join(scratch, `${index}-${basename(input)}.bc`);
-  const object = join(scratch, `${index}-${basename(input)}.o`);
-  let source = input;
-  if (regionTool) {
-    source = join(scratch, `${index}.region.ll`);
-    const result = await execFileAsync(regionTool, [input, source, ...(options.includes("--regions") ? [] : ["--no-regions"]), ...(options.includes("--direct-exits") ? ["--direct-exits"] : []), ...(options.includes("--unary-swizzles") ? ["--unary-swizzles"] : [])], { maxBuffer: 1 << 24 });
-    regionReports[index] = JSON.parse(result.stdout);
-  }
-  if (inlineReads) {
-    const inline = join(scratch, `${index}.inline.ll`);
-    await writeFile(inline, inlineVmReads(await readFile(source, "utf8")));
-    source = inline;
-  }
-  await execFileAsync(llvmAs, [source, "-o", bitcode], { maxBuffer: 1 << 24 });
-  await execFileAsync(llc, [
-    "-mtriple=wasm32-unknown-unknown",
-    "-mattr=+atomics,+bulk-memory,+mutable-globals,+sign-ext,+simd128,+tail-call",
-    pic ? "-relocation-model=pic" : undefined,
-    "-O3",
-    "-filetype=obj",
-    bitcode,
-    "-o",
-    object,
-  ].filter(Boolean), { maxBuffer: 1 << 24 });
-  rmSync(bitcode, { force: true });
-  return object;
-}
-
 try {
-  const objects = new Array(inputs.length);
-  let next = 0;
-  await Promise.all(Array.from({ length: Math.min(jobs, inputs.length) }, async () => {
-    while (next < inputs.length) {
-      const index = next++;
-      objects[index] = await lower(inputs[index], index);
+  const objects = inputs.map((input, index) => join(scratch, `${index}-${basename(input)}.o`));
+  const workerCount = Math.min(jobs, inputs.length);
+  const batches = Array.from({ length: workerCount }, () => []);
+  for (let index = 0; index < inputs.length; index += 1) {
+    batches[index % workerCount].push({ index, input: inputs[index], object: objects[index] });
+  }
+  const toolFlags = [
+    ...(options.includes("--regions") ? [] : ["--no-regions"]),
+    ...(options.includes("--direct-exits") ? ["--direct-exits"] : []),
+    ...(options.includes("--unary-swizzles") ? ["--unary-swizzles"] : []),
+    ...(inlineReads ? ["--inline-reads"] : []),
+    ...(inlineWrites ? ["--inline-writes"] : []),
+    "--emit-obj",
+    ...(pic ? ["--pic"] : []),
+  ];
+  await Promise.all(batches.map(async (batch, workerIndex) => {
+    if (!batch.length) return;
+    const batchFile = join(scratch, `batch-${workerIndex}.txt`);
+    await writeFile(batchFile, batch.map((item) => `${item.input}\t${item.object}`).join("\n") + "\n");
+    const result = await execFileAsync(regionTool, ["--batch", batchFile, ...toolFlags], { maxBuffer: 1 << 26 });
+    const parsed = JSON.parse(result.stdout);
+    for (let i = 0; i < batch.length; i += 1) {
+      regionReports[batch[i].index] = parsed[i];
     }
   }));
 
   const linkOptions = [
     pic ? "--shared" : "--no-entry",
+    `--threads=${jobs}`,
     "--import-memory",
     "--shared-memory",
     pic ? undefined : "--initial-memory=16777216",
@@ -194,7 +139,7 @@ try {
     pic,
     bytes: bytes.byteLength,
     runtimeArchives,
-    ...(regionTool ? { regions: regionReports } : {}),
+    ...(useRegionTool ? { regions: regionReports } : {}),
     imports: WebAssembly.Module.imports(module),
     exports: WebAssembly.Module.exports(module),
   })}\n`);

@@ -1,16 +1,38 @@
 import { supportsSuspending } from "./rpcs3-suspending.mjs";
 
 export async function runtimeOptions(target, overrides = {}) {
-  const commercial = target?.startsWith("/opfs/");
+  const commercial = Boolean(
+    target?.startsWith("/opfs/games/") ||
+    (target?.startsWith("/opfs/") && (/lbp|littlebigplanet|BCUS98245/i.test(target) || /\.iso$/i.test(target)))
+  );
   let bundles = {};
   if (commercial) {
-    const response = await fetch(new URL("./local-aot/index.json", import.meta.url));
-    if (!response.ok) throw new Error(`bundle index: HTTP ${response.status}`);
-    const entry = (await response.json()).titles?.find((title) => title.disc === target);
-    if (entry) bundles = { ppuAotBundle: entry.ppu, spuAotBundle: entry.spu };
+    try {
+      const response = await fetch(new URL("./local-aot/index.json", import.meta.url));
+      const contentType = response.headers?.get("content-type") || "";
+      if (response.ok && (!contentType || contentType.includes("json"))) {
+        const titles = (await response.json()).titles ?? [];
+        const entry = titles.find((title) => title.disc === target || (title.serial && target.includes(title.serial)))
+          ?? (/\.SAVESTAT(?:\.zst)?$/i.test(target) && titles.length === 1 ? titles[0] : undefined);
+        if (entry) bundles = { ppuAotBundle: entry.ppu, spuAotBundle: entry.spu };
+      }
+    } catch {}
   }
   const options = {
-    ...(commercial ? { directRenderer: true, ppuJit: true, spuDecoder: "llvm", spuLlvmWorkers: 2, clockScale: 100 } : {}),
+    // A commercial title always starts on the fail-closed AOT path. Its live
+    // EBOOT/PRX code is compiled to Wasm before execution, and the worker's
+    // persistent cache supplies the same modules on later boots. Block-JIT is
+    // disabled by default; fail-closed misses still compile synchronously
+    // through the same AOT worker rather than executing PPU instructions.
+    ...(commercial ? {
+      directRenderer: true,
+      ppuBackend: "aot",
+      ppuFailClosed: true,
+      ppuJit: false,
+      autoRecomp: true,
+      spuDecoder: "llvm",
+      clockScale: 100,
+    } : {}),
     ...bundles,
     ...Object.fromEntries(Object.entries(overrides).filter(([, value]) => value !== undefined)),
   };

@@ -25,7 +25,7 @@ struct spu_chain_context
 	uint32_t edge_slots, profile_clock;
 };
 
-#define SPU_CHAIN_CACHE_SLOTS 4096
+#define SPU_CHAIN_CACHE_SLOTS 65536
 static inline uint32_t spu_chain_cache_slot(uint32_t pc)
 {
 	const uint32_t word = (pc & 0x3fffc) >> 2;

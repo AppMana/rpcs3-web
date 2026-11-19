@@ -4022,6 +4022,8 @@ public:
 
 			// Cache precompilation never executes the returned address. It only
 			// requires a non-null result so it can continue exporting other units.
+			add_loc->compiled = spu_runtime::tr_interpreter;
+			add_loc->compiled.notify_all();
 			return spu_runtime::tr_interpreter;
 #endif
 		}

@@ -1,4 +1,5 @@
 const worker = new Worker("./unit-smoke-worker.mjs", { type: "module" });
+const filter = new URL(location.href).searchParams.get("gtest_filter") || undefined;
 const result = await new Promise((resolve, reject) => {
   const timer = setTimeout(() => reject(new Error("RPCS3 Wasm units timed out")), 60_000);
   worker.addEventListener("message", (event) => {
@@ -10,7 +11,7 @@ const result = await new Promise((resolve, reject) => {
     clearTimeout(timer);
     reject(new Error(event.message || "RPCS3 Wasm unit worker failed"));
   });
-  worker.postMessage({ type: "run-units" });
+  worker.postMessage({ type: "run-units", filter });
 });
 
 globalThis.__rpcs3UnitResult = {

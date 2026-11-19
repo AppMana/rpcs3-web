@@ -100,6 +100,34 @@ export async function importFirmware(file, onProgress) {
   return writeFileToOPFS(file, "firmware/PS3UPDAT.PUP", onProgress);
 }
 
+export async function existsInOPFS(pathOrMounted) {
+  if (!navigator.storage?.getDirectory || typeof pathOrMounted !== "string") return false;
+  const stripped = pathOrMounted.startsWith(`${RPCS3_OPFS_MOUNT}/`)
+    ? pathOrMounted.slice(RPCS3_OPFS_MOUNT.length + 1)
+    : pathOrMounted;
+  let path;
+  try {
+    path = normalizeRelativePath(stripped);
+  } catch {
+    return false;
+  }
+  const parts = path.split("/");
+  const name = parts.pop();
+  try {
+    const root = await navigator.storage.getDirectory();
+    const dir = await directoryFor(root, parts, false);
+    try {
+      await dir.getFileHandle(name, { create: false });
+      return true;
+    } catch {
+      await dir.getDirectoryHandle(name, { create: false });
+      return true;
+    }
+  } catch {
+    return false;
+  }
+}
+
 export async function listOPFS(maxEntries = 5000) {
   if (!navigator.storage?.getDirectory) return [];
   const root = await navigator.storage.getDirectory();

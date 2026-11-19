@@ -414,8 +414,29 @@ bool compressed_serialization_file_handler::handle_file_op(utils::serial& ar, us
 	}
 
 	// Adjustment to prevent overflow
-	const usz subtrahend = ar.data.empty() ? 0 : 1;
-	const usz read_past_buffer = utils::sub_saturate<usz>(pos + (size - subtrahend), ar.data_offset + (ar.data.size() - subtrahend));
+	usz subtrahend = ar.data.empty() ? 0 : 1;
+	usz read_past_buffer = utils::sub_saturate<usz>(pos + (size - subtrahend), ar.data_offset + (ar.data.size() - subtrahend));
+
+	if (read_past_buffer && pos > ar.data_offset && pos - ar.data_offset >= 0x80'0000)
+	{
+		const usz discard_bytes = std::min<usz>(pos - ar.data_offset, ar.data.size());
+		ar.data_offset += discard_bytes;
+		if (discard_bytes == ar.data.size())
+		{
+			ar.data.clear();
+		}
+		else
+		{
+			ar.data.erase(ar.data.begin(), ar.data.begin() + discard_bytes);
+		}
+		if (ar.data.capacity() >= 0x200'0000)
+		{
+			ar.data.shrink_to_fit();
+		}
+		subtrahend = ar.data.empty() ? 0 : 1;
+		read_past_buffer = utils::sub_saturate<usz>(pos + (size - subtrahend), ar.data_offset + (ar.data.size() - subtrahend));
+	}
+
 	const usz read_limit = utils::sub_saturate<usz>(ar.m_max_data, ar.data_offset); 
 
 	if (read_past_buffer)
@@ -426,7 +447,9 @@ bool compressed_serialization_file_handler::handle_file_op(utils::serial& ar, us
 		const usz old_size = ar.data.size();
 
 		// Try to prefetch data by reading more than requested
-		const usz new_size = std::min<usz>(read_limit, std::max<usz>({ ar.data.capacity(), ar.data.size() + read_past_buffer * 3 / 2, ar.expect_little_data() ? usz{4096} : usz{0x10'0000} }));
+		const usz prefetch_past = std::min<usz>(read_past_buffer * 3 / 2, read_past_buffer + 0x40'0000);
+		const usz capped_cap = std::min<usz>(ar.data.capacity(), ar.data.size() + 0x80'0000);
+		const usz new_size = std::min<usz>(read_limit, std::max<usz>({ capped_cap, ar.data.size() + prefetch_past, ar.expect_little_data() ? usz{4096} : usz{0x10'0000} }));
 
 		if (new_size < old_size)
 		{
@@ -974,8 +997,29 @@ bool compressed_zstd_serialization_file_handler::handle_file_op(utils::serial& a
 	}
 
 	// Adjustment to prevent overflow
-	const usz subtrahend = ar.data.empty() ? 0 : 1;
-	const usz read_past_buffer = utils::sub_saturate<usz>(pos + (size - subtrahend), ar.data_offset + (ar.data.size() - subtrahend));
+	usz subtrahend = ar.data.empty() ? 0 : 1;
+	usz read_past_buffer = utils::sub_saturate<usz>(pos + (size - subtrahend), ar.data_offset + (ar.data.size() - subtrahend));
+
+	if (read_past_buffer && pos > ar.data_offset && pos - ar.data_offset >= 0x80'0000)
+	{
+		const usz discard_bytes = std::min<usz>(pos - ar.data_offset, ar.data.size());
+		ar.data_offset += discard_bytes;
+		if (discard_bytes == ar.data.size())
+		{
+			ar.data.clear();
+		}
+		else
+		{
+			ar.data.erase(ar.data.begin(), ar.data.begin() + discard_bytes);
+		}
+		if (ar.data.capacity() >= 0x200'0000)
+		{
+			ar.data.shrink_to_fit();
+		}
+		subtrahend = ar.data.empty() ? 0 : 1;
+		read_past_buffer = utils::sub_saturate<usz>(pos + (size - subtrahend), ar.data_offset + (ar.data.size() - subtrahend));
+	}
+
 	const usz read_limit = utils::sub_saturate<usz>(ar.m_max_data, ar.data_offset); 
 
 	if (read_past_buffer)
@@ -986,7 +1030,9 @@ bool compressed_zstd_serialization_file_handler::handle_file_op(utils::serial& a
 		const usz old_size = ar.data.size();
 
 		// Try to prefetch data by reading more than requested
-		const usz new_size = std::min<usz>(read_limit, std::max<usz>({ ar.data.capacity(), ar.data.size() + read_past_buffer * 3 / 2, ar.expect_little_data() ? usz{4096} : usz{0x10'0000} }));
+		const usz prefetch_past = std::min<usz>(read_past_buffer * 3 / 2, read_past_buffer + 0x40'0000);
+		const usz capped_cap = std::min<usz>(ar.data.capacity(), ar.data.size() + 0x80'0000);
+		const usz new_size = std::min<usz>(read_limit, std::max<usz>({ capped_cap, ar.data.size() + prefetch_past, ar.expect_little_data() ? usz{4096} : usz{0x10'0000} }));
 
 		if (new_size < old_size)
 		{

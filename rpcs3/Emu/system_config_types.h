@@ -61,6 +61,9 @@ enum class audio_renderer
 #ifdef HAVE_FAUDIO
 	faudio,
 #endif
+#ifdef RPCS3_WEB
+	webaudio,
+#endif
 };
 
 enum class audio_provider

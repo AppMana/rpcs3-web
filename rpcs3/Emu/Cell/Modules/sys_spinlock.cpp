@@ -51,8 +51,8 @@ void sys_spinlock_unlock(vm::ptr<atomic_be_t<u32>> lock)
 
 void sysPrxForUser_sys_spinlock_init()
 {
-	REG_FUNC(sysPrxForUser, sys_spinlock_initialize);
-	REG_FUNC(sysPrxForUser, sys_spinlock_lock);
-	REG_FUNC(sysPrxForUser, sys_spinlock_trylock);
-	REG_FUNC(sysPrxForUser, sys_spinlock_unlock);
+	REG_FUNC(sysPrxForUser, sys_spinlock_initialize).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, sys_spinlock_lock).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, sys_spinlock_trylock).flag(MFF_PERFECT);
+	REG_FUNC(sysPrxForUser, sys_spinlock_unlock).flag(MFF_PERFECT);
 }

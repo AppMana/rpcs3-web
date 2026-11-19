@@ -32,6 +32,7 @@ public:
 
 	s32 AddLddPad();
 	void UnregisterLddPad(u32 handle);
+	void sync_injected_pad_locked();
 
 	void open_home_menu();
 
@@ -63,8 +64,11 @@ protected:
 
 private:
 	void apply_copilots();
+	void apply_copilots_locked();
 	void update_pad_states();
 
+	bool m_inited = false;
+	u32 m_last_injected_sequence = umax;
 	u32 m_mask_start_press_to_resume = 0;
 	u64 m_track_start_press_begin_timestamp = 0;
 	bool m_resume_emulation_flag = false;
@@ -119,8 +123,12 @@ namespace injected_pad
 	{
 		u32 frame, digital1, digital2, left_x, left_y, right_x, right_y;
 	};
+	bool active();
+	void enable();
 	bool replaying();
 	u32 applied();
+	u32 frame();
+	void reset_frame();
 	void clear_schedule();
 	void add_schedule(scheduled_state entry);
 	void advance_replay();

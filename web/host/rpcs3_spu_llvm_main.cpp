@@ -98,6 +98,7 @@ extern "C"
 		// Same analysis settings as the runtime's dispatch-time analyse() (defaults); no disk cache here
 		g_cfg.core.spu_cache.set(false);
 		g_cfg.core.spu_debug.set(false);
+		g_cfg.savestate.compatible_mode.set(true);
 		g_fxo->reset();
 		g_fxo->init<spu_runtime>();
 		s_compiler = spu_recompiler_base::make_llvm_recompiler();

@@ -42,29 +42,48 @@ export function broadcastAotLoad({ module, key, load, readyTimeoutMs = 60_000 })
       });
     });
     pending.set(worker, promise);
-    // Bounded, slow resend: a worker still loading its own wasm queues early messages through
-    // Emscripten's handler, which drops unknown ones.
-    let attempts = 0;
-    const resend = setInterval(() => {
-      if (++attempts > 20) { clearInterval(resend); return; }
-      worker.postMessage({ [key]: load });
-    }, 3000);
-    promise.then(() => clearInterval(resend));
     worker.postMessage({ [key]: load });
   };
-  const idle = [...PThread.unusedWorkers];
-  for (const worker of idle) send(worker);
-  for (const worker of Object.values(PThread.pthreads ?? {})) if (worker && typeof worker.postMessage === "function") send(worker);
+  PThread.__rpcs3AotSenders ??= {};
+  PThread.__rpcs3AotSenders[key] = send;
+  const roleName = key === "rpcs3SpuAot" ? "spu" : key === "rpcs3PpuAot" ? "ppu" : null;
+  const roleQuota = key === "rpcs3SpuAot" ? 8 : 24;
+  if (roleName && PThread.unusedWorkers.length >= 32 && typeof module._rpcs3_web_rsx_spawn_flag_address === "function") {
+    PThread.__rpcs3RoleScoped = true;
+    module.rpcs3PinWorkerPools?.(module._rpcs3_web_rsx_spawn_flag_address() >>> 0);
+  }
+  const idle = [];
+  if (PThread.__rpcs3RoleScoped && roleName) {
+    for (const worker of PThread.unusedWorkers) {
+      if (idle.length >= roleQuota) break;
+      if (!worker.__rpcs3Role || worker.__rpcs3Role === roleName) {
+        worker.__rpcs3Role = roleName;
+        idle.push(worker);
+      }
+    }
+    for (const worker of idle) send(worker);
+  } else {
+    idle.push(...PThread.unusedWorkers);
+    for (const worker of idle) send(worker);
+    for (const worker of Object.values(PThread.pthreads ?? {})) if (worker && typeof worker.postMessage === "function") send(worker);
+  }
   const originalLoad = PThread.loadWasmModuleToWorker;
   PThread.loadWasmModuleToWorker = (worker) => {
     const result = originalLoad.call(PThread, worker);
-    send(worker);
+    const maybeSend = () => {
+      if (!PThread.__rpcs3RoleScoped || !roleName || worker.__rpcs3Role === roleName) send(worker);
+    };
+    if (result && typeof result.then === "function") {
+      result.then(maybeSend, () => {});
+    } else {
+      maybeSend();
+    }
     return result;
   };
   const originalReturn = PThread.returnWorkerToPool;
   PThread.returnWorkerToPool = (worker) => {
     originalReturn.call(PThread, worker);
-    send(worker);
+    if (!PThread.__rpcs3RoleScoped || !roleName || worker.__rpcs3Role === roleName) send(worker);
   };
   return Promise.race([
     Promise.all(idle.map((worker) => pending.get(worker))),
@@ -73,6 +92,7 @@ export function broadcastAotLoad({ module, key, load, readyTimeoutMs = 60_000 })
     idleWorkers: idle.length,
     idleWorkersReady: idle.filter((worker) => status.get(worker) === "ready").length,
     workersReady: ready.workersReady,
+    workersSent: pending.size,
     errors: ready.errors,
   }));
 }

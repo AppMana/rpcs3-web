@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "forks": [
+    {
+      "name": "forks-ps3recomp",
+      "upstream": "https://github.com/sp00nznet/ps3recomp.git",
+      "commit": "de4f090328ea08bef6b2f15caec0b85e343a7ece",
+      "integration": "source",
+      "purpose": "PS3 lift tests, ABI/lane audits, RPCS3 oracle probes, and regression methodology"
+    },
+    {
+      "name": "forks-XenonRecomp",
+      "upstream": "https://github.com/hedge-dev/XenonRecomp.git",
+      "commit": "ddd128bcca99fe8bfbb99bea583c972351fa6ace",
+      "integration": "source",
+      "purpose": "whole-function PowerPC context, call graph, register localization, and patch-hook reference"
+    },
+    {
+      "name": "forks-AnyPS3",
+      "upstream": "https://github.com/maceeek/AnyPS3.git",
+      "commit": "9f61171adea5cb2c72582b1879e625ad8bdf1fad",
+      "integration": "reference",
+      "purpose": "fail-closed PPU runtime behavior and acceptance scenarios"
+    },
+    {
+      "name": "forks-DolRecomp",
+      "upstream": "https://github.com/ExpansionPak/DolRecomp.git",
+      "commit": "02e27aca1c408cfcb2a4079a3a5b5ab3ae39d340",
+      "integration": "reference",
+      "purpose": "LLVM backend, CFG/liveness, native ABI, hooks, and profile-guided ranges"
+    },
+    {
+      "name": "forks-Ghidra-to-LLVM",
+      "upstream": "https://github.com/toor-de-force/Ghidra-to-LLVM.git",
+      "commit": "2e59bc48d6bb820ecf6b390e5cf5893fc6ea0216",
+      "integration": "reference",
+      "purpose": "historical P-Code lowering prototype"
+    },
+    {
+      "name": "forks-Ghidrall",
+      "upstream": "https://github.com/pk2708/Ghidrall.git",
+      "commit": "dd7c750f3bf085384659341cb027df68f9633bb6",
+      "integration": "reference",
+      "purpose": "historical SSA/LLVM experiment"
+    }
+  ]
+}

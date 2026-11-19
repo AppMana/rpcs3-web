@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "target": "/opfs/rpcs3/savestates/lbp2-gameplay.SAVESTAT.zst",
+  "entries": [
+    { "frame": 10, "digital1": 0, "digital2": 0, "leftX": 255, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 35, "digital1": 0, "digital2": 64, "leftX": 255, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 45, "digital1": 0, "digital2": 0, "leftX": 255, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 85, "digital1": 0, "digital2": 64, "leftX": 255, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 95, "digital1": 0, "digital2": 0, "leftX": 255, "leftY": 128, "rightX": 128, "rightY": 128 },
+    { "frame": 150, "digital1": 0, "digital2": 0, "leftX": 128, "leftY": 128, "rightX": 128, "rightY": 128 }
+  ]
+}

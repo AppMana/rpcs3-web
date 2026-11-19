@@ -1,0 +1,11 @@
+# Prevent search/indexing tools from scanning minified bundles, Emscripten glue, build trees, or raw profiles
+web/dist/
+web/public/core/
+web/public/firmware-wasm/
+web/public/local-aot/
+build-*/
+*.cpuprofile
+*.trace.json
+*.wasm
+*.min.js
+*.min.mjs

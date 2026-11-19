@@ -15,7 +15,13 @@ const libraryProxy = {
 
 export default defineConfig({
   base: process.env.BASE_PATH || "/",
-  server: { headers: isolationHeaders, proxy: libraryProxy },
+  server: {
+    headers: isolationHeaders,
+    proxy: libraryProxy,
+    // Local HTTPS parity runs preserve the hosted origin so Chrome exposes the
+    // existing origin-private OPFS game and firmware library.
+    allowedHosts: ["rpcs3.appmana.com"],
+  },
   preview: {
     headers: isolationHeaders,
     proxy: libraryProxy,

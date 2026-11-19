@@ -26,7 +26,9 @@ TEST(SpuWebDispatch, RevalidatesLocalStoreAndRecoversAfterMutation)
 	EXPECT_EQ(attempted, (std::vector<unsigned>{2, 0}));
 	local_store = 40;
 	EXPECT_EQ(dispatch(), 3u);
-	EXPECT_EQ(attempted, (std::vector<unsigned>{0, 1, 2}));
+	// The last successful candidate remains a fallback preference, then the
+	// full verified search proceeds in publication order.
+	EXPECT_EQ(attempted, (std::vector<unsigned>{0, 2, 1}));
 	local_store = 20;
 	EXPECT_EQ(dispatch(), 1u);
 }

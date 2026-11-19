@@ -5,6 +5,7 @@ import { chromium } from "playwright";
 
 const prefix = (process.argv[2] || "").replace(/^\/+/, "");
 const readPath = (process.env.RPCS3_OPFS_READ || "").replace(/^\/+/, "");
+const removePath = (process.env.RPCS3_OPFS_REMOVE || "").replace(/^\/+/, "");
 const outputPath = process.env.RPCS3_OPFS_EXPORT
   ? path.resolve(process.env.RPCS3_OPFS_EXPORT)
   : undefined;
@@ -20,7 +21,7 @@ const context = await chromium.launchPersistentContext(profilePath, {
 try {
   const page = context.pages()[0] ?? await context.newPage();
   await page.goto(`${baseURL}/storage.html`, { waitUntil: "domcontentloaded" });
-  const result = await page.evaluate(async ({ selectedPrefix, selectedPath }) => {
+  const result = await page.evaluate(async ({ selectedPrefix, selectedPath, selectedRemovePath }) => {
     const root = await navigator.storage.getDirectory();
     const entries = [];
 
@@ -37,7 +38,22 @@ try {
     }
 
     await visit(root, "");
-    if (!selectedPath) return { entries };
+    let removed = false;
+    if (selectedRemovePath) {
+      const parts = selectedRemovePath.split("/").filter(Boolean);
+      if (!parts.length) throw new Error("refusing to remove the OPFS root");
+      const entryName = parts.pop();
+      let directory = root;
+      try {
+        for (const part of parts) directory = await directory.getDirectoryHandle(part);
+        await directory.removeEntry(entryName, { recursive: true });
+        removed = true;
+      } catch (error) {
+        if (error?.name !== "NotFoundError") throw error;
+      }
+    }
+
+    if (!selectedPath) return { entries, removed };
 
     const parts = selectedPath.split("/").filter(Boolean);
     const fileName = parts.pop();
@@ -45,8 +61,8 @@ try {
     for (const part of parts) directory = await directory.getDirectoryHandle(part);
     const handle = await directory.getFileHandle(fileName);
     const file = await handle.getFile();
-    return { entries, bytes: [...new Uint8Array(await file.arrayBuffer())] };
-  }, { selectedPrefix: prefix, selectedPath: readPath });
+    return { entries, removed, bytes: [...new Uint8Array(await file.arrayBuffer())] };
+  }, { selectedPrefix: prefix, selectedPath: readPath, selectedRemovePath: removePath });
 
   if (result.bytes) {
     const bytes = Uint8Array.from(result.bytes);

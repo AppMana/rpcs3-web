@@ -475,6 +475,8 @@ error_code _cellGcmInitBody(ppu_thread& ppu, vm::pptr<CellGcmContextData> contex
 
 	g_defaultCommandBufferBegin = ioAddress;
 	g_defaultCommandBufferFragmentCount = cmdSize / (32 * 1024);
+	gcm_cfg.default_cmd_buffer_begin = g_defaultCommandBufferBegin;
+	gcm_cfg.default_cmd_buffer_frag_count = g_defaultCommandBufferFragmentCount;
 
 	gcm_cfg.gcm_info.context_addr = rsx_ctxaddr;
 	gcm_cfg.gcm_info.control_addr = render->dma_address;
@@ -1470,11 +1472,14 @@ error_code cellGcmGpadCaptureSnapshot(u32 num)
  */
 static std::pair<u32, u32> getNextCommandBufferBeginEnd(u32 current)
 {
-	u32 currentRange = (current - g_defaultCommandBufferBegin) / (32 * 1024);
-	if (currentRange >= g_defaultCommandBufferFragmentCount - 1)
-		return std::make_pair(g_defaultCommandBufferBegin + 4096, g_defaultCommandBufferBegin + 32 * 1024 - 4);
-	return std::make_pair(g_defaultCommandBufferBegin + (currentRange + 1) * 32 * 1024,
-		g_defaultCommandBufferBegin + (currentRange + 2) * 32 * 1024 - 4);
+	const auto& gcm_cfg = g_fxo->get<gcm_config>();
+	const u32 cmd_begin = gcm_cfg.default_cmd_buffer_begin ? gcm_cfg.default_cmd_buffer_begin : g_defaultCommandBufferBegin;
+	const u32 frag_count = gcm_cfg.default_cmd_buffer_frag_count ? gcm_cfg.default_cmd_buffer_frag_count : g_defaultCommandBufferFragmentCount;
+	u32 currentRange = (current - cmd_begin) / (32 * 1024);
+	if (currentRange >= frag_count - 1)
+		return std::make_pair(cmd_begin + 4096, cmd_begin + 32 * 1024 - 4);
+	return std::make_pair(cmd_begin + (currentRange + 1) * 32 * 1024,
+		cmd_begin + (currentRange + 2) * 32 * 1024 - 4);
 }
 
 static u32 getOffsetFromAddress(u32 address)
@@ -1490,11 +1495,14 @@ static u32 getOffsetFromAddress(u32 address)
  */
 static bool isInCommandBufferExcept(u32 getPos, u32 bufferBegin, u32 bufferEnd)
 {
+	const auto& gcm_cfg = g_fxo->get<gcm_config>();
+	const u32 cmd_begin = gcm_cfg.default_cmd_buffer_begin ? gcm_cfg.default_cmd_buffer_begin : g_defaultCommandBufferBegin;
+	const u32 frag_count = gcm_cfg.default_cmd_buffer_frag_count ? gcm_cfg.default_cmd_buffer_frag_count : g_defaultCommandBufferFragmentCount;
 	// Is outside of default command buffer :
 	// It's in a call/return statement
 	// Conservatively return false here
-	if (getPos < getOffsetFromAddress(g_defaultCommandBufferBegin + 4096) &&
-		getPos > getOffsetFromAddress(g_defaultCommandBufferBegin + g_defaultCommandBufferFragmentCount * 32 * 1024))
+	if (getPos < getOffsetFromAddress(cmd_begin + 4096) &&
+		getPos > getOffsetFromAddress(cmd_begin + frag_count * 32 * 1024))
 		return false;
 	if (getPos >= getOffsetFromAddress(bufferBegin) &&
 		getPos <= getOffsetFromAddress(bufferEnd))

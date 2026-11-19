@@ -5,6 +5,22 @@
 
 namespace rsx
 {
+#ifdef RPCS3_WEB
+	template<bool IsFullLock = false, uint Stride = 128>
+	class reservation_lock
+	{
+	public:
+		constexpr reservation_lock(u32, u32) noexcept {}
+		constexpr reservation_lock(u32, u32, bool) noexcept {}
+		constexpr reservation_lock(u32, u32, u32, u32) noexcept {}
+
+		template <typename T = void>
+		constexpr void update_if_enabled(u32, u32, const std::add_pointer_t<T>& = std::add_pointer_t<void>{}) noexcept {}
+
+		constexpr void unlock(bool = false) noexcept {}
+		~reservation_lock() = default;
+	};
+#else
 	template<bool IsFullLock = false, uint Stride = 128>
 	class reservation_lock
 	{
@@ -119,4 +135,5 @@ namespace rsx
 			unlock(true);
 		}
 	};
+#endif
 }

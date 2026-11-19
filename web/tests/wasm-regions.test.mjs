@@ -94,6 +94,148 @@ test('recursive edges remain bounded in code size and repeated lowering is stabl
   assert.equal(second.linkedCalls, 0);
 });
 
+test('must-tail continuation edges remain separate functions', () => {
+  const input = join(scratch, 'musttail.ll'), output = join(scratch, 'musttail-out.ll');
+  writeFileSync(input, `define void @__0x500(ptr %ctx) {
+  musttail call void @__0x504(ptr %ctx)
+  ret void
+}
+define void @__0x504(ptr %ctx) {
+  ret void
+}
+`);
+  const report = JSON.parse(execFileSync(tool, [input, output], { encoding: 'utf8' }));
+  assert.equal(report.linkedCalls, 0);
+  assert.match(readFileSync(output, 'utf8'), /musttail call void @__0x504/);
+});
+
+test('large dispatch fallbacks lower cross-shard import stubs to direct HLE', () => {
+  const input = join(scratch, 'hle-stub.ll'), output = join(scratch, 'hle-stub-out.ll');
+  const contextFields = Array.from({ length: 167 }, () => 'i64').join(', ');
+  writeFileSync(input, `%context_t = type { ${contextFields} }
+declare i32 @__hle_call_fnid(ptr, i32, i32)
+define void @__0x608214(ptr %0, ptr noalias %1, i64 %2, ptr %3, i64 %4, i64 %5, i64 %6) {
+entry:
+  br i1 true, label %no_page, label %have_page
+no_page:
+  br label %fallback
+have_page:
+  %index = ptrtoint ptr %3 to i32
+  br label %pred
+pred:
+  br i1 true, label %slot, label %fallback
+slot:
+  br i1 true, label %call, label %fallback
+call:
+  %fn = inttoptr i32 %index to ptr
+  musttail call void %fn(ptr %0, ptr %1, i64 %2, ptr %3, i64 %4, i64 %5, i64 %6)
+  ret void
+fallback:
+  %unused_dispatch = phi i32 [ 0, %no_page ], [ %index, %pred ], [ %index, %slot ]
+  %cia = getelementptr %context_t, ptr %1, i32 0, i32 166
+  store i32 11655788, ptr %cia, align 4
+  %r0 = getelementptr %context_t, ptr %1, i32 0, i32 3
+  store i64 %4, ptr %r0, align 8
+  %r1 = getelementptr %context_t, ptr %1, i32 0, i32 4
+  store i64 %5, ptr %r1, align 8
+  %r2 = getelementptr %context_t, ptr %1, i32 0, i32 5
+  store i64 %6, ptr %r2, align 8
+  ret void
+}
+`);
+  const report = JSON.parse(execFileSync(tool, [
+    input, output,
+    '--stub', 'b1da6c:c6c7a0:1bc200f4',
+  ], { encoding: 'utf8' }));
+  assert.equal(report.stubCalls, 1);
+  assert.match(readFileSync(output, 'utf8'), /call i32 @__hle_call_fnid/);
+});
+
+test('self import stubs lower after large dispatch fallback canonicalization', () => {
+  const input = join(scratch, 'hle-self-stub.ll'), output = join(scratch, 'hle-self-stub-out.ll');
+  const contextFields = Array.from({ length: 167 }, () => 'i64').join(', ');
+  writeFileSync(input, `%context_t = type { ${contextFields} }
+declare i32 @__hle_call_fnid(ptr, i32, i32)
+define void @__0xb1dacc(ptr %0, ptr noalias %1, i64 %2, ptr %3, i64 %4, i64 %5, i64 %6) {
+entry:
+  br i1 true, label %no_page, label %have_page
+no_page:
+  br label %fallback
+have_page:
+  %index = ptrtoint ptr %3 to i32
+  br label %pred
+pred:
+  br i1 true, label %slot, label %fallback
+slot:
+  br i1 true, label %call, label %fallback
+call:
+  %fn = inttoptr i32 %index to ptr
+  musttail call void %fn(ptr %0, ptr %1, i64 %2, ptr %3, i64 %4, i64 %5, i64 %6)
+  ret void
+fallback:
+  %unused_dispatch = phi i32 [ 0, %no_page ], [ %index, %pred ], [ %index, %slot ]
+  %cia = getelementptr %context_t, ptr %1, i32 0, i32 166
+  store i32 11655884, ptr %cia, align 4
+  %r0 = getelementptr %context_t, ptr %1, i32 0, i32 3
+  store i64 %4, ptr %r0, align 8
+  %r1 = getelementptr %context_t, ptr %1, i32 0, i32 4
+  store i64 %5, ptr %r1, align 8
+  %r2 = getelementptr %context_t, ptr %1, i32 0, i32 5
+  store i64 %6, ptr %r2, align 8
+  ret void
+}
+`);
+  const report = JSON.parse(execFileSync(tool, [
+    input, output,
+    '--stubs-only',
+    '--stub', 'b1dacc:c6c7ac:2f85c0ef',
+  ], { encoding: 'utf8' }));
+  assert.equal(report.stubCalls, 1);
+  const lowered = readFileSync(output, 'utf8');
+  assert.match(lowered, /call i32 @__hle_call_fnid/);
+});
+
+test('self import stubs lower with the page-test dispatch CFG', () => {
+  const input = join(scratch, 'hle-self-page-cfg.ll'), output = join(scratch, 'hle-self-page-cfg-out.ll');
+  const contextFields = Array.from({ length: 167 }, () => 'i64').join(', ');
+  writeFileSync(input, `%context_t = type { ${contextFields} }
+declare i32 @__hle_call_fnid(ptr, i32, i32)
+define void @__0xb1df0c(ptr %0, ptr noalias %1, i64 %2, ptr %3, i64 %4, i64 %5, i64 %6) {
+entry:
+  br i1 true, label %no_page, label %have_page
+no_page:
+  br label %fallback
+have_page:
+  %index = ptrtoint ptr %3 to i32
+  br i1 true, label %call, label %fallback
+call:
+  %fn = inttoptr i32 %index to ptr
+  musttail call void %fn(ptr %0, ptr %1, i64 %2, ptr %3, i64 %4, i64 %5, i64 %6)
+  ret void
+fallback:
+  %unused_dispatch = phi i32 [ 0, %no_page ], [ %index, %have_page ]
+  %cia = getelementptr %context_t, ptr %1, i32 0, i32 166
+  store i32 11656972, ptr %cia, align 4
+  %r0 = getelementptr %context_t, ptr %1, i32 0, i32 3
+  store i64 %4, ptr %r0, align 8
+  %r1 = getelementptr %context_t, ptr %1, i32 0, i32 4
+  store i64 %5, ptr %r1, align 8
+  %r2 = getelementptr %context_t, ptr %1, i32 0, i32 5
+  store i64 %6, ptr %r2, align 8
+  ret void
+}
+`);
+  const report = JSON.parse(execFileSync(tool, [
+    input, output,
+    '--stubs-only',
+    '--stub', 'b1df0c:c6c828:718bf5f8',
+  ], { encoding: 'utf8' }));
+  assert.equal(report.stubCalls, 1);
+  const lowered = readFileSync(output, 'utf8');
+  assert.match(lowered, /call i32 @__hle_call_fnid/);
+  assert.match(lowered, /musttail call void %fn/);
+});
+
 test('large callees stay outside the region budget', () => {
   const large = `define void @__0x400(ptr %p) { call void @__0x404(ptr %p) ret void }\ndefine internal void @__0x404(ptr %p) {\n${Array.from({ length: 600 }, (_, i) => `%v${i} = load volatile i32, ptr %p`).join('\n')}\nret void\n}`;
   writeFileSync(join(scratch, 'large.ll'), large);

@@ -16,7 +16,23 @@ await mkdir(output, { recursive: true });
 const origin = process.env.RPCS3_WEB_URL || "https://rpcs3.appmana.com";
 const profilePath = process.env.RPCS3_CHROME_PROFILE || path.join(homedir(), ".cache/rpcs3-web-chrome-profile");
 const lockPath = `${profilePath}.benchmark-lock`;
-const lock = await open(lockPath, "wx");
+let lock;
+try {
+  lock = await open(lockPath, "wx");
+} catch (error) {
+  if (error?.code !== "EEXIST") throw error;
+  const owner = Number((await readFile(lockPath, "utf8").catch(() => "")).trim());
+  let ownerAlive = false;
+  try {
+    if (owner > 0) {
+      process.kill(owner, 0);
+      ownerAlive = true;
+    }
+  } catch {}
+  if (ownerAlive) throw new Error(`benchmark profile is already locked by process ${owner}`);
+  await unlink(lockPath);
+  lock = await open(lockPath, "wx");
+}
 await lock.writeFile(`${process.pid}\n`);
 const runId = randomUUID();
 const streaming = process.env.RPCS3_TRACE === "1";
@@ -64,9 +80,10 @@ try {
   if (process.env.RPCS3_V8_FLAGS) args.push(`--js-flags=${process.env.RPCS3_V8_FLAGS}`);
   report.chromeArgs = args;
   if (process.env.RPCS3_DEBUG_PORT) args.push(`--remote-debugging-port=${Number(process.env.RPCS3_DEBUG_PORT)}`);
+  const headed = process.env.RPCS3_HEADED === "1";
   context = await chromium.launchPersistentContext(profilePath, {
     executablePath: process.env.RPCS3_CHROME_PATH || "/usr/bin/google-chrome",
-    headless: false, viewport: { width: 1280, height: 720 }, args,
+    headless: !headed, viewport: { width: 1280, height: 720 }, args,
   });
   report.networkFailures = [];
   context.on("requestfailed", (request) => {
@@ -78,32 +95,50 @@ try {
   page.on("pageerror", (error) => report.failures.push({ type: "pageerror", message: error.stack }));
   page.on("crash", () => report.failures.push({ type: "crash" }));
   page.on("console", (message) => {
+    const text = message.text().slice(0, 4000);
     if (report.console.length >= 1000) report.console.shift();
-    report.console.push({ type: message.type(), text: message.text().slice(0, 4000) });
+    report.console.push({ type: message.type(), text });
+    if (process.env.RPCS3_STREAM_CONSOLE === "1" && /RPCS3 Web PPU|PPU LLVM tier|PPU direct HLE/.test(text)) {
+      process.stderr.write(`${text}\n`);
+    }
   });
-  await page.goto(`${origin}/storage.html`, { waitUntil: "domcontentloaded" });
-  await page.waitForFunction(() => Boolean(window.__rpcs3Storage));
-  report.capabilities = await page.evaluate(async () => {
-    const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
-    return { isolated: crossOriginIsolated, secure: isSecureContext,
-      adapter: adapter && { ...Object.fromEntries(["vendor", "architecture", "device", "description"].map((key) => [key, adapter.info[key]])), fallback: adapter.info.isFallbackAdapter, features: [...adapter.features] },
-      hardwareConcurrency: navigator.hardwareConcurrency };
-  });
+  await page.goto(`${origin}/storage.html?headless=1`, { waitUntil: "domcontentloaded", timeout: fetchTimeoutMs });
+  await page.waitForFunction(() => Boolean(window.__rpcs3Storage), null, { timeout: fetchTimeoutMs });
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    report.capabilities = await page.evaluate(async () => {
+      const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" }) ?? await navigator.gpu?.requestAdapter();
+      return { isolated: crossOriginIsolated, secure: isSecureContext,
+        adapter: adapter && { ...Object.fromEntries(["vendor", "architecture", "device", "description"].map((key) => [key, adapter.info[key]])), fallback: adapter.info.isFallbackAdapter, features: [...adapter.features] },
+        hardwareConcurrency: navigator.hardwareConcurrency };
+    });
+    if (report.capabilities?.adapter) break;
+    await page.waitForTimeout(500);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => Boolean(window.__rpcs3Storage));
+  }
   if (!report.capabilities.isolated || !report.capabilities.adapter || report.capabilities.adapter.fallback
       || /swiftshader|llvmpipe|software/i.test(JSON.stringify(report.capabilities.adapter))) throw new Error("hardware WebGPU and cross-origin isolation required");
   if (target.startsWith("/opfs/")) {
     const exists = await page.evaluate(async (target) => {
+      if (typeof window.__rpcs3Storage.exists === "function") {
+        return window.__rpcs3Storage.exists(target);
+      }
       const entries = await window.__rpcs3Storage.list(20_000);
       return entries.some((entry) => `/opfs/${entry.path}` === target);
     }, target);
     if (!exists) {
       console.log(`importing ${target} into ${origin}`);
-      const destination = target.split("/").at(-2);
-      report.import = await page.evaluate(({ name, destination }) => window.__rpcs3Storage.importFromLibrary(name, destination), { name: target.split("/").at(-1), destination });
+      const parts = target.split("/").filter(Boolean);
+      const isGameBoot = parts[0] === "opfs" && parts[1] === "games" && parts.length >= 4 && /^\d+$/.test(parts.at(-1));
+      const name = isGameBoot ? parts.at(-2) : parts.at(-1);
+      const destination = isGameBoot ? parts.slice(1, -2).join("/") : parts.slice(1, -1).join("/");
+      report.import = await page.evaluate(({ name, destination }) => window.__rpcs3Storage.importFromLibrary(name, destination), { name, destination });
     }
   }
   const session = await context.newCDPSession(page);
   const browserSession = await context.browser().newBrowserCDPSession();
+  await session.send("Network.enable");
+  await session.send("Network.setCacheDisabled", { cacheDisabled: true });
   report.systemInfo = await browserSession.send("SystemInfo.getInfo");
   if (streaming) {
     traceSession = browserSession;
@@ -119,11 +154,6 @@ try {
   const after = await timestamp();
   report.clock = { offsetUs: (before + after) / 2 - epochUs, uncertaintyUs: (after - before) / 2 };
   const samplingIntervalUs = Number(process.env.RPCS3_CPU_INTERVAL_US || 5000);
-  if (process.env.RPCS3_PROFILE === "1" && profileFrom === 0) {
-    profileStarted = true;
-    profiler = createWorkerProfiler(session, samplingIntervalUs);
-    await profiler.start();
-  }
   const corePath = `core/${report.core === "release" ? "" : report.core + "/"}rpcs3-web.wasm`;
   report.artifacts = {};
   for (const resource of [corePath, corePath.replace(/\.wasm$/, ".mjs"), "play-runtime.mjs", "runtime-smoke-worker.mjs", "rpcs3-runtime-session.mjs", "local-aot/index.json"]) {
@@ -161,12 +191,14 @@ try {
     }
   }
   const query = new URLSearchParams({ ...(target.startsWith("fixtures/") ? { fixture: target } : { boot: target }), core: report.core, benchmark: runId, spuDispatchCache: report.spuDispatchCache ? "1" : "0", spuExecutionSlices: report.spuExecutionSlices ? "1" : "0" });
-  for (const [key, value] of Object.entries({ bindGroupCache: process.env.RPCS3_BIND_GROUP_CACHE, presentationYield: process.env.RPCS3_PRESENTATION_YIELD, ppuAot: process.env.RPCS3_PPU_AOT, ppuInlineReads: process.env.RPCS3_PPU_INLINE_READS, llvmCompiler: process.env.RPCS3_LLVM_COMPILER, ppuBatchedDiagnostics: process.env.RPCS3_PPU_BATCHED_DIAGNOSTICS, spuAot: process.env.RPCS3_SPU_AOT,
-    spuDecoder: process.env.RPCS3_SPU_DECODER, spuLlvmWorkers: process.env.RPCS3_SPU_LLVM_WORKERS, clockScale: process.env.RPCS3_CLOCK_SCALE, introSkip: process.env.RPCS3_INTRO_SKIP, introSkipScale: process.env.RPCS3_INTRO_SKIP_SCALE, introDrawsThreshold: process.env.RPCS3_INTRO_DRAWS_THRESHOLD, introDrawsRun: process.env.RPCS3_INTRO_DRAWS_RUN, autoStartSec: process.env.RPCS3_AUTO_START_SEC, spuBlockSize: process.env.RPCS3_SPU_BLOCK_SIZE, spuHotThreshold: process.env.RPCS3_SPU_HOT_THRESHOLD, ppuJitThreshold: process.env.RPCS3_PPU_JIT_THRESHOLD })) {
+  for (const [key, value] of Object.entries({ diagnostics: process.env.RPCS3_DIAGNOSTICS, bindGroupCache: process.env.RPCS3_BIND_GROUP_CACHE, presentationYield: process.env.RPCS3_PRESENTATION_YIELD, ppuAot: process.env.RPCS3_PPU_AOT, ppuBackend: process.env.RPCS3_PPU_BACKEND, ppuFailClosed: process.env.RPCS3_PPU_FAIL_CLOSED, ppuInlineReads: process.env.RPCS3_PPU_INLINE_READS, ppuReturnDispatch: process.env.RPCS3_PPU_RETURN_DISPATCH, llvmCompiler: process.env.RPCS3_LLVM_COMPILER, ppuBatchedDiagnostics: process.env.RPCS3_PPU_BATCHED_DIAGNOSTICS, spuAot: process.env.RPCS3_SPU_AOT,
+    spuDecoder: process.env.RPCS3_SPU_DECODER, spuLlvmWorkers: process.env.RPCS3_SPU_LLVM_WORKERS, clockScale: process.env.RPCS3_CLOCK_SCALE, introSkip: process.env.RPCS3_INTRO_SKIP, introSkipScale: process.env.RPCS3_INTRO_SKIP_SCALE, introDrawsThreshold: process.env.RPCS3_INTRO_DRAWS_THRESHOLD, introDrawsRun: process.env.RPCS3_INTRO_DRAWS_RUN, autoStartSec: process.env.RPCS3_AUTO_START_SEC, autoStartUntilFrame: process.env.RPCS3_AUTO_START_UNTIL_FRAME, autoStartIntervalFrames: process.env.RPCS3_AUTO_START_INTERVAL_FRAMES, spuBlockSize: process.env.RPCS3_SPU_BLOCK_SIZE, spuFallbackHistogram: process.env.RPCS3_SPU_FALLBACK_HIST, spuHotThreshold: process.env.RPCS3_SPU_HOT_THRESHOLD, ppuJit: process.env.RPCS3_PPU_JIT, ppuJitThreshold: process.env.RPCS3_PPU_JIT_THRESHOLD, autoRecomp: process.env.RPCS3_AUTO_RECOMP, localAot: process.env.RPCS3_LOCAL_AOT, debugAddresses: process.env.RPCS3_DEBUG_ADDRESSES, tracePc: process.env.RPCS3_TRACE_PC, traceDelayPc: process.env.RPCS3_TRACE_DELAY_PC, traceDelayMs: process.env.RPCS3_TRACE_DELAY_MS, watchAddress: process.env.RPCS3_WATCH_ADDRESS, captureEvery: process.env.RPCS3_CAPTURE_EVERY, saveState: process.env.RPCS3_SAVE_STATE, saveStatePath: process.env.RPCS3_SAVE_STATE_PATH })) {
     if (value) query.set(key, value);
   }
-  if (process.env.RPCS3_INPUT_TRACE) {
-    const trace = JSON.parse(await readFile(process.env.RPCS3_INPUT_TRACE, "utf8"));
+  const cliTraceIdx = process.argv.indexOf("--input-trace");
+  const inputTracePath = process.env.RPCS3_INPUT_TRACE || (cliTraceIdx !== -1 ? process.argv[cliTraceIdx + 1] : "");
+  if (inputTracePath) {
+    const trace = JSON.parse(await readFile(inputTracePath, "utf8"));
     await page.route("**/benchmark-input.json", (route) => route.fulfill({ json: trace }));
     query.set("trace", `${origin}/benchmark-input.json`);
     report.inputTrace = trace;
@@ -175,8 +207,13 @@ try {
   // runs of the same core can otherwise silently compare different AOT policies.
   report.playUrl = `${origin}/play.html?${query}`;
   report.requestedPlayback = Object.fromEntries(query);
-  await page.goto(report.playUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(report.playUrl, { waitUntil: "domcontentloaded", timeout: fetchTimeoutMs });
   await page.bringToFront();
+  if (process.env.RPCS3_PROFILE === "1" && profileFrom === 0) {
+    profileStarted = true;
+    profiler = createWorkerProfiler(session, samplingIntervalUs);
+    await profiler.start();
+  }
   const deadline = Date.now() + (durationMs || timeoutMs);
   let lastProgress = 0;
   while (Date.now() < deadline) {
@@ -246,29 +283,39 @@ try {
       }
       if (Date.now() - lastProgress >= 10_000) {
         console.log(JSON.stringify(state)); lastProgress = Date.now();
-        const partial = await page.evaluate(() => window.__rpcs3Playable?.benchmark());
-        report.frames = partial?.frames ?? [];
-        if (report.frames.length && report.frames.at(-1).bindGroupCache !== (process.env.RPCS3_BIND_GROUP_CACHE === "1")) throw new Error("Bind group cache policy mismatch");
-        if (process.env.RPCS3_BIND_GROUP_CACHE === "1" && state.frames >= 4500 && !(report.frames.at(-1)?.directStats?.bindGroupHits > 0)) throw new Error("Requested bind cache recorded no reuse in gameplay");
-        const actualYield = report.frames.at(-1)?.presentationYield;
-        if (report.frames.length && actualYield !== (process.env.RPCS3_PRESENTATION_YIELD ?? "timer")) throw new Error(`Presentation yield mismatch: ${actualYield}`);
-        const compilation = report.frames.at(-1)?.compilation;
-        if (compilation) {
-          if (compilation.ppuInlineReads !== (process.env.RPCS3_PPU_INLINE_READS === "1")) throw new Error("runtime PPU inline-read policy does not match requested setting");
-          if (compilation.compilerUrl !== compilerUrl.href) throw new Error("runtime compiler URL does not match recorded artifact");
+        const latest = await page.evaluate(() => window.__rpcs3Playable?.benchmarkLatest ? window.__rpcs3Playable.benchmarkLatest() : { lastFrame: window.__rpcs3Playable?.benchmark()?.frames?.at(-1) });
+        const lastFrame = latest?.lastFrame;
+        if (lastFrame) {
+          if (lastFrame.bindGroupCache !== (process.env.RPCS3_BIND_GROUP_CACHE !== "0")) throw new Error("Bind group cache policy mismatch");
+          if (process.env.RPCS3_BIND_GROUP_CACHE !== "0" && state.frames >= 4500 && lastFrame.directStats?.draws > 0 && !(lastFrame.directStats?.bindGroupHits > 0)) throw new Error("Requested bind cache recorded no reuse in gameplay");
+          const actualYield = lastFrame.presentationYield;
+          if (actualYield !== (process.env.RPCS3_PRESENTATION_YIELD ?? "message")) throw new Error(`Presentation yield mismatch: ${actualYield}`);
+          const compilation = lastFrame.compilation;
+          if (compilation) {
+            if (compilation.ppuInlineReads !== (process.env.RPCS3_PPU_INLINE_READS === "1")) throw new Error("runtime PPU inline-read policy does not match requested setting");
+            if (compilation.compilerUrl !== compilerUrl.href) throw new Error("runtime compiler URL does not match recorded artifact");
+          }
         }
-        report.flipTimings = partial?.flipTimings;
-        await save();
       }
       if (state.frames >= frameBudget) break;
     }
     if (report.failures.length) throw new Error("browser failed");
-    await page.waitForTimeout(1000);
+    const nearProfileWindow = profileFrom > 0 && report.status?.frames >= Math.max(0, profileFrom - 300) && report.status?.frames <= profileTo + 100;
+    await page.waitForTimeout(nearProfileWindow ? 200 : 1000);
   }
   report.completed = durationMs ? report.status?.frames > 0 : report.status?.frames >= frameBudget;
+  if (profiler) {
+    const stoppedAt = Date.now();
+    await writeCpuProfiles(await profiler.stop(), path.join(output, "run.cpuprofile"), samplingIntervalUs);
+    profiler = undefined;
+    if (report.profileWindow) {
+      report.profileWindow = { ...report.profileWindow, stoppedAtFrame: report.status?.frames, stoppedAt };
+    }
+  }
   const benchmark = await page.evaluate(() => window.__rpcs3Playable?.benchmark());
   report.frames = benchmark?.frames ?? [];
   report.flipTimings = benchmark?.flipTimings;
+  report.workerErrors = benchmark?.workerErrors ?? [];
   report.timingDrops = benchmark?.timingDrops;
   report.observationDrops = benchmark?.observationDrops;
   report.inputTrace ??= await page.evaluate(() => window.__rpcs3Playable?.exportInputTrace());
@@ -277,15 +324,36 @@ try {
     report.edgeWindow.end = await page.evaluate(() => window.__rpcs3Playable?.exportSpuChainEdges());
     if (report.edgeWindow.end?.error) throw new Error(report.edgeWindow.end.error);
   }
-  await page.screenshot({ path: path.join(output, "frame.png") });
-  if (profiler) {
-    await writeCpuProfiles(await profiler.stop(), path.join(output, "run.cpuprofile"), samplingIntervalUs);
-    profiler = undefined;
+  if (process.env.RPCS3_PPU_PROFILE === "1") {
+    const ppuProfile = await page.evaluate(() => window.__rpcs3Playable?.exportPpuProfile?.());
+    if (ppuProfile?.base64) {
+      await writeFile(path.join(output, "ppu-used.bin"), Buffer.from(ppuProfile.base64, "base64"));
+    }
+  }
+  if (process.env.RPCS3_SPU_FALLBACK_HIST === "1") {
+    const spuMisses = await page.evaluate(() => window.__rpcs3Playable?.exportSpuMisses?.());
+    if (spuMisses?.base64) {
+      const buf = Buffer.from(spuMisses.base64, "base64");
+      await writeFile(path.join(output, "spu-misses.dat"), buf);
+      report.spuMissesBytes = buf.byteLength;
+    }
+  }
+  const captureDataUrl = await page.evaluate(() => window.__rpcs3Playable?.capturePng?.());
+  if (captureDataUrl?.startsWith("data:image/png;base64,")) {
+    await writeFile(path.join(output, "frame.png"), Buffer.from(captureDataUrl.slice("data:image/png;base64,".length), "base64"));
+  } else {
+    await page.screenshot({ path: path.join(output, "frame.png") });
   }
   report.shutdown = await page.evaluate(() => window.__rpcs3Playable?.stop());
   if (!report.completed) throw new Error("guest frame budget was not reached");
 } catch (error) {
   report.failures.push({ type: "runner", message: error.stack });
+  try {
+    const page = context?.pages().find((candidate) => candidate.url() !== "about:blank");
+    if (page) report.timeoutSnapshot = await page.evaluate(() => window.__rpcs3Playable?.threadSnapshot());
+  } catch (snapshotError) {
+    report.failures.push({ type: "timeout-snapshot", message: snapshotError.stack });
+  }
   process.exitCode = 1;
 } finally {
   await stopPerf();

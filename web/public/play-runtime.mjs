@@ -1,6 +1,6 @@
 import { readGamepad, samePadState } from "./rpcs3-gamepad.mjs";
 import { runtimeOptions, presentationCanvas, requestRuntime, frameCount as guestFrames } from "./rpcs3-runtime-session.mjs";
-import { importFromLibrary, listOPFS } from "./rpcs3-storage.mjs";
+import { existsInOPFS, importFromLibrary, listOPFS } from "./rpcs3-storage.mjs";
 
 const Digital1 = Object.freeze({ select: 0x01, l3: 0x02, r3: 0x04, start: 0x08, up: 0x10, right: 0x20, down: 0x40, left: 0x80 });
 const Digital2 = Object.freeze({ l2: 0x01, r2: 0x02, l1: 0x04, r1: 0x08, triangle: 0x10, circle: 0x20, cross: 0x40, square: 0x80 });
@@ -27,6 +27,7 @@ const bootPath = search.get("boot");
 const keys = new Set();
 const touches = new Map();
 let directView;
+let scratch;
 let suspending = false;
 let lastPadState;
 let worker;
@@ -41,6 +42,7 @@ let currentStatus = { state: "booting", frames: 0, fps: 0 };
 const sessionStart = performance.now();
 const benchmarkFrames = [];
 const flipTimings = [];
+const workerErrors = [];
 let timingDrops = 0;
 let observationDrops = 0;
 let retainedTimingDrops = 0;
@@ -58,7 +60,7 @@ let introSkipDraws = 0;
 let introSkipHighCount = 0;
 let gameplayAnchor = 0;
 
-function controlState() {
+function controlState(gamepad = readGamepad()) {
   const controls = new Set([...keys].map((code) => keyControls.get(code)).filter(Boolean));
   touches.forEach((control) => controls.add(control));
   let digital1 = 0;
@@ -75,7 +77,6 @@ function controlState() {
     const deflection = keySticks.get(code);
     if (deflection) sticks[deflection[0]] = deflection[1];
   });
-  const gamepad = readGamepad();
   if (!gamepad) return { digital1, digital2, ...sticks };
   // A stick the keyboard is not deflecting stays at the controller's value, and the other way
   // round, so neither input source pins the other to centre.
@@ -128,6 +129,7 @@ function updateStatus(frame) {
     bindGroupCache: frame.directGpu?.bindGroupCache,
     presentationYield: frame.directGpu?.presentationYield,
     presented: presentedFrames, directStats: frame.directStats, dispatchProfile: frame.dispatchProfile,
+    debugWords: frame.debugWords,
     // Preserve execution-tier counts already supplied by the worker. Program
     // compilation counts alone do not show which tier actually runs the game.
     spuDispatches: frame.spuAotTable?.dispatches,
@@ -164,6 +166,10 @@ function updateStatus(frame) {
     draws,
     ppuInstructions: frame.ppuInstructions,
     spuInstructions: frame.spuInstructions,
+    ppuLastPc: frame.ppuLastPc,
+    ppuLastFunction: frame.ppuLastFunction,
+    traceHits: frame.traceHits,
+    threads: frame.threads,
     droppedPackets: frame.droppedPackets,
     padScheduleApplied: frame.padScheduleApplied,
     // Whether a title's compiled blocks are in play, which is the difference between a title
@@ -176,6 +182,9 @@ function updateStatus(frame) {
     backend: frame.directStats,
     // Table entries the runtime tiers have taken, and what a compiler worker's heap reached
     ppuJit: frame.ppuJitReport && {
+      backend: frame.ppuJitReport.backend,
+      failClosed: frame.ppuJitReport.failClosed,
+      semanticsVersion: frame.ppuJitReport.semanticsVersion,
       registered: frame.ppuJitReport.registered,
       pending: frame.ppuJitReport.pending,
       refused: frame.ppuJitReport.refused,
@@ -185,6 +194,9 @@ function updateStatus(frame) {
     spuLlvm: frame.spuLlvm && {
       compiled: frame.spuLlvm.compiled,
       peakHeapBytes: frame.spuLlvm.peakHeapBytes,
+      workers: frame.spuLlvm.workers,
+      queued: frame.spuLlvm.queued,
+      ppu: frame.spuLlvm.ppu,
     },
   };
   statusElement.textContent = `${currentStatus.state} · ${currentStatus.fps.toFixed(1)} fps`;
@@ -202,11 +214,8 @@ function fail(detail) {
 }
 
 async function prepareStorage() {
-  const entries = await listOPFS(20_000).catch(() => []);
-  const has = (prefix) => entries.some((entry) => entry.path.startsWith(prefix));
-
-  if (has("rpcs3/dev_flash/sys/external")) return;
-  if (!has("firmware/PS3UPDAT.PUP")) {
+  if (await existsInOPFS("rpcs3/dev_flash/sys/external/liblv2.sprx")) return;
+  if (!(await existsInOPFS("firmware/PS3UPDAT.PUP"))) {
     statusElement.textContent = "fetching firmware";
     await importFromLibrary("PS3UPDAT.PUP", "firmware", {
       onProgress: ({ offset, total }) => {
@@ -237,15 +246,18 @@ async function start() {
   stopped = false;
   presentedFrames = 0;
   await prepareStorage();
+  const localAotDisabled = search.get("localAot") === "0";
   // With a suspending core the RSX thread yields between flips, so it can render into the displayed
   // canvas itself and the frame never crosses back to this page. Without one it renders into a
   // canvas of its own and hands each frame over as an ImageBitmap, which this page displays.
   const options = await runtimeOptions(bootPath, {
     directRenderer: true, ppuJit: true, spuDecoder: search.get("spuDecoder") ?? "llvm",
-    spuLlvmWorkers: Number(search.get("spuLlvmWorkers")) || 2,
-    ppuAotBundle: search.get("ppuAot") ?? undefined,
+    ppuBackend: search.get("ppuBackend") ?? undefined,
+    ppuFailClosed: search.has("ppuFailClosed") ? search.get("ppuFailClosed") !== "0" : undefined,
+    spuLlvmWorkers: Number(search.get("spuLlvmWorkers")) || undefined,
+    ppuAotBundle: localAotDisabled ? null : search.get("ppuAot") ?? undefined,
     ppuBatchedDiagnostics: search.get("ppuBatchedDiagnostics") !== "0",
-    spuAotBundle: search.get("spuAot") ?? undefined,
+    spuAotBundle: localAotDisabled ? null : search.get("spuAot") ?? undefined,
     clockScale: Number(search.get("clockScale")) || (introSkip ? introSkipScale : 100),
     suspending: search.get("core") === "release" || search.get("core") === "profile" ? false : undefined,
     coreUrl: search.has("core") ? `./core/${search.get("core") === "release" ? "" : search.get("core") + "/"}rpcs3-web.mjs` : undefined,
@@ -258,18 +270,56 @@ async function start() {
   canvas.width = Math.max(768, Math.round(bounds.width * scale));
   canvas.height = Math.max(432, Math.round(bounds.height * scale));
   if (search.has("benchmark")) { canvas.width = 1280; canvas.height = 720; }
-  const presentation = presentationCanvas(canvas, suspending);
+  // Real-pixel capture. With a suspending core the RSX thread renders into the transferred
+  // OffscreenCanvas and presents it itself, and Chromium/headless does not composite that
+  // transferred worker surface into page.screenshot(), so #gpu-output stays black on this path.
+  // The C++ snapshots the OffscreenCanvas via createImageBitmap at capture.frame / capture.every
+  // and posts runtime-capture; the page blits each snapshot onto a scratch canvas whose PNG is
+  // exposed through window.__rpcs3Playable.capturePng() for the host to write to its output dir.
+  const wantsCapture = search.has("benchmark") || search.has("capture");
+  const presentation = presentationCanvas(canvas, suspending && !wantsCapture);
   const directCanvas = presentation.gpuCanvas;
   directView = presentation.view;
+  if (wantsCapture) {
+    scratch = document.createElement("canvas");
+    scratch.width = canvas.width;
+    scratch.height = canvas.height;
+  }
+  workerErrors.length = 0;
   worker = new Worker("./runtime-smoke-worker.mjs", { type: "module" });
   worker.addEventListener("message", (event) => {
     if (stopped) return;
+    if (event.data?.type === "worker-error") {
+      workerErrors.push(event.data.error);
+      console.error(`[rpcs3 worker error] ${event.data.error}`);
+      return;
+    }
+    if (event.data?.type === "runtime-progress") {
+      currentStatus = {
+        ...currentStatus,
+        frames: event.data.emuFlipId ?? currentStatus.frames,
+        ppuLastPc: event.data.ppuLastPc ?? currentStatus.ppuLastPc,
+        ppuLastFunction: event.data.ppuLastFunction ?? currentStatus.ppuLastFunction,
+        traceHits: event.data.traceHits ?? currentStatus.traceHits,
+        threads: event.data.threads || currentStatus.threads,
+      };
+      return;
+    }
     if (event.data?.frameTimings) {
       const batch = event.data.frameTimings.frames;
       const available = Math.max(0, benchmarkLimit - flipTimings.length);
       flipTimings.push(...batch.slice(0, available));
       retainedTimingDrops += Math.max(0, batch.length - available);
       timingDrops = event.data.frameTimings.dropped;
+    }
+    if (event.data?.type === "runtime-capture") {
+      // Preserve a real-pixel snapshot (the suspending core's transferred OffscreenCanvas is not
+      // composited by Chromium/headless, so page.screenshot() of #gpu-output is otherwise black).
+      if (scratch) scratch.getContext("2d", { willReadFrequently: false }).drawImage(event.data.bitmap, 0, 0);
+      // Also blit the same frame onto the DOM display canvas so page.screenshot() composites real
+      // pixels. drawImage copies before transferFromImageBitmap consumes the ImageBitmap.
+      directView?.transferFromImageBitmap(event.data.bitmap);
+      return;
     }
     if (event.data?.type === "runtime-present") {
       presentedFrames += 1;
@@ -284,6 +334,7 @@ async function start() {
     // A frame that took too long is not a failed session: a title can go a long time between flips
     // while it loads. Only a runtime that has actually stopped ends the run.
     if (!event.data.ok && (event.data.bootResult !== 0 || event.data.status === 0)) {
+      if (event.data.rpcs3Log) console.error(`[rpcs3 runtime stopped]\n${event.data.rpcs3Log}`);
       fail(event.data.detail);
       return;
     }
@@ -294,12 +345,11 @@ async function start() {
   // ?trace=<url> replays a recorded input trace; inputs are always recorded
   // so a session can be exported with __rpcs3Playable.exportInputTrace().
   const traceUrl = search.get("trace");
-  let inputTrace;
-  if (traceUrl) {
+  const trace = traceUrl ? await (async () => {
     const response = await fetch(traceUrl);
     if (!response.ok) throw new Error(`input trace fetch returned ${response.status}`);
-    inputTrace = (await response.json()).entries;
-  }
+    return response.json();
+  })() : null;
   worker.postMessage({
     type: "boot",
     ...(bootPath ? { path: bootPath } : { fixture: search.get("fixture") ?? "fixtures/gs_gcm_tetris.elf" }),
@@ -309,6 +359,7 @@ async function start() {
     // what a transferred canvas needs before it will present.
     coreUrl: suspending ? "./core/jspi/rpcs3-web.mjs" : undefined,
     suspending,
+    diagnostics: search.get("diagnostics") === "1",
     // The flip packet is what marks a frame; discardPackets drops the per-draw payloads with it
     returnPackets: true,
     discardPackets: true,
@@ -321,14 +372,30 @@ async function start() {
     spuExecutionSlices: search.get("spuExecutionSlices") !== "0",
     ppuReturnDispatch: search.get("ppuReturnDispatch") === "1",
     ppuInlineReads: search.get("ppuInlineReads") === "1",
-    bindGroupCache: search.get("bindGroupCache") === "1",
-    presentationYield: search.get("presentationYield") ?? "timer",
+    bindGroupCache: search.get("bindGroupCache") !== "0",
+    presentationYield: search.get("presentationYield") ?? "message",
+    // Snapshot periodically in benchmark mode (or every frame when ?capture is explicit) so the
+    // scratch holds a recent real rendered frame without stalling every benchmark flip.
+    capture: wantsCapture ? { frame: 0, every: Number(search.get("captureEvery")) || (search.has("capture") ? 1 : 20) } : undefined,
     llvmCompilerUrl: search.get("llvmCompiler") || undefined,
     spuBlockSize: ["safe", "mega", "giga"].includes(search.get("spuBlockSize")) ? search.get("spuBlockSize") : undefined,
+    spuFallbackHistogram: search.get("spuFallbackHistogram") === "1",
     spuHotThreshold: Number(search.get("spuHotThreshold")) || 0,
+    ppuJit: search.has("ppuJit") ? search.get("ppuJit") === "1" : undefined,
     ppuJitThreshold: Number(search.get("ppuJitThreshold")) || 0,
-    inputTrace,
+    autoRecomp: search.has("autoRecomp") ? search.get("autoRecomp") === "1" : undefined,
+    // The schedule is applied before guest threads start. Updating it through a
+    // separate worker message can race asynchronous boot and corrupt execution.
+    inputTrace: trace?.entries,
     pad: controlState(),
+    autoStartSec: Number(search.get("autoStartSec")) || 0,
+    autoStartUntilFrame: Number(search.get("autoStartUntilFrame")) || undefined,
+    autoStartIntervalFrames: Number(search.get("autoStartIntervalFrames")) || undefined,
+    debugAddresses: (search.get("debugAddresses") || "").split(",").filter(Boolean).map((value) => Number(value)),
+    tracePc: Number(search.get("tracePc")) || 0,
+    traceDelayPc: Number(search.get("traceDelayPc")) || 0,
+    traceDelayMs: Number(search.get("traceDelayMs")) || 0,
+    watchAddress: Number(search.get("watchAddress")) || 0,
     // Every tier the port has, on. A guest block starts interpreted; the PPU tier and the SPU
     // tiers compile it while the game runs, and a bundle built from an earlier profiled run
     // supplies the blocks that run before either tier can reach them. Without these a commercial
@@ -340,26 +407,24 @@ async function start() {
     spuLlvmWorkers: Number(search.get("spuLlvmWorkers")) || 2,
     ...options,
   }, [directCanvas]);
-
-  // Optional auto-advance past a title's movie/menu: ?autoStartSec=30 taps the pad START at a
-  // fixed monotonic wall time after boot. Validation runs press Start anyway ~30 s in; doing it
-  // here deterministically reaches the 3D rendering stretch without waiting out the whole intro.
-  const autoStartSec = Number(search.get("autoStartSec")) || 0;
-  if (autoStartSec > 0) {
-    const wait = Math.max(0, sessionStart + autoStartSec * 1000 - performance.now());
-    setTimeout(() => {
-      worker.postMessage({ type: "pad", state: { digital1: Digital1.start, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 } });
-      setTimeout(() => worker.postMessage({ type: "pad", state: { digital1: 0, digital2: 0, leftX: 128, leftY: 128, rightX: 128, rightY: 128 } }), 250);
-    }, wait);
-  }
 }
 
-async function stop() {
+async function stop(options = {}) {
   stopped = true;
   const active = worker;
   if (!active) return;
+  const saveState = Boolean(options?.saveState || search.get("saveState") === "1");
+  const saveStatePath = options?.saveStatePath || search.get("saveStatePath") || "";
   let report;
-  try { report = await requestRuntime(active, { type: "shutdown" }, "runtime-shutdown"); }
+  try {
+    report = await requestRuntime(
+      active,
+      { type: "shutdown", saveState, saveStatePath },
+      "runtime-shutdown",
+      saveState ? 60_000 : 8_000,
+    );
+  }
+  catch (error) { report = { ok: false, timedOut: true, detail: error instanceof Error ? error.message : String(error) }; }
   finally { active.terminate(); }
   worker = undefined;
   currentStatus = { ...currentStatus, state: "stopped" };
@@ -384,14 +449,16 @@ addEventListener("blur", () => { keys.clear(); touches.clear(); sendPad(); });
 // running at 30 fps would otherwise sample the stick 30 times a second. Posting only on a change
 // keeps a held button or a resting stick off the worker's queue.
 const padPollIntervalMs = 8;
-setInterval(() => {
-  const gamepad = readGamepad();
-  // A real controller is the better input, so the on-screen pad gets out of the picture. A pad that
-  // has gone to sleep brings it back, and waking the pad takes it away again.
-  document.body.classList.toggle("has-gamepad", Boolean(gamepad));
-  const state = controlState();
-  if (!samePadState(state, lastPadState)) sendPad(state);
-}, padPollIntervalMs);
+if (!search.has("trace")) {
+  setInterval(() => {
+    const gamepad = readGamepad();
+    // A real controller is the better input, so the on-screen pad gets out of the picture. A pad that
+    // has gone to sleep brings it back, and waking the pad takes it away again.
+    document.body.classList.toggle("has-gamepad", Boolean(gamepad));
+    const state = controlState(gamepad);
+    if (!samePadState(state, lastPadState)) sendPad(state);
+  }, padPollIntervalMs);
+}
 
 // Safari does not report a controller until a button on it has been pressed, so this is also how a
 // player finds out the pad was seen at all
@@ -436,11 +503,20 @@ document.querySelector("#export-trace")?.addEventListener("click", async () => {
 window.__rpcs3Playable = {
   start,
   stop,
-  status: () => ({ ...currentStatus }),
-  benchmark: () => ({ schemaVersion: 2, frames: benchmarkFrames.slice(), flipTimings: flipTimings.slice(), timingDrops: timingDrops + retainedTimingDrops, observationDrops, status: { ...currentStatus } }),
+  status: () => ({ ...currentStatus, workerErrorCount: workerErrors.length }),
+  benchmark: () => ({ schemaVersion: 2, frames: benchmarkFrames.slice(), flipTimings: flipTimings.slice(), workerErrors: workerErrors.slice(0, 100), timingDrops: timingDrops + retainedTimingDrops, observationDrops, status: { ...currentStatus } }),
+  benchmarkLatest: () => ({ lastFrame: benchmarkFrames.at(-1), workerErrorCount: workerErrors.length, status: { ...currentStatus } }),
   setPad: (state) => worker?.postMessage({ type: "pad", state }),
+  setClockScale: (percent) => worker?.postMessage({ type: "set-clock-scale", percent }),
   exportInputTrace,
   exportSpuChainEdges: () => worker ? requestRuntime(worker, { type: "spu-chain-edges" }, "spu-chain-edges") : Promise.resolve(undefined),
+  exportSpuMisses: () => worker ? requestRuntime(worker, { type: "spu-misses" }, "spu-misses") : Promise.resolve(undefined),
+  exportPpuProfile: () => worker ? requestRuntime(worker, { type: "ppu-profile" }, "ppu-profile") : Promise.resolve(undefined),
+  threadSnapshot: () => worker ? requestRuntime(worker, { type: "snapshot" }, "progress") : Promise.resolve(undefined),
+  // The scratch holds the most recent real rendered frame (a transferred worker OffscreenCanvas
+  // is not composited by Chromium/headless, so page.screenshot() of it is black). Return it as a
+  // PNG data URL for the host to write to its output directory.
+  capturePng: () => scratch ? scratch.toDataURL("image/png") : undefined,
 };
 
 void start().catch((error) => fail(error instanceof Error ? error.message : String(error)));

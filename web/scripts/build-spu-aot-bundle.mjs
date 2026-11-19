@@ -22,7 +22,7 @@ const option = (name, fallback) => {
   const found = options.find((entry) => entry.startsWith(`--${name}=`));
   return found ? Number(found.slice(name.length + 3)) : fallback;
 };
-const jobs = Math.max(1, option("jobs", Math.min(8, availableParallelism())));
+const jobs = Math.max(1, option("jobs", availableParallelism()));
 const perPart = Math.max(1, Math.min(90_000, option("per-part", 40_000)));
 const inputDirectory = resolve(inputArg);
 const outputDirectory = resolve(outputArg);

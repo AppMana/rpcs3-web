@@ -39,6 +39,12 @@ Module["rpcs3PopulatePpuAot"] = (load) => {
         guestPages.__rpcs3_guest_pages = new WebAssembly.Global({ value: "i32", mutable: true }, address);
         continue;
       }
+      if (imported.module === "GOT.mem" && imported.kind === "global" && imported.name === "__rpcs3_web_page_versions") {
+        const address = wasmExports["rpcs3_web_versions_address"]?.() >>> 0;
+        if (!address) throw new Error("PPU module requires a page version table from the runtime");
+        guestPages.__rpcs3_web_page_versions = new WebAssembly.Global({ value: "i32", mutable: true }, address);
+        continue;
+      }
       if (imported.module !== "env") throw new Error(`unsupported import ${imported.module}.${imported.name}`);
       if (imported.name in env) continue;
       if (imported.kind === "global" && imported.name === "__stack_pointer") {
@@ -233,7 +239,7 @@ function rpcs3SpuHotSyncImpl() {
     const bytes = new Uint8Array(wasmMemory.buffer, pointer, size).slice();
     const module = new WebAssembly.Module(bytes);
     const need = kind === 1 ? Math.max(index + 1, elemBase + tableSize) : index + 1;
-    if (table.length < need) table.grow(need - table.length);
+    if (table.length < need) table.grow(Math.max(need - table.length, 256));
     table.set(index, kind === 1 ? rpcs3InstantiateSpuSide(module, elemBase, memoryBase, importsTable, table) : rpcs3InstantiateSpuHot(module));
     if (index > maxIndex) maxIndex = index;
     if ((self.__rpcs3SpuHotLogged = (self.__rpcs3SpuHotLogged | 0) + 1) <= 40) console.log(`[rpcs3 spu hot] worker placed entry ${placed} at table index ${index} (table length ${table.length}, ${size} bytes)`);
@@ -249,17 +255,37 @@ Module["rpcs3SpuHotStats"] = () => ({ placedHere: self.__rpcs3SpuHotPlaced >>> 0
 // data sits at the memoryBase the registry reserved, bound to the runtime's direct dispatch exports.
 const rpcs3PpuHotBindings = Object.freeze({
   __check: "rpcs3_web_ppu_direct_check", __error: "rpcs3_web_ppu_direct_error",
+  __ppu_trap: "rpcs3_web_ppu_direct_trap", __trap: "rpcs3_web_ppu_direct_trap",
   __syscall: "rpcs3_web_ppu_direct_syscall", __lv1call: "rpcs3_web_ppu_direct_lv1call",
-  __get_tb: "rpcs3_web_ppu_direct_get_tb", __lwarx: "rpcs3_web_ppu_direct_lwarx",
-  __ldarx: "rpcs3_web_ppu_direct_ldarx", __stwcx: "rpcs3_web_ppu_direct_stwcx",
+  __hle_bridge: "rpcs3_web_ppu_direct_hle_bridge",
+  __hle_call_fnid: "rpcs3_web_ppu_direct_hle_fnid",
+  __get_tb: "rpcs3_web_ppu_direct_get_tb",
+  __lwarx: "rpcs3_web_ppu_direct_lwarx", __lwarx_at: "rpcs3_web_ppu_direct_lwarx_at",
+  __ldarx: "rpcs3_web_ppu_direct_ldarx", __ldarx_at: "rpcs3_web_ppu_direct_ldarx_at",
+  __stwcx: "rpcs3_web_ppu_direct_stwcx",
   __stdcx: "rpcs3_web_ppu_direct_stdcx",
   fma: "rpcs3_web_libcall_fma", fmaf: "rpcs3_web_libcall_fmaf",
   fmod: "rpcs3_web_libcall_fmod", fmodf: "rpcs3_web_libcall_fmodf",
   memcpy: "rpcs3_web_libcall_memcpy", memmove: "rpcs3_web_libcall_memmove",
   memset: "rpcs3_web_libcall_memset", memcmp: "rpcs3_web_libcall_memcmp",
 });
+const rpcs3PpuMathFallbacks = Object.freeze({
+  exp2f: (x) => Math.fround(Math.pow(2, x)),
+  log2f: (x) => Math.fround(Math.log2(x)),
+  exp2: (x) => Math.pow(2, x),
+  log2: (x) => Math.log2(x),
+  powf: (x, y) => Math.fround(Math.pow(x, y)),
+  pow: Math.pow,
+  sinf: (x) => Math.fround(Math.sin(x)),
+  cosf: (x) => Math.fround(Math.cos(x)),
+  sin: Math.sin,
+  cos: Math.cos,
+  ldexpf: (x, n) => Math.fround(x * Math.pow(2, n | 0)),
+  ldexp: (x, n) => x * Math.pow(2, n | 0),
+});
 function rpcs3InstantiatePpuSide(module, elemBase, memoryBase, importsTable, table) {
   const guestPages = {};
+  const gotFunc = {};
   const env = {
     memory: wasmMemory,
     __memory_base: new WebAssembly.Global({ value: "i32", mutable: false }, memoryBase),
@@ -273,6 +299,20 @@ function rpcs3InstantiatePpuSide(module, elemBase, memoryBase, importsTable, tab
       guestPages.__rpcs3_guest_pages = new WebAssembly.Global({ value: "i32", mutable: true }, address);
       continue;
     }
+    if (imported.module === "GOT.mem" && imported.kind === "global" && imported.name === "__rpcs3_web_page_versions") {
+      const address = wasmExports["rpcs3_web_versions_address"]?.() >>> 0;
+      if (!address) throw new Error("PPU module requires a page version table from the runtime");
+      guestPages.__rpcs3_web_page_versions = new WebAssembly.Global({ value: "i32", mutable: true }, address);
+      continue;
+    }
+    if (imported.module === "GOT.mem" && imported.kind === "global") {
+      guestPages[imported.name] = new WebAssembly.Global({ value: "i32", mutable: true }, 0);
+      continue;
+    }
+    if (imported.module === "GOT.func" && imported.kind === "global") {
+      gotFunc[imported.name] = new WebAssembly.Global({ value: "i32", mutable: true }, 0);
+      continue;
+    }
     if (imported.module !== "env") throw new Error(`unsupported PPU side-module import ${imported.module}.${imported.name}`);
     if (imported.name in env) continue;
     if (imported.kind === "global" && imported.name === "__stack_pointer") {
@@ -282,16 +322,32 @@ function rpcs3InstantiatePpuSide(module, elemBase, memoryBase, importsTable, tab
     }
     if (imported.kind !== "function") throw new Error(`unsupported PPU side-module import ${imported.kind} ${imported.name}`);
     const target = rpcs3PpuHotBindings[imported.name] ?? (imported.name.startsWith("rpcs3_web_vm_") ? imported.name : undefined);
-    if (!target || typeof wasmExports[target] !== "function") throw new Error(`no runtime binding for PPU side-module import ${imported.name}`);
-    env[imported.name] = wasmExports[target];
+    if (target && typeof wasmExports[target] === "function") {
+      env[imported.name] = wasmExports[target];
+      continue;
+    }
+    if (typeof rpcs3PpuMathFallbacks[imported.name] === "function") {
+      env[imported.name] = rpcs3PpuMathFallbacks[imported.name];
+      continue;
+    }
+    if (imported.name.startsWith("__mtspr_")) {
+      env[imported.name] = () => {};
+      continue;
+    }
+    if (imported.name.startsWith("__mfspr_") || imported.name.startsWith("__mftb_")) {
+      env[imported.name] = wasmExports["rpcs3_web_ppu_direct_get_tb"] ?? (() => 0n);
+      continue;
+    }
+    throw new Error(`no runtime binding for PPU side-module import ${imported.name}`);
   }
-  const instance = new WebAssembly.Instance(module, { env, "GOT.mem": guestPages });
+  const instance = new WebAssembly.Instance(module, { env, "GOT.mem": guestPages, "GOT.func": gotFunc });
   for (const init of ["__wasm_init_memory", "__wasm_apply_data_relocs", "__wasm_call_ctors"]) {
     if (typeof instance.exports[init] === "function") instance.exports[init]();
   }
   const name = WebAssembly.Module.exports(module).find((e) => e.kind === "function" && /^__0x[0-9a-f]+$/i.test(e.name));
-  if (!name) throw new Error("PPU side module exports no block");
-  return instance.exports[name.name];
+  // Whole-module recompiled shards (index === 0) populate all their hidden __0x* blocks directly
+  // into [elemBase, elemBase + tableSize) via the module's element segment during instantiation!
+  return name ? instance.exports[name.name] : instance;
 }
 // A compiled block reaches another through the function table, so a slot the runtime tier may
 // publish while this worker is inside compiled code has to be callable already: the whole region is
@@ -303,9 +359,11 @@ function rpcs3ReserveHotRegion(table) {
   const base = wasmExports["rpcs3_web_hot_table_base"]() >>> 0;
   const limit = wasmExports["rpcs3_web_hot_table_limit"]() >>> 0;
   if (!base) { self.__rpcs3HotRegionReserved = false; return; }
-  if (table.length < limit) table.grow(limit - table.length);
   const unplaced = wasmExports["rpcs3_web_ppu_direct_unplaced"];
-  for (let index = base; index < limit; index++) {
+  if (table.length < base) table.grow(base - table.length);
+  const existingLimit = Math.min(table.length, limit);
+  if (table.length < limit) table.grow(limit - table.length, unplaced);
+  for (let index = base; index < existingLimit; index++) {
     if (table.get(index) === null) table.set(index, unplaced);
   }
 }
@@ -314,40 +372,115 @@ function rpcs3PpuHotSyncImpl() {
   const count = wasmExports["rpcs3_web_ppu_hot_count"]() >>> 0;
   const table = wasmExports["__indirect_function_table"];
   rpcs3ReserveHotRegion(table);
+  const placedSet = self.__rpcs3PlacedEntries ??= new Set();
   let placed = self.__rpcs3PpuHotPlaced >>> 0;
   if (placed >= count) return self.__rpcs3PpuHotMaxIndex >>> 0;
   const info = self.__rpcs3PpuHotInfo ??= wasmExports["malloc"](32) >>> 0;
   let maxIndex = self.__rpcs3PpuHotMaxIndex >>> 0;
   for (; placed < count; placed++) {
-    wasmExports["rpcs3_web_ppu_hot_info"](placed, info);
-    const [index, pointer, size, elemBase, tableSize, memoryBase, importsTable] = new Uint32Array(wasmMemory.buffer, info, 7);
-    const bytes = new Uint8Array(wasmMemory.buffer, pointer, size).slice();
-    const module = new WebAssembly.Module(bytes);
-    const need = Math.max(index + 1, elemBase + tableSize);
-    if (table.length < need) table.grow(need - table.length);
-    table.set(index, rpcs3InstantiatePpuSide(module, elemBase, memoryBase, importsTable, table));
-    if (index > maxIndex) maxIndex = index;
-    if ((self.__rpcs3PpuHotLogged = (self.__rpcs3PpuHotLogged | 0) + 1) <= 40) console.log(`[rpcs3 ppu jit] worker placed entry ${placed} at table index ${index} (table length ${table.length}, ${size} bytes)`);
+    try {
+      wasmExports["rpcs3_web_ppu_hot_info"](placed, info);
+      const [index, pointer, size, elemBase, tableSize, memoryBase, importsTable] = new Uint32Array(wasmMemory.buffer, info, 7);
+      const module = self.__rpcs3SharedHotModules?.get(placed)
+        ?? new WebAssembly.Module(new Uint8Array(wasmMemory.buffer, pointer, size).slice());
+      const need = Math.max(index ? index + 1 : 0, elemBase + tableSize);
+      if (table.length < need) table.grow(need - table.length);
+      const instantiated = rpcs3InstantiatePpuSide(module, elemBase, memoryBase, importsTable, table);
+      if (index) {
+        table.set(index, instantiated);
+        if (index > maxIndex) maxIndex = index;
+      } else if (elemBase + tableSize > 0) {
+        const shardMax = (elemBase + tableSize - 1) >>> 0;
+        if (shardMax > maxIndex) maxIndex = shardMax;
+      }
+      placedSet.add(placed);
+      self.__rpcs3PpuHotPlaced = placed + 1;
+      self.__rpcs3PpuHotMaxIndex = maxIndex;
+      if ((self.__rpcs3PpuHotLogged = (self.__rpcs3PpuHotLogged | 0) + 1) <= 40) console.log(`[rpcs3 ppu recomp] worker placed entry ${placed} at table ${index || `${elemBase}+${tableSize}`} (table length ${table.length}, ${size} bytes)`);
+    } catch (err) {
+      console.error(`[rpcs3 ppu recomp] worker failed placing entry ${placed}:`, err);
+      throw err;
+    }
   }
-  self.__rpcs3PpuHotPlaced = placed;
-  self.__rpcs3PpuHotMaxIndex = maxIndex;
   return maxIndex;
+}
+function rpcs3PpuHotEnsureImpl(targetIndex, outSpanPtr) {
+  const table = wasmExports["__indirect_function_table"];
+  rpcs3ReserveHotRegion(table);
+  const unplaced = wasmExports["rpcs3_web_ppu_direct_unplaced"];
+  const info = self.__rpcs3PpuHotInfo ??= wasmExports["malloc"](32) >>> 0;
+  const found = wasmExports["rpcs3_web_ppu_hot_find_entry"](targetIndex >>> 0, info) >>> 0;
+  if (!found) return 0;
+  const [index, pointer, size, elemBase, tableSize, memoryBase, importsTable, entryIdx] = new Uint32Array(wasmMemory.buffer, info, 8);
+  const placedSet = self.__rpcs3PlacedEntries ??= new Set();
+  // A sync can place a whole-module shard without visiting Ensure. Conversely, a
+  // table slot can still be the unplaced stub after bookkeeping was initialized,
+  // so the actual function-table entry is the authority before dispatch uses it.
+  if (!placedSet.has(entryIdx) || targetIndex >= table.length || table.get(targetIndex) === unplaced) {
+    try {
+      const module = self.__rpcs3SharedHotModules?.get(entryIdx)
+        ?? new WebAssembly.Module(new Uint8Array(wasmMemory.buffer, pointer, size).slice());
+      const need = Math.max(index ? index + 1 : 0, elemBase + tableSize);
+      if (table.length < need) table.grow(need - table.length);
+      const instantiated = rpcs3InstantiatePpuSide(module, elemBase, memoryBase, importsTable, table);
+      if (index) {
+        table.set(index, instantiated);
+      }
+      placedSet.add(entryIdx);
+      self.__rpcs3PpuHotPlaced = placedSet.size;
+      if ((self.__rpcs3PpuHotLogged = (self.__rpcs3PpuHotLogged | 0) + 1) <= 16) {
+        console.log(`[rpcs3 ppu recomp] worker placed shard ${entryIdx} at table ${index || `${elemBase}+${tableSize}`} (${size} bytes)`);
+      }
+    } catch (err) {
+      console.error(`[rpcs3 ppu recomp] worker failed placing shard ${entryIdx}:`, err);
+      throw err;
+    }
+  }
+  if (targetIndex >= table.length || table.get(targetIndex) === unplaced) {
+    placedSet.delete(entryIdx);
+    return 0;
+  }
+  if (outSpanPtr) {
+    const outWords = new Uint32Array(wasmMemory.buffer, outSpanPtr >>> 0, 2);
+    outWords[0] = elemBase >>> 0;
+    outWords[1] = (index ? (index + 1) : (elemBase + tableSize)) >>> 0;
+  }
+  return 1;
 }
 Module["rpcs3PpuHotStats"] = () => ({ placedHere: self.__rpcs3PpuHotPlaced >>> 0, count: wasmExports["rpcs3_web_ppu_hot_count"]() >>> 0 });
 
-// One region above every bundle for both runtime tiers, so a PPU block and an SPU program never
-// claim the same function table index
+Module["rpcs3ShareHotModule"] = (slot, wasmMod) => {
+  if (!(wasmMod instanceof WebAssembly.Module)) return;
+  const s = slot >>> 0;
+  (self.__rpcs3SharedHotModules ??= new Map()).set(s, wasmMod);
+};
+
+// One region above every bundle for both runtime tiers, with a dedicated 4096-slot SPU hot/LLVM
+// span below the PPU recomp/hot span so an SPU program and a PPU block never claim the same
+// function table index even when no pre-baked SPU AOT bundle is loaded.
 Module["rpcs3InstallHotTable"] = (ppuLoad, spuLoad) => {
   const table = wasmExports["__indirect_function_table"];
   let base = table.length;
   for (const load of [ppuLoad, spuLoad]) {
     if (load) base = Math.max(base, (load.tableBase >>> 0) + (load.tableSize >>> 0));
   }
+  const existingSpuBase = typeof wasmExports["rpcs3_web_spu_hot_table_base"] === "function"
+    ? (wasmExports["rpcs3_web_spu_hot_table_base"]() >>> 0)
+    : 0;
+  let spuBase = existingSpuBase;
+  if (!spuBase) {
+    spuBase = base;
+    base = (spuBase + 4096) >>> 0;
+    if (table.length < base) table.grow(base - table.length);
+    Module["ccall"]("rpcs3_web_spu_set_hot_table_base", null, ["number"], [spuBase]);
+  } else {
+    base = Math.max(base, (spuBase + 4096) >>> 0);
+  }
   Module["ccall"]("rpcs3_web_set_hot_table_base", null, ["number"], [base]);
-  return { base };
+  return { base, spuBase };
 };
 
-Module["rpcs3PrepareGpu"] = (canvas, flagAddress, capture, presentationYield = "timer", bindGroupCache = false) => new Promise((resolve, reject) => {
+Module["rpcs3PrepareGpu"] = (canvas, flagAddress, capture, presentationYield = "message", bindGroupCache = true) => new Promise((resolve, reject) => {
   const PThread = Module["PThread"];
   const worker = PThread.unusedWorkers[PThread.unusedWorkers.length - 1];
   if (!worker) { reject(new Error("no idle pthread worker to host the GPU device")); return; }
@@ -378,6 +511,9 @@ Module["rpcs3PrepareGpu"] = (canvas, flagAddress, capture, presentationYield = "
     } else if (data.rpcs3Presented !== undefined && Module["rpcs3OnPresented"]) {
       // A transferred canvas presents itself; this only reports that a frame went out
       Module["rpcs3OnPresented"](data.rpcs3Presented);
+    } else if (typeof data.rpcs3WorkerError === "string") {
+      if (Module["rpcs3OnWorkerError"]) Module["rpcs3OnWorkerError"](data.rpcs3WorkerError);
+      else console.error(`[rpcs3 gpu worker error] ${data.rpcs3WorkerError}`);
     }
   };
   worker.addEventListener("message", onMessage);
@@ -388,24 +524,71 @@ Module["rpcs3PrepareGpu"] = (canvas, flagAddress, capture, presentationYield = "
     worker.postMessage({ rpcs3GpuPing: 1 });
   }, 250);
   worker.postMessage({ rpcs3GpuPing: 1 });
-  if (!PThread.__rpcs3GpuPinned) {
-    PThread.__rpcs3GpuPinned = true;
-    const originalGetNewWorker = PThread.getNewWorker.bind(PThread);
-    PThread.getNewWorker = () => {
+  Module["rpcs3PinWorkerPools"]?.(flagAddress);
+});
+
+Module["rpcs3PinWorkerPools"] = (flagAddress) => {
+  if (flagAddress) Module["__rpcs3RsxSpawnFlag"] = flagAddress >>> 0;
+  if (PThread.__rpcs3GpuPinned) return;
+  PThread.__rpcs3GpuPinned = true;
+  const originalGetNewWorker = PThread.getNewWorker.bind(PThread);
+  const takeRoleWorker = (role, aotKey) => {
+    const unused = PThread.unusedWorkers;
+    for (let i = 0; i < unused.length; i++) {
+      if (unused[i].__rpcs3Role === role) {
+        const [worker] = unused.splice(i, 1);
+        return worker;
+      }
+    }
+    for (let i = unused.length - 1; i >= 0; i--) {
+      if (!unused[i].__rpcs3Role) {
+        const [worker] = unused.splice(i, 1);
+        worker.__rpcs3Role = role;
+        PThread.__rpcs3AotSenders?.[aotKey]?.(worker);
+        return worker;
+      }
+    }
+    const worker = originalGetNewWorker();
+    if (worker) {
+      worker.__rpcs3Role = role;
+      PThread.__rpcs3AotSenders?.[aotKey]?.(worker);
+    }
+    return worker;
+  };
+  PThread.getNewWorker = () => {
+    const flag = Module["__rpcs3RsxSpawnFlag"];
+    if (flag && Module["HEAPU8"]) {
+      const words = new Uint32Array(Module["HEAPU8"].buffer);
+      const base = flag >>> 2;
       const gpuWorker = Module["__rpcs3GpuWorker"];
-      const flag = Module["__rpcs3RsxSpawnFlag"];
-      if (gpuWorker && flag) {
-        const words = new Uint32Array(Module["HEAPU8"].buffer);
-        if (Atomics.load(words, flag >>> 2) !== 0) {
-          Atomics.store(words, flag >>> 2, 0);
-          Module["__rpcs3GpuWorker"] = undefined;
-          return gpuWorker;
+      if (gpuWorker && Atomics.load(words, base) !== 0) {
+        Atomics.store(words, base, 0);
+        Module["__rpcs3GpuWorker"] = undefined;
+        return gpuWorker;
+      }
+      if (PThread.__rpcs3RoleScoped) {
+        if (Atomics.load(words, base + 1) > 0) {
+          Atomics.sub(words, base + 1, 1);
+          return takeRoleWorker("ppu", "rpcs3PpuAot");
+        }
+        if (Atomics.load(words, base + 2) > 0) {
+          Atomics.sub(words, base + 2, 1);
+          return takeRoleWorker("spu", "rpcs3SpuAot");
         }
       }
-      return originalGetNewWorker();
-    };
-  }
-});
+    }
+    if (PThread.__rpcs3RoleScoped) {
+      const unused = PThread.unusedWorkers;
+      for (let i = unused.length - 1; i >= 0; i--) {
+        if (!unused[i].__rpcs3Role) {
+          const [worker] = unused.splice(i, 1);
+          return worker;
+        }
+      }
+    }
+    return originalGetNewWorker();
+  };
+};
 
 if (typeof self !== "undefined" && typeof self.addEventListener === "function") {
   // An uncaught error in a pthread worker only reaches the parent as a message string; forward the
@@ -442,14 +625,18 @@ if (typeof self !== "undefined" && typeof self.addEventListener === "function") 
   self.addEventListener("message", (event) => {
     const data = event.data;
     if (!data) return;
+    if (data.rpcs3SharedHotModule) {
+      (self.__rpcs3SharedHotModules ??= new Map()).set(data.rpcs3SharedHotModule.slot >>> 0, data.rpcs3SharedHotModule.mod);
+      return;
+    }
     if (data.rpcs3GpuPing) { self.postMessage({ rpcs3GpuPong: 1 }); return; }
     if (!data.rpcs3PrepareGpu) return;
     (async () => {
       const canvas = data.rpcs3PrepareGpu.canvas;
       self.__rpcs3GpuCapture = data.rpcs3PrepareGpu.capture;
-      const bindGroupCache = data.rpcs3PrepareGpu.bindGroupCache === true;
+      const bindGroupCache = data.rpcs3PrepareGpu.bindGroupCache !== false;
       self.__rpcs3BindGroupCache = bindGroupCache;
-      const presentationYield = data.rpcs3PrepareGpu.presentationYield ?? "timer";
+      const presentationYield = data.rpcs3PrepareGpu.presentationYield ?? "message";
       if (!["timer", "message"].includes(presentationYield)) throw new Error(`Invalid presentation yield: ${presentationYield}`);
       self.__rpcs3PresentationYield = presentationYield;
       if (presentationYield === "message") {
@@ -467,15 +654,25 @@ if (typeof self !== "undefined" && typeof self.addEventListener === "function") 
         self.__rpcs3YieldPresentation = () => new Promise((resolve) => setTimeout(resolve, 0));
       }
       if (!("gpu" in navigator)) throw new Error("navigator.gpu is unavailable in this worker");
-      const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+      let adapter = null;
+      for (let attempt = 0; attempt < 5 && !adapter; attempt++) {
+        adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" }) ?? await navigator.gpu.requestAdapter();
+        if (!adapter && attempt < 4) await new Promise((resolve) => setTimeout(resolve, 250));
+      }
       if (!adapter) throw new Error("requestAdapter returned null in the worker");
       // Features the backend uses when the adapter has them (BC textures for DXT, filterable
-      // float for the float render targets, depth clip control for RSX depth clamp)
-      const wanted = ["texture-compression-bc", "float32-filterable", "depth-clip-control", "shader-f16"];
+      // float for the float render targets, depth clip control for RSX depth clamp, timestamp-query for profiling)
+      const wanted = ["texture-compression-bc", "float32-filterable", "depth-clip-control", "shader-f16", "timestamp-query"];
       const requiredFeatures = wanted.filter((feature) => adapter.features.has(feature));
       const device = await adapter.requestDevice({ requiredFeatures });
+      self.__rpcs3WebGpuErrors = 0;
       device.addEventListener("uncapturederror", (error) => {
-        self.postMessage({ rpcs3WorkerError: `WebGPU uncaptured error: ${String(error.error && error.error.message || error.error)}` });
+        if ((self.__rpcs3WebGpuErrors = (self.__rpcs3WebGpuErrors | 0) + 1) <= 50) {
+          self.postMessage({ rpcs3WorkerError: `WebGPU uncaptured error (#${self.__rpcs3WebGpuErrors}): ${String(error.error && error.error.message || error.error)}` });
+        }
+      });
+      device.lost?.then((info) => {
+        self.postMessage({ rpcs3WorkerError: `WebGPU device lost (${info?.reason || "unknown"}): ${info?.message || ""}` });
       });
       self.__rpcs3GpuCanvas = canvas;
       Module["preinitializedWebGPUDevice"] = device;

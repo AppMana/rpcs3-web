@@ -23,6 +23,9 @@ LOG_CHANNEL(vm_log, "VM");
 
 void ppu_remove_hle_instructions(u32 addr, u32 size);
 extern bool is_memory_compatible_for_copy_from_executable_optimization(u32 addr, u32 size);
+#ifdef RPCS3_WEB
+extern void ppu_web_dump_current_state(const char* reason);
+#endif
 
 namespace vm
 {
@@ -72,16 +75,62 @@ namespace vm
 	std::array<u8*, 0x100000> g_web_pages{};
 	std::array<u32, 0x100000> g_web_reverse_pages{};
 	// Write version per guest page (web_note_write / web_page_version_sum)
-	static std::array<std::atomic<u32>, 0x100000> g_web_page_versions{};
+	std::array<std::atomic<u32>, 0x100000> g_web_page_versions{};
+	std::array<std::atomic<u32>, 4096> g_web_spu_waiter_addr{};
+	std::atomic<u32> g_web_rsx_wait_raddr{0xffff'ffffu};
+	std::atomic<s32*> g_web_rsx_wait_ptr{nullptr};
 
-	void web_note_write(u32 addr, u32 size) noexcept
+	[[gnu::noinline]] void web_notify_rsx_waiter() noexcept
+	{
+#ifdef ARCH_WASM32
+		if (s32* rsx_wait_ptr = g_web_rsx_wait_ptr.load(std::memory_order_acquire))
+		{
+			__builtin_wasm_memory_atomic_notify(rsx_wait_ptr, 1);
+		}
+#endif
+	}
+
+	[[gnu::noinline]] void web_notify_spu_waiter(u32 raddr) noexcept
+	{
+		if (!raddr) return;
+		if (g_web_rsx_wait_raddr.load(std::memory_order_relaxed) == raddr)
+		{
+			web_notify_rsx_waiter();
+		}
+		if (g_web_spu_waiter_addr[web_spu_waiter_slot(raddr)].load(std::memory_order_relaxed) != 0u)
+		{
+			const u64 ntime = vm::reservation_acquire(raddr) & -128ull;
+			vm::reservation_notifier_notify(raddr, ntime);
+			vm::reservation_notifier_notify(raddr, ntime - 128);
+		}
+	}
+
+	void web_note_write_slow(u32 addr, u32 size) noexcept
 	{
 		if (!size) return;
 		const u32 first = addr >> 12;
 		const u32 last = static_cast<u32>((static_cast<u64>(addr) + size - 1) >> 12);
 		for (u32 page = first; page <= last && page < 0x100000; page++)
 		{
-			g_web_page_versions[page].fetch_add(1, std::memory_order_relaxed);
+			web_note_write_page(page);
+		}
+		const u32 first_line = addr & -128u;
+		const u32 last_line = static_cast<u32>((static_cast<u64>(addr) + size - 1)) & -128u;
+		const u32 rsx_wait_raddr = g_web_rsx_wait_raddr.load(std::memory_order_relaxed);
+		if ((rsx_wait_raddr - first_line) <= (last_line - first_line)) [[unlikely]]
+		{
+			web_notify_rsx_waiter();
+		}
+		if (size <= 512)
+		{
+			for (u32 line = first_line;; line += 128u)
+			{
+				if (g_web_spu_waiter_addr[web_spu_waiter_slot(line)].load(std::memory_order_relaxed) != 0u) [[unlikely]]
+				{
+					web_notify_spu_waiter(line);
+				}
+				if (line == last_line) break;
+			}
 		}
 	}
 
@@ -93,6 +142,9 @@ namespace vm
 		if (reported++ < 32)
 		{
 			vm_log.error("Guest access to unmapped memory (sink page): addr=0x%x thread=%s", addr, thread_ctrl::get_name());
+			char reason[96];
+			std::snprintf(reason, sizeof(reason), "guest access to unmapped memory addr=0x%08x", addr);
+			ppu_web_dump_current_state(reason);
 		}
 	}
 
@@ -168,7 +220,7 @@ namespace vm
 		}
 	}
 
-	bool web_is_contiguous(u32 addr, u32 size) noexcept
+	bool web_is_contiguous_slow(u32 addr, u32 size) noexcept
 	{
 		if (!size)
 		{
@@ -219,7 +271,7 @@ namespace vm
 			if (is_write)
 			{
 				std::memcpy(guest, bytes + offset, chunk);
-				g_web_page_versions[current >> 12].fetch_add(1, std::memory_order_relaxed);
+				web_note_write_page(current >> 12);
 			}
 			else
 			{
@@ -2078,7 +2130,13 @@ namespace vm
 
 			// Map the memory through the same method as alloc() and falloc()
 			// Copy the shared handle unconditionally
+#ifdef RPCS3_WEB
+			ensure(try_alloc(addr0, pflags, size0, ::as_rvalue(flags & preallocated
+				? std::make_shared<utils::shm>(this->addr == rsx::constants::local_mem_base ? this->size : size0)
+				: shared[ar.pop<usz>()])));
+#else
 			ensure(try_alloc(addr0, pflags, size0, ::as_rvalue(flags & preallocated ? null_shm : shared[ar.pop<usz>()])));
+#endif
 
 			if (flags & preallocated)
 			{

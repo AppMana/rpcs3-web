@@ -234,12 +234,12 @@ DECLARE(ppu_module_manager::sysPrxForUser)("sysPrxForUser", [](ppu_static_module
 	REG_VAR(sysPrxForUser, g_ppu_atexitspawn).flag(MFF_HIDDEN);
 	REG_VAR(sysPrxForUser, g_ppu_at_Exitspawn).flag(MFF_HIDDEN);
 
-	REG_FUNC(sysPrxForUser, sys_time_get_system_time);
+	REG_FUNC(sysPrxForUser, sys_time_get_system_time).flag(MFF_PERFECT);
 
 	REG_FUNC(sysPrxForUser, sys_process_exit);
 	REG_FUNC(sysPrxForUser, _sys_process_atexitspawn);
 	REG_FUNC(sysPrxForUser, _sys_process_at_Exitspawn);
-	REG_FUNC(sysPrxForUser, sys_process_is_stack);
+	REG_FUNC(sysPrxForUser, sys_process_is_stack).flag(MFF_PERFECT);
 	REG_FUNC(sysPrxForUser, sys_process_get_paramsfo); // 0xe75c40f2
 
 	REG_FUNC(sysPrxForUser, sys_get_random_number);

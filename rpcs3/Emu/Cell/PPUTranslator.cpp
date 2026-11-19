@@ -62,6 +62,8 @@ void PPUTranslator::prepare()
 	{
 		const char* inline_reads = std::getenv("RPCS3_PPU_WASM_INLINE_READS");
 		m_wasm_inline_reads = inline_reads && *inline_reads == '1';
+		const char* inline_writes = std::getenv("RPCS3_PPU_WASM_INLINE_WRITES");
+		m_wasm_inline_writes = inline_writes && *inline_writes == '1';
 		m_use_ssse3 = false;
 		m_use_fma = false;
 		m_use_avx = false;
@@ -139,6 +141,7 @@ void PPUTranslator::prepare()
 	thread_struct.emplace_back(ArrayType::get(GetType<char>(), 3)); // Padding
 	thread_struct.insert(thread_struct.end(), 1, GetType<u32[4]>()); // sat
 	thread_struct.insert(thread_struct.end(), 1, GetType<u32>()); // jm_mask
+	thread_struct.insert(thread_struct.end(), 16, GetType<u32>()); // cross-instance dispatch diagnostics
 
 	m_thread_type = StructType::create(m_context, thread_struct, "context_t");
 
@@ -175,7 +178,8 @@ void PPUTranslator::prepare()
 				continue;
 			}
 
-			// Ignore 64-bit relocations
+			// Ignore data-pointer relocations (32-bit R_PPC64_ADDR32 in trailing .rodata & 64-bit relocs)
+			case 1:
 			case 20:
 			case 22:
 			case 38:
@@ -231,9 +235,20 @@ Function* PPUTranslator::Translate(const ppu_function& info)
 	m_attr = m_info.attr;
 
 	m_function = m_module->getFunction(fmt::format("__0x%x", m_addr));
+	m_wasm_local_blocks.clear();
+	ResetLocalRegisters();
 
-	std::fill(std::begin(m_globals), std::end(m_globals), nullptr);
-	std::fill(std::begin(m_locals), std::end(m_locals), nullptr);
+	std::map<u32, u32> guest_blocks = info.blocks;
+	std::erase_if(guest_blocks, [](const auto& block) { return !block.second; });
+
+	if (guest_blocks.empty())
+	{
+		guest_blocks.emplace(info.addr, info.size);
+	}
+	else if (!guest_blocks.contains(info.addr))
+	{
+		guest_blocks.emplace(info.addr, info.size);
+	}
 
 	IRBuilder<> irb(BasicBlock::Create(m_context, "__entry", m_function));
 	m_ir = &irb;
@@ -241,32 +256,35 @@ Function* PPUTranslator::Translate(const ppu_function& info)
 	// Don't emit check in small blocks without terminator
 	bool need_check = info.size >= 16;
 
-	for (u64 addr = m_addr; addr < m_addr + info.size; addr += 4)
+	for (const auto& [block_addr, block_size] : guest_blocks)
 	{
-		const u32 op = *ensure(m_info.get_ptr<u32>(::narrow<u32>(addr + base)));
+		for (u64 addr = block_addr; addr < block_addr + block_size; addr += 4)
+		{
+			const u32 op = *ensure(m_info.get_ptr<u32>(::narrow<u32>(addr)));
 
-		switch (g_ppu_itype.decode(op))
-		{
-		case ppu_itype::UNK:
-		case ppu_itype::ECIWX:
-		case ppu_itype::ECOWX:
-		case ppu_itype::TD:
-		case ppu_itype::TDI:
-		case ppu_itype::TW:
-		case ppu_itype::TWI:
-		case ppu_itype::B:
-		case ppu_itype::BC:
-		case ppu_itype::BCCTR:
-		case ppu_itype::BCLR:
-		case ppu_itype::SC:
-		{
-			need_check = true;
-			break;
-		}
-		default:
-		{
-			break;
-		}
+			switch (g_ppu_itype.decode(op))
+			{
+			case ppu_itype::UNK:
+			case ppu_itype::ECIWX:
+			case ppu_itype::ECOWX:
+			case ppu_itype::TD:
+			case ppu_itype::TDI:
+			case ppu_itype::TW:
+			case ppu_itype::TWI:
+			case ppu_itype::B:
+			case ppu_itype::BC:
+			case ppu_itype::BCCTR:
+			case ppu_itype::BCLR:
+			case ppu_itype::SC:
+			{
+				need_check = true;
+				break;
+			}
+			default:
+			{
+				break;
+			}
+			}
 		}
 	}
 
@@ -279,7 +297,35 @@ Function* PPUTranslator::Translate(const ppu_function& info)
 	m_gpr[1] = m_function->getArg(5);
 	m_gpr[2] = m_function->getArg(6);
 
-	const auto body = BasicBlock::Create(m_context, "__body", m_function);
+	// The AOT calling convention passes the volatile ABI registers as function
+	// arguments, while all other GPRs live in the PPU context. Preserve r0-r2 in
+	// the context before any block switch or edge. FlushRegisters() followed by
+	// ResetLocalRegisters() must be able to reload them even when the callee did
+	// not modify them.
+	for (u32 reg = 0; reg < 3; ++reg)
+	{
+		m_ir->CreateStore(m_gpr[reg], m_ir->CreateStructGEP(m_thread_type, m_thread, 3 + reg));
+	}
+
+	const auto entry_body = BasicBlock::Create(m_context, "__body", m_function);
+	m_wasm_local_blocks.emplace(info.addr, entry_body);
+
+	for (const auto& [block_addr, block_size] : guest_blocks)
+	{
+		if (block_addr == info.addr || !block_size)
+		{
+			continue;
+		}
+
+		auto* block = BasicBlock::Create(m_context, fmt::format("__bb_0x%x", block_addr), m_function);
+		m_wasm_local_blocks.emplace(block_addr, block);
+	}
+
+	BasicBlock* dispatch = entry_body;
+	if (m_wasm_aot && m_wasm_local_blocks.size() > 1)
+	{
+		dispatch = BasicBlock::Create(m_context, "__aot_dispatch", m_function);
+	}
 
 	//Call(GetType<void>(), "__trace", GetAddr());
 	if (need_check)
@@ -289,7 +335,7 @@ Function* PPUTranslator::Translate(const ppu_function& info)
 		assert(ptr->getResultElementType() == GetType<u32>());
 		const auto vstate = m_ir->CreateLoad(ptr->getResultElementType(), ptr, true);
 		const auto vcheck = BasicBlock::Create(m_context, "__test", m_function);
-		m_ir->CreateCondBr(m_ir->CreateIsNull(vstate), body, vcheck, m_md_likely);
+		m_ir->CreateCondBr(m_ir->CreateIsNull(vstate), dispatch, vcheck, m_md_likely);
 
 		m_ir->SetInsertPoint(vcheck);
 
@@ -302,22 +348,59 @@ Function* PPUTranslator::Translate(const ppu_function& info)
 	}
 	else
 	{
-		m_ir->CreateBr(body);
+		m_ir->CreateBr(dispatch);
 	}
 
-	m_ir->SetInsertPoint(body);
+	if (dispatch != entry_body)
+	{
+		m_ir->SetInsertPoint(dispatch);
+		Value* cia = m_ir->CreateLoad(GetType<u32>(), m_ir->CreateStructGEP(m_thread_type, m_thread, static_cast<uint>(&m_cia - m_locals)));
+		if (m_reloc)
+		{
+			const auto image_base = m_ir->CreateSub(m_seg0, m_ir->getInt64(base));
+			cia = Trunc(m_ir->CreateSub(ZExt(cia, GetType<u64>()), image_base), GetType<u32>());
+		}
+
+		auto* sw = m_ir->CreateSwitch(cia, entry_body, ::size32(m_wasm_local_blocks) - 1);
+
+		for (const auto& [block_addr, block] : m_wasm_local_blocks)
+		{
+			if (block_addr != info.addr)
+			{
+				sw->addCase(m_ir->getInt32(block_addr - base), block);
+			}
+		}
+	}
 
 	// Process blocks
-	const auto block = std::make_pair(info.addr, info.size);
+	bool first_block = true;
+	for (const auto& [block_addr, block_size] : guest_blocks)
 	{
+		if (!block_size)
+		{
+			continue;
+		}
+
+		const auto local = m_wasm_local_blocks.find(block_addr);
+		ensure(local != m_wasm_local_blocks.end());
+
+		if (!first_block)
+		{
+			ResetLocalRegisters();
+		}
+
+		first_block = false;
+		m_addr = block_addr - base;
+		m_ir->SetInsertPoint(local->second);
+
 		// Optimize BLR (prefetch LR)
-		if (*ensure(m_info.get_ptr<u32>(block.first + block.second - 4)) == ppu_instructions::BLR())
+		if (block_size >= 4 && *ensure(m_info.get_ptr<u32>(block_addr + block_size - 4)) == ppu_instructions::BLR())
 		{
 			RegLoad(m_lr);
 		}
 
 		// Process the instructions
-		for (m_addr = block.first - base; m_addr < block.first + block.second - base; m_addr += 4)
+		for (; m_addr < block_addr + block_size - base; m_addr += 4)
 		{
 			if (m_ir->GetInsertBlock()->getTerminator())
 			{
@@ -662,10 +745,26 @@ void PPUTranslator::CallFunction(u64 target, Value* indirect)
 				break;
 			}
 
+			if (m_wasm_aot)
+			{
+				const auto local = m_wasm_local_blocks.find(target_last);
+
+				if (local != m_wasm_local_blocks.end())
+				{
+					// Direct edges stay inside the compiled function. Registers are
+					// committed once at the edge and reloaded in the destination block,
+					// avoiding a guest-address table lookup and call boundary.
+					FlushRegisters();
+					ResetLocalRegisters();
+					m_ir->CreateBr(local->second);
+					return;
+				}
+			}
+
 			if (!indirect && m_wasm_aot && !m_wasm_part_blocks.count(target_last))
 			{
 				// The block lives in another module part: resolve it through the guest-address table at run time
-				WasmCallThroughTable(m_ir->getInt32(target_last), seg0);
+				WasmCallThroughTable(m_reloc ? m_ir->CreateAdd(m_ir->getInt64(target_last - base), seg0) : m_ir->getInt32(target_last), seg0);
 				return;
 			}
 
@@ -673,6 +772,19 @@ void PPUTranslator::CallFunction(u64 target, Value* indirect)
 			{
 				callee = m_module->getOrInsertFunction(fmt::format("__0x%x", target_last - base), type);
 				cast<Function>(callee.getCallee())->setCallingConv(m_wasm_aot ? CallingConv::C : CallingConv::GHC);
+
+				if (m_wasm_aot)
+				{
+					// A compiled function can be entered at any recovered basic block.
+					// Its prologue selects that block from the guest CIA.
+					Value* runtime_target = m_ir->getInt32(target_last);
+					if (m_reloc)
+					{
+						runtime_target = Trunc(m_ir->CreateAdd(m_seg0, m_ir->getInt64(target_last - base)), GetType<u32>());
+					}
+
+					m_ir->CreateStore(runtime_target, m_ir->CreateStructGEP(m_thread_type, m_thread, static_cast<uint>(&m_cia - m_locals)));
+				}
 
 				if (g_cfg.core.ppu_prof)
 				{
@@ -725,8 +837,14 @@ void PPUTranslator::CallFunction(u64 target, Value* indirect)
 	m_ir->CreateRetVoid();
 }
 
-void PPUTranslator::WasmCallThroughTable(Value* target, Value* seg0)
+void PPUTranslator::WasmCallThroughTable(Value* target, Value* /*seg0*/)
 {
+	// The call ABI carries the live guest GPRs into another Wasm instance. Commit
+	// the current block before creating the dispatch CFG and reload the three
+	// ABI registers before the split so no sibling-block SSA value can leak
+	// across this boundary.
+	FlushRegisters();
+	ResetLocalRegisters();
 
 	// Exec base (arg 0) is the directory of 64 KiB guest pages; a page's first member is the u32 wasm table index per guest word.
 	// Unregistered blocks store cia and return, and the owning PPU thread continues in the interpreter.
@@ -738,13 +856,36 @@ void PPUTranslator::WasmCallThroughTable(Value* target, Value* seg0)
 	const auto r1 = GetGpr(1);
 	const auto r2 = GetGpr(2);
 
-	const auto have_page = BasicBlock::Create(m_context, "", m_function);
-	const auto call = BasicBlock::Create(m_context, "", m_function);
-	const auto fallback = BasicBlock::Create(m_context, "", m_function);
+	const auto record_dispatch = [&](BasicBlock* block, Value* dispatch_index, u32 kind)
+	{
+		m_ir->SetInsertPoint(block);
+		const auto store = [&](u32 slot, Value* value)
+		{
+			m_ir->CreateStore(value, m_ir->CreateStructGEP(m_thread_type, m_thread, 175 + slot));
+		};
+		store(0, m_ir->getInt32(static_cast<u32>(m_addr)));
+		store(1, addr);
+		store(2, dispatch_index);
+		store(3, Trunc(r0, GetType<u32>()));
+		store(4, Trunc(r1, GetType<u32>()));
+		store(5, Trunc(r2, GetType<u32>()));
+		store(6, Trunc(m_ir->CreateLoad(GetType<u64>(), m_ir->CreateStructGEP(m_thread_type, m_thread, 163)), GetType<u32>()));
+		store(7, m_ir->getInt32(kind));
+	};
+
+	const auto no_page = BasicBlock::Create(m_context, "__aot_no_page", m_function);
+	const auto have_page = BasicBlock::Create(m_context, "__aot_have_page", m_function);
+	const auto call = BasicBlock::Create(m_context, "__aot_call", m_function);
+	const auto fallback = BasicBlock::Create(m_context, "__aot_fallback", m_function);
+	const auto fallback_index = PHINode::Create(GetType<u32>(), 4, "__aot_fallback_index", fallback);
 
 	const auto dir_slot = m_ir->CreateGEP(GetType<u32>(), m_exec, m_ir->CreateLShr(addr, 16));
 	const auto page = m_ir->CreateLoad(GetType<u32>(), dir_slot);
-	m_ir->CreateCondBr(m_ir->CreateIsNull(page), fallback, have_page, m_md_unlikely);
+	m_ir->CreateCondBr(m_ir->CreateIsNull(page), no_page, have_page, m_md_unlikely);
+
+	record_dispatch(no_page, m_ir->getInt32(0), 2);
+	fallback_index->addIncoming(m_ir->getInt32(0), no_page);
+	m_ir->CreateBr(fallback);
 
 	m_ir->SetInsertPoint(have_page);
 	const auto page_ptr = m_ir->CreateIntToPtr(page, GetType<u8*>());
@@ -765,30 +906,44 @@ void PPUTranslator::WasmCallThroughTable(Value* target, Value* seg0)
 		const auto context = BasicBlock::Create(m_context, "", m_function);
 		const auto bounds = BasicBlock::Create(m_context, "", m_function);
 		m_ir->CreateCondBr(callable, context, fallback, m_md_likely);
+		fallback_index->addIncoming(index, have_page);
 		m_ir->SetInsertPoint(context);
 		m_ir->CreateCondBr(m_ir->CreateIsNull(m_base), fallback, bounds);
+		fallback_index->addIncoming(index, context);
 		m_ir->SetInsertPoint(bounds);
 		const auto begin = m_ir->CreateLoad(GetType<u32>(), m_base);
 		const auto end = m_ir->CreateLoad(GetType<u32>(), m_ir->CreatePtrAdd(m_base, m_ir->getInt32(offsetof(ppu_wasm_dispatch_context, table_end))));
 		const auto local = m_ir->CreateAnd(m_ir->CreateICmpUGE(index, begin), m_ir->CreateICmpULT(index, end));
 		m_ir->CreateCondBr(local, call, fallback);
+		fallback_index->addIncoming(index, bounds);
 	}
 	else
 	{
 		m_ir->CreateCondBr(callable, call, fallback, m_md_likely);
+		fallback_index->addIncoming(index, have_page);
 	}
 
 	m_ir->SetInsertPoint(call);
+	record_dispatch(call, index, 1);
 	// The target's own address, so a slot the calling worker's table does not hold yet lands on a
 	// stub that returns and the interpreter resumes at the block the branch went to
 	m_ir->CreateStore(addr, m_ir->CreateStructGEP(m_thread_type, m_thread, static_cast<uint>(&m_cia - m_locals)));
-	const auto c = m_ir->CreateCall(FunctionCallee(type, m_ir->CreateIntToPtr(index, GetType<u8*>())), {m_exec, m_thread, seg0, m_base, r0, r1, r2});
+	const auto next_seg0_slot = m_ir->CreateGEP(GetType<u32>(), m_ir->CreatePtrAdd(m_exec, m_ir->getInt32(0x40000)), m_ir->CreateLShr(addr, 16));
+	const auto next_seg0 = m_ir->CreateZExt(m_ir->CreateLoad(GetType<u32>(), next_seg0_slot), GetType<u64>());
+	const auto c = m_ir->CreateCall(FunctionCallee(type, m_ir->CreateIntToPtr(index, GetType<u8*>())), {m_exec, m_thread, next_seg0, m_base, r0, r1, r2});
 	c->setTailCallKind(llvm::CallInst::TCK_MustTail);
 	c->setCallingConv(CallingConv::C);
 	m_ir->CreateRetVoid();
 
 	m_ir->SetInsertPoint(fallback);
+	record_dispatch(fallback, fallback_index, 3);
 	m_ir->CreateStore(addr, m_ir->CreateStructGEP(m_thread_type, m_thread, static_cast<uint>(&m_cia - m_locals)));
+	// The host resumes from the guest context after a table miss. Commit the
+	// live AOT ABI registers here as well as at the caller-side split so the
+	// resumed hook or compiled block sees the same values as this CFG branch.
+	m_ir->CreateStore(r0, m_ir->CreateStructGEP(m_thread_type, m_thread, 3));
+	m_ir->CreateStore(r1, m_ir->CreateStructGEP(m_thread_type, m_thread, 4));
+	m_ir->CreateStore(r2, m_ir->CreateStructGEP(m_thread_type, m_thread, 5));
 	m_ir->CreateRetVoid();
 }
 
@@ -825,8 +980,45 @@ Value* PPUTranslator::RegLoad(Value*& local)
 
 void PPUTranslator::RegStore(llvm::Value* value, llvm::Value*& local)
 {
+	if (&local == &m_lr)
+	{
+		RecordLrWrite(value);
+	}
+	else if (&local == &m_gpr[11])
+	{
+		RecordGpr11Write(value);
+	}
+
 	RegInit(local);
 	local = value;
+}
+
+void PPUTranslator::RecordLrWrite(llvm::Value* value)
+{
+	if (!m_wasm_aot || m_wasm_branch_mode != ppu_wasm_branch_mode::return_to_dispatcher || !m_base)
+	{
+		return;
+	}
+
+	const u64 guest_pc = m_addr + (m_reloc ? m_reloc->addr : 0);
+	m_ir->CreateStore(m_ir->getInt32(static_cast<u32>(guest_pc)),
+		m_ir->CreatePtrAdd(m_base, m_ir->getInt32(offsetof(ppu_wasm_dispatch_context, lr_write_pc))));
+	m_ir->CreateStore(Trunc(value),
+		m_ir->CreatePtrAdd(m_base, m_ir->getInt32(offsetof(ppu_wasm_dispatch_context, lr_write_value))));
+}
+
+void PPUTranslator::RecordGpr11Write(llvm::Value* value)
+{
+	if (!m_wasm_aot || m_wasm_branch_mode != ppu_wasm_branch_mode::return_to_dispatcher || !m_base)
+	{
+		return;
+	}
+
+	const u64 guest_pc = m_addr + (m_reloc ? m_reloc->addr : 0);
+	m_ir->CreateStore(m_ir->getInt32(static_cast<u32>(guest_pc)),
+		m_ir->CreatePtrAdd(m_base, m_ir->getInt32(offsetof(ppu_wasm_dispatch_context, gpr11_write_pc))));
+	m_ir->CreateStore(Trunc(value),
+		m_ir->CreatePtrAdd(m_base, m_ir->getInt32(offsetof(ppu_wasm_dispatch_context, gpr11_write_value))));
 }
 
 void PPUTranslator::FlushRegisters()
@@ -836,6 +1028,17 @@ void PPUTranslator::FlushRegisters()
 	for (auto& local : m_locals)
 	{
 		const auto index = ::narrow<uint>(&local - m_locals);
+
+		// AOT calls carry r0-r2 across module-instance boundaries. A register
+		// reloaded from the context has no cached global pointer, but it still
+		// must be committed before the CFG split; otherwise a sibling prologue
+		// can overwrite the context value while this live SSA value survives.
+		if (m_wasm_aot && index >= 3 && index <= 5 && local)
+		{
+			m_ir->CreateStore(local, m_ir->CreateStructGEP(m_thread_type, m_thread, index));
+			m_globals[index] = nullptr;
+			continue;
+		}
 
 		// Store value if necessary
 		if (local && m_globals[index])
@@ -855,6 +1058,12 @@ void PPUTranslator::FlushRegisters()
 	}
 
 	m_ir->SetInsertPoint(block);
+}
+
+void PPUTranslator::ResetLocalRegisters()
+{
+	std::fill(std::begin(m_globals), std::end(m_globals), nullptr);
+	std::fill(std::begin(m_locals), std::end(m_locals), nullptr);
 }
 
 Value* PPUTranslator::Solid(Value* value)
@@ -981,6 +1190,10 @@ void PPUTranslator::UseCondition(MDNode* hint, Value* cond)
 		m_ir->SetInsertPoint(next);
 		CallFunction(m_addr + 4);
 		m_ir->SetInsertPoint(local);
+		// Both successors inherit the committed parent state. The fallthrough path
+		// may have cached values in its own CFG, so the conditional path must reload
+		// from the guest context rather than retain sibling-block SSA values.
+		ResetLocalRegisters();
 	}
 }
 
@@ -1038,7 +1251,7 @@ Value* PPUTranslator::ReadMemory(Value* addr, Type* type, bool is_be, u32 align)
 			// The loader binds this explicit data import to vm::g_web_pages. Keeping
 			// translation here removes a cross-instance helper call for mapped reads.
 			const auto pages = m_module->getOrInsertGlobal("__rpcs3_guest_pages", ArrayType::get(GetType<u32>(), 0x100000));
-			const auto page = m_ir->CreateLoad(GetType<u32>(), m_ir->CreateGEP(GetType<u32>(), pages, m_ir->CreateLShr(guest_addr, 12)));
+			const auto page = m_ir->CreateLoad(GetType<u32>(), m_ir->CreateGEP(GetType<u32>(), pages, m_ir->CreateLShr(guest_addr, 12)), true);
 			const auto offset = m_ir->CreateAnd(guest_addr, 0xfff);
 			const auto in_page = m_ir->CreateICmpULE(offset, m_ir->getInt32(0x1000 - size / 8));
 			const auto mapped = m_ir->CreateIsNotNull(page);
@@ -1049,7 +1262,7 @@ Value* PPUTranslator::ReadMemory(Value* addr, Type* type, bool is_be, u32 align)
 			m_ir->CreateCondBr(m_ir->CreateAnd(in_page, mapped), direct, fallback, m_md_likely);
 			m_ir->SetInsertPoint(direct);
 			const auto pointer = m_ir->CreateIntToPtr(m_ir->CreateAdd(page, offset), GetType<u8*>());
-			const auto loaded = m_ir->CreateAlignedLoad(int_type, pointer, llvm::Align(1));
+			const auto loaded = m_ir->CreateAlignedLoad(int_type, pointer, llvm::Align(1), true);
 			m_ir->CreateBr(merge);
 			m_ir->SetInsertPoint(fallback);
 			const auto slow = slow_read();
@@ -1150,17 +1363,50 @@ void PPUTranslator::WriteMemory(Value* addr, Value* value, bool is_be, u32 align
 		}
 
 		const auto guest_addr = Trunc(addr, GetType<u32>());
-		if (size == 128)
+		const auto slow_write = [&]()
 		{
-			const auto i128 = m_ir->getIntNTy(128);
-			const auto bits = bitcast(value, i128);
-			Call(GetType<void>(), "rpcs3_web_vm_write64_raw", guest_addr, m_ir->CreateTrunc(bits, GetType<u64>()));
-			Call(GetType<void>(), "rpcs3_web_vm_write64_raw", m_ir->CreateAdd(guest_addr, m_ir->getInt32(8)), m_ir->CreateTrunc(m_ir->CreateLShr(bits, 64), GetType<u64>()));
+			if (size == 128)
+			{
+				const auto i128 = m_ir->getIntNTy(128);
+				const auto bits = bitcast(value, i128);
+				Call(GetType<void>(), "rpcs3_web_vm_write64_raw", guest_addr, m_ir->CreateTrunc(bits, GetType<u64>()));
+				Call(GetType<void>(), "rpcs3_web_vm_write64_raw", m_ir->CreateAdd(guest_addr, m_ir->getInt32(8)), m_ir->CreateTrunc(m_ir->CreateLShr(bits, 64), GetType<u64>()));
+			}
+			else
+			{
+				const auto int_type = m_ir->getIntNTy(size);
+				Call(GetType<void>(), fmt::format("rpcs3_web_vm_write%u_raw", size), guest_addr, bitcast(value, int_type));
+			}
+		};
+		if (m_wasm_inline_writes)
+		{
+			const auto pages = m_module->getOrInsertGlobal("__rpcs3_guest_pages", ArrayType::get(GetType<u32>(), 0x100000));
+			const auto versions = m_module->getOrInsertGlobal("__rpcs3_web_page_versions", ArrayType::get(GetType<u32>(), 0x100000));
+			const auto page_index = m_ir->CreateLShr(guest_addr, 12);
+			const auto page = m_ir->CreateLoad(GetType<u32>(), m_ir->CreateGEP(GetType<u32>(), pages, page_index), true);
+			const auto offset = m_ir->CreateAnd(guest_addr, 0xfff);
+			const auto in_page = m_ir->CreateICmpULE(offset, m_ir->getInt32(0x1000 - size / 8));
+			const auto mapped = m_ir->CreateIsNotNull(page);
+			const auto direct = BasicBlock::Create(m_context, "vm_write_direct", m_function);
+			const auto fallback = BasicBlock::Create(m_context, "vm_write_fallback", m_function);
+			const auto done = BasicBlock::Create(m_context, "vm_write_done", m_function);
+			const auto int_type = m_ir->getIntNTy(size);
+			m_ir->CreateCondBr(m_ir->CreateAnd(in_page, mapped), direct, fallback, m_md_likely);
+			m_ir->SetInsertPoint(direct);
+			const auto pointer = m_ir->CreateIntToPtr(m_ir->CreateAdd(page, offset), GetType<u8*>());
+			m_ir->CreateAlignedStore(bitcast(value, int_type), pointer, llvm::Align(1))->setVolatile(true);
+			const auto ver_ptr = m_ir->CreateGEP(GetType<u32>(), versions, page_index);
+			const auto old_ver = m_ir->CreateLoad(GetType<u32>(), ver_ptr, true);
+			m_ir->CreateStore(m_ir->CreateAdd(old_ver, m_ir->getInt32(1)), ver_ptr)->setVolatile(true);
+			m_ir->CreateBr(done);
+			m_ir->SetInsertPoint(fallback);
+			slow_write();
+			m_ir->CreateBr(done);
+			m_ir->SetInsertPoint(done);
 		}
 		else
 		{
-			const auto int_type = m_ir->getIntNTy(size);
-			Call(GetType<void>(), fmt::format("rpcs3_web_vm_write%u_raw", size), guest_addr, bitcast(value, int_type));
+			slow_write();
 		}
 		return;
 	}
@@ -2524,7 +2770,7 @@ void PPUTranslator::BC(ppu_opcode_t op)
 
 	if (op.lk)
 	{
-		m_ir->CreateStore(GetAddr(+4), m_ir->CreateStructGEP(m_thread_type, m_thread, static_cast<uint>(&m_lr - m_locals)));
+		RegStore(GetAddr(+4), m_lr);
 	}
 
 	UseCondition(CheckBranchProbability(op.bo), CheckBranchCondition(op.bo, op.bi));
@@ -2604,7 +2850,7 @@ void PPUTranslator::BCLR(ppu_opcode_t op)
 
 	if (op.lk)
 	{
-		m_ir->CreateStore(GetAddr(+4), m_ir->CreateStructGEP(m_thread_type, m_thread, static_cast<uint>(&m_lr - m_locals)));
+		RegStore(GetAddr(+4), m_lr);
 	}
 
 	UseCondition(CheckBranchProbability(op.bo), CheckBranchCondition(op.bo, op.bi));
@@ -2667,7 +2913,7 @@ void PPUTranslator::BCCTR(ppu_opcode_t op)
 
 	if (op.lk)
 	{
-		m_ir->CreateStore(GetAddr(+4), m_ir->CreateStructGEP(m_thread_type, m_thread, static_cast<uint>(&m_lr - m_locals)));
+		RegStore(GetAddr(+4), m_lr);
 	}
 
 	UseCondition(CheckBranchProbability(op.bo | 0x4), CheckBranchCondition(op.bo | 0x4, op.bi));
@@ -3129,7 +3375,10 @@ void PPUTranslator::LWARX(ppu_opcode_t op)
 		return;
 	}
 
-	SetGpr(op.rd, Call(GetType<u32>(), "__lwarx", m_thread, op.ra ? m_ir->CreateAdd(GetGpr(op.ra), GetGpr(op.rb)) : GetGpr(op.rb)));
+	const auto addr = op.ra ? m_ir->CreateAdd(GetGpr(op.ra), GetGpr(op.rb)) : GetGpr(op.rb);
+	SetGpr(op.rd, m_wasm_aot
+		? Call(GetType<u32>(), "__lwarx_at", m_thread, addr, GetAddr())
+		: Call(GetType<u32>(), "__lwarx", m_thread, addr));
 }
 
 void PPUTranslator::LDX(ppu_opcode_t op)
@@ -3281,7 +3530,10 @@ void PPUTranslator::LDARX(ppu_opcode_t op)
 		return;
 	}
 
-	SetGpr(op.rd, Call(GetType<u64>(), "__ldarx", m_thread, op.ra ? m_ir->CreateAdd(GetGpr(op.ra), GetGpr(op.rb)) : GetGpr(op.rb)));
+	const auto addr = op.ra ? m_ir->CreateAdd(GetGpr(op.ra), GetGpr(op.rb)) : GetGpr(op.rb);
+	SetGpr(op.rd, m_wasm_aot
+		? Call(GetType<u64>(), "__ldarx_at", m_thread, addr, GetAddr())
+		: Call(GetType<u64>(), "__ldarx", m_thread, addr));
 }
 
 void PPUTranslator::DCBF(ppu_opcode_t)
@@ -3720,7 +3972,7 @@ void PPUTranslator::STHUX(ppu_opcode_t op)
 
 void PPUTranslator::OR(ppu_opcode_t op)
 {
-	const auto result = op.rs == op.rb ? GetGpr(op.rs) : m_ir->CreateOr(GetGpr(op.rs), GetGpr(op.rb));
+	const auto result = ppu_or_is_move(op) ? GetGpr(op.rs) : m_ir->CreateOr(GetGpr(op.rs), GetGpr(op.rb));
 	SetGpr(op.ra, result);
 	if (op.rc) SetCrFieldSignedCmp(0, result, m_ir->getInt64(0));
 }

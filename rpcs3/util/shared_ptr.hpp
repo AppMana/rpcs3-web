@@ -584,15 +584,20 @@ namespace stx
 	class atomic_ptr
 	{
 	private:
+#ifdef ARCH_WASM32
+		struct alignas(8) fat_ptr
+		{
+			uptr ptr{};
+			u32 ref_ctr{};
+		};
+#else
 		struct fat_ptr
 		{
 			uptr ptr{};
 			u32 is_non_null{};
 			u32 ref_ctr{};
-#ifdef ARCH_WASM32
-			u32 padding{};
-#endif
 		};
+#endif
 
 		mutable atomic_t<fat_ptr> m_val{fat_ptr{}};
 
@@ -608,12 +613,20 @@ namespace stx
 
 		static fat_ptr to_val(const volatile std::remove_extent_t<T>* ptr) noexcept
 		{
+#ifdef ARCH_WASM32
+			return fat_ptr{reinterpret_cast<uptr>(ptr), 0};
+#else
 			return fat_ptr{reinterpret_cast<uptr>(ptr), ptr != nullptr, 0};
+#endif
 		}
 
 		static fat_ptr to_val(uptr ptr) noexcept
 		{
+#ifdef ARCH_WASM32
+			return fat_ptr{ptr, 0};
+#else
 			return fat_ptr{ptr, ptr != 0, 0};
+#endif
 		}
 
 		static std::remove_extent_t<T>* ptr_to(fat_ptr val) noexcept
@@ -1105,7 +1118,11 @@ namespace stx
 		// Simple atomic load is much more effective than load(), but it's a non-owning reference
 		T* observe() const noexcept
 		{
+#ifdef ARCH_WASM32
+			return std::launder(reinterpret_cast<std::remove_extent_t<T>*>(utils::bless<const atomic_t<uptr>>(&m_val.raw().ptr)->load()));
+#else
 			return std::launder(ptr_to(m_val));
+#endif
 		}
 
 		explicit constexpr operator bool() const noexcept
@@ -1127,7 +1144,11 @@ namespace stx
 
 		atomic_t<u32> &get_wait_atomic()
 		{
+#ifdef ARCH_WASM32
+			return *utils::bless<atomic_t<u32>>(&m_val.raw().ptr);
+#else
 			return *utils::bless<atomic_t<u32>>(&m_val.raw().is_non_null);
+#endif
 		}
 
 		void wait(std::nullptr_t, atomic_wait_timeout timeout = atomic_wait_timeout::inf)

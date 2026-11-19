@@ -11,6 +11,8 @@ struct CellGcmControl
 
 struct CellGcmConfig
 {
+	ENABLE_BITWISE_SERIALIZATION;
+
 	be_t<u32> localAddress;
 	be_t<u32> ioAddress;
 	be_t<u32> localSize;
@@ -25,6 +27,8 @@ using CellGcmContextCallback = s32 (vm::ptr<CellGcmContextData>, u32);
 
 struct CellGcmContextData
 {
+	ENABLE_BITWISE_SERIALIZATION;
+
 	vm::bptr<u32> begin;
 	vm::bptr<u32> end;
 	vm::bptr<u32> current;
@@ -33,6 +37,8 @@ struct CellGcmContextData
 
 struct gcmInfo
 {
+	ENABLE_BITWISE_SERIALIZATION;
+
 	u32 config_addr;
 	u32 context_addr;
 	u32 control_addr;

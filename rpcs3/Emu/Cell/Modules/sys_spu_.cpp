@@ -271,6 +271,8 @@ error_code sys_spu_image_import(ppu_thread& ppu, vm::ptr<sys_spu_image> img, u32
 {
 	sysPrxForUser.warning("sys_spu_image_import(img=*0x%x, src=0x%x, type=%d)", img, src, type);
 
+	ppu.state += cpu_flag::wait;
+
 	if (type != SYS_SPU_IMAGE_PROTECT && type != SYS_SPU_IMAGE_DIRECT)
 	{
 		return CELL_EINVAL;
@@ -356,6 +358,8 @@ error_code sys_spu_image_import(ppu_thread& ppu, vm::ptr<sys_spu_image> img, u32
 error_code sys_spu_image_close(ppu_thread& ppu, vm::ptr<sys_spu_image> img)
 {
 	sysPrxForUser.warning("sys_spu_image_close(img=*0x%x)", img);
+
+	ppu.state += cpu_flag::wait;
 
 	if (img->type == SYS_SPU_IMAGE_TYPE_USER)
 	{

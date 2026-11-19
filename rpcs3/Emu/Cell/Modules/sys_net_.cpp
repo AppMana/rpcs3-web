@@ -4,25 +4,41 @@
 
 LOG_CHANNEL(libnet);
 
-s32 sys_net_accept(s32 s, vm::ptr<sys_net_sockaddr> addr, vm::ptr<u32> paddrlen)
-{
-	libnet.todo("accept(s=%d, addr=*0x%x, paddrlen=*0x%x)", s, addr, paddrlen);
+vm::ptr<s32> _sys_net_errno_loc(ppu_thread& ppu);
 
-	return 0;
+static s32 sys_net_return(ppu_thread& ppu, error_code res)
+{
+	const s32 ret = +res;
+	if (ret < 0)
+	{
+		if (auto err_ptr = _sys_net_errno_loc(ppu); err_ptr && vm::check_addr(err_ptr.addr(), vm::page_writable, 4))
+		{
+			*err_ptr = -ret;
+		}
+		return -1;
+	}
+	return ret;
 }
 
-s32 sys_net_bind(s32 s, vm::cptr<sys_net_sockaddr> addr, u32 addrlen)
+s32 sys_net_accept(ppu_thread& ppu, s32 s, vm::ptr<sys_net_sockaddr> addr, vm::ptr<u32> paddrlen)
 {
-	libnet.todo("bind(s=%d, addr=*0x%x, addrlen=%u)", s, addr, addrlen);
+	libnet.trace("accept(s=%d, addr=*0x%x, paddrlen=*0x%x)", s, addr, paddrlen);
 
-	return 0;
+	return sys_net_return(ppu, sys_net_bnet_accept(ppu, s, addr, paddrlen));
 }
 
-s32 sys_net_connect(s32 s, vm::ptr<sys_net_sockaddr> addr, u32 addrlen)
+s32 sys_net_bind(ppu_thread& ppu, s32 s, vm::cptr<sys_net_sockaddr> addr, u32 addrlen)
 {
-	libnet.todo("connect(s=%d, addr=*0x%x, addrlen=%u)", s, addr, addrlen);
+	libnet.trace("bind(s=%d, addr=*0x%x, addrlen=%u)", s, addr, addrlen);
 
-	return 0;
+	return sys_net_return(ppu, sys_net_bnet_bind(ppu, s, addr, addrlen));
+}
+
+s32 sys_net_connect(ppu_thread& ppu, s32 s, vm::ptr<sys_net_sockaddr> addr, u32 addrlen)
+{
+	libnet.trace("connect(s=%d, addr=*0x%x, addrlen=%u)", s, addr, addrlen);
+
+	return sys_net_return(ppu, sys_net_bnet_connect(ppu, s, addr, addrlen));
 }
 
 s32 sys_net_gethostbyaddr()
@@ -37,38 +53,66 @@ s32 sys_net_gethostbyname()
 	return CELL_OK;
 }
 
-s32 sys_net_getpeername(s32 s, vm::ptr<sys_net_sockaddr> addr, vm::ptr<u32> paddrlen)
+s32 sys_net_getpeername(ppu_thread& ppu, s32 s, vm::ptr<sys_net_sockaddr> addr, vm::ptr<u32> paddrlen)
 {
-	libnet.todo("getpeername(s=%d, addr=*0x%x, paddrlen=*0x%x)", s, addr, paddrlen);
+	libnet.trace("getpeername(s=%d, addr=*0x%x, paddrlen=*0x%x)", s, addr, paddrlen);
 
-	return CELL_OK;
+	return sys_net_return(ppu, sys_net_bnet_getpeername(ppu, s, addr, paddrlen));
 }
 
-s32 sys_net_getsockname(s32 s, vm::ptr<sys_net_sockaddr> addr, vm::ptr<u32> paddrlen)
+s32 sys_net_getsockname(ppu_thread& ppu, s32 s, vm::ptr<sys_net_sockaddr> addr, vm::ptr<u32> paddrlen)
 {
-	libnet.todo("getsockname(s=%d, addr=*0x%x, paddrlen=*0x%x)", s, addr, paddrlen);
+	libnet.trace("getsockname(s=%d, addr=*0x%x, paddrlen=*0x%x)", s, addr, paddrlen);
 
-	return CELL_OK;
+	return sys_net_return(ppu, sys_net_bnet_getsockname(ppu, s, addr, paddrlen));
 }
 
-s32 sys_net_getsockopt(s32 s, s32 level, s32 optname, vm::ptr<void> optval, vm::ptr<u32> optlen)
+s32 sys_net_getsockopt(ppu_thread& ppu, s32 s, s32 level, s32 optname, vm::ptr<void> optval, vm::ptr<u32> optlen)
 {
-	libnet.todo("getsockopt(s=%d, level=%d, optname=%d, optval=*0x%x, optlen=*0x%x)", s, level, optname, optval, optlen);
+	libnet.trace("getsockopt(s=%d, level=%d, optname=%d, optval=*0x%x, optlen=*0x%x)", s, level, optname, optval, optlen);
 
-	return CELL_OK;
+	return sys_net_return(ppu, sys_net_bnet_getsockopt(ppu, s, level, optname, optval, optlen));
 }
 
 u32 sys_net_inet_addr(vm::cptr<char> cp)
 {
-	libnet.todo("inet_addr(cp=%s)", cp);
+	libnet.trace("inet_addr(cp=%s)", cp);
+
+	if (!cp)
+	{
+		return 0xffffffff;
+	}
+
+	unsigned int a = 0, b = 0, c = 0, d = 0;
+	if (std::sscanf(cp.get_ptr(), "%u.%u.%u.%u", &a, &b, &c, &d) == 4 && a <= 255 && b <= 255 && c <= 255 && d <= 255)
+	{
+		return (a << 24) | (b << 16) | (c << 8) | d;
+	}
 
 	return 0xffffffff;
 }
 
-s32 sys_net_inet_aton()
+s32 sys_net_inet_aton(vm::cptr<char> cp, vm::ptr<sys_net_in_addr> inp)
 {
-	UNIMPLEMENTED_FUNC(libnet);
-	return CELL_OK;
+	libnet.trace("inet_aton(cp=%s, inp=*0x%x)", cp, inp);
+
+	if (!cp)
+	{
+		return 0;
+	}
+
+	const u32 addr = sys_net_inet_addr(cp);
+	if (addr == 0xffffffff && std::strcmp(cp.get_ptr(), "255.255.255.255") != 0)
+	{
+		return 0;
+	}
+
+	if (inp)
+	{
+		inp->_s_addr = addr;
+	}
+
+	return 1;
 }
 
 s32 sys_net_inet_lnaof()
@@ -109,102 +153,123 @@ vm::cptr<char> sys_net_inet_ntop(s32 af, vm::ptr<void> src, vm::ptr<char> dst, u
 	return vm::null;
 }
 
-s32 sys_net_inet_pton(s32 af, vm::cptr<char> src, vm::ptr<char> dst)
+s32 sys_net_inet_pton(ppu_thread& ppu, s32 af, vm::cptr<char> src, vm::ptr<char> dst)
 {
-	libnet.todo("inet_pton(af=%d, src=%s, dst=*0x%x)", af, src, dst);
+	libnet.trace("inet_pton(af=%d, src=%s, dst=*0x%x)", af, src, dst);
 
-	return 0;
+	if (af != SYS_NET_AF_INET)
+	{
+		if (auto err_ptr = _sys_net_errno_loc(ppu); err_ptr && vm::check_addr(err_ptr.addr(), vm::page_writable, 4))
+		{
+			*err_ptr = SYS_NET_EAFNOSUPPORT;
+		}
+		return -1;
+	}
+
+	if (!src || !dst)
+	{
+		return 0;
+	}
+
+	const u32 addr = sys_net_inet_addr(src);
+	if (addr == 0xffffffff && std::strcmp(src.get_ptr(), "255.255.255.255") != 0)
+	{
+		return 0;
+	}
+
+	*reinterpret_cast<be_t<u32>*>(dst.get_ptr()) = addr;
+	return 1;
 }
 
-s32 sys_net_listen(s32 s, s32 backlog)
+s32 sys_net_listen(ppu_thread& ppu, s32 s, s32 backlog)
 {
-	libnet.todo("listen(s=%d, backlog=%d)", s, backlog);
+	libnet.trace("listen(s=%d, backlog=%d)", s, backlog);
 
-	return 0;
+	return sys_net_return(ppu, sys_net_bnet_listen(ppu, s, backlog));
 }
 
-s32 sys_net_recv(s32 s, vm::ptr<void> buf, u32 len, s32 flags)
+s32 sys_net_recv(ppu_thread& ppu, s32 s, vm::ptr<void> buf, u32 len, s32 flags)
 {
-	libnet.todo("recv(s=%d, buf=*0x%x, len=%d, flags=0x%x)", s, buf, len, flags);
+	libnet.trace("recv(s=%d, buf=*0x%x, len=%d, flags=0x%x)", s, buf, len, flags);
 
-	return 0;
+	return sys_net_return(ppu, sys_net_bnet_recvfrom(ppu, s, buf, len, flags, vm::null, vm::null));
 }
 
-s32 sys_net_recvfrom(s32 s, vm::ptr<void> buf, u32 len, s32 flags, vm::ptr<sys_net_sockaddr> addr, vm::ptr<u32> paddrlen)
+s32 sys_net_recvfrom(ppu_thread& ppu, s32 s, vm::ptr<void> buf, u32 len, s32 flags, vm::ptr<sys_net_sockaddr> addr, vm::ptr<u32> paddrlen)
 {
-	libnet.todo("recvfrom(s=%d, buf=*0x%x, len=%d, flags=0x%x, addr=*0x%x, paddrlen=*0x%x)", s, buf, len, flags, addr, paddrlen);
+	libnet.trace("recvfrom(s=%d, buf=*0x%x, len=%d, flags=0x%x, addr=*0x%x, paddrlen=*0x%x)", s, buf, len, flags, addr, paddrlen);
 
-	return 0;
+	return sys_net_return(ppu, sys_net_bnet_recvfrom(ppu, s, buf, len, flags, addr, paddrlen));
 }
 
-s32 sys_net_recvmsg(s32 s, vm::ptr<sys_net_msghdr> msg, s32 flags)
+s32 sys_net_recvmsg(ppu_thread& ppu, s32 s, vm::ptr<sys_net_msghdr> msg, s32 flags)
 {
-	libnet.todo("recvmsg(s=%d, msg=*0x%x, flags=0x%x)", s, msg, flags);
+	libnet.trace("recvmsg(s=%d, msg=*0x%x, flags=0x%x)", s, msg, flags);
 
-	return CELL_OK;
+	return sys_net_return(ppu, sys_net_bnet_recvmsg(ppu, s, msg, flags));
 }
 
-s32 sys_net_send(s32 s, vm::cptr<void> buf, u32 len, s32 flags)
+s32 sys_net_send(ppu_thread& ppu, s32 s, vm::cptr<void> buf, u32 len, s32 flags)
 {
-	libnet.todo("send(s=%d, buf=*0x%x, len=%d, flags=0x%x)", s, buf, len, flags);
+	libnet.trace("send(s=%d, buf=*0x%x, len=%d, flags=0x%x)", s, buf, len, flags);
 
-	return 0;
+	return sys_net_return(ppu, sys_net_bnet_sendto(ppu, s, buf, len, flags, vm::null, 0));
 }
 
-s32 sys_net_sendmsg(s32 s, vm::cptr<sys_net_msghdr> msg, s32 flags)
+s32 sys_net_sendmsg(ppu_thread& ppu, s32 s, vm::cptr<sys_net_msghdr> msg, s32 flags)
 {
-	libnet.todo("sendmsg(s=%d, msg=*0x%x, flags=0x%x)", s, msg, flags);
+	libnet.trace("sendmsg(s=%d, msg=*0x%x, flags=0x%x)", s, msg, flags);
 
-	return CELL_OK;
+	return sys_net_return(ppu, sys_net_bnet_sendmsg(ppu, s, msg, flags));
 }
 
-s32 sys_net_sendto(s32 s, vm::cptr<void> buf, u32 len, s32 flags, vm::cptr<sys_net_sockaddr> addr, u32 addrlen)
+s32 sys_net_sendto(ppu_thread& ppu, s32 s, vm::cptr<void> buf, u32 len, s32 flags, vm::cptr<sys_net_sockaddr> addr, u32 addrlen)
 {
-	libnet.todo("sendto(s=%d, buf=*0x%x, len=%d, flags=0x%x, addr=*0x%x, addrlen=%d)", s, buf, len, flags, addr, addrlen);
+	libnet.trace("sendto(s=%d, buf=*0x%x, len=%d, flags=0x%x, addr=*0x%x, addrlen=%d)", s, buf, len, flags, addr, addrlen);
 
-	return 0;
+	return sys_net_return(ppu, sys_net_bnet_sendto(ppu, s, buf, len, flags, addr, addrlen));
 }
 
-s32 sys_net_setsockopt(s32 s, s32 level, s32 optname, vm::cptr<void> optval, u32 optlen)
+s32 sys_net_setsockopt(ppu_thread& ppu, s32 s, s32 level, s32 optname, vm::cptr<void> optval, u32 optlen)
 {
-	libnet.todo("setsockopt(s=%d, level=%d, optname=%d, optval=*0x%x, optlen=%d)", s, level, optname, optval, optlen);
+	libnet.trace("setsockopt(s=%d, level=%d, optname=%d, optval=*0x%x, optlen=%d)", s, level, optname, optval, optlen);
 
-	return 0;
+	return sys_net_return(ppu, sys_net_bnet_setsockopt(ppu, s, level, optname, optval, optlen));
 }
 
-s32 sys_net_shutdown(s32 s, s32 how)
+s32 sys_net_shutdown(ppu_thread& ppu, s32 s, s32 how)
 {
-	libnet.todo("shutdown(s=%d, how=%d)", s, how);
+	libnet.trace("shutdown(s=%d, how=%d)", s, how);
 
-	return 0;
+	return sys_net_return(ppu, sys_net_bnet_shutdown(ppu, s, how));
 }
 
-s32 sys_net_socket(s32 family, s32 type, s32 protocol)
+s32 sys_net_socket(ppu_thread& ppu, s32 family, s32 type, s32 protocol)
 {
-	libnet.todo("socket(family=%d, type=%d, protocol=%d)", family, type, protocol);
+	libnet.trace("socket(family=%d, type=%d, protocol=%d)", family, type, protocol);
 
-	return 0;
+	return sys_net_return(ppu, sys_net_bnet_socket(ppu, static_cast<lv2_socket_family>(family), static_cast<lv2_socket_type>(type), static_cast<lv2_ip_protocol>(protocol)));
 }
 
-s32 sys_net_socketclose(s32 s)
+s32 sys_net_socketclose(ppu_thread& ppu, s32 s)
 {
-	libnet.warning("socketclose(s=%d)", s);
+	libnet.trace("socketclose(s=%d)", s);
 
-	return 0;
+	return sys_net_return(ppu, sys_net_bnet_close(ppu, s));
 }
 
-s32 sys_net_socketpoll(vm::ptr<sys_net_pollfd> fds, s32 nfds, s32 ms)
+s32 sys_net_socketpoll(ppu_thread& ppu, vm::ptr<sys_net_pollfd> fds, s32 nfds, s32 ms)
 {
-	libnet.todo("socketpoll(fds=*0x%x, nfds=%d, ms=%d)", fds, nfds, ms);
+	libnet.trace("socketpoll(fds=*0x%x, nfds=%d, ms=%d)", fds, nfds, ms);
 
-	return CELL_OK;
+	return sys_net_return(ppu, sys_net_bnet_poll(ppu, fds, nfds, ms));
 }
 
-s32 sys_net_socketselect(s32 nfds, vm::ptr<sys_net_fd_set> readfds, vm::ptr<sys_net_fd_set> writefds, vm::ptr<sys_net_fd_set> exceptfds, vm::ptr<sys_net_timeval> timeout)
+s32 sys_net_socketselect(ppu_thread& ppu, s32 nfds, vm::ptr<sys_net_fd_set> readfds, vm::ptr<sys_net_fd_set> writefds, vm::ptr<sys_net_fd_set> exceptfds, vm::ptr<sys_net_timeval> timeout)
 {
-	libnet.todo("socketselect(nfds=%d, readfds=*0x%x, writefds=*0x%x, exceptfds=*0x%x, timeout=*0x%x)", nfds, readfds, writefds, exceptfds, timeout);
+	libnet.trace("socketselect(nfds=%d, readfds=*0x%x, writefds=*0x%x, exceptfds=*0x%x, timeout=*0x%x)", nfds, readfds, writefds, exceptfds, timeout);
 
-	return 0;
+	return sys_net_return(ppu, sys_net_bnet_select(ppu, nfds, readfds, writefds, exceptfds, timeout));
 }
 
 s32 sys_net_initialize_network_ex(vm::ptr<sys_net_initialize_parameter_t> param)
@@ -290,7 +355,7 @@ s32 sys_net_show_nameserver()
 
 vm::ptr<s32> _sys_net_errno_loc(ppu_thread& ppu)
 {
-	libnet.warning("_sys_net_errno_loc()");
+	libnet.trace("_sys_net_errno_loc()");
 
 	// Return fake location from system TLS area
 	return vm::cast(ppu.gpr[13] - 0x7030 + 0x2c);
@@ -367,7 +432,7 @@ s32 sys_net_finalize_network()
 
 vm::ptr<s32> _sys_net_h_errno_loc(ppu_thread& ppu)
 {
-	libnet.warning("_sys_net_h_errno_loc()");
+	libnet.trace("_sys_net_h_errno_loc()");
 
 	// Return fake location from system TLS area
 	return vm::cast(ppu.gpr[13] - 0x7030 + 0x28);

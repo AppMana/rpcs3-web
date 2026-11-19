@@ -219,6 +219,15 @@ namespace
 	// Essentially a fat semaphore
 	struct alignas(64) cond_handle
 	{
+#ifdef ARCH_WASM32
+		struct alignas(8) fat_ptr
+		{
+			uptr ptr{};
+			u32 ref_ctr{};
+
+			auto operator<=>(const fat_ptr& other) const = default;
+		};
+#else
 		struct fat_ptr
 		{
 			u64 ptr{};
@@ -227,6 +236,7 @@ namespace
 
 			auto operator<=>(const fat_ptr& other) const = default;
 		};
+#endif
 
 		atomic_t<fat_ptr> ptr_ref;
 		u64 tid;
@@ -265,7 +275,7 @@ namespace
 			mtx.init(mtx);
 #endif
 
-			ensure(ptr_ref.exchange(fat_ptr{iptr, 0, 1}) == fat_ptr{});
+			ensure(ptr_ref.exchange(fat_ptr{.ptr = iptr, .ref_ctr = 1}) == fat_ptr{});
 		}
 
 		void destroy()
@@ -457,7 +467,7 @@ namespace
 				if (cond_id)
 				{
 					// Set fake refctr
-					s_cond_list[cond_id].ptr_ref.release(cond_handle::fat_ptr{0, 0, 1});
+					s_cond_list[cond_id].ptr_ref.release(cond_handle::fat_ptr{.ptr = 0, .ref_ctr = 1});
 					cond_free(cond_id, -1);
 				}
 			}
@@ -477,7 +487,7 @@ static u32 cond_alloc(uptr iptr, u32 tls_slot = -1)
 	{
 		// Fast reinitialize
 		const u32 id = std::exchange(*ptls, 0);
-		s_cond_list[id].ptr_ref.release(cond_handle::fat_ptr{iptr, 0, 1});
+		s_cond_list[id].ptr_ref.release(cond_handle::fat_ptr{.ptr = iptr, .ref_ctr = 1});
 		return id;
 	}
 
@@ -671,6 +681,19 @@ static cond_handle* cond_id_lock(u32 cond_id, uptr iptr = 0)
 
 namespace
 {
+#ifdef ARCH_WASM32
+	struct alignas(8) slot_allocator
+	{
+		u64 maxc: 5; // Collision counter
+		u64 maxd: 11; // Distance counter
+		u64 bits: 24; // Allocated bits
+		u64 prio: 8; // Reserved
+
+		u64 ref : 16; // Ref counter
+	};
+
+	static_assert(sizeof(slot_allocator) == 8);
+#else
 	struct alignas(16) slot_allocator
 	{
 		u64 maxc: 5; // Collision counter
@@ -683,6 +706,7 @@ namespace
 	};
 
 	static_assert(sizeof(slot_allocator) == 16);
+#endif
 
 	// Need to spare 16 bits for ref counter
 	static constexpr u64 max_threads = 24;
@@ -765,6 +789,9 @@ namespace
 
 u64 utils::get_unique_tsc()
 {
+#ifdef ARCH_WASM32
+	return s_min_tsc.add_fetch(1);
+#else
 	const u64 stamp0 = utils::get_tsc();
 
 	if (!s_min_tsc.fetch_op([=](u64& tsc)
@@ -789,6 +816,7 @@ u64 utils::get_unique_tsc()
 	}
 
 	return stamp0;
+#endif
 }
 
 atomic_t<u16>* root_info::slot_alloc(uptr ptr) noexcept
@@ -808,10 +836,12 @@ atomic_t<u16>* root_info::slot_alloc(uptr ptr) noexcept
 				return nullptr;
 			}
 
+#ifndef ARCH_WASM32
 			if (bits.iptr == 0)
 				bits.iptr = ptr;
 			if (bits.maxc == 0 && bits.iptr != ptr && bits.ref)
 				bits.maxc = 1;
+#endif
 			if (bits.maxd < limit)
 				bits.maxd = limit;
 
@@ -1302,7 +1332,9 @@ atomic_wait_engine::wait(const void* data, u32 old_value, u64 timeout, atomic_wa
 
 	root_info::slot_free(iptr, slot, 0);
 
+#ifndef __EMSCRIPTEN__
 	s_tls_wait_cb(data, -1, stamp0);
+#endif
 	s_tls_one_time_wait_cb = nullptr;
 }
 
@@ -1495,7 +1527,11 @@ namespace atomic_wait
 			const auto root = &s_hashtable[i];
 			const auto slot = root->bits.load();
 
+#ifdef ARCH_WASM32
+			if (cb(i, static_cast<u32>(slot.ref), 0, static_cast<u32>(slot.maxc)))
+#else
 			if (cb(i, static_cast<u32>(slot.ref), slot.iptr, static_cast<u32>(slot.maxc)))
+#endif
 			{
 				break;
 			}

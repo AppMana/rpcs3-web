@@ -31,7 +31,7 @@ function fixture({ mode = 0, budget = 5, target = 1, end = 3, profile = false } 
   table.set(1, instance.exports.chain_program_a);
   table.set(2, instance.exports.chain_program_b);
   const words = new Uint32Array(memory.buffer);
-  const context = 256, thread = 64, ls = 128, lists = 65536, cache = 400000;
+  const context = 256, thread = 64, ls = 128, lists = 65536, cache = 1048576;
   words.set([0x1000, 0, 0, 0, 0, mode, 0], thread / 4);
   words.set([thread, thread + 8, thread + 16, lists, cache, 1, end, target, budget, 0, 0], context / 4);
   const edges = 620000;

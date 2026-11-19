@@ -1,5 +1,6 @@
 import {
   abortLibraryImport,
+  existsInOPFS,
   fetchLibraryIndex,
   formatBytes,
   formatRate,
@@ -188,6 +189,7 @@ libraryAbortButton.addEventListener("click", () => abortLibraryImport());
 window.__rpcs3Storage = {
   status: storageStatus,
   persist: requestPersistentStorage,
+  exists: existsInOPFS,
   list: listOPFS,
   importFiles,
   importFirmware,
@@ -197,17 +199,19 @@ window.__rpcs3Storage = {
   abortImport: abortLibraryImport,
 };
 
-await Promise.all([updateCapacity(), refreshFiles(), refreshLibrary()]);
-
 const parameters = new URLSearchParams(location.search);
 const autoImport = parameters.get("import");
-if (autoImport) {
-  const destination = parameters.get("destination") || (/\.pup$/i.test(autoImport) ? "firmware" : "games");
-  libraryFile.value = autoImport;
-  libraryDestination.value = destination;
-  window.__rpcs3AutoImport = runLibraryImport(autoImport, destination, {
-    restart: parameters.get("restart") === "1",
-    verify: parameters.get("verify") === "1",
-    chunkSize: parameters.get("chunk") ? Number(parameters.get("chunk")) : undefined,
-  }).catch((error) => ({ failed: true, error: error.message }));
+if (parameters.get("headless") !== "1") {
+  void Promise.all([updateCapacity(), refreshFiles(), refreshLibrary()]).then(() => {
+    if (autoImport) {
+      const destination = parameters.get("destination") || (/\.pup$/i.test(autoImport) ? "firmware" : "games");
+      libraryFile.value = autoImport;
+      libraryDestination.value = destination;
+      window.__rpcs3AutoImport = runLibraryImport(autoImport, destination, {
+        restart: parameters.get("restart") === "1",
+        verify: parameters.get("verify") === "1",
+        chunkSize: parameters.get("chunk") ? Number(parameters.get("chunk")) : undefined,
+      }).catch((error) => ({ failed: true, error: error.message }));
+    }
+  });
 }

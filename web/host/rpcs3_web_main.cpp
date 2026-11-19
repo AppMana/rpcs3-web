@@ -5,21 +5,26 @@
 #include "Emu/IdManager.h"
 #include "Emu/VFS.h"
 #include "Emu/Cell/PPUFunction.h"
+#include "Emu/Cell/PPUDisAsm.h"
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/Cell/SPUThread.h"
 #include "Emu/Cell/SPUWasmAbi.h"
+#include "Emu/Cell/lv2/sys_sync.h"
 #include "Emu/Cell/timers.hpp"
 #include "Emu/RSX/GSFrameBase.h"
 #include "Emu/RSX/Null/NullGSRender.h"
 #include "Emu/RSX/WG/WebGPUGSRender.h"
 #include "Emu/RSX/WG/WebGPUDirectGSRender.h"
 
-extern volatile u32 g_rpcs3_web_rsx_spawn_pending;
+extern volatile u32 g_rpcs3_web_spawn_pending[3];
+void initialize_timebased_time(u64 timebased_init, bool reset = false);
 #include "Emu/RSX/WG/WebGPUHost.h"
 #include "Emu/Memory/vm.h"
 #include "Emu/Memory/vm_locking.h"
 #include "Emu/Audio/Null/NullAudioBackend.h"
 #include "Emu/Audio/Null/null_enumerator.h"
+#include "Emu/Audio/WebAudio/WebAudioBackend.h"
+#include "Emu/Host/HostPlatform.h"
 #include "Emu/Io/Null/null_camera_handler.h"
 #include "Emu/Io/Null/NullKeyboardHandler.h"
 #include "Emu/Io/Null/NullMouseHandler.h"
@@ -71,6 +76,8 @@ extern volatile u32 g_rpcs3_web_rsx_spawn_pending;
 extern atomic_t<u64> g_ppu_web_instruction_count;
 extern atomic_t<u32> g_ppu_web_last_pc;
 extern atomic_t<u32> g_ppu_web_trace_pc;
+extern atomic_t<u32> g_ppu_web_trace_extra_pcs[7];
+extern atomic_t<u32> g_ppu_web_trace_extra_count;
 extern atomic_t<u32> g_ppu_web_trace_hits;
 extern atomic_t<u32> g_ppu_web_trace_delay_pc;
 extern atomic_t<u32> g_ppu_web_trace_delay_hits;
@@ -90,6 +97,7 @@ extern u32 spu_web_miss_count();
 extern std::string spu_web_wasm_selftest(const u8* cache, u32 size);
 extern std::string spu_web_hot_report();
 extern void spu_web_set_hot_table_base(u32 base);
+extern u32 spu_web_hot_table_base();
 extern u32 spu_web_hot_count();
 extern u32 spu_web_hot_index(u32 i);
 extern const u8* spu_web_hot_bytes(u32 i);
@@ -142,6 +150,10 @@ extern void web_hot_table_set_base(u32 base);
 extern u32 web_hot_table_limit();
 extern u32 web_hot_table_base();
 extern void ppu_web_jit_set_enabled(bool enabled);
+extern void ppu_web_codegen_configure(bool aot, bool fail_closed);
+extern u32 ppu_web_codegen_backend();
+extern u32 ppu_web_codegen_fail_closed();
+extern u32 ppu_web_codegen_semantics_version();
 extern void ppu_web_jit_set_threshold(u32 misses);
 extern void ppu_web_jit_set_capacity(u32 entries);
 extern s32 ppu_web_jit_poll();
@@ -153,14 +165,32 @@ extern void ppu_web_jit_slot_finish(u32 i, u8* bytes, u32 size, u32 memory_size,
 extern u32 ppu_web_jit_count();
 extern void ppu_web_jit_info(u32 i, u32* out);
 extern std::string ppu_web_jit_report();
+extern u32 ppu_web_jit_find_entry(u32 target_index, u32* out);
+extern void ppu_web_auto_recomp_set_enabled(bool enabled);
+extern u32 ppu_web_auto_recomp_enabled();
+extern s32 ppu_web_recomp_poll();
+extern const u8* ppu_web_recomp_slot_data();
+extern u32 ppu_web_recomp_slot_size();
+extern const char* ppu_web_recomp_slot_name();
+extern const char* ppu_web_recomp_slot_sha1();
+extern u32 ppu_web_recomp_slot_seg0();
+extern u32 ppu_web_recomp_slot_is_firmware();
+extern u32 ppu_web_recomp_register_shard(const u8* wasm_bytes, u32 wasm_size, u32 memory_size, u32 memory_align, u32 table_size, u32 imports_table, const u32* guest_rel_pairs, u32 pair_count, u32 shard_seg0);
+extern void ppu_web_recomp_slot_finish(u32 ok);
+extern atomic_t<u64> g_ppu_web_hle_hook_count;
 extern void* ppu_web_aot_exec_base();
 extern u32 ppu_web_aot_registered(u32 addr);
+extern u32 ppu_web_direct_hle_bridge(ppu_thread& ppu, const void* base_ptr);
+extern u32 ppu_web_direct_hle_fnid(ppu_thread& ppu, u32 faddr, u32 fnid, u32 return_pc);
 extern atomic_t<u64> g_ppu_web_aot_dispatch_count;
 extern u32 ppu_lwarx(ppu_thread& ppu, u32 addr);
+	extern u32 ppu_lwarx_at(ppu_thread& ppu, u32 addr, u32 source_pc);
 extern u64 ppu_ldarx(ppu_thread& ppu, u32 addr);
+	extern u64 ppu_ldarx_at(ppu_thread& ppu, u32 addr, u32 source_pc);
 extern bool ppu_stwcx(ppu_thread& ppu, u32 addr, u32 reg_value);
 extern bool ppu_stdcx(ppu_thread& ppu, u32 addr, u64 reg_value);
 extern void ppu_execute_syscall(ppu_thread& ppu, u64 code);
+extern void ppu_trap(ppu_thread& ppu, u64 addr);
 extern atomic_t<u32> g_ppu_web_aot_hold_entry;
 extern atomic_t<u32> g_ppu_web_aot_entry_ready;
 extern atomic_t<u32> g_ppu_web_aot_step_request;
@@ -188,30 +218,141 @@ namespace
 	using web_v128 = u8 __attribute__((vector_size(16)));
 
 	// PPU AOT memory accesses: an access inside one mapped page is a direct (unaligned) wasm
-	// load or store; only page-crossing accesses take the per-page copy loop
-	template <typename T>
-	T read_guest_raw(u32 addr) noexcept
+	// load or store; only page-crossing or unmapped accesses take the out-of-line slow path so
+	// the hot caller never spills a local buffer to the Wasm linear-memory shadow stack.
+	[[gnu::noinline]] u64 read_guest_raw_slow(u32 addr, u32 size) noexcept
 	{
-		T value{};
-		if ((addr & 0xfff) + sizeof(T) <= 0x1000) [[likely]]
+		u64 value = 0;
+		if ((addr & 0xfff) + size <= 0x1000)
 		{
-			std::memcpy(&value, vm::web_ptr(addr), sizeof(T));
+			std::memcpy(&value, vm::web_ptr(addr), size);
 			return value;
 		}
-		vm::web_copy_range(addr, &value, sizeof(value), false);
+		vm::web_copy_range(addr, &value, size, false);
 		return value;
 	}
 
 	template <typename T>
-	void write_guest_raw(u32 addr, T value) noexcept
+	[[gnu::always_inline]] inline T read_guest_raw(u32 addr) noexcept
 	{
-		if ((addr & 0xfff) + sizeof(T) <= 0x1000) [[likely]]
+		if constexpr (sizeof(T) == 1)
 		{
-			std::memcpy(vm::web_ptr(addr), &value, sizeof(T));
-			vm::web_note_write(addr, sizeof(T));
+			if (const u8* page = vm::g_web_pages[addr >> 12]) [[likely]]
+			{
+				return *reinterpret_cast<const T*>(page + (addr & 0xfff));
+			}
+			return static_cast<T>(read_guest_raw_slow(addr, 1));
+		}
+		else if constexpr (sizeof(T) <= 8)
+		{
+			if ((addr & 0xfff) <= 0x1000 - sizeof(T)) [[likely]]
+			{
+				if (const u8* page = vm::g_web_pages[addr >> 12]) [[likely]]
+				{
+					T value;
+					std::memcpy(&value, page + (addr & 0xfff), sizeof(T));
+					return value;
+				}
+			}
+			return static_cast<T>(read_guest_raw_slow(addr, sizeof(T)));
+		}
+		else
+		{
+			T value{};
+			if ((addr & 0xfff) <= 0x1000 - sizeof(T)) [[likely]]
+			{
+				if (const u8* page = vm::g_web_pages[addr >> 12]) [[likely]]
+				{
+					std::memcpy(&value, page + (addr & 0xfff), sizeof(T));
+					return value;
+				}
+				std::memcpy(&value, vm::web_ptr(addr), sizeof(T));
+				return value;
+			}
+			vm::web_copy_range(addr, &value, sizeof(value), false);
+			return value;
+		}
+	}
+
+	[[gnu::noinline]] void write_guest_raw_slow(u32 addr, u64 value, u32 size) noexcept
+	{
+		if ((addr & 0xfff) + size <= 0x1000)
+		{
+			std::memcpy(vm::web_ptr(addr), &value, size);
+			vm::web_note_write_addr(addr);
 			return;
 		}
-		vm::web_copy_range(addr, &value, sizeof(value), true);
+		vm::web_copy_range(addr, &value, size, true);
+	}
+
+	std::atomic<u32> s_ppu_web_watch_write_hits{0};
+
+	[[gnu::noinline]] void trace_guest_watch_write(u32 addr, u64 value, u32 size) noexcept
+	{
+		const u32 watch = g_ppu_web_watch_address;
+		if (!watch || addr >= watch + 4u || addr + size <= watch)
+		{
+			return;
+		}
+
+		const u32 hit = s_ppu_web_watch_write_hits.fetch_add(1, std::memory_order_relaxed);
+		if (hit >= 64)
+		{
+			return;
+		}
+
+		const u32 old_value = vm::check_addr<4>(watch) ? static_cast<u32>(vm::read32(watch)) : 0;
+		std::fprintf(stderr,
+			"RPCS3 Web PPU memory watch write: hit=%u address=0x%08x old=0x%08x pc=0x%08x write_addr=0x%08x size=%u value=0x%llx\n",
+			hit, watch, old_value, g_ppu_web_last_pc.load(), addr, size,
+			static_cast<unsigned long long>(value));
+	}
+
+	template <typename T>
+	[[gnu::always_inline]] inline void write_guest_raw(u32 addr, T value) noexcept
+	{
+		if constexpr (sizeof(T) == 1)
+		{
+			const u32 page_idx = addr >> 12;
+			if (u8* page = vm::g_web_pages[page_idx]) [[likely]]
+			{
+				*reinterpret_cast<T*>(page + (addr & 0xfff)) = value;
+				vm::web_note_write_addr(addr);
+				return;
+			}
+			write_guest_raw_slow(addr, static_cast<u64>(value), 1);
+		}
+		else if constexpr (sizeof(T) <= 8)
+		{
+			if ((addr & 0xfff) <= 0x1000 - sizeof(T)) [[likely]]
+			{
+				const u32 page_idx = addr >> 12;
+				if (u8* page = vm::g_web_pages[page_idx]) [[likely]]
+				{
+					std::memcpy(page + (addr & 0xfff), &value, sizeof(T));
+					vm::web_note_write_addr(addr);
+					return;
+				}
+			}
+			write_guest_raw_slow(addr, static_cast<u64>(value), sizeof(T));
+		}
+		else
+		{
+			if ((addr & 0xfff) <= 0x1000 - sizeof(T)) [[likely]]
+			{
+				const u32 page_idx = addr >> 12;
+				if (u8* page = vm::g_web_pages[page_idx]) [[likely]]
+				{
+					std::memcpy(page + (addr & 0xfff), &value, sizeof(T));
+					vm::web_note_write_addr(addr);
+					return;
+				}
+				std::memcpy(vm::web_ptr(addr), &value, sizeof(T));
+				vm::web_note_write_addr(addr);
+				return;
+			}
+			vm::web_copy_range(addr, &value, sizeof(value), true);
+		}
 	}
 
 	std::atomic<bool> s_initialized{false};
@@ -409,6 +550,10 @@ namespace
 		void set_current(draw_context_t) override {}
 		void flip(draw_context_t, bool skip_frame = false) override
 		{
+			if (s_null_renderer && !skip_frame)
+			{
+				rsx::webgpu::host_command_queue().note_flip();
+			}
 			notify_host_event("rpcs3-frame", skip_frame ? 1u : 0u);
 		}
 		int client_width() override { return 1280; }
@@ -513,7 +658,14 @@ namespace
 				g_fxo->init<rsx::thread, named_thread<WebGPUGSRender>>(ar);
 			}
 		};
-		callbacks.get_audio = [] { return std::make_shared<NullAudioBackend>(); };
+		callbacks.get_audio = []() -> std::shared_ptr<AudioBackend>
+		{
+			if (g_cfg.audio.renderer == audio_renderer::null)
+			{
+				return std::make_shared<NullAudioBackend>();
+			}
+			return std::make_shared<WebAudioBackend>();
+		};
 		callbacks.get_audio_enumerator = [](u64) { return std::make_shared<null_enumerator>(); };
 
 		callbacks.get_msg_dialog = [] { return std::shared_ptr<MsgDialogBase>{}; };
@@ -566,6 +718,24 @@ void qt_events_aware_op(int repeat_duration_ms, std::function<bool()> wrapped_op
 
 	while (!wrapped_op())
 	{
+		if (emscripten_is_main_runtime_thread())
+		{
+			for (;;)
+			{
+				std::function<void()> task;
+				{
+					std::lock_guard lock(s_host_task_mutex);
+					if (s_host_tasks.empty())
+					{
+						break;
+					}
+					task = std::move(s_host_tasks.front());
+					s_host_tasks.pop_front();
+				}
+				task();
+			}
+		}
+
 		if (repeat_duration_ms == 0)
 		{
 			std::this_thread::yield();
@@ -646,7 +816,7 @@ extern "C"
 	}
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_rsx_spawn_flag_address()
 	{
-		return static_cast<u32>(reinterpret_cast<uptr>(&g_rpcs3_web_rsx_spawn_pending));
+		return static_cast<u32>(reinterpret_cast<uptr>(&g_rpcs3_web_spawn_pending[0]));
 	}
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_null_renderer(s32 enabled)
 	{
@@ -686,6 +856,10 @@ extern "C"
 		}
 
 		Emu.SetForceBoot(true);
+		if (!injected_pad::replaying())
+		{
+			injected_pad::reset_frame();
+		}
 		const std::string_view target(path);
 		const bool rsx_capture = target.ends_with(".rrc") || target.ends_with(".rrc.gz") || target.ends_with(".rrc.zst");
 		const game_boot_result result = rsx_capture
@@ -841,6 +1015,11 @@ extern "C"
 		return static_cast<u32>(reinterpret_cast<uptr>(vm::g_web_pages.data()));
 	}
 
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_versions_address()
+	{
+		return static_cast<u32>(reinterpret_cast<uptr>(vm::g_web_page_versions.data()));
+	}
+
 
 
 	EMSCRIPTEN_KEEPALIVE u8 rpcs3_web_vm_read8_raw(u32 addr)
@@ -873,21 +1052,25 @@ extern "C"
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_vm_write8_raw(u32 addr, u8 value)
 	{
+		trace_guest_watch_write(addr, value, sizeof(value));
 		write_guest_raw(addr, value);
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_vm_write16_raw(u32 addr, u16 value)
 	{
+		trace_guest_watch_write(addr, value, sizeof(value));
 		write_guest_raw(addr, value);
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_vm_write32_raw(u32 addr, u32 value)
 	{
+		trace_guest_watch_write(addr, value, sizeof(value));
 		write_guest_raw(addr, value);
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_vm_write64_raw(u32 addr, u64 value)
 	{
+		trace_guest_watch_write(addr, value, sizeof(value));
 		write_guest_raw(addr, value);
 	}
 
@@ -895,6 +1078,7 @@ extern "C"
 	{
 		if (value)
 		{
+			trace_guest_watch_write(addr, 0, sizeof(*value));
 			write_guest_raw(addr, *value);
 		}
 	}
@@ -1066,10 +1250,34 @@ extern "C"
 		ppu.cia = ::narrow<u32>(addr);
 	}
 
+	// __ppu_trap: ppu_trap (renamed from __trap to avoid colliding with compiler-rt's __trap())
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_direct_trap(u32 thread, u64 addr)
+	{
+		ppu_trap(*reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread)), addr);
+	}
+
 	// __syscall: ppu_execute_syscall (cia already stored by the compiled block)
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_direct_syscall(u32 thread, u64 code)
 	{
 		ppu_execute_syscall(*reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread)), code);
+	}
+
+	// __hle_bridge: executes hook/HLE/PRX step(s) at ppu.cia and returns the next AOT table index in-instance (or 0 to unwind)
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_direct_hle_bridge(u32 thread, u32 base)
+	{
+		return ppu_web_direct_hle_bridge(
+			*reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread)),
+			reinterpret_cast<const void*>(static_cast<uptr>(base)));
+	}
+
+	// __hle_call_fnid: executes a .sceStub.text import call directly by .lib.stub faddr and returns 0 when continuing at return_pc
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_direct_hle_fnid(u32 thread, u32 faddr, u32 fnid, u32 return_pc)
+	{
+		return ppu_web_direct_hle_fnid(
+			*reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread)),
+			faddr,
+			fnid,
+			return_pc);
 	}
 
 	// __lv1call has no native binding; the interpreter executes the SC instruction at the stored cia
@@ -1087,9 +1295,19 @@ extern "C"
 		return ppu_lwarx(*reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread)), static_cast<u32>(addr));
 	}
 
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_direct_lwarx_at(u32 thread, u64 addr, u64 source_pc)
+	{
+		return ppu_lwarx_at(*reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread)), static_cast<u32>(addr), static_cast<u32>(source_pc));
+	}
+
 	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_ppu_direct_ldarx(u32 thread, u64 addr)
 	{
 		return ppu_ldarx(*reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread)), static_cast<u32>(addr));
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_ppu_direct_ldarx_at(u32 thread, u64 addr, u64 source_pc)
+	{
+		return ppu_ldarx_at(*reinterpret_cast<ppu_thread*>(static_cast<uptr>(thread)), static_cast<u32>(addr), static_cast<u32>(source_pc));
 	}
 
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_direct_stwcx(u32 thread, u64 addr, u32 value)
@@ -1106,7 +1324,21 @@ extern "C"
 	// LLVM recompiler binds (SPULLVMRecompiler.cpp exec_*), running on the owning SPU pthread.
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_aot_register_many(u32 pairs, u32 count)
 	{
-		spu_web_aot_register(reinterpret_cast<const u32*>(static_cast<uptr>(pairs)), count);
+		const auto* src = reinterpret_cast<const u32*>(static_cast<uptr>(pairs));
+		std::vector<u32> filtered;
+		filtered.reserve(count * 2);
+		for (u32 i = 0; i < count; ++i)
+		{
+			const u32 addr = src[i * 2] & 0x3fffc;
+			// Skip offline SPU AOT functions that call spu_read_events without compatible_mode GPR flushes
+			if (addr == 0x00cc8 || addr == 0x02310)
+			{
+				continue;
+			}
+			filtered.push_back(src[i * 2]);
+			filtered.push_back(src[i * 2 + 1]);
+		}
+		spu_web_aot_register(filtered.data(), ::size32(filtered) / 2);
 	}
 
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_register_chain_span(u32 begin, u32 end, u32 runner)
@@ -1202,10 +1434,19 @@ extern "C"
 		spu_web_set_hot_table_base(base);
 	}
 
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_hot_table_base()
+	{
+		return spu_web_hot_table_base();
+	}
+
 	// The function table region both runtime tiers allocate their indices from
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_hot_table_base(u32 base)
 	{
-		spu_web_set_hot_table_base(base);
+		web_hot_table_set_base(base);
+		if (!spu_web_hot_table_base())
+		{
+			spu_web_set_hot_table_base(base);
+		}
 	}
 
 	// One past the last index the runtime tiers may use; a worker reserves this whole span before it
@@ -1221,9 +1462,16 @@ extern "C"
 	}
 
 	// Placed in every reserved slot no compiled block occupies: the caller stored the target address
-	// in cia, so returning hands the block back to the interpreter (PPUTranslator::WasmCallThroughTable)
-	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_direct_unplaced(void*, void*, u64, void*, u64, u64, u64)
+	// in cia, so returning hands the block back to the dispatcher (PPUTranslator::WasmCallThroughTable)
+	// after committing the incoming r0..r2 arguments to the PPU thread state.
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_direct_unplaced(void*, void* thread_ptr, u64, void*, u64 r0, u64 r1, u64 r2)
 	{
+		if (auto* ppu = static_cast<ppu_thread*>(thread_ptr))
+		{
+			ppu->gpr[0] = r0;
+			ppu->gpr[1] = r1;
+			ppu->gpr[2] = r2;
+		}
 	}
 
 	// Library calls the WebAssembly backend emits for intrinsics it cannot lower to an instruction.
@@ -1274,6 +1522,28 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_llvm_set_enabled(s32 enabled)
 	{
 		ppu_web_jit_set_enabled(enabled != 0);
+	}
+
+	// Select the production PPU backend. AOT is fail-closed: an uncovered block
+	// suspends for compilation and aborts if it cannot be registered.
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_ppu_set_backend(s32 aot, s32 fail_closed)
+	{
+		ppu_web_codegen_configure(aot != 0, fail_closed != 0);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_codegen_backend()
+	{
+		return ppu_web_codegen_backend();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_codegen_fail_closed()
+	{
+		return ppu_web_codegen_fail_closed();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_codegen_semantics_version()
+	{
+		return ppu_web_codegen_semantics_version();
 	}
 
 	// Interpreter entries into an uncompiled block before the tier is asked for it (default 64)
@@ -1332,11 +1602,96 @@ extern "C"
 		ppu_web_jit_info(i, out);
 	}
 
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_ppu_hot_find_entry(u32 target_index, u32* out)
+	{
+		return ppu_web_jit_find_entry(target_index, out);
+	}
+
 	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_ppu_jit_report()
 	{
 		static std::string report;
 		report = ppu_web_jit_report();
 		return report.c_str();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_ppu_hle_hooks()
+	{
+		return g_ppu_web_hle_hook_count.load();
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_recomp_set_enabled(s32 enabled)
+	{
+		ppu_web_auto_recomp_set_enabled(enabled != 0);
+	}
+
+	EMSCRIPTEN_KEEPALIVE s32 rpcs3_web_recomp_poll()
+	{
+		return ppu_web_recomp_poll();
+	}
+
+	EMSCRIPTEN_KEEPALIVE const u8* rpcs3_web_recomp_slot_data()
+	{
+		return ppu_web_recomp_slot_data();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_recomp_slot_size()
+	{
+		return ppu_web_recomp_slot_size();
+	}
+
+	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_recomp_slot_name()
+	{
+		return ppu_web_recomp_slot_name();
+	}
+
+	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_recomp_slot_sha1()
+	{
+		return ppu_web_recomp_slot_sha1();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_recomp_slot_seg0()
+	{
+		return ppu_web_recomp_slot_seg0();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_recomp_slot_is_firmware()
+	{
+		return ppu_web_recomp_slot_is_firmware();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_recomp_register_shard(
+		const u8* wasm_bytes,
+		u32 wasm_size,
+		u32 memory_size,
+		u32 memory_align,
+		u32 table_size,
+		u32 imports_table,
+		const u32* guest_rel_pairs,
+		u32 pair_count,
+		u32 shard_seg0)
+	{
+		return ppu_web_recomp_register_shard(
+			wasm_bytes, wasm_size, memory_size, memory_align, table_size, imports_table, guest_rel_pairs, pair_count, shard_seg0);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_audio_ring_address()
+	{
+		return static_cast<u32>(reinterpret_cast<uptr>(&emu::host::services().audio_ring()));
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_audio_pull_f32(f32* dst, u32 frames, u32 channels)
+	{
+		return emu::host::services().pull_audio_frames(dst, frames, channels);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u64 rpcs3_web_resc_flips()
+	{
+		return emu::host::services().display_upscale().resc_flips.load(std::memory_order_relaxed);
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_recomp_slot_finish(u32 ok)
+	{
+		ppu_web_recomp_slot_finish(ok);
 	}
 
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_spu_hot_count()
@@ -1470,6 +1825,7 @@ extern "C"
 		}
 
 		static_cast<void>(spu.test_stopped());
+		spu.unsavable = false;
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_spu_direct_mfc_cmd_saveable(u32 thread)
@@ -1970,8 +2326,13 @@ extern "C"
 	}
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_clock_scale(u32 percent)
 	{
+		const u64 current_tb = s_initialized ? get_timebased_time() : 0;
 		g_rpcs3_web_clocks_scale = std::clamp(percent, 10u, 3000u);
 		g_cfg.core.clocks_scale.set(g_rpcs3_web_clocks_scale);
+		if (s_initialized)
+		{
+			initialize_timebased_time(current_tb, false);
+		}
 	}
 
 	// RPCS3's SPU decoder choice (system_config.h): 0 static interpreter, 1 asmjit (the SPU->wasm
@@ -2019,7 +2380,27 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_trace_pc(u32 pc)
 	{
 		g_ppu_web_trace_hits = 0;
+		g_ppu_web_trace_extra_count = 0;
+		for (auto& trace_pc : g_ppu_web_trace_extra_pcs)
+		{
+			trace_pc = 0;
+		}
 		g_ppu_web_trace_pc = pc;
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_add_trace_pc(u32 pc)
+	{
+		if (!pc)
+		{
+			return;
+		}
+
+		const u32 count = std::min<u32>(g_ppu_web_trace_extra_count, std::size(g_ppu_web_trace_extra_pcs));
+		if (count < std::size(g_ppu_web_trace_extra_pcs))
+		{
+			g_ppu_web_trace_extra_pcs[count] = pc;
+			g_ppu_web_trace_extra_count = count + 1;
+		}
 	}
 
 	EMSCRIPTEN_KEEPALIVE void rpcs3_web_set_trace_delay(u32 pc, u32 delay_ms)
@@ -2090,6 +2471,11 @@ extern "C"
 	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_pad_schedule_applied()
 	{
 		return injected_pad::applied();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_pad_schedule_frame()
+	{
+		return injected_pad::frame();
 	}
 
 	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_ppu_last_function()
@@ -2192,11 +2578,42 @@ extern "C"
 		idm::select<named_thread<ppu_thread>>([&](u32 id, ppu_thread& ppu)
 		{
 			const auto name = ppu.ppu_tname.load();
-			fmt::append(snapshot, "PPU id=0x%08x name=%s pc=0x%08x lr=0x%llx ctr=0x%llx state=0x%x current=%s last=%s args=[0x%llx,0x%llx,0x%llx,0x%llx]\n",
+			fmt::append(snapshot, "PPU id=0x%08x name=%s pc=0x%08x lr=0x%llx ctr=0x%llx state=0x%x current=%s last=%s args=[0x%llx,0x%llx,0x%llx,0x%llx] hle=[target=0x%08x fnid=0x%08x return=0x%08x lr=0x%08x stack_lr=0x%08x expected=0x%08x actual=0x%08x after=0x%08x] dispatch=[source=0x%08x target=0x%08x index=%u kind=%u prev_source=0x%08x prev_target=0x%08x prev_kind=%u]\n",
 				id, name ? name->c_str() : "", ppu.cia, ppu.lr, ppu.ctr, static_cast<u32>(+ppu.state),
 				ppu.current_function ? ppu.current_function : "", ppu.last_function ? ppu.last_function : "",
-				ppu.gpr[3], ppu.gpr[4], ppu.gpr[5], ppu.gpr[6]);
+				ppu.gpr[3], ppu.gpr[4], ppu.gpr[5], ppu.gpr[6],
+				ppu.web_hle_target, ppu.web_hle_fnid, ppu.web_hle_return_pc, ppu.web_hle_lr_before,
+				ppu.web_hle_stack_lr, ppu.web_hle_expected, ppu.web_hle_actual, ppu.web_hle_after,
+				ppu.web_dispatch_source, ppu.web_dispatch_target, ppu.web_dispatch_index, ppu.web_dispatch_kind,
+				ppu.web_dispatch_prev_source, ppu.web_dispatch_prev_target, ppu.web_dispatch_prev_kind);
+			if (ppu.web_dispatch_kind == 4 && ppu.web_dispatch_prev_kind == 4 &&
+				ppu.web_dispatch_source == ppu.web_dispatch_target &&
+				ppu.web_dispatch_prev_source == ppu.web_dispatch_prev_target &&
+				ppu.web_dispatch_source == ppu.web_dispatch_prev_source)
+			{
+				PPUDisAsm disasm(cpu_disasm_mode::normal, vm::g_sudo_addr);
+				const u32 begin = ppu.web_dispatch_source > 0x10 ? ppu.web_dispatch_source - 0x10 : ppu.web_dispatch_source;
+				fmt::append(snapshot, "  repeated compiled PC 0x%08x code:", ppu.web_dispatch_source);
+				for (u32 pc = begin; pc <= ppu.web_dispatch_source + 0x10; pc += 4)
+				{
+					disasm.disasm(pc);
+					fmt::append(snapshot, " [0x%08x: %s]", pc, disasm.last_opcode);
+				}
+				snapshot += '\n';
+			}
 		});
+		if (const u32 trace_pc = g_ppu_web_trace_pc; trace_pc && g_ppu_web_trace_hits)
+		{
+			PPUDisAsm disasm(cpu_disasm_mode::normal, vm::g_sudo_addr);
+			const u32 begin = trace_pc > 0x20 ? trace_pc - 0x20 : trace_pc;
+			fmt::append(snapshot, "trace PC 0x%08x code:", trace_pc);
+			for (u32 pc = begin; pc <= trace_pc + 0x20; pc += 4)
+			{
+				disasm.disasm(pc);
+				fmt::append(snapshot, " [0x%08x: %s]", pc, disasm.last_opcode);
+			}
+			snapshot += '\n';
+		}
 		idm::select<named_thread<spu_thread>>([&](u32, spu_thread& spu)
 		{
 			const auto name = spu.spu_tname.load();
@@ -2230,6 +2647,78 @@ extern "C"
 			// (event-loop) thread, which Emscripten proxies thread cleanup through.
 			Emu.Kill(false);
 		}
+	}
+
+	EMSCRIPTEN_KEEPALIVE void rpcs3_web_save_state()
+	{
+		g_ppu_web_aot_hold_entry = 0;
+		g_ppu_web_aot_step_request.notify_all();
+		if (s_aot_slice_active)
+		{
+			s_aot_slice_release.release(1);
+			s_aot_slice_release.notify_one();
+			while (!s_aot_slice_complete)
+			{
+				s_aot_slice_complete.wait(0);
+			}
+			s_aot_slice_active = 0;
+		}
+		s_aot_context_thread.reset();
+		if (s_initialized && !Emu.IsStopped())
+		{
+			g_cfg.savestate.compatible_mode.set(true);
+			g_cfg.savestate.suspend_emu.set(false);
+			g_cfg.savestate.start_paused.set(false);
+			Emu.Kill(false, true);
+		}
+	}
+
+	EMSCRIPTEN_KEEPALIVE const char* rpcs3_web_last_savestate_path()
+	{
+		static std::string path;
+		path = s_initialized ? Emu.GetBoot() : "";
+		return path.c_str();
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_savestate_size(const char* path)
+	{
+		if (!path || !*path)
+		{
+			return 0;
+		}
+		fs::stat_t st{};
+		if (!fs::get_stat(path, st) || st.is_directory)
+		{
+			return 0;
+		}
+		return static_cast<u32>(st.size);
+	}
+
+	EMSCRIPTEN_KEEPALIVE u32 rpcs3_web_move_savestate(const char* dst_path)
+	{
+		if (!s_initialized || !dst_path || !*dst_path)
+		{
+			return 0;
+		}
+		const std::string src = Emu.GetBoot();
+		const std::string dst = dst_path;
+		if (src.empty() || !fs::is_file(src))
+		{
+			return 0;
+		}
+		if (src != dst)
+		{
+			fs::create_path(fs::get_parent_dir(dst));
+			fs::remove_file(dst);
+			if (!fs::rename(src, dst, true))
+			{
+				if (!fs::copy_file(src, dst, true))
+				{
+					return 0;
+				}
+			}
+		}
+		return rpcs3_web_savestate_size(dst.c_str());
 	}
 
 	// Run functions RPCS3 queued for its main thread. Called by the worker

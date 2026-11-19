@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "Emu/Cell/PPUModule.h"
+#include "Emu/Cell/timers.hpp"
 #include "Emu/Cell/lv2/sys_ppu_thread.h"
 #include "Emu/Cell/lv2/sys_interrupt.h"
 #include "Emu/Cell/lv2/sys_lwmutex.h"
@@ -119,6 +120,13 @@ void sys_initialize_tls(ppu_thread& ppu, u64 main_thread_id, u32 tls_seg_addr, u
 	lwa->name_u64   = "_lv2prx\0"_u64;
 	sys_lwmutex_create(ppu, g_ppu_prx_lwm, lwa);
 	// TODO: missing prx initialization
+#ifdef RPCS3_WEB
+	extern error_code sysmoduleInitializeWeb(ppu_thread& ppu);
+	if (const error_code result = sysmoduleInitializeWeb(ppu); result != CELL_OK)
+	{
+		sysPrxForUser.error("Failed to initialize browser HLE sysmodule mutex: 0x%x", result + 0u);
+	}
+#endif
 }
 
 error_code sys_ppu_thread_create(ppu_thread& ppu, vm::ptr<u64> thread_id, u32 entry, u64 arg, s32 prio, u32 stacksize, u64 flags, vm::cptr<char> threadname)
@@ -160,7 +168,43 @@ error_code sys_ppu_thread_get_id(ppu_thread& ppu, vm::ptr<u64> thread_id)
 {
 	sysPrxForUser.trace("sys_ppu_thread_get_id(thread_id=*0x%x)", thread_id);
 
+	if (!thread_id) [[unlikely]]
+	{
+		return CELL_EFAULT;
+	}
+
 	*thread_id = ppu.id;
+
+#ifdef RPCS3_WEB
+	// Games such as LittleBigPlanet 2 poll async job queues on worker threads via a
+	// non-sleeping loop (__0x30bc74 -> __0x30b534(0) -> sys_ppu_thread_get_id) that
+	// neither sleeps nor yields when called off the queue-owner thread, burning 100%
+	// CPU and starving the 2 LV2 ONPROC PPU slots. Detect rapid back-to-back calls
+	// on the same thread and briefly sleep in LV2 so the owner thread can run.
+	thread_local u64 tl_last_get_id_time = 0;
+	thread_local u32 tl_get_id_streak = 0;
+	const u64 now = get_system_time();
+	if (now - tl_last_get_id_time < 100)
+	{
+		if (++tl_get_id_streak >= 4)
+		{
+			if (!ppu.test_stopped())
+			{
+				ppu.state += cpu_flag::wait;
+				lv2_obj::sleep(ppu, 500);
+				lv2_obj::wait_timeout(500, &ppu, true, true);
+				static_cast<void>(ppu.test_stopped());
+			}
+			tl_last_get_id_time = get_system_time();
+			return CELL_OK;
+		}
+	}
+	else
+	{
+		tl_get_id_streak = 1;
+	}
+	tl_last_get_id_time = now;
+#endif
 
 	return CELL_OK;
 }
@@ -278,7 +322,11 @@ void sysPrxForUser_sys_ppu_thread_init()
 
 	REG_FUNC(sysPrxForUser, sys_initialize_tls).args = {"main_thread_id", "tls_seg_addr", "tls_seg_size", "tls_mem_size"}; // Test
 	REG_FUNC(sysPrxForUser, sys_ppu_thread_create);
+#ifdef RPCS3_WEB
+	REG_FUNC(sysPrxForUser, sys_ppu_thread_get_id).flag(MFF_FORCED_HLE);
+#else
 	REG_FUNC(sysPrxForUser, sys_ppu_thread_get_id);
+#endif
 	REG_FUNC(sysPrxForUser, sys_ppu_thread_exit);
 	REG_FUNC(sysPrxForUser, sys_ppu_thread_once);
 	REG_FUNC(sysPrxForUser, sys_ppu_thread_register_atexit);

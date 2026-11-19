@@ -62,10 +62,10 @@ for (const { suspending, presentationYield, bindGroupCache } of designs) {
     expect(report.presented).toBeGreaterThan(0);
     expect(Number.isInteger(report.frameHash)).toBe(true);
     if (process.env.RPCS3_TEST_STRICT_PIXELS === "1") {
-      // Re-bootstrapped 2026-09-11 after dispatch:build regenerated the
-      // PSL1GHT fixtures (the old pin 3241800133 reflected the previous ELF
-      // bytes). Verify stability by re-running this lane at least twice.
-      expect(report.frameHash).toBe(2236050885);
+      // Pin to the hardware-rendered Tetris frame hash (2236050885 was the FNV-1a
+      // hash of a 320x180 all-zero transparent canvas when createImageBitmap failed
+      // to extract the OffscreenCanvas swapchain texture).
+      expect(report.frameHash).toBe(3241800133);
       expect(report.colored).toBeGreaterThan(100);
     }
     expect(report.timingDrops).toBe(0);

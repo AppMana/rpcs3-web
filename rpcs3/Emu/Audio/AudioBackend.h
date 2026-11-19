@@ -128,6 +128,13 @@ public:
 		return false;
 	}
 
+	// Optional notification invoked when cellAudio commits a new mixed block.
+	// Zero-thread ringbuffer backends (e.g. WebAudioBackend) use this hook to drain
+	// elapsed samples into shared linear memory without spawning extra OS pthreads.
+	virtual void OnDataEnqueued()
+	{
+	}
+
 	/*
 	 * Helper methods
 	 */

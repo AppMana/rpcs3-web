@@ -83,13 +83,17 @@ class PPUTranslator final : public cpu_translator
 
 	// Everything the constructors share once the context is bound
 	void prepare();
+	void RecordLrWrite(llvm::Value* value);
+	void RecordGpr11Write(llvm::Value* value);
 	bool m_may_be_mmio = false;
 	ppu_wasm_branch_mode m_wasm_branch_mode = ppu_wasm_branch_mode::tail_call;
 	bool m_wasm_aot = false;
 	bool m_wasm_inline_reads = false;
+	bool m_wasm_inline_writes = false;
 
 	// Block entry addresses translated into this module part (wasm AOT): calls to any other address go through the guest-address table
 	std::unordered_set<u32> m_wasm_part_blocks;
+	std::map<u32, llvm::BasicBlock*> m_wasm_local_blocks;
 
 #define DEF_VALUE(loc, glb, pos)\
 	llvm::Value*& loc = m_locals[pos];\
@@ -191,6 +195,7 @@ public:
 
 	// Write global registers
 	void FlushRegisters();
+	void ResetLocalRegisters();
 
 	// Load gpr
 	llvm::Value* GetGpr(u32 r, u32 num_bits = 64);

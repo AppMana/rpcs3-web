@@ -13,6 +13,7 @@
 
 #include <emscripten.h>
 
+#include <bit>
 #include <cstring>
 
 #pragma clang diagnostic push
@@ -21,16 +22,20 @@
 #include <common/xxhash.h>
 #pragma clang diagnostic pop
 
-extern volatile u32 g_rpcs3_web_rsx_spawn_pending;
+extern volatile u32 g_rpcs3_web_spawn_pending[3];
 
 
 namespace
 {
 	constexpr u32 vertex_layout_bytes = 144;
-	constexpr u32 vertex_state_bytes = 96 + 468 * 16 + vertex_layout_bytes;
+	constexpr u32 vertex_constants_bytes = 468 * 16;
+	constexpr u32 vertex_env_layout_bytes = 96 + vertex_layout_bytes;
+	constexpr u32 vertex_state_bytes = 96 + vertex_constants_bytes + vertex_layout_bytes;
 	constexpr u32 fragment_constant_slots = 256;
 	constexpr u32 fragment_state_bytes = 32 + fragment_constant_slots * 16;
 	constexpr u32 uniform_alignment = 256;
+	constexpr u32 vertex_constants_stride = utils::align(vertex_constants_bytes, uniform_alignment);
+	constexpr u32 vertex_env_layout_stride = utils::align(vertex_env_layout_bytes, uniform_alignment);
 	constexpr u32 vertex_state_stride = utils::align(vertex_state_bytes, uniform_alignment);
 	constexpr u32 fragment_state_stride = utils::align(fragment_state_bytes, uniform_alignment);
 
@@ -127,6 +132,12 @@ struct BlitOut { @builtin(position) position: vec4f, @location(0) uv: vec2f };
 		case WGPUTextureFormat_RGBA16Float: return "rgba16float";
 		case WGPUTextureFormat_RGBA32Float: return "rgba32float";
 		case WGPUTextureFormat_R32Float: return "r32float";
+		case WGPUTextureFormat_RG16Float: return "rg16float";
+		case WGPUTextureFormat_R16Unorm: return "r16unorm";
+		case WGPUTextureFormat_RG16Unorm: return "rg16unorm";
+		case WGPUTextureFormat_BC1RGBAUnorm: return "bc1-rgba-unorm";
+		case WGPUTextureFormat_BC2RGBAUnorm: return "bc2-rgba-unorm";
+		case WGPUTextureFormat_BC3RGBAUnorm: return "bc3-rgba-unorm";
 		case WGPUTextureFormat_Depth16Unorm: return "depth16unorm";
 		case WGPUTextureFormat_Depth24Plus: return "depth24plus";
 		default: return "?";
@@ -301,8 +312,14 @@ EM_ASYNC_JS(void, rpcs3_web_direct_present, (u32 frame), {
 	if (!self.__rpcs3GpuCanvas) return;
 	const capture = self.__rpcs3GpuCapture;
 	if (capture && (frame === capture.frame || (capture.every && (frame + 1) % capture.every === 0))) {
-		// Snapshot before yielding: the presentation texture may be discarded afterwards.
-		const bitmap = await createImageBitmap(self.__rpcs3GpuCanvas);
+		// Snapshot before yielding: transferToImageBitmap synchronously extracts the WebGPU
+		// presentation texture when the canvas is a standalone OffscreenCanvas (capture mode).
+		let bitmap;
+		try {
+			bitmap = self.__rpcs3GpuCanvas.transferToImageBitmap();
+		} catch (_) {
+			bitmap = await createImageBitmap(self.__rpcs3GpuCanvas);
+		}
 		self.postMessage({ rpcs3Capture: bitmap, frame }, [bitmap]);
 	}
 	self.postMessage({ rpcs3Presented: frame });
@@ -354,7 +371,7 @@ EM_JS(char*, rpcs3_web_direct_translate, (const u8* vp, u32 vp_len, u32 vp_entry
 			textureSwizzles: textureSwizzles,
 		});
 		const header = "slots=" + result.textureSlots.join(",") + ";dims=" + result.textureSlots.map((slot) => result.textureDimensions[slot]).join(",")
-			+ ";constants=" + result.constantCount + ";inputs=" + result.inputs.join(",") + "\n";
+			+ ";constants=" + result.constantCount + ";vconstants=" + (result.vertexConstantCount ?? 468) + ";inputs=" + result.inputs.join(",") + "\n";
 		return stringToNewUTF8(header + result.code);
 	} catch (error) {
 		return stringToNewUTF8("error\n" + String(error && error.stack ? error.stack : error));
@@ -454,6 +471,7 @@ void WebGPUDirectGSRender::on_init_thread()
 void WebGPUDirectGSRender::on_exit()
 {
 	clear_draw_bind_groups();
+	clear_buffer_bind_groups();
 	end_pass();
 	if (m_encoder) { wgpuCommandEncoderRelease(m_encoder); m_encoder = nullptr; }
 	m_rtts.destroy();
@@ -492,6 +510,19 @@ WGPUCommandEncoder WebGPUDirectGSRender::encoder()
 	return m_encoder;
 }
 
+void WebGPUDirectGSRender::reset_pass_state() noexcept
+{
+	m_pass_pipeline = nullptr;
+	m_pass_sx = 0xffffffff;
+	m_pass_sy = 0xffffffff;
+	m_pass_sw = 0;
+	m_pass_sh = 0;
+	m_pass_blend_mask = 0;
+	m_pass_blend_constant = {};
+	m_pass_texture_group = nullptr;
+	m_pass_index_slab_bound = false;
+}
+
 void WebGPUDirectGSRender::begin_pass(const targets& targets)
 {
 	end_pass();
@@ -516,6 +547,7 @@ void WebGPUDirectGSRender::begin_pass(const targets& targets)
 	descriptor.depthStencilAttachment = targets.depth ? &depth : nullptr;
 	m_pass = wgpuCommandEncoderBeginRenderPass(encoder(), &descriptor);
 	m_pass_key = targets.key;
+	reset_pass_state();
 }
 
 void WebGPUDirectGSRender::end_pass()
@@ -526,18 +558,20 @@ void WebGPUDirectGSRender::end_pass()
 		wgpuRenderPassEncoderRelease(m_pass);
 		m_pass = nullptr;
 		m_pass_key = {};
+		reset_pass_state();
 	}
 }
 
 WGPUBindGroup WebGPUDirectGSRender::cached_draw_bind_group(const draw_bind_key& key, const WGPUBindGroupDescriptor& descriptor, bool texture)
 {
-	if (auto found = m_draw_bind_groups.find(key); found != m_draw_bind_groups.end())
+	auto& cache = texture ? m_draw_bind_groups : m_buffer_bind_groups;
+	if (auto found = cache.find(key); found != cache.end())
 	{
 		(texture ? m_stats.texture_bind_group_hits : m_stats.bind_group_hits)++;
 		return found->second;
 	}
 	const auto group = wgpuDeviceCreateBindGroup(m_device, &descriptor);
-	m_draw_bind_groups.emplace(key, group);
+	cache.emplace(key, group);
 	(texture ? m_stats.texture_bind_group_creates : m_stats.bind_group_creates)++;
 	return group;
 }
@@ -546,6 +580,13 @@ void WebGPUDirectGSRender::clear_draw_bind_groups()
 {
 	for (auto& [key, group] : m_draw_bind_groups) wgpuBindGroupRelease(group);
 	m_draw_bind_groups.clear();
+	m_pass_texture_group = nullptr;
+}
+
+void WebGPUDirectGSRender::clear_buffer_bind_groups()
+{
+	for (auto& [key, group] : m_buffer_bind_groups) wgpuBindGroupRelease(group);
+	m_buffer_bind_groups.clear();
 }
 
 void WebGPUDirectGSRender::submit()
@@ -563,7 +604,40 @@ void WebGPUDirectGSRender::submit()
 		wgpuCommandEncoderRelease(m_encoder);
 		m_encoder = nullptr;
 	}
-	clear_draw_bind_groups();
+	if (!m_retired_buffers.empty())
+	{
+		clear_buffer_bind_groups();
+	}
+	if (!m_retired_views.empty())
+	{
+		for (auto it = m_draw_bind_groups.begin(); it != m_draw_bind_groups.end();)
+		{
+			bool uses_retired = false;
+			for (u32 slot = 0; slot < 16 && !uses_retired; ++slot)
+			{
+				const auto view_ptr = it->first[5 + slot * 2];
+				if (!view_ptr) continue;
+				for (auto retired : m_retired_views)
+				{
+					if (view_ptr == reinterpret_cast<uintptr_t>(retired))
+					{
+						uses_retired = true;
+						break;
+					}
+				}
+			}
+			if (uses_retired)
+			{
+				if (m_pass_texture_group == it->second) m_pass_texture_group = nullptr;
+				wgpuBindGroupRelease(it->second);
+				it = m_draw_bind_groups.erase(it);
+			}
+			else
+			{
+				++it;
+			}
+		}
+	}
 	for (auto view : m_retired_views) wgpuTextureViewRelease(view);
 	// Releasing an Emscripten handle only drops a JS reference. Explicit destruction
 	// lets WebGPU reclaim the allocation after already-submitted work completes,
@@ -584,16 +658,24 @@ void WebGPUDirectGSRender::submit()
 	m_uniform_ring.offset = 0;
 	m_stream_ring.offset = 0;
 	m_index_ring.offset = 0;
+	m_index_slab_base = 0;
+	m_index_slab_used = 0;
+	m_index_slab_size = 0;
+	m_index_slab_format = WGPUIndexFormat_Undefined;
+	m_index_slab_buffer = nullptr;
 	m_frame_serial++;
 }
 
-u64 WebGPUDirectGSRender::ring_allocate(ring_buffer& ring, u64 bytes, WGPUBufferUsage usage, const char* label)
+u64 WebGPUDirectGSRender::ring_allocate(ring_buffer& ring, u64 bytes, WGPUBufferUsage usage, const char* label, u64 guard_slack)
 {
-	const u64 needed = utils::align(bytes, uniform_alignment);
-	if (!ring.buffer || ring.offset + needed > ring.size)
+	const u64 align = (usage & WGPUBufferUsage_Index) ? 4ull : static_cast<u64>(uniform_alignment);
+	const u64 needed = utils::align(bytes, align);
+	const u64 required_space = std::max(needed, utils::align(guard_slack, align));
+	if (!ring.buffer || ring.offset + required_space > ring.size)
 	{
 		// Grow: the previous buffer stays referenced by the bind groups and commands of this frame
-		const u64 size = std::max<u64>({ ring.size * 2, ring.offset + needed, 4ull << 20 });
+		const u64 min_initial = (usage & WGPUBufferUsage_Storage) ? (16ull << 20) : (8ull << 20);
+		const u64 size = std::max<u64>({ ring.size * 2, ring.offset + required_space, min_initial });
 		WGPUBufferDescriptor descriptor{};
 		descriptor.label = sv(label);
 		descriptor.usage = usage | WGPUBufferUsage_CopyDst;
@@ -664,22 +746,34 @@ void WebGPUDirectGSRender::prepare_rtts(rsx::framebuffer_creation_context contex
 	m_rtts.orphaned_surfaces.clear();
 	m_current_framebuffer_context = context;
 	m_rtts_bound = true;
+	m_rtt_config_seq++;
 }
 
-void WebGPUDirectGSRender::read_barrier_sampled_surfaces()
+u32 WebGPUDirectGSRender::read_barrier_sampled_surfaces()
 {
+	u32 rtt_overlap_mask = 0;
 	for (u32 i = 0; i < rsx::limits::fragment_textures_count; ++i)
 	{
 		if (!(current_fp_metadata.referenced_textures_mask & (1u << i))) continue;
+		const auto& entry = m_slot_texture_cache[i];
+		const u32* raw_regs = &rsx::method_registers.registers[NV4097_SET_TEXTURE_OFFSET + i * 8];
+		const u32 ctrl3 = rsx::method_registers.registers[NV4097_SET_TEXTURE_CONTROL3 + i];
+		if (!entry.overlaps_rtt && entry.frame_serial == m_frame_serial && entry.rtt_config_seq == m_rtt_config_seq
+			&& entry.control3 == ctrl3 && std::memcmp(entry.regs.data(), raw_regs, 32) == 0)
+		{
+			continue;
+		}
 		const auto& tex = rsx::method_registers.fragment_textures[i];
 		if (!tex.enabled()) continue;
 		const u32 address = rsx::get_address(tex.offset(), tex.location());
 		const u32 length = std::max<u32>(static_cast<u32>(get_texture_size(tex)), 1);
 		m_rtts.for_each_overlapping(rsx::address_range32::start_length(address, length), [&](rsx::webgpu::render_target* surface)
 		{
+			rtt_overlap_mask |= (1u << i);
 			surface->read_barrier(m_surface_ops);
 		});
 	}
+	return rtt_overlap_mask;
 }
 
 WebGPUDirectGSRender::gpu_surface* WebGPUDirectGSRender::surface_by_id(u32 id)
@@ -716,6 +810,7 @@ void WebGPUDirectGSRender::erase_surface(gpu_surface& surface)
 	WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder(), &descriptor);
 	wgpuRenderPassEncoderEnd(pass);
 	wgpuRenderPassEncoderRelease(pass);
+	surface.write_seq = ++m_surface_write_seq;
 }
 
 void WebGPUDirectGSRender::copy_surface(gpu_surface& source, gpu_surface& target, u32 sx1, u32 sy1, u32 sx2, u32 sy2, u32 dx1, u32 dy1, u32 dx2, u32 dy2)
@@ -734,6 +829,7 @@ void WebGPUDirectGSRender::copy_surface(gpu_surface& source, gpu_surface& target
 		WGPUTexelCopyTextureInfo dst{ target.texture, 0, { dx1, dy1, 0 }, WGPUTextureAspect_All };
 		WGPUExtent3D extent{ dw, dh, 1 };
 		wgpuCommandEncoderCopyTextureToTexture(encoder(), &src, &dst, &extent);
+		target.write_seq = ++m_surface_write_seq;
 		return;
 	}
 
@@ -798,6 +894,7 @@ void WebGPUDirectGSRender::copy_surface(gpu_surface& source, gpu_surface& target
 	wgpuRenderPassEncoderEnd(pass);
 	wgpuRenderPassEncoderRelease(pass);
 	wgpuBindGroupRelease(group);
+	target.write_seq = ++m_surface_write_seq;
 }
 
 void WebGPUDirectGSRender::apply_surface_ops()
@@ -835,8 +932,10 @@ void WebGPUDirectGSRender::apply_surface_ops()
 			descriptor.sampleCount = 1;
 			surface.texture = wgpuDeviceCreateTexture(m_device, &descriptor);
 			surface.view = wgpuTextureCreateView(surface.texture, nullptr);
+			surface.write_seq = ++m_surface_write_seq;
 			if (auto existing = surface_by_id(op.id))
 			{
+				release_surface_copies(*existing);
 				m_retired_views.push_back(existing->view);
 				m_retired_textures.push_back(existing->texture);
 			}
@@ -933,8 +1032,14 @@ WebGPUDirectGSRender::targets WebGPUDirectGSRender::bound_targets()
 
 WebGPUDirectGSRender::gpu_program& WebGPUDirectGSRender::get_program(const program_key& key, const std::array<sampled_texture, 16>& textures)
 {
+	if (m_last_program && key == m_last_program_key)
+	{
+		return *m_last_program;
+	}
 	if (const auto found = m_programs.find(key); found != m_programs.end())
 	{
+		m_last_program_key = key;
+		m_last_program = &found->second;
 		return found->second;
 	}
 
@@ -1008,6 +1113,8 @@ WebGPUDirectGSRender::gpu_program& WebGPUDirectGSRender::get_program(const progr
 		if (program.constant_offsets.size() > fragment_constant_slots)
 			program.constant_offsets.resize(fragment_constant_slots);
 	}
+	const auto vconst_str = field("vconstants");
+	program.vertex_constant_count = vconst_str.empty() ? 468u : std::min<u32>(468u, static_cast<u32>(std::stoul(vconst_str)));
 
 	WGPUShaderSourceWGSL source{};
 	source.chain.sType = WGPUSType_ShaderSourceWGSL;
@@ -1027,13 +1134,17 @@ WebGPUDirectGSRender::gpu_program& WebGPUDirectGSRender::get_program(const progr
 		entry.buffer.hasDynamicOffset = m_bind_cache_enabled;
 		entries.push_back(entry);
 	};
+	if (m_bind_cache_enabled)
+	{
+		buffer_entry(31, WGPUShaderStage_Vertex, WGPUBufferBindingType_Uniform);
+	}
 	buffer_entry(32, WGPUShaderStage_Vertex, WGPUBufferBindingType_Uniform);
 	buffer_entry(34, WGPUShaderStage_Vertex, WGPUBufferBindingType_ReadOnlyStorage);
 	buffer_entry(35, WGPUShaderStage_Vertex, WGPUBufferBindingType_ReadOnlyStorage);
 	buffer_entry(33, WGPUShaderStage_Fragment, WGPUBufferBindingType_Uniform);
 	if (m_bind_cache_enabled)
 	{
-		// All translated draw programs share the same four buffer bindings.
+		// All translated draw programs share the same five buffer bindings.
 		if (!m_draw_buffer_layout)
 		{
 			WGPUBindGroupLayoutDescriptor descriptor{};
@@ -1071,14 +1182,23 @@ WebGPUDirectGSRender::gpu_program& WebGPUDirectGSRender::get_program(const progr
 	m_stats.programs++;
 	if (key.color_output_map != (0xe4u & ((1u << (key.target_count * 2)) - 1)))
 		m_stats.remapped_color_programs++;
-	return m_programs.emplace(key, program).first->second;
+	auto& inserted = m_programs.emplace(key, program).first->second;
+	m_last_program_key = key;
+	m_last_program = &inserted;
+	return inserted;
 }
 
 WGPURenderPipeline WebGPUDirectGSRender::get_pipeline(const pipeline_key& key, const gpu_program& program, const targets& targets,
 	WGPUPrimitiveTopology topology, WGPUIndexFormat strip_index_format, const rsx::webgpu::resolved_state_packet& state)
 {
+	if (m_last_pipeline && key == m_last_pipeline_key)
+	{
+		return m_last_pipeline;
+	}
 	if (const auto found = m_pipelines.find(key); found != m_pipelines.end())
 	{
+		m_last_pipeline_key = key;
+		m_last_pipeline = found->second;
 		return found->second;
 	}
 
@@ -1132,6 +1252,8 @@ WGPURenderPipeline WebGPUDirectGSRender::get_pipeline(const pipeline_key& key, c
 	WGPURenderPipeline pipeline = wgpuDeviceCreateRenderPipeline(m_device, &descriptor);
 	m_stats.pipelines++;
 	m_pipelines.emplace(key, pipeline);
+	m_last_pipeline_key = key;
+	m_last_pipeline = pipeline;
 	return pipeline;
 }
 
@@ -1379,39 +1501,81 @@ WebGPUDirectGSRender::gpu_texture* WebGPUDirectGSRender::upload_texture(const rs
 	struct placement_key { rsx::webgpu::texture_packet_record record; u32 address; u32 size; } placement{ record, address, size };
 	std::memset(reinterpret_cast<u8*>(&placement.record) + sizeof(record) - 8, 0, 8);
 	const u64 key = XXH64(&placement, sizeof(placement), 0);
-	const u64 version = vm::web_page_version_sum(address, size);
-	if (const auto found = m_textures.find(key); found != m_textures.end())
+	const auto found = m_textures.find(key);
+	if (found != m_textures.end() && found->second.last_use == m_frame_serial)
 	{
-		if (found->second.version == version)
+		m_stats.texture_hits++;
+		return &found->second;
+	}
+	const u64 version = vm::web_page_version_sum(address, size);
+	if (found != m_textures.end() && found->second.version == version)
+	{
+		found->second.last_use = m_frame_serial;
+		m_stats.texture_hits++;
+		return &found->second;
+	}
+
+	// Guest bytes staged contiguously, 16-byte aligned: the decoder casts spans to the block type
+	// (DXT3/5 blocks are 16 bytes) and requires natural alignment of pointer and size
+	m_guest_staging.resize(utils::align<usz>(size, 16) + 16);
+	std::byte* guest_bytes = reinterpret_cast<std::byte*>(utils::align(reinterpret_cast<uptr>(m_guest_staging.data()), 16));
+	if (!copy_guest_range(guest_bytes, address, size))
+	{
+		return nullptr;
+	}
+	const u64 content_hash = XXH64(guest_bytes, size, 0);
+	bool reuse_existing = false;
+	if (found != m_textures.end())
+	{
+		if (found->second.content_hash == content_hash)
 		{
+			// Unrelated data on a shared 4 KiB page changed; texture bytes are identical
+			found->second.version = version;
 			found->second.last_use = m_frame_serial;
 			m_stats.texture_hits++;
 			return &found->second;
 		}
-		// The guest wrote these pages since the upload: decode again
-		m_retired_views.push_back(found->second.view);
-		m_retired_textures.push_back(found->second.texture);
-		m_texture_bytes -= found->second.bytes;
-		m_textures.erase(found);
+		// The guest modified the texture bytes since the upload: decode again
 		m_stats.texture_invalidations++;
+		if (found->second.last_use != m_frame_serial)
+		{
+			reuse_existing = true;
+		}
+		else
+		{
+			m_retired_views.push_back(found->second.view);
+			m_retired_textures.push_back(found->second.texture);
+			m_texture_bytes -= found->second.bytes;
+			m_textures.erase(found);
+		}
 	}
 
 	const bool cube = record.dimension == 2;
 	const u32 mip_count = std::max<u32>(record.mip_count, 1);
+	const bool swizzled = !(record.format & CELL_GCM_TEXTURE_LN);
+	const u32 block_bytes = rsx::get_format_block_size_in_bytes(gcm_format);
+	const u32 block_texels = rsx::get_format_block_size_in_texel(gcm_format);
+	const u32 tex_width = utils::align<u32>( std::max<u32>(record.width, 1), block_texels);
+	const u32 tex_height = record.dimension == 0 ? 1u : utils::align<u32>(std::max<u32>(record.height, 1), block_texels);
 	WGPUTextureDescriptor descriptor{};
 	descriptor.label = sv("RPCS3 RSX texture");
 	descriptor.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
 	descriptor.dimension = record.dimension == 3 ? WGPUTextureDimension_3D : record.dimension == 0 ? WGPUTextureDimension_1D : WGPUTextureDimension_2D;
-	descriptor.size = { record.width, record.dimension == 0 ? 1u : record.height, cube ? 6u : (record.dimension == 3 ? std::max<u32>(record.depth, 1) : 1u) };
+	descriptor.size = { tex_width, tex_height, cube ? 6u : (record.dimension == 3 ? std::max<u32>(record.depth, 1) : 1u) };
 	descriptor.format = format;
 	descriptor.mipLevelCount = record.dimension == 0 ? 1 : mip_count;
 	descriptor.sampleCount = 1;
-	gpu_texture result{};
-	result.texture = wgpuDeviceCreateTexture(m_device, &descriptor);
+	gpu_texture result = reuse_existing ? found->second : gpu_texture{};
+	if (reuse_existing)
+	{
+		m_texture_bytes -= result.bytes;
+		result.bytes = 0;
+	}
+	else
+	{
+		result.texture = wgpuDeviceCreateTexture(m_device, &descriptor);
+	}
 
-	const bool swizzled = !(record.format & CELL_GCM_TEXTURE_LN);
-	const u32 block_bytes = rsx::get_format_block_size_in_bytes(gcm_format);
-	const u32 block_texels = rsx::get_format_block_size_in_texel(gcm_format);
 	rsx::texture_uploader_capabilities caps{};
 	caps.supports_byteswap = false;
 	caps.supports_vtc_decoding = false;
@@ -1420,15 +1584,6 @@ WebGPUDirectGSRender::gpu_texture* WebGPUDirectGSRender::upload_texture(const rs
 	caps.supports_dxt = true;
 	caps.alignment = 256;
 
-	// Guest bytes staged contiguously, 16-byte aligned: the decoder casts spans to the block type
-	// (DXT3/5 blocks are 16 bytes) and requires natural alignment of pointer and size
-	m_guest_staging.resize(utils::align<usz>(size, 16) + 16);
-	std::byte* guest_bytes = reinterpret_cast<std::byte*>(utils::align(reinterpret_cast<uptr>(m_guest_staging.data()), 16));
-	if (!copy_guest_range(guest_bytes, address, size))
-	{
-		wgpuTextureRelease(result.texture);
-		return nullptr;
-	}
 	u16 layout_height = record.height, layout_depth = 1;
 	u8 layout_layers = 1;
 	switch (record.dimension)
@@ -1453,26 +1608,35 @@ WebGPUDirectGSRender::gpu_texture* WebGPUDirectGSRender::upload_texture(const rs
 		rsx::upload_texture_subresource(buffer, layout, gcm_format, swizzled, caps);
 		WGPUTexelCopyTextureInfo destination{ result.texture, layout.level, { 0, 0, layout.layer }, WGPUTextureAspect_All };
 		WGPUTexelCopyBufferLayout data_layout{ 0, row_pitch, layout.height_in_block };
-		const u32 mip_width = std::max<u32>(record.width >> layout.level, 1);
-		const u32 mip_height = std::max<u32>(record.height >> layout.level, 1);
+		const u32 mip_width = utils::align<u32>(std::max<u32>(tex_width >> layout.level, 1), block_texels);
+		const u32 mip_height = record.dimension == 0 ? 1u : utils::align<u32>(std::max<u32>(tex_height >> layout.level, 1), block_texels);
 		WGPUExtent3D extent{ std::min<u32>(mip_width, layout.width_in_block * block_texels), std::min<u32>(mip_height, layout.height_in_block * block_texels),
 			record.dimension == 3 ? std::max<u32>(layout.depth, 1) : 1u };
 		wgpuQueueWriteTexture(m_queue, &destination, staging_bytes, bytes, &data_layout, &extent);
 		result.bytes += static_cast<u32>(bytes);
 	}
 
-	static const WGPUTextureViewDimension view_dimensions[4] = { WGPUTextureViewDimension_1D, WGPUTextureViewDimension_2D, WGPUTextureViewDimension_Cube, WGPUTextureViewDimension_3D };
-	WGPUTextureViewDescriptor view_descriptor{};
-	view_descriptor.format = format;
-	view_descriptor.dimension = view_dimensions[record.dimension & 3];
-	view_descriptor.mipLevelCount = descriptor.mipLevelCount;
-	view_descriptor.arrayLayerCount = cube ? 6 : 1;
-	view_descriptor.aspect = WGPUTextureAspect_All;
-	result.view = wgpuTextureCreateView(result.texture, &view_descriptor);
+	if (!reuse_existing)
+	{
+		static const WGPUTextureViewDimension view_dimensions[4] = { WGPUTextureViewDimension_1D, WGPUTextureViewDimension_2D, WGPUTextureViewDimension_Cube, WGPUTextureViewDimension_3D };
+		WGPUTextureViewDescriptor view_descriptor{};
+		view_descriptor.format = format;
+		view_descriptor.dimension = view_dimensions[record.dimension & 3];
+		view_descriptor.mipLevelCount = descriptor.mipLevelCount;
+		view_descriptor.arrayLayerCount = cube ? 6 : 1;
+		view_descriptor.aspect = WGPUTextureAspect_All;
+		result.view = wgpuTextureCreateView(result.texture, &view_descriptor);
+	}
 	result.last_use = m_frame_serial;
 	result.version = version;
+	result.content_hash = content_hash;
 	m_texture_bytes += result.bytes;
 	m_stats.texture_uploads++;
+	if (reuse_existing)
+	{
+		found->second = result;
+		return &found->second;
+	}
 
 	// Budget: retire the least recently used uploads beyond 512 MiB
 	if (m_texture_bytes > (512ull << 20))
@@ -1495,8 +1659,9 @@ WebGPUDirectGSRender::gpu_texture* WebGPUDirectGSRender::upload_texture(const rs
 	return &m_textures.emplace(key, result).first->second;
 }
 
-WebGPUDirectGSRender::sampled_texture WebGPUDirectGSRender::resolve_texture(const rsx::fragment_texture& texture, u32 slot)
+WebGPUDirectGSRender::sampled_texture WebGPUDirectGSRender::resolve_texture(const rsx::fragment_texture& texture, u32 slot, bool* out_aliased)
 {
+	if (out_aliased) *out_aliased = false;
 	sampled_texture result{};
 	rsx::webgpu::texture_packet_record record{};
 	u32 address = 0;
@@ -1516,6 +1681,7 @@ WebGPUDirectGSRender::sampled_texture WebGPUDirectGSRender::resolve_texture(cons
 	// slice stacks (the texture cache's surface path), before any guest-memory upload
 	if ((result.dimension == 1 || result.dimension == 3) && alias_surface_texture(record, address, gcm_format, result))
 	{
+		if (out_aliased) *out_aliased = true;
 		m_stats.surface_hits++;
 		return result;
 	}
@@ -1598,9 +1764,20 @@ bool WebGPUDirectGSRender::alias_surface_texture(const rsx::webgpu::texture_pack
 		return true;
 	}
 
-	end_pass();
 	if (whole)
 	{
+		if (hit->scratch.texture && hit->scratch.width == hit->width && hit->scratch.height == hit->height && hit->scratch.source_write_seq == hit->write_seq)
+		{
+			result.view = hit->scratch.view;
+			return true;
+		}
+		end_pass();
+		if (hit->scratch.texture && (hit->scratch.width != hit->width || hit->scratch.height != hit->height))
+		{
+			m_retired_views.push_back(hit->scratch.view);
+			m_retired_textures.push_back(hit->scratch.texture);
+			hit->scratch = {};
+		}
 		if (!hit->scratch.texture)
 		{
 			WGPUTextureDescriptor descriptor{};
@@ -1620,6 +1797,7 @@ bool WebGPUDirectGSRender::alias_surface_texture(const rsx::webgpu::texture_pack
 		WGPUTexelCopyTextureInfo dst{ hit->scratch.texture, 0, { 0, 0, 0 }, WGPUTextureAspect_All };
 		WGPUExtent3D extent{ hit->width, hit->height, 1 };
 		wgpuCommandEncoderCopyTextureToTexture(encoder(), &src, &dst, &extent);
+		hit->scratch.source_write_seq = hit->write_seq;
 		result.view = hit->scratch.view;
 		return true;
 	}
@@ -1630,8 +1808,14 @@ bool WebGPUDirectGSRender::alias_surface_texture(const rsx::webgpu::texture_pack
 	const u32 region_width = std::max<u32>(1, static_cast<u32>(std::lround((static_cast<f32>(record.width) / hit->samples_x) * scale_x)));
 	const u32 region_height = std::max<u32>(1, static_cast<u32>(std::lround((static_cast<f32>(record.height) / hit->samples_y) * scale_y)));
 	const u32 region_row = static_cast<u32>(std::lround((static_cast<f32>(row_offset) / hit->samples_y) * scale_y));
-	const std::string key = fmt::format("%u:%ux%ux%u", row_offset, record.width, record.height, depth);
+	const u64 key = (static_cast<u64>(row_offset) << 48) | (static_cast<u64>(record.width) << 32) | (static_cast<u64>(record.height) << 16) | (depth & 0xffffu);
 	auto& region = hit->regions[key];
+	if (region.texture && region.width == region_width && region.height == region_height && region.depth == depth && region.row == region_row && region.source_write_seq == hit->write_seq)
+	{
+		result.view = region.view;
+		return true;
+	}
+	end_pass();
 	if (region.texture && (region.width != region_width || region.height != region_height || region.depth != depth))
 	{
 		m_retired_views.push_back(region.view);
@@ -1661,6 +1845,7 @@ bool WebGPUDirectGSRender::alias_surface_texture(const rsx::webgpu::texture_pack
 		region.depth = depth;
 	}
 	region.row = region_row;
+	region.source_write_seq = hit->write_seq;
 	for (u32 slice = 0; slice < depth; slice++)
 	{
 		const u32 source_row = region_row + slice * region_height;
@@ -1698,6 +1883,8 @@ void WebGPUDirectGSRender::end()
 	}
 
 	draw_scope.next(utils::frame_timing::phase::draw_setup);
+	const bool vp_ucode_dirty = m_graphics_state.test(rsx::pipeline_state::vertex_program_ucode_dirty);
+	const bool fp_ucode_dirty = m_graphics_state.test(rsx::pipeline_state::fragment_program_ucode_dirty);
 	analyse_current_rsx_pipeline();
 	if (!current_fp_metadata.referenced_textures_mask)
 	{
@@ -1714,7 +1901,7 @@ void WebGPUDirectGSRender::end()
 	{
 		if (auto surface = std::get<1>(rtt)) surface->write_barrier(m_surface_ops);
 	}
-	read_barrier_sampled_surfaces();
+	const u32 rtt_overlap_mask = read_barrier_sampled_surfaces();
 	apply_surface_ops();
 
 	const targets targets = bound_targets();
@@ -1738,45 +1925,73 @@ void WebGPUDirectGSRender::end()
 		// Record enabled, shader-referenced use before changing coordinate semantics.
 		if (texture.enabled() && (texture.format() & CELL_GCM_TEXTURE_UN))
 			m_stats.unnormalized_texture_slots |= 1u << slot;
-		textures[slot] = resolve_texture(texture, slot);
+
+		const u32* raw_regs = &rsx::method_registers.registers[NV4097_SET_TEXTURE_OFFSET + slot * 8];
+		const u32 ctrl3 = rsx::method_registers.registers[NV4097_SET_TEXTURE_CONTROL3 + slot];
+		auto& cache_entry = m_slot_texture_cache[slot];
+		if (!(rtt_overlap_mask & (1u << slot)) &&
+			!cache_entry.overlaps_rtt &&
+			cache_entry.frame_serial == m_frame_serial &&
+			cache_entry.rtt_config_seq == m_rtt_config_seq &&
+			cache_entry.control3 == ctrl3 &&
+			std::memcmp(cache_entry.regs.data(), raw_regs, 32) == 0)
+		{
+			textures[slot] = cache_entry.resolved;
+			dimensions[slot] = textures[slot].dimension;
+			m_stats.texture_hits++;
+			continue;
+		}
+
+		bool aliased = false;
+		textures[slot] = resolve_texture(texture, slot, &aliased);
 		dimensions[slot] = textures[slot].dimension;
+		std::memcpy(cache_entry.regs.data(), raw_regs, 32);
+		cache_entry.control3 = ctrl3;
+		cache_entry.frame_serial = m_frame_serial;
+		cache_entry.rtt_config_seq = m_rtt_config_seq;
+		cache_entry.overlaps_rtt = aliased || ((rtt_overlap_mask & (1u << slot)) != 0);
+		cache_entry.resolved = textures[slot];
 	}
 
 	draw_scope.next(utils::frame_timing::phase::draw_program);
-	const double ts_state0 = utils::frame_timing::now_us();
 	rsx::webgpu::resolved_state_packet state{};
 	rsx::webgpu::fill_resolved_state(state, 0, m_framebuffer_layout);
-	m_stats.preamble_state_ns += static_cast<u64>((utils::frame_timing::now_us() - ts_state0) * 1000.0);
 	const u32 alpha_func = state.alpha_test_enabled ? (state.alpha_func & 7) : 0xff;
 	const u32 target_count = static_cast<u32>(targets.colors.size());
 
 	// RPCS3's ucode hashes: the fragment hash skips the inline constants, which the draw
 	// supplies through the fragment uniform (fragment_program_utils::get_fragment_program_ucode_hash).
-	// Consecutive clauses that redraw the SAME program (byte-identical ucode, same backing
-	// pointer/len) skip re-hashing: the preamble cost on the RSX thread drops to a pointer check.
-	const double ts_hash0 = utils::frame_timing::now_us();
-	const u64 vp_hash = [&]()
+	if (vp_ucode_dirty || m_vp_hash_cache.hash == 0)
 	{
 		const auto* vd = reinterpret_cast<const u8*>(current_vertex_program.data.data());
 		const auto vl = static_cast<u32>(current_vp_metadata.ucode_length);
-		if (m_vp_hash_cache.data == vd && m_vp_hash_cache.len == vl)
-			return m_vp_hash_cache.hash;
 		const u64 h = program_hash_util::vertex_program_utils::get_vertex_program_ucode_hash(current_vertex_program);
 		m_vp_hash_cache = {vd, vl, h};
-		return h;
-	}();
-	const u64 fp_hash = [&]()
+	}
+	const u64 vp_hash = m_vp_hash_cache.hash;
+
+	if (fp_ucode_dirty || m_fp_hash_cache.hash == 0)
 	{
 		const auto* fd = static_cast<const u8*>(current_fragment_program.get_data());
 		const auto fl = static_cast<u32>(current_fragment_program.ucode_length);
-		if (m_fp_hash_cache.data == fd && m_fp_hash_cache.len == fl)
-			return m_fp_hash_cache.hash;
-		const u64 h = program_hash_util::fragment_program_utils::get_fragment_program_ucode_hash(current_fragment_program);
-		m_fp_hash_cache = {fd, fl, h};
-		return h;
-	}();
-	m_stats.preamble_hash_ns += static_cast<u64>((utils::frame_timing::now_us() - ts_hash0) * 1000.0);
-	const double ts_key0 = utils::frame_timing::now_us();
+		if (m_fp_hash_cache.data != fd || m_fp_hash_cache.len != fl)
+		{
+			const usz slot = ((reinterpret_cast<uintptr_t>(fd) >> 4) ^ (static_cast<usz>(fl) * 131u)) & (m_fp_frame_hashes.size() - 1);
+			auto& entry = m_fp_frame_hashes[slot];
+			if (entry.data == fd && entry.len == fl && entry.frame == m_frame_serial)
+			{
+				m_fp_hash_cache = {fd, fl, entry.hash};
+			}
+			else
+			{
+				const u64 h = program_hash_util::fragment_program_utils::get_fragment_program_ucode_hash(current_fragment_program);
+				entry = {fd, fl, m_frame_serial, h};
+				m_fp_hash_cache = {fd, fl, h};
+			}
+		}
+	}
+	const u64 fp_hash = m_fp_hash_cache.hash;
+
 	program_key program_id{};
 	program_id.vertex_hash = vp_hash;
 	program_id.fragment_hash = fp_hash;
@@ -1793,7 +2008,6 @@ void WebGPUDirectGSRender::end()
 		if (current_fp_metadata.referenced_textures_mask & (1u << slot)) program_id.swizzles[slot] = textures[slot].swizzle;
 	}
 	gpu_program& program = get_program(program_id, textures);
-	m_stats.preamble_keymap_ns += static_cast<u64>((utils::frame_timing::now_us() - ts_key0) * 1000.0);
 	if (!program.valid)
 	{
 		m_stats.draws_skipped++;
@@ -1808,34 +2022,47 @@ void WebGPUDirectGSRender::end()
 		m_stats.unsupported++;
 	}
 
+	// Build texture bind group (group 0) once per end() call when bind caching is active.
+	WGPUBindGroup clause_texture_group = nullptr;
+	if (m_bind_cache_enabled)
+	{
+		draw_scope.next(utils::frame_timing::phase::draw_bind);
+		if (m_draw_bind_groups.size() >= 16384) clear_draw_bind_groups();
+		std::array<WGPUBindGroupEntry, 32> tex_entries{};
+		usz tex_entry_count = 0;
+		draw_bind_key texture_key{};
+		texture_key[0] = reinterpret_cast<uintptr_t>(program.bind_group_layout);
+		for (u32 slot : program.texture_slots)
+		{
+			auto& view = tex_entries[tex_entry_count++];
+			view.binding = slot * 2;
+			view.textureView = textures[slot].view ? textures[slot].view : null_texture_view(program.texture_dimensions[slot]);
+			texture_key[5 + view.binding] = reinterpret_cast<uintptr_t>(static_cast<void*>(view.textureView));
+
+			auto& sampler = tex_entries[tex_entry_count++];
+			sampler.binding = slot * 2 + 1;
+			sampler.sampler = textures[slot].sampler ? textures[slot].sampler : null_sampler();
+			texture_key[5 + sampler.binding] = reinterpret_cast<uintptr_t>(static_cast<void*>(sampler.sampler));
+		}
+		WGPUBindGroupDescriptor tex_group_desc{};
+		tex_group_desc.layout = program.bind_group_layout;
+		tex_group_desc.entryCount = tex_entry_count;
+		tex_group_desc.entries = tex_entries.data();
+		clause_texture_group = cached_draw_bind_group(texture_key, tex_group_desc, true);
+	}
+
+	const bool vconst_dirty = m_graphics_state.test(rsx::transform_constants_dirty);
+	if (vconst_dirty) m_graphics_state.clear(rsx::transform_constants_dirty);
+	bool clause_vconst_uploaded = false;
+	u64 clause_frag_offset = 0;
+	bool clause_frag_uploaded = false;
+
 	auto& clause = rsx::method_registers.current_draw_clause;
 	clause.begin();
 	u32 subdraw = 0;
-	// Dawn's render-pass encoder is stateful: consecutive subdraws in one clause very often
-	// share the pipeline, scissor rect, blend constant and the texture bind group (only the
-	// dynamic-offset buffer bind group varies per draw). Hoist the cheap state-setting so a
-	// run of N same-state subdraws emits ONE Dawn call instead of N; the per-draw bindgroup
-	// (dynamic offsets) and the draw itself remain inside the loop.
-	WGPURenderPipeline last_pipeline = nullptr;
-	u32 last_sx = 0xffffffff, last_sy = 0xffffffff, last_sw = 0, last_sh = 0;
-	u32 last_blend_mask = 0;
-	std::array<f32, 4> last_blend_constant{0.f, 0.f, 0.f, 0.f};
-	WGPUBindGroup last_texture_group = nullptr;
-	usz last_texture_sz = 0;
-	// Clause-scoped index slab: consecutive indexed runs in one clause merge into ONE slab
-	// slot (allocated on the first indexed run of each index-format segment), so Dawn's
-	// setIndexBuffer is emitted once per segment (Dawn keeps the bound index buffer) and each
-	// run draws with a per-run firstIndex into that buffer. An overflow or format change
-	// allocates a fresh slab slot and re-binds; the previously bound Dawn buffer stays valid
-	// for the encoder (a flush retires the pool but never overwrites referenced GPU buffers).
-	constexpr u64 k_clause_index_slab = 1 << 16;
-	u64 index_slab_base = 0;
-	u64 index_slab_used = 0;
-	WGPUIndexFormat index_slab_format = WGPUIndexFormat_Undefined;
-	bool index_slab_bound = false;
 	do
 	{
-		utils::frame_timing::phase_scope stage(utils::frame_timing::phase::draw_clause);
+		draw_scope.next(utils::frame_timing::phase::draw_clause);
 		const auto pipeline_state = subdraw == 0 ? rsx::flags32_t{ rsx::vertex_arrays_changed } : rsx::flags32_t{ clause.execute_pipeline_dependencies(m_ctx) };
 		subdraw++;
 		if (pipeline_state & rsx::vertex_arrays_changed)
@@ -1851,7 +2078,7 @@ void WebGPUDirectGSRender::end()
 			}
 		}
 		if (!m_vertex_layout.validate()) continue;
-		stage.next(utils::frame_timing::phase::draw_vertex);
+		draw_scope.next(utils::frame_timing::phase::draw_vertex);
 
 		const auto command = m_draw_processor.get_draw_command(rsx::method_registers);
 		const auto upload = rsx::webgpu::prepare_draw_vertex_upload(m_vertex_layout, command);
@@ -1871,10 +2098,23 @@ void WebGPUDirectGSRender::end()
 		const auto requirements = calculate_memory_requirements(m_vertex_layout, upload.first_vertex, upload.allocated_vertex_count);
 		// Reserve the complete draw before exposing staging pointers. Growing a ring
 		// invalidates its staging pointers and retires its previous GPU buffer.
-		const u64 persistent_span = utils::align<u64>(std::max<usz>(requirements.first, 16), uniform_alignment);
-		const u64 transient_span = utils::align<u64>(std::max<usz>(requirements.second, 16), uniform_alignment);
-		const u64 persistent_offset = ring_allocate(m_stream_ring, persistent_span + transient_span, WGPUBufferUsage_Storage, "RPCS3 RSX vertex streams");
-		const u64 transient_offset = persistent_offset + persistent_span;
+		// Bucket smaller vertex stream spans to powers of two when bind caching is active
+		// so draws with varying vertex counts reuse a tiny set of buffer bind groups.
+		const auto bucket_stream_span = [this](usz raw_bytes) -> u64
+		{
+			const u64 aligned = utils::align<u64>(std::max<usz>(raw_bytes, 16), uniform_alignment);
+			if (m_bind_cache_enabled && aligned <= 65536)
+			{
+				return std::bit_ceil(aligned);
+			}
+			return aligned;
+		};
+		const u64 persistent_alloc = utils::align<u64>(std::max<usz>(requirements.first, 16), uniform_alignment);
+		const u64 transient_alloc = utils::align<u64>(std::max<usz>(requirements.second, 16), uniform_alignment);
+		const u64 persistent_span = bucket_stream_span(requirements.first);
+		const u64 transient_span = bucket_stream_span(requirements.second);
+		const u64 persistent_offset = ring_allocate(m_stream_ring, persistent_alloc + transient_alloc, WGPUBufferUsage_Storage, "RPCS3 RSX vertex streams", persistent_span + transient_span);
+		const u64 transient_offset = persistent_offset + persistent_alloc;
 		const std::span<std::byte> persistent{m_stream_ring.staging.data() + persistent_offset, requirements.first};
 		const std::span<std::byte> transient{m_stream_ring.staging.data() + transient_offset, requirements.second};
 		// Prepare directly in the upload ring instead of copying per-draw scratch
@@ -1882,51 +2122,137 @@ void WebGPUDirectGSRender::end()
 		m_draw_processor.write_vertex_data_to_memory(m_vertex_layout, upload.first_vertex, upload.allocated_vertex_count,
 			persistent.empty() ? nullptr : persistent.data(), transient.empty() ? nullptr : transient.data());
 
-		stage.next(utils::frame_timing::phase::draw_uniform);
-		const u64 uniform_offset = ring_allocate(m_uniform_ring, vertex_state_stride + fragment_state_stride, WGPUBufferUsage_Uniform, "RPCS3 RSX uniforms");
-		const std::span<std::byte> vertex_state{m_uniform_ring.staging.data() + uniform_offset, vertex_state_bytes};
-		std::fill(vertex_state.begin(), vertex_state.end(), std::byte{});
-		m_draw_processor.fill_scale_offset_data(vertex_state.data(), false);
-		m_draw_processor.fill_user_clip_data(vertex_state.data() + 64);
-		*reinterpret_cast<u32*>(vertex_state.data() + 68) = rsx::method_registers.transform_branch_bits();
-		*reinterpret_cast<f32*>(vertex_state.data() + 72) = rsx::method_registers.point_size() * resolution_scaling_config.scale_factor();
-		*reinterpret_cast<f32*>(vertex_state.data() + 76) = rsx::method_registers.clip_min();
-		*reinterpret_cast<f32*>(vertex_state.data() + 80) = rsx::method_registers.clip_max();
-		m_draw_processor.fill_vertex_program_constants_data(vertex_state.data() + 96, {});
-		auto* layout_words = reinterpret_cast<u32*>(vertex_state.data() + 96 + 468 * 16);
-		layout_words[0] = upload.vertex_index_base;
-		layout_words[1] = upload.vertex_index_offset;
-		m_draw_processor.fill_vertex_layout_state(m_vertex_layout, current_vp_metadata, upload.first_vertex, upload.allocated_vertex_count, reinterpret_cast<s32*>(layout_words + 4), 0, 0);
-
-		const std::span<std::byte> fragment_state{m_uniform_ring.staging.data() + uniform_offset + vertex_state_stride, fragment_state_bytes};
-		std::fill(fragment_state.begin(), fragment_state.end(), std::byte{});
-		m_draw_processor.fill_fragment_state_buffer(fragment_state.data(), current_fragment_program);
-		if (!program.constant_offsets.empty())
+		draw_scope.next(utils::frame_timing::phase::draw_uniform);
+		u64 vconst_offset = 0;
+		u64 uniform_offset = 0;
+		u64 frag_offset = 0;
+		if (m_bind_cache_enabled)
 		{
-			const std::span<f32> constants{reinterpret_cast<f32*>(fragment_state.data() + 32), program.constant_offsets.size() * 4};
-			rsx::write_fragment_constants_to_buffer(constants, current_fragment_program, program.constant_offsets, false);
+			const bool subdraw_vconst_dirty = (!clause_vconst_uploaded && vconst_dirty) || (pipeline_state & rsx::transform_constants_changed);
+			const u32 needed_vconsts = std::min<u32>(468u, program.vertex_constant_count);
+			const bool need_vconst_upload = subdraw_vconst_dirty ||
+				m_last_vconst_frame != m_frame_serial ||
+				m_last_vconst_buffer != m_uniform_ring.buffer ||
+				needed_vconsts > m_last_vconst_count;
+			if (need_vconst_upload)
+			{
+				const u32 upload_vconsts = subdraw_vconst_dirty ? needed_vconsts : std::max<u32>(needed_vconsts, m_last_vconst_count);
+				const u64 vconst_write_bytes = std::max<u64>(static_cast<u64>(upload_vconsts) * 16ull, 16ull);
+				vconst_offset = ring_allocate(m_uniform_ring, vconst_write_bytes, WGPUBufferUsage_Uniform, "RPCS3 RSX uniforms", vertex_constants_stride);
+				if (upload_vconsts > 0)
+				{
+					m_draw_processor.fill_vertex_program_constants_data(m_uniform_ring.staging.data() + vconst_offset, std::span<const u16>{});
+				}
+				m_last_vconst_offset = vconst_offset;
+				m_last_vconst_count = upload_vconsts;
+				m_last_vconst_frame = m_frame_serial;
+				m_last_vconst_buffer = m_uniform_ring.buffer;
+				clause_vconst_uploaded = true;
+			}
+			else
+			{
+				vconst_offset = m_last_vconst_offset;
+			}
+
+			uniform_offset = ring_allocate(m_uniform_ring, vertex_env_layout_stride, WGPUBufferUsage_Uniform, "RPCS3 RSX uniforms");
+			if (m_last_vconst_buffer != m_uniform_ring.buffer)
+			{
+				const u32 upload_vconsts = std::max<u32>(needed_vconsts, m_last_vconst_count);
+				const u64 vconst_write_bytes = std::max<u64>(static_cast<u64>(upload_vconsts) * 16ull, 16ull);
+				vconst_offset = ring_allocate(m_uniform_ring, vconst_write_bytes, WGPUBufferUsage_Uniform, "RPCS3 RSX uniforms", vertex_constants_stride);
+				if (upload_vconsts > 0)
+				{
+					m_draw_processor.fill_vertex_program_constants_data(m_uniform_ring.staging.data() + vconst_offset, std::span<const u16>{});
+				}
+				m_last_vconst_offset = vconst_offset;
+				m_last_vconst_count = upload_vconsts;
+				m_last_vconst_frame = m_frame_serial;
+				m_last_vconst_buffer = m_uniform_ring.buffer;
+			}
+
+			const std::span<std::byte> vertex_state{m_uniform_ring.staging.data() + uniform_offset, vertex_env_layout_bytes};
+			std::memset(vertex_state.data() + 64, 0, 48);
+			m_draw_processor.fill_scale_offset_data(vertex_state.data(), false);
+			m_draw_processor.fill_user_clip_data(vertex_state.data() + 64);
+			*reinterpret_cast<u32*>(vertex_state.data() + 68) = rsx::method_registers.transform_branch_bits();
+			*reinterpret_cast<f32*>(vertex_state.data() + 72) = rsx::method_registers.point_size() * resolution_scaling_config.scale_factor();
+			*reinterpret_cast<f32*>(vertex_state.data() + 76) = rsx::method_registers.clip_min();
+			*reinterpret_cast<f32*>(vertex_state.data() + 80) = rsx::method_registers.clip_max();
+			auto* layout_words = reinterpret_cast<u32*>(vertex_state.data() + 96);
+			layout_words[0] = upload.vertex_index_base;
+			layout_words[1] = upload.vertex_index_offset;
+			layout_words[2] = 0;
+			layout_words[3] = 0;
+			m_draw_processor.fill_vertex_layout_state(m_vertex_layout, current_vp_metadata, upload.first_vertex, upload.allocated_vertex_count, reinterpret_cast<s32*>(layout_words + 4), 0, 0);
+
+			if (!clause_frag_uploaded)
+			{
+				const u64 frag_write_bytes = 32ull + static_cast<u64>(program.constant_offsets.size()) * 16ull;
+				clause_frag_offset = ring_allocate(m_uniform_ring, frag_write_bytes, WGPUBufferUsage_Uniform, "RPCS3 RSX uniforms", fragment_state_stride);
+				if (m_last_vconst_buffer != m_uniform_ring.buffer)
+				{
+					const u32 upload_vconsts = std::max<u32>(needed_vconsts, m_last_vconst_count);
+					const u64 vconst_write_bytes = std::max<u64>(static_cast<u64>(upload_vconsts) * 16ull, 16ull);
+					vconst_offset = ring_allocate(m_uniform_ring, vconst_write_bytes, WGPUBufferUsage_Uniform, "RPCS3 RSX uniforms", vertex_constants_stride);
+					if (upload_vconsts > 0)
+					{
+						m_draw_processor.fill_vertex_program_constants_data(m_uniform_ring.staging.data() + vconst_offset, std::span<const u16>{});
+					}
+					m_last_vconst_offset = vconst_offset;
+					m_last_vconst_count = upload_vconsts;
+					m_last_vconst_frame = m_frame_serial;
+					m_last_vconst_buffer = m_uniform_ring.buffer;
+				}
+				std::byte* frag_ptr = m_uniform_ring.staging.data() + clause_frag_offset;
+				std::memset(frag_ptr, 0, 32);
+				m_draw_processor.fill_fragment_state_buffer(frag_ptr, current_fragment_program);
+				if (!program.constant_offsets.empty())
+				{
+					const std::span<f32> constants{reinterpret_cast<f32*>(frag_ptr + 32), program.constant_offsets.size() * 4};
+					rsx::write_fragment_constants_to_buffer(constants, current_fragment_program, program.constant_offsets, false);
+				}
+				clause_frag_uploaded = true;
+			}
+			frag_offset = clause_frag_offset;
+		}
+		else
+		{
+			uniform_offset = ring_allocate(m_uniform_ring, vertex_state_stride + fragment_state_stride, WGPUBufferUsage_Uniform, "RPCS3 RSX uniforms");
+			frag_offset = uniform_offset + vertex_state_stride;
+			const std::span<std::byte> vertex_state{m_uniform_ring.staging.data() + uniform_offset, vertex_state_bytes};
+			std::fill(vertex_state.begin(), vertex_state.end(), std::byte{});
+			m_draw_processor.fill_scale_offset_data(vertex_state.data(), false);
+			m_draw_processor.fill_user_clip_data(vertex_state.data() + 64);
+			*reinterpret_cast<u32*>(vertex_state.data() + 68) = rsx::method_registers.transform_branch_bits();
+			*reinterpret_cast<f32*>(vertex_state.data() + 72) = rsx::method_registers.point_size() * resolution_scaling_config.scale_factor();
+			*reinterpret_cast<f32*>(vertex_state.data() + 76) = rsx::method_registers.clip_min();
+			*reinterpret_cast<f32*>(vertex_state.data() + 80) = rsx::method_registers.clip_max();
+			m_draw_processor.fill_vertex_program_constants_data(vertex_state.data() + 96, {});
+			auto* layout_words = reinterpret_cast<u32*>(vertex_state.data() + 96 + 468 * 16);
+			layout_words[0] = upload.vertex_index_base;
+			layout_words[1] = upload.vertex_index_offset;
+			m_draw_processor.fill_vertex_layout_state(m_vertex_layout, current_vp_metadata, upload.first_vertex, upload.allocated_vertex_count, reinterpret_cast<s32*>(layout_words + 4), 0, 0);
+
+			const std::span<std::byte> fragment_state{m_uniform_ring.staging.data() + frag_offset, fragment_state_bytes};
+			std::fill(fragment_state.begin(), fragment_state.end(), std::byte{});
+			m_draw_processor.fill_fragment_state_buffer(fragment_state.data(), current_fragment_program);
+			if (!program.constant_offsets.empty())
+			{
+				const std::span<f32> constants{reinterpret_cast<f32*>(fragment_state.data() + 32), program.constant_offsets.size() * 4};
+				rsx::write_fragment_constants_to_buffer(constants, current_fragment_program, program.constant_offsets, false);
+			}
 		}
 
 		u64 index_offset = 0;
 		if (upload.indexed)
 		{
-			// Merge consecutive runs into a clause slab slot; a new segment (format change or
-			// slab overflow) allocates a fresh slot and requires a re-bind.
-			const WGPUIndexFormat this_format = upload.index_type == rsx::index_array_type::u32 ? WGPUIndexFormat_Uint32 : WGPUIndexFormat_Uint16;
-			if (index_slab_used == 0 || this_format != index_slab_format || index_slab_used + upload.indices.size() > k_clause_index_slab)
-			{
-				index_slab_base = ring_allocate(m_index_ring, k_clause_index_slab, WGPUBufferUsage_Index, "RPCS3 RSX indices");
-				index_slab_used = 0;
-				index_slab_format = this_format;
-				index_slab_bound = false;
-			}
-			index_offset = index_slab_base + index_slab_used;
+			const u64 aligned_indices_size = utils::align<u64>(upload.indices.size(), 4);
+			index_offset = ring_allocate(m_index_ring, aligned_indices_size, WGPUBufferUsage_Index, "RPCS3 RSX indices");
 			ring_write(m_index_ring, index_offset, upload.indices.data(), upload.indices.size());
-			index_slab_used += utils::align<u64>(upload.indices.size(), 4);
 		}
 
-		stage.next(utils::frame_timing::phase::draw_bind);
-		std::array<WGPUBindGroupEntry, 36> entries{};
+		draw_scope.next(utils::frame_timing::phase::draw_bind);
+		std::array<WGPUBindGroupEntry, 37> entries{};
 		usz entry_count = 0;
 		auto buffer_entry = [&](u32 binding, WGPUBuffer buffer, u64 offset, u64 size)
 		{
@@ -1937,54 +2263,49 @@ void WebGPUDirectGSRender::end()
 			entry.size = size;
 			entries[entry_count++] = entry;
 		};
-		buffer_entry(32, m_uniform_ring.buffer, uniform_offset, vertex_state_bytes);
-		buffer_entry(34, m_stream_ring.buffer, persistent_offset, utils::align(std::max<usz>(persistent.size(), 16), 16));
-		buffer_entry(35, m_stream_ring.buffer, transient_offset, utils::align(std::max<usz>(transient.size(), 16), 16));
-		buffer_entry(33, m_uniform_ring.buffer, uniform_offset + vertex_state_stride, fragment_state_bytes);
-		for (u32 slot : program.texture_slots)
-		{
-			auto& view = entries[entry_count++];
-			view.binding = slot * 2;
-			view.textureView = textures[slot].view ? textures[slot].view : null_texture_view(program.texture_dimensions[slot]);
-			auto& sampler = entries[entry_count++];
-			sampler.binding = slot * 2 + 1;
-			sampler.sampler = textures[slot].sampler ? textures[slot].sampler : null_sampler();
-		}
-		WGPUBindGroupDescriptor group_descriptor{};
-		group_descriptor.layout = program.bind_group_layout;
-		group_descriptor.entryCount = entry_count;
-		group_descriptor.entries = entries.data();
 		WGPUBindGroup group = nullptr;
-		WGPUBindGroup texture_group = nullptr;
+		WGPUBindGroup texture_group = clause_texture_group;
 		if (m_bind_cache_enabled)
 		{
-			// Clear before acquiring either group, so eviction cannot invalidate
-			// the first group handle while constructing the second one.
-			if (m_draw_bind_groups.size() >= 16384) clear_draw_bind_groups();
+			if (m_buffer_bind_groups.size() >= 4096) clear_buffer_bind_groups();
+			buffer_entry(31, m_uniform_ring.buffer, vconst_offset, vertex_constants_bytes);
+			buffer_entry(32, m_uniform_ring.buffer, uniform_offset, vertex_env_layout_bytes);
+			buffer_entry(34, m_stream_ring.buffer, persistent_offset, persistent_span);
+			buffer_entry(35, m_stream_ring.buffer, transient_offset, transient_span);
+			buffer_entry(33, m_uniform_ring.buffer, frag_offset, fragment_state_bytes);
 			const auto buffer_key = rsx::webgpu::buffer_binding_key(
 				reinterpret_cast<uintptr_t>(m_draw_buffer_layout), reinterpret_cast<uintptr_t>(m_uniform_ring.buffer),
-				reinterpret_cast<uintptr_t>(m_stream_ring.buffer), entries[1].size, entries[2].size);
+				reinterpret_cast<uintptr_t>(m_stream_ring.buffer), persistent_span, transient_span);
+			WGPUBindGroupDescriptor group_descriptor{};
 			group_descriptor.layout = m_draw_buffer_layout;
-			group_descriptor.entryCount = 4;
+			group_descriptor.entryCount = 5;
+			group_descriptor.entries = entries.data();
 			group = cached_draw_bind_group(buffer_key, group_descriptor, false);
-
-			draw_bind_key texture_key{};
-			texture_key[0] = reinterpret_cast<uintptr_t>(program.bind_group_layout);
-			for (usz i = 4; i < entry_count; ++i)
-				texture_key[5 + entries[i].binding] = reinterpret_cast<uintptr_t>(entries[i].textureView ?
-					static_cast<void*>(entries[i].textureView) : static_cast<void*>(entries[i].sampler));
-			group_descriptor.layout = program.bind_group_layout;
-			group_descriptor.entryCount = entry_count - 4;
-			group_descriptor.entries = entries.data() + 4;
-			texture_group = cached_draw_bind_group(texture_key, group_descriptor, true);
 		}
 		else
 		{
+			buffer_entry(32, m_uniform_ring.buffer, uniform_offset, vertex_state_bytes);
+			buffer_entry(34, m_stream_ring.buffer, persistent_offset, utils::align(std::max<usz>(persistent.size(), 16), 16));
+			buffer_entry(35, m_stream_ring.buffer, transient_offset, utils::align(std::max<usz>(transient.size(), 16), 16));
+			buffer_entry(33, m_uniform_ring.buffer, frag_offset, fragment_state_bytes);
+			for (u32 slot : program.texture_slots)
+			{
+				auto& view = entries[entry_count++];
+				view.binding = slot * 2;
+				view.textureView = textures[slot].view ? textures[slot].view : null_texture_view(program.texture_dimensions[slot]);
+				auto& sampler = entries[entry_count++];
+				sampler.binding = slot * 2 + 1;
+				sampler.sampler = textures[slot].sampler ? textures[slot].sampler : null_sampler();
+			}
+			WGPUBindGroupDescriptor group_descriptor{};
+			group_descriptor.layout = program.bind_group_layout;
+			group_descriptor.entryCount = entry_count;
+			group_descriptor.entries = entries.data();
 			group = wgpuDeviceCreateBindGroup(m_device, &group_descriptor);
 			m_stats.bind_group_creates++;
 		}
 
-		stage.next(utils::frame_timing::phase::draw_encode);
+		draw_scope.next(utils::frame_timing::phase::draw_encode);
 		pipeline_key pipeline_id{};
 		pipeline_id.program = &program;
 		pipeline_id.formats = targets.formats;
@@ -2002,11 +2323,6 @@ void WebGPUDirectGSRender::end()
 		if (m_pass_key != targets.key)
 		{
 			begin_pass(targets);
-			// A new render pass resets Dawn's encoder state, so every hoisted state below
-			// must be re-applied for the first subdraw of this pass.
-			last_pipeline = nullptr; last_sx = 0xffffffff; last_sy = 0xffffffff; last_sw = 0; last_sh = 0;
-			last_blend_mask = 0; last_blend_constant = {};
-			last_texture_group = nullptr; last_texture_sz = 0;
 		}
 		(void)get_scissor(m_scissor, true);
 		const u32 extent_w = targets.colors.empty() ? targets.depth->width : targets.colors[0]->width;
@@ -2018,49 +2334,57 @@ void WebGPUDirectGSRender::end()
 			if (!m_bind_cache_enabled) wgpuBindGroupRelease(group);
 			continue;
 		}
-		if (pipeline != last_pipeline)
+		if (pipeline != m_pass_pipeline)
 		{
 			wgpuRenderPassEncoderSetPipeline(m_pass, pipeline);
-			last_pipeline = pipeline;
+			m_pass_pipeline = pipeline;
 		}
-		if (sx != last_sx || sy != last_sy || (sx2 - sx) != last_sw || (sy2 - sy) != last_sh)
+		if (sx != m_pass_sx || sy != m_pass_sy || (sx2 - sx) != m_pass_sw || (sy2 - sy) != m_pass_sh)
 		{
 			wgpuRenderPassEncoderSetScissorRect(m_pass, sx, sy, sx2 - sx, sy2 - sy);
-			last_sx = sx; last_sy = sy; last_sw = sx2 - sx; last_sh = sy2 - sy;
+			m_pass_sx = sx; m_pass_sy = sy; m_pass_sw = sx2 - sx; m_pass_sh = sy2 - sy;
 		}
-		if (state.blend_enabled_mask != last_blend_mask
-			|| (state.blend_enabled_mask && (state.blend_color[0] != last_blend_constant[0] || state.blend_color[1] != last_blend_constant[1]
-				|| state.blend_color[2] != last_blend_constant[2] || state.blend_color[3] != last_blend_constant[3])))
+		if (state.blend_enabled_mask != m_pass_blend_mask
+			|| (state.blend_enabled_mask && (state.blend_color[0] != m_pass_blend_constant[0] || state.blend_color[1] != m_pass_blend_constant[1]
+				|| state.blend_color[2] != m_pass_blend_constant[2] || state.blend_color[3] != m_pass_blend_constant[3])))
 		{
 			if (state.blend_enabled_mask)
 			{
 				const WGPUColor constant{ state.blend_color[0], state.blend_color[1], state.blend_color[2], state.blend_color[3] };
 				wgpuRenderPassEncoderSetBlendConstant(m_pass, &constant);
 			}
-			last_blend_mask = state.blend_enabled_mask;
-			last_blend_constant = { state.blend_color[0], state.blend_color[1], state.blend_color[2], state.blend_color[3] };
+			m_pass_blend_mask = state.blend_enabled_mask;
+			m_pass_blend_constant = { state.blend_color[0], state.blend_color[1], state.blend_color[2], state.blend_color[3] };
 		}
-		// Dynamic offsets are ordered by binding number, not descriptor insertion.
-		const std::array<u32, 4> offsets{static_cast<u32>(uniform_offset),
-			static_cast<u32>(uniform_offset + vertex_state_stride), static_cast<u32>(persistent_offset), static_cast<u32>(transient_offset)};
+		// Dynamic offsets are ordered by binding number (31, 32, 33, 34, 35), not descriptor insertion.
+		const std::array<u32, 5> offsets{
+			static_cast<u32>(vconst_offset),
+			static_cast<u32>(uniform_offset),
+			static_cast<u32>(frag_offset),
+			static_cast<u32>(persistent_offset),
+			static_cast<u32>(transient_offset)};
 		if (m_bind_cache_enabled)
 		{
-			// The texture group is offset-independent; emit once per distinct texture set.
-			if (texture_group != last_texture_group || entry_count != last_texture_sz)
+			// The texture group is offset-independent; emit once per distinct texture set across the render pass.
+			if (texture_group != m_pass_texture_group)
 			{
 				wgpuRenderPassEncoderSetBindGroup(m_pass, 0, texture_group, 0, nullptr);
-				last_texture_group = texture_group; last_texture_sz = entry_count;
+				m_pass_texture_group = texture_group;
 			}
 		}
+		wgpuRenderPassEncoderSetBindGroup(m_pass, m_bind_cache_enabled ? 1 : 0, group, m_bind_cache_enabled ? 5 : 0, m_bind_cache_enabled ? offsets.data() : nullptr);
 		if (upload.indexed)
 		{
-			if (!index_slab_bound)
+			if (!m_pass_index_slab_bound || m_index_slab_format != index_format || m_index_slab_buffer != m_index_ring.buffer)
 			{
-				wgpuRenderPassEncoderSetIndexBuffer(m_pass, m_index_ring.buffer, index_format, index_slab_base, k_clause_index_slab);
-				index_slab_bound = true;
+				wgpuRenderPassEncoderSetIndexBuffer(m_pass, m_index_ring.buffer, index_format, 0, m_index_ring.size);
+				m_pass_index_slab_bound = true;
+				m_index_slab_format = index_format;
+				m_index_slab_buffer = m_index_ring.buffer;
 			}
-			// All runs in the slab share the bound index buffer; vary only firstIndex.
-			const u32 first_index = static_cast<u32>(index_offset - index_slab_base);
+			// All indexed draws share the bound index ring buffer; vary only firstIndex (in index elements).
+			const u32 index_stride = index_format == WGPUIndexFormat_Uint32 ? 4u : 2u;
+			const u32 first_index = static_cast<u32>(index_offset / index_stride);
 			wgpuRenderPassEncoderDrawIndexed(m_pass, upload.draw_count, 1, first_index, 0, 0);
 		}
 		else
@@ -2073,6 +2397,14 @@ void WebGPUDirectGSRender::end()
 	while (clause.next());
 
 	draw_scope.next(utils::frame_timing::phase::draw_end);
+	for (auto* c : targets.colors)
+	{
+		if (c) c->write_seq = ++m_surface_write_seq;
+	}
+	if (targets.depth)
+	{
+		targets.depth->write_seq = ++m_surface_write_seq;
+	}
 	m_rtts.on_write(m_framebuffer_layout.color_write_enabled, m_framebuffer_layout.zeta_write_enabled);
 	rsx::thread::end();
 }
@@ -2220,6 +2552,20 @@ void WebGPUDirectGSRender::clear_surface(u32 mask)
 	wgpuRenderPassEncoderSetBindGroup(m_pass, 0, group, 0, nullptr);
 	wgpuRenderPassEncoderDraw(m_pass, 3, 1, 0, 0);
 	wgpuBindGroupRelease(group);
+	m_pass_pipeline = pipeline;
+	m_pass_sx = sx; m_pass_sy = sy; m_pass_sw = sx2 - sx; m_pass_sh = sy2 - sy;
+	m_pass_texture_group = nullptr;
+	if (write_mask != 0)
+	{
+		for (auto* c : targets.colors)
+		{
+			if (c) c->write_seq = ++m_surface_write_seq;
+		}
+	}
+	if (depth_write && targets.depth)
+	{
+		targets.depth->write_seq = ++m_surface_write_seq;
+	}
 	m_stats.clears++;
 }
 

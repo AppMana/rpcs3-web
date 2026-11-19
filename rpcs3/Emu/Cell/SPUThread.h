@@ -788,6 +788,9 @@ public:
 
 	// Thread name
 	atomic_ptr<std::string> spu_tname;
+#ifdef ARCH_WASM32
+	u64 spu_tname_abi_pad = 0;
+#endif
 
 	std::unique_ptr<class spu_recompiler_base> jit; // Recompiler instance
 

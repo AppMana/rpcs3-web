@@ -643,6 +643,18 @@ namespace rsx
 		ar(in_begin_end);
 		ar(display_buffers, display_buffers_count, current_display_buffer);
 		ar(unsent_gcm_events, rsx::method_registers.current_draw_clause);
+		ar(isHLE, flip_status, debug_level, flip_handler, user_handler, vblank_handler, queue_handler);
+
+		u32 intr_thread_id = ar.is_writing() ? (intr_thread ? intr_thread->id : 0u) : 0u;
+		ar(intr_thread_id);
+		if (!ar.is_writing() && intr_thread_id)
+		{
+			intr_thread = idm::get_unlocked<named_thread<ppu_thread>>(intr_thread_id);
+			if (intr_thread)
+			{
+				intr_thread->stop_flag_removal_protection = false;
+			}
+		}
 
 		if (ar.is_writing() || version >= 2)
 		{
@@ -971,10 +983,12 @@ namespace rsx
 
 		const u64 event_flags = unsent_gcm_events.exchange(0);
 
-		if (Emu.IsStarting())
+		if (Emu.IsStarting() || Emu.IsRunning())
 		{
 			Emu.CallFromMainThread([]
 			{
+				// Another startup path may finalize the run before this callback
+				// reaches the main thread, but the PPU threads still need waking.
 				Emu.RunPPU();
 			});
 		}
@@ -1023,7 +1037,7 @@ namespace rsx
 
 		g_fxo->get<vblank_thread>().set_thread(std::shared_ptr<named_thread<std::function<void()>>>(new named_thread<std::function<void()>>("VBlank Thread"sv, [this]() -> void
 		{
-#ifdef __linux__
+#if defined(__linux__) || defined(__EMSCRIPTEN__)
 			constexpr u32 host_min_quantum = 10;
 #else
 			constexpr u32 host_min_quantum = 500;
@@ -1047,7 +1061,7 @@ namespace rsx
 				// Calculate time remaining to that time (0 if we passed it)
 				const u64 wait_for = current >= post_event_time ? 0 : post_event_time - current;
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__EMSCRIPTEN__)
 				const u64 wait_sleep = wait_for;
 #else
 				// Substract host operating system min sleep quantom to get sleep time
@@ -2898,6 +2912,10 @@ namespace rsx
 
 		// Some cases do not need full delay
 		remaining = utils::aligned_div(remaining, div);
+#ifdef __EMSCRIPTEN__
+		thread_ctrl::wait_for(remaining, false);
+		return;
+#else
 		const u64 until = get_system_time() + remaining;
 
 		while (true)
@@ -2938,6 +2956,7 @@ namespace rsx
 
 			remaining = until - current;
 		}
+#endif
 	}
 
 	u32 thread::get_fifo_cmd() const

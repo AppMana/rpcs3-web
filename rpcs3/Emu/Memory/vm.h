@@ -37,6 +37,7 @@ namespace vm
 	extern u8 g_reservations[65536 / 128 * 64];
 
 #ifdef RPCS3_WEB
+	extern std::array<atomic_t<u8>, 0x100000000 / 4096> g_pages;
 	// Browser Wasm32 cannot reserve RPCS3's native 4/8 GiB host aliases.
 	// Translate the PS3's u32 address space through 4 KiB forward/reverse page
 	// tables into compact, demand-allocated WebAssembly linear memory.
@@ -45,13 +46,83 @@ namespace vm
 	void web_map(u32 addr, u32 size, u8* host_ptr);
 	void web_unmap(u32 addr, u32 size);
 	u32 web_mapped_pages() noexcept;
-	bool web_is_contiguous(u32 addr, u32 size) noexcept;
+	bool web_is_contiguous_slow(u32 addr, u32 size) noexcept;
+	inline bool web_is_contiguous(u32 addr, u32 size) noexcept
+	{
+		if (!size) [[unlikely]] return true;
+		const u32 first_page = addr >> 12;
+		const u32 last_page = (addr + size - 1) >> 12;
+		if (first_page == last_page) [[likely]]
+		{
+			return g_web_pages[first_page] != nullptr;
+		}
+		if (last_page == first_page + 1) [[likely]]
+		{
+			u8* const p0 = g_web_pages[first_page];
+			return p0 && g_web_pages[last_page] == p0 + 0x1000;
+		}
+		return web_is_contiguous_slow(addr, size);
+	}
 	bool web_copy_range(u32 addr, void* buffer, u32 size, bool is_write) noexcept;
 
 	// Guest page write versions. The web build has no page protection, so every guest write
 	// path bumps the version of the pages it touches; consumers that cache guest contents
 	// (the RSX texture cache) compare the versions of their pages instead of trapping writes.
-	void web_note_write(u32 addr, u32 size) noexcept;
+	extern std::array<std::atomic<u32>, 0x100000> g_web_page_versions;
+	extern std::array<std::atomic<u32>, 4096> g_web_spu_waiter_addr;
+	extern std::atomic<u32> g_web_rsx_wait_raddr;
+	extern std::atomic<s32*> g_web_rsx_wait_ptr;
+	inline constexpr u32 web_spu_waiter_slot(u32 addr) noexcept
+	{
+		return ((addr >> 7) ^ (addr >> 16) ^ (addr >> 24)) & 0xfffu;
+	}
+	void web_notify_spu_waiter(u32 raddr) noexcept;
+	void web_notify_rsx_waiter() noexcept;
+#ifdef RPCS3_WEB
+	// Implemented by the PPU runtime tier. Called only for writes that touch a
+	// page marked executable, so generated/self-modified guest code cannot keep
+	// dispatching to stale compiled blocks.
+	void ppu_web_code_invalidate(u32 addr, u32 size) noexcept;
+#endif
+	inline void web_note_write_page(u32 page) noexcept
+	{
+		if (page < 0x100000) [[likely]]
+		{
+			auto* versions = reinterpret_cast<volatile u32*>(g_web_page_versions.data());
+			versions[page] = versions[page] + 1u;
+		}
+	}
+	inline void web_note_write_addr(u32 addr) noexcept
+	{
+		__atomic_signal_fence(__ATOMIC_ACQ_REL);
+		const u32 page = addr >> 12;
+#ifdef RPCS3_WEB
+		if (g_pages[page].load() & (1u << 2)) [[unlikely]]
+		{
+			ppu_web_code_invalidate(addr, 1);
+		}
+#endif
+		auto* versions = reinterpret_cast<volatile u32*>(g_web_page_versions.data());
+		versions[page] = versions[page] + 1u;
+		const u32 raddr = addr & -128u;
+		const auto* waiters = reinterpret_cast<const volatile u32*>(g_web_spu_waiter_addr.data());
+		if (static_cast<int>(waiters[web_spu_waiter_slot(addr)] != 0u) | static_cast<int>(*reinterpret_cast<const volatile u32*>(&g_web_rsx_wait_raddr) == raddr)) [[unlikely]]
+		{
+			web_notify_spu_waiter(raddr);
+		}
+	}
+	void web_note_write_slow(u32 addr, u32 size) noexcept;
+	inline void web_note_write(u32 addr, u32 size) noexcept
+	{
+		if (!size) [[unlikely]] return;
+		const u32 end = addr + size - 1;
+		if ((addr ^ end) < 0x80) [[likely]]
+		{
+			web_note_write_addr(addr);
+			return;
+		}
+		web_note_write_slow(addr, size);
+	}
 	u64 web_page_version_sum(u32 addr, u32 size) noexcept;
 
 	inline u8* web_base(u32 addr) noexcept

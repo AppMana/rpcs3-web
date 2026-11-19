@@ -48,3 +48,60 @@ test("replays a frame-indexed input trace at the recorded guest frames", async (
   }
   expect(right.blockCentroidX).toBeGreaterThan(left.blockCentroidX + 15);
 });
+
+test("applies frame-indexed input traces deterministically on NullGSRender and saves/resumes savestates", async ({ page }) => {
+  test.setTimeout(300_000);
+  await page.goto("/runtime.html");
+  const outcome = await page.evaluate(async () => {
+    const runtime = (window as Window & {
+      __rpcs3Runtime?: { run(fixture?: string, options?: Record<string, unknown>): Promise<Record<string, unknown>> };
+    }).__rpcs3Runtime;
+    if (!runtime) throw new Error("runtime acceptance API is unavailable");
+
+    const entries = [
+      { frame: 5, digital2: 0x40 },
+      { frame: 6, digital2: 0x00 },
+      { frame: 10, digital1: 0x08 },
+      { frame: 11, digital1: 0x00 },
+    ];
+    const nullRun = await runtime.run("fixtures/gs_gcm_cube.elf", {
+      frames: 15,
+      nullRenderer: true,
+      inputTrace: entries,
+      saveState: true,
+      saveStatePath: "/opfs/test-cube.SAVESTAT.zst",
+    });
+    const nullFrames = (nullRun.frames ?? []) as Array<{ padScheduleApplied: number }>;
+    const shutdown = nullRun.shutdown as { savestatePath?: string; savestateBytes?: number } | undefined;
+
+    const resumedRun = await runtime.run("/opfs/test-cube.SAVESTAT.zst", {
+      frames: 10,
+      render: true,
+      renderEvery: 10,
+      captureRgba: true,
+      inputTrace: [
+        { frame: 2, digital2: 0x40 },
+        { frame: 4, digital2: 0x00 },
+      ],
+    });
+    const resumedFrames = (resumedRun.frames ?? []) as Array<{ padScheduleApplied: number }>;
+    const gpu = resumedRun.gpu as { draws?: number; nonBlackPixels?: number } | undefined;
+    return {
+      nullOk: nullRun.ok,
+      nullApplied: nullFrames.at(-1)?.padScheduleApplied ?? 0,
+      savestatePath: shutdown?.savestatePath ?? "",
+      savestateBytes: shutdown?.savestateBytes ?? 0,
+      resumedOk: resumedRun.ok,
+      resumedApplied: resumedFrames.at(-1)?.padScheduleApplied ?? 0,
+      resumedDraws: gpu?.draws ?? 0,
+    };
+  });
+
+  expect(outcome.nullOk).toBe(true);
+  expect(outcome.nullApplied).toBe(4);
+  expect(outcome.savestatePath).toBe("/opfs/test-cube.SAVESTAT.zst");
+  expect(outcome.savestateBytes).toBeGreaterThan(1000);
+  expect(outcome.resumedOk).toBe(true);
+  expect(outcome.resumedApplied).toBe(2);
+  expect(outcome.resumedDraws).toBeGreaterThan(0);
+});

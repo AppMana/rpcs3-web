@@ -1038,7 +1038,10 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 				{
 					// New function
 					ppu_log.trace("OPD*: [0x%x] 0x%x (TOC=0x%x)", _ptr, ptr[0], ptr[1]);
-					add_func(*ptr, addr_heap.count(_ptr.addr()) ? toc : 0, 0);
+					// The OPD entry is authoritative for the function TOC. Do not
+					// discard it and let call-graph inference pick a different TOC
+					// for the same entry point.
+					add_func(*ptr, toc, 0);
 					advance(_ptr, ptr, 2);
 				}
 				else
@@ -1128,7 +1131,7 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 			//const u32 toc_end = _toc + 0x7ffc;
 
 			// TODO: improve TOC constraints
-			if (toc_begin % 4 || !get_ptr<u8>(toc_begin) || toc_begin >= 0x40000000 || (toc_begin >= start && toc_begin < end))
+			if (_toc < 0x8000 || toc_begin % 4 || toc_begin < end || toc_begin >= 0x40000000 || !get_ptr<u8>(toc_begin))
 			{
 				sec_end.set(0);
 				break;
@@ -1157,7 +1160,8 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 			ppu_log.trace("OPD: [0x%x] 0x%x (TOC=0x%x)", _ptr, addr, toc);
 
 			TOCs.emplace(toc);
-			add_func(addr, addr_heap.count(_ptr.addr()) ? toc : 0, 0);
+			// The validated OPD entry is authoritative for the function TOC.
+			add_func(addr, toc, 0);
 			known_functions.emplace(addr);
 		}
 	}
@@ -2685,7 +2689,7 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 					{
 						if (target < func.addr || target >= func.addr + func.size)
 						{
-							add_func(target, func.toc ? func.toc + func.trampoline : 0, func.addr);
+							add_func(target, func.toc && func.toc != umax ? func.toc + func.trampoline : 0, func.addr);
 						}
 					}
 				}
@@ -2818,6 +2822,25 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 
 	(fmap.empty() ? ppu_log.error : ppu_log.notice)("Function analysis: %zu functions (%zu enqueued)", fmap.size(), func_queue.size());
 
+	// Preserve the original function spans. The block pass below adds and
+	// normalizes fmap entries, so taking the final snapshot here would otherwise
+	// truncate a function at its first basic-block boundary.
+	std::vector<ppu_function> function_bases;
+	function_bases.reserve(fmap.size());
+	for (const auto& [addr, func] : fmap)
+	{
+		if (!func.size)
+		{
+			continue;
+		}
+
+		ppu_function whole;
+		whole.addr = func.addr;
+		whole.toc = func.toc;
+		whole.size = func.size;
+		function_bases.push_back(std::move(whole));
+	}
+
 	// Decompose functions to basic blocks
 	if (!entry && !sec_end)
 	{
@@ -2844,7 +2867,7 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 
 		const ppu_function_ext& func = it->second;
 
-		if (func.attr & ppu_attr::no_size && !is_relocatable)
+		if (func.attr & ppu_attr::no_size)
 		{
 			// Disabled for PRX for now
 			const u32 lim = get_limit(func.addr);
@@ -3241,6 +3264,24 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 		{
 			it->second.size = next->first - it->first;
 		}
+	}
+
+	// Keep the completed function-level CFG immediately before the legacy JIT
+	// path flattens it into independently dispatched basic blocks. AOT consumers
+	// use this snapshot to preserve direct control-flow edges and optimize whole
+	// functions, while the original spans remain authoritative.
+	functions.clear();
+	functions.reserve(function_bases.size());
+	for (auto& whole : function_bases)
+	{
+		const auto found = fmap.find(whole.addr);
+
+		if (found != fmap.end())
+		{
+			whole.blocks = found->second.blocks;
+		}
+
+		functions.push_back(std::move(whole));
 	}
 
 	// Convert map to vector (destructive)

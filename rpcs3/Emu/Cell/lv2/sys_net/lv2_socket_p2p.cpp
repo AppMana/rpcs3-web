@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "lv2_socket_p2p.h"
+#include "Emu/System.h"
 #include "Emu/NP/np_helpers.h"
 #include "network_context.h"
 #include "sys_net_helpers.h"
@@ -26,6 +27,20 @@ lv2_socket_p2p::lv2_socket_p2p(utils::serial& ar, lv2_socket_type type)
 	for (; !data_dequeue.empty(); data_dequeue.pop_front())
 	{
 		data.push(std::move(data_dequeue.front()));
+	}
+
+	if (type == SYS_NET_SOCK_DGRAM_P2P && port && vport)
+	{
+		Emu.PostponeInitCode([this]()
+		{
+			auto& nc = g_fxo->get<p2p_context>();
+			std::lock_guard list_lock(nc.list_p2p_ports_mutex);
+			nc.create_p2p_port(port);
+			auto& pport = ::at32(nc.list_p2p_ports, port);
+			native_socket = pport.p2p_socket;
+			std::lock_guard lock(pport.bound_p2p_vports_mutex);
+			pport.bound_p2p_vports[vport].insert(lv2_id);
+		});
 	}
 }
 

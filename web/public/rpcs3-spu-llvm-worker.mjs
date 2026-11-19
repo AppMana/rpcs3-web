@@ -26,6 +26,7 @@ self.onmessage = async (event) => {
         throw new Error(`${module.ccall("rpcs3_ppu_llvm_error", "string", [], [])}\n${lines.join("\n")}`);
       }
       if (data.ppuInlineReads) module.ccall("rpcs3_ppu_llvm_inline_reads", null, ["number"], [1]);
+      if (data.ppuInlineWrites) module.ccall("rpcs3_ppu_llvm_inline_writes", null, ["number"], [1]);
       if (data.ppuReturnDispatch) module.ccall("rpcs3_ppu_llvm_return_dispatch", null, ["number"], [1]);
       if (data.spuPortableCalls) module.ccall("rpcs3_spu_llvm_portable_calls", null, ["number"], [1]);
       wasmRegions = data.wasmRegions === true;
@@ -40,6 +41,149 @@ self.onmessage = async (event) => {
   // Views are taken fresh from the memory: the module grows its heap while compiling, and a cached
   // HEAPU8 would then point at a detached buffer
   const heap = () => new Uint8Array(module.wasmMemory.buffer);
+  if (data.type === "recomp-lift") {
+    const startedAt = performance.now();
+    let inPtr = 0;
+    try {
+      const input = new Uint8Array(data.input);
+      inPtr = module._malloc(input.length) >>> 0;
+      heap().set(input, inPtr);
+      const shardCap = Math.max(64, (data.maxBlocksPerShard ?? 2048) >>> 0);
+      const totalBlocks = module.ccall(
+        "rpcs3_recomp_plan_descriptor",
+        "number",
+        ["number", "number", "string", "number", "number"],
+        [inPtr, input.length, data.moduleName || "module", (data.prxBase ?? 0) >>> 0, shardCap],
+      ) >>> 0;
+      const ms = performance.now() - startedAt;
+      if (!totalBlocks) {
+        self.postMessage({ type: "failed", id: data.id, ms, error: `${module.ccall("rpcs3_ppu_llvm_error", "string", [], [])}\n${lines.slice(-20).join("\n")}` });
+        return;
+      }
+      const descPtr = module.ccall("rpcs3_recomp_desc_data", "number", [], []) >>> 0;
+      const descByteLength = module.ccall("rpcs3_recomp_desc_size", "number", [], []) >>> 0;
+      const blocksPtr = module.ccall("rpcs3_recomp_plan_blocks_data", "number", [], []) >>> 0;
+      const blocksByteLength = module.ccall("rpcs3_recomp_plan_blocks_bytes", "number", [], []) >>> 0;
+      const cleanMod = module.ccall("rpcs3_recomp_plan_clean_mod", "string", [], []);
+      const blocksByteOffset = (descByteLength + 7) & ~7;
+      const planSab = new SharedArrayBuffer(blocksByteOffset + blocksByteLength);
+      const planU8 = new Uint8Array(planSab);
+      planU8.set(heap().subarray(descPtr, descPtr + descByteLength), 0);
+      planU8.set(heap().subarray(blocksPtr, blocksPtr + blocksByteLength), blocksByteOffset);
+      module.ccall("rpcs3_recomp_clear_lifted", null, [], []);
+      self.postMessage({
+        type: "recomp-lifted",
+        id: data.id,
+        planSab,
+        descByteLength,
+        blocksByteOffset,
+        blocksByteLength,
+        blockEntryBytes: module.ccall("rpcs3_recomp_plan_block_entry_bytes", "number", [], []) >>> 0,
+        totalBlocks,
+        cleanMod,
+        maxBlocksPerShard: shardCap,
+        ms,
+        heapBytes: module.wasmMemory.buffer.byteLength,
+      });
+    } catch (error) {
+      self.postMessage({ type: "failed", id: data.id, ms: performance.now() - startedAt, error: `${String(error?.stack ?? error)}\n${lines.slice(-20).join("\n")}` });
+    } finally {
+      if (inPtr) module._free(inPtr);
+    }
+    return;
+  }
+  if (data.type === "recomp-compile-shard") {
+    const startedAt = performance.now();
+    let descPtr = 0;
+    let blocksPtr = 0;
+    let irPtr = 0;
+    try {
+      let size = 0;
+      let emittedBlocks = data.blocks >>> 0;
+      if (data.planSab) {
+        const planU8 = new Uint8Array(data.planSab);
+        const descLen = data.descByteLength >>> 0;
+        const blocksOff = data.blocksByteOffset >>> 0;
+        const blockEntryBytes = data.blockEntryBytes >>> 0;
+        if (!blockEntryBytes) throw new Error("compiler did not report BlockPlanEntry size");
+        const pos = data.pos >>> 0;
+        const endPos = data.endPos >>> 0;
+        const sliceBlocks = endPos - pos;
+        const sliceByteOff = blocksOff + pos * blockEntryBytes;
+        const sliceByteLen = sliceBlocks * blockEntryBytes;
+        if (sliceByteOff + sliceByteLen > planU8.length) throw new Error("planned block slice exceeds shared plan");
+        descPtr = module._malloc(descLen) >>> 0;
+        blocksPtr = module._malloc(sliceByteLen) >>> 0;
+        heap().set(planU8.subarray(0, descLen), descPtr);
+        heap().set(planU8.subarray(sliceByteOff, sliceByteOff + sliceByteLen), blocksPtr);
+        size = module.ccall(
+          "rpcs3_recomp_lift_and_compile_shard",
+          "number",
+          ["number", "number", "number", "number", "number", "number", "string", "number", "number", "number", "number"],
+          [
+            descPtr,
+            descLen,
+            blocksPtr,
+            sliceBlocks,
+            0,
+            sliceBlocks,
+            data.suffix,
+            data.returnDispatch ? 1 : 0,
+            data.formRegions !== false ? 1 : 0,
+            data.inlineReads !== false ? 1 : 0,
+            data.inlineWrites === true ? 1 : 0,
+          ],
+        ) >>> 0;
+        if (size) {
+          emittedBlocks = module.ccall("rpcs3_recomp_last_emitted_blocks", "number", [], []) >>> 0;
+        }
+      } else {
+        const descBytes = new Uint8Array(data.descBytes);
+        const irBytes = new Uint8Array(data.irBytes);
+        descPtr = module._malloc(descBytes.length) >>> 0;
+        irPtr = module._malloc(irBytes.length + 1) >>> 0;
+        heap().set(descBytes, descPtr);
+        heap().set(irBytes, irPtr);
+        heap()[irPtr + irBytes.length] = 0;
+        size = module.ccall(
+          "rpcs3_recomp_compile_shard",
+          "number",
+          ["number", "number", "string", "number", "number", "number", "number", "number"],
+          [descPtr, descBytes.length, data.suffix, irPtr, irBytes.length, data.formRegions !== false ? 1 : 0, data.inlineReads !== false ? 1 : 0, data.inlineWrites === true ? 1 : 0],
+        ) >>> 0;
+      }
+      const ms = performance.now() - startedAt;
+      if (!size) {
+        self.postMessage({ type: "failed", id: data.id, suffix: data.suffix, ms, error: `${module.ccall("rpcs3_ppu_llvm_error", "string", [], [])}\n${lines.slice(-20).join("\n")}` });
+        return;
+      }
+      const outPtr = module.ccall("rpcs3_ppu_llvm_output", "number", [], []) >>> 0;
+      const bytes = heap().slice(outPtr, outPtr + size);
+      const hleCalls = module.ccall("rpcs3_recomp_last_hle_calls", "number", [], []) >>> 0;
+      const regionLinks = module.ccall("rpcs3_recomp_last_region_links", "number", [], []) >>> 0;
+      self.postMessage({
+        type: "recomp-shard-compiled",
+        id: data.id,
+        suffix: data.suffix,
+        bytes,
+        blocks: emittedBlocks,
+        hleCalls,
+        regionLinks,
+        ms,
+        heapBytes: module.wasmMemory.buffer.byteLength,
+      }, [bytes.buffer]);
+    } catch (error) {
+      // Put the compiler's phase diagnostics first. The pool deliberately truncates worker
+      // failures to keep logs bounded, and a Wasm abort stack can otherwise consume that
+      // budget before the last completed compiler phase reaches the browser console.
+      self.postMessage({ type: "failed", id: data.id, suffix: data.suffix, ms: performance.now() - startedAt, error: `${lines.slice(-20).join("\n")}\n${String(error?.stack ?? error)}` });
+    } finally {
+      if (descPtr) module._free(descPtr);
+      if (blocksPtr) module._free(blocksPtr);
+      if (irPtr) module._free(irPtr);
+    }
+    return;
+  }
   if (data.type === "compile-ppu") {
     const startedAt = performance.now();
     let pointer = 0;

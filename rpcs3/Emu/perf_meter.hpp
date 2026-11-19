@@ -83,6 +83,62 @@ public:
 };
 
 // Object that prints event length at the end
+#ifdef RPCS3_WEB
+template <auto ShortName, auto... SubEvents>
+class perf_meter
+{
+	u64 m_timestamp = 0;
+
+public:
+	constexpr perf_meter() noexcept = default;
+	constexpr perf_meter(int) noexcept {}
+	constexpr explicit operator bool() const noexcept { return m_timestamp != 0; }
+
+	template <auto SN, auto... S>
+	constexpr perf_meter(const perf_meter<SN, S...>& r) noexcept : m_timestamp(r.raw_get()) {}
+
+	template <auto SN, auto... S>
+	constexpr perf_meter(perf_meter<SN, S...>&& r) noexcept : m_timestamp(r.raw_get()) { r.reset(); }
+
+	template <auto SN, auto... S>
+	constexpr perf_meter& operator =(const perf_meter<SN, S...>& r) noexcept
+	{
+		m_timestamp = r.raw_get();
+		return *this;
+	}
+
+	template <auto SN, auto... S>
+	constexpr perf_meter& operator =(perf_meter<SN, S...>& r) noexcept
+	{
+		m_timestamp = r.raw_get();
+		r.reset();
+		return *this;
+	}
+
+	template <auto Event, usz Index = 0>
+	constexpr void push() noexcept {}
+
+	constexpr u64 raw_get() const noexcept { return m_timestamp; }
+
+	u64 get() noexcept
+	{
+		if (!m_timestamp)
+		{
+			m_timestamp = utils::get_tsc();
+		}
+		return m_timestamp;
+	}
+
+	u64 get() const noexcept
+	{
+		return m_timestamp ? m_timestamp : utils::get_tsc();
+	}
+
+	constexpr void reset() noexcept { m_timestamp = 0; }
+	constexpr void restart() noexcept { m_timestamp = 0; }
+	~perf_meter() = default;
+};
+#else
 template <auto ShortName, auto... SubEvents>
 class perf_meter
 {
@@ -109,14 +165,14 @@ public:
 	template <auto SN, auto... S>
 	FORCE_INLINE SAFE_BUFFERS() perf_meter(const perf_meter<SN, S...>& r) noexcept
 	{
-		m_timestamps[0] = r.get();
+		m_timestamps[0] = r.raw_get();
 		std::memset(m_timestamps + 1, 0, sizeof(m_timestamps) - sizeof(u64));
 	}
 
 	template <auto SN, auto... S>
 	SAFE_BUFFERS() perf_meter(perf_meter<SN, S...>&& r) noexcept
 	{
-		m_timestamps[0] = r.get();
+		m_timestamps[0] = r.raw_get();
 		r.reset();
 	}
 
@@ -124,14 +180,14 @@ public:
 	template <auto SN, auto... S>
 	SAFE_BUFFERS(perf_meter&) operator =(const perf_meter<SN, S...>& r) noexcept
 	{
-		m_timestamps[0] = r.get();
+		m_timestamps[0] = r.raw_get();
 		return *this;
 	}
 
 	template <auto SN, auto... S>
 	SAFE_BUFFERS(perf_meter&) operator =(perf_meter<SN, S...>& r) noexcept
 	{
-		m_timestamps[0] = r.get();
+		m_timestamps[0] = r.raw_get();
 		r.reset();
 		return *this;
 	}
@@ -153,10 +209,24 @@ public:
 		}
 	}
 
-	// Obtain initial timestamp
-	u64 get() const noexcept
+	u64 raw_get() const noexcept
 	{
 		return m_timestamps[0];
+	}
+
+	// Obtain initial timestamp (lazily initialized on demand when perf_report is disabled)
+	u64 get() noexcept
+	{
+		if (!m_timestamps[0])
+		{
+			m_timestamps[0] = utils::get_tsc();
+		}
+		return m_timestamps[0];
+	}
+
+	u64 get() const noexcept
+	{
+		return m_timestamps[0] ? m_timestamps[0] : utils::get_tsc();
 	}
 
 	// Disable this counter
@@ -165,8 +235,9 @@ public:
 		m_timestamps[0] = 0;
 	}
 
-	// Re-initialize first timestamp, or leave the counter in the disabled state a zero start time
-	// already means to the destructor when nothing will read the measurement
+	// Re-initialize first timestamp when perf_report is enabled; callers that read get() for spin/wait
+	// timeouts (e.g. SPUThread GETLLAR) lazily sample get_tsc() on demand without paying a Wasm->JS call
+	// on every LARX/STCX/DMA/PUTLLC when perf_report is off.
 	FORCE_INLINE SAFE_BUFFERS(void) restart() noexcept
 	{
 		m_timestamps[0] = g_cfg.core.perf_report ? utils::get_tsc() : 0;
@@ -192,3 +263,4 @@ public:
 		// TODO: handle push(), currently ignored
 	}
 };
+#endif

@@ -51,6 +51,12 @@ namespace vm
 	template <uint Size = 0>
 	FORCE_INLINE void range_lock(atomic_t<u64, 128>* range_lock, u32 begin, u32 _size)
 	{
+#ifdef RPCS3_WEB
+		(void)range_lock;
+		(void)begin;
+		(void)_size;
+		return;
+#else
 		if constexpr (Size == 0)
 		{
 			if (begin >> 28 == rsx::constants::local_mem_base >> 28)
@@ -84,6 +90,7 @@ namespace vm
 
 		// Fallback to slow path
 		range_lock_internal(range_lock, begin, size);
+#endif
 	}
 
 	// Release it

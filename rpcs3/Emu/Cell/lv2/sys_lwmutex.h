@@ -51,6 +51,26 @@ struct sys_lwmutex_t
 	be_t<u32> pad;
 };
 
+// The browser can only perform guest-memory atomics when the guest address is
+// naturally aligned. Lightweight mutex storage is not guaranteed to meet that
+// requirement, so these helpers use bounded range copies and a host lock.
+u32 lwmutex_owner_load(vm::ptr<sys_lwmutex_t> lwmutex);
+u32 lwmutex_owner_compare_and_swap(vm::ptr<sys_lwmutex_t> lwmutex, u32 expected, u32 desired);
+bool lwmutex_owner_compare_and_swap_test(vm::ptr<sys_lwmutex_t> lwmutex, u32 expected, u32 desired);
+u32 lwmutex_owner_exchange(vm::ptr<sys_lwmutex_t> lwmutex, u32 value);
+void lwmutex_owner_release(vm::ptr<sys_lwmutex_t> lwmutex, u32 value);
+u32 lwmutex_get_attribute(vm::ptr<sys_lwmutex_t> lwmutex);
+void lwmutex_set_attribute(vm::ptr<sys_lwmutex_t> lwmutex, u32 value);
+u32 lwmutex_get_recursive_count(vm::ptr<sys_lwmutex_t> lwmutex);
+void lwmutex_set_recursive_count(vm::ptr<sys_lwmutex_t> lwmutex, u32 value);
+u32 lwmutex_get_sleep_queue(vm::ptr<sys_lwmutex_t> lwmutex);
+void lwmutex_set_sleep_queue(vm::ptr<sys_lwmutex_t> lwmutex, u32 value);
+void lwmutex_set_free(vm::ptr<sys_lwmutex_t> lwmutex);
+void lwmutex_add_waiter(vm::ptr<sys_lwmutex_t> lwmutex, s32 value);
+void lwmutex_reserve_owner(vm::ptr<sys_lwmutex_t> lwmutex);
+void lwmutex_restore_owner(vm::ptr<sys_lwmutex_t> lwmutex, u32 owner);
+bool lwmutex_release_if_unwaited(vm::ptr<sys_lwmutex_t> lwmutex, u32 owner);
+
 struct lv2_lwmutex final : lv2_obj
 {
 	static const u32 id_base = 0x95000000;

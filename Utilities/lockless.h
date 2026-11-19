@@ -385,12 +385,20 @@ template <typename T>
 class lf_queue final
 {
 private:
+#ifdef ARCH_WASM32
+	struct alignas(8) fat_ptr
+	{
+		uptr ptr{};
+		u32 reserved{};
+	};
+#else
 	struct fat_ptr
 	{
 		u64 ptr{};
 		u32 is_non_null{};
 		u32 reserved{};
 	};
+#endif
 
 	atomic_t<fat_ptr> m_head{fat_ptr{}};
 
@@ -402,7 +410,7 @@ private:
 	// Extract all elements and reverse element order (FILO to FIFO)
 	lf_queue_item<T>* reverse() noexcept
 	{
-		if (auto* head = load(m_head) ? load(m_head.exchange(fat_ptr{})) : nullptr)
+		if (auto* head = observe() ? load(m_head.exchange(fat_ptr{})) : nullptr)
 		{
 			if (auto* prev = head->m_link)
 			{
@@ -457,12 +465,20 @@ public:
 
 	atomic_t<u32> &get_wait_atomic()
 	{
+#ifdef ARCH_WASM32
+		return *utils::bless<atomic_t<u32>>(&m_head.raw().ptr);
+#else
 		return *utils::bless<atomic_t<u32>>(&m_head.raw().is_non_null);
+#endif
 	}
 
 	const volatile void* observe() const noexcept
 	{
+#ifdef ARCH_WASM32
+		return reinterpret_cast<const volatile void*>(utils::bless<const atomic_t<uptr>>(&m_head.raw().ptr)->load());
+#else
 		return load(m_head);
+#endif
 	}
 
 	explicit operator bool() const noexcept
@@ -476,7 +492,11 @@ public:
 		auto oldv = m_head.load();
 		auto item = new lf_queue_item<T>(load(oldv), std::forward<Args>(args)...);
 
+#ifdef ARCH_WASM32
+		while (!m_head.compare_exchange(oldv, fat_ptr{reinterpret_cast<uptr>(item), 0}))
+#else
 		while (!m_head.compare_exchange(oldv, fat_ptr{reinterpret_cast<u64>(item), item != nullptr, 0}))
+#endif
 		{
 			item->m_link = load(oldv);
 		}

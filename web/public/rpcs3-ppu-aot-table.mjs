@@ -11,13 +11,25 @@ import { dylinkInfo } from "./wasm-dylink.mjs";
 const bindings = Object.freeze({
   __check: "rpcs3_web_ppu_direct_check",
   __error: "rpcs3_web_ppu_direct_error",
+  __ppu_trap: "rpcs3_web_ppu_direct_trap",
+  __trap: "rpcs3_web_ppu_direct_trap",
   __syscall: "rpcs3_web_ppu_direct_syscall",
   __lv1call: "rpcs3_web_ppu_direct_lv1call",
+  __hle_bridge: "rpcs3_web_ppu_direct_hle_bridge",
+  __hle_call_fnid: "rpcs3_web_ppu_direct_hle_fnid",
   __get_tb: "rpcs3_web_ppu_direct_get_tb",
   __lwarx: "rpcs3_web_ppu_direct_lwarx",
   __ldarx: "rpcs3_web_ppu_direct_ldarx",
   __stwcx: "rpcs3_web_ppu_direct_stwcx",
   __stdcx: "rpcs3_web_ppu_direct_stdcx",
+  fma: "rpcs3_web_libcall_fma",
+  fmaf: "rpcs3_web_libcall_fmaf",
+  fmod: "rpcs3_web_libcall_fmod",
+  fmodf: "rpcs3_web_libcall_fmodf",
+  memcpy: "rpcs3_web_libcall_memcpy",
+  memmove: "rpcs3_web_libcall_memmove",
+  memset: "rpcs3_web_libcall_memset",
+  memcmp: "rpcs3_web_libcall_memcmp",
 });
 
 async function mapConcurrent(items, limit, worker) {
@@ -32,13 +44,28 @@ async function mapConcurrent(items, limit, worker) {
   return results;
 }
 
-export async function loadPpuAotBundle({ module, mainInstance, mainMemory, manifestUrl, readyTimeoutMs = 60_000, log = () => {} }) {
+export async function loadPpuAotBundle({ module, mainInstance, mainMemory, manifestUrl, expectedPolicy, readyTimeoutMs = 60_000, log = () => {} }) {
   if (!(mainMemory instanceof WebAssembly.Memory)) throw new TypeError("mainMemory must be RPCS3's WebAssembly.Memory");
   const startedAt = performance.now();
   const manifestResponse = await fetch(manifestUrl);
   if (!manifestResponse.ok) throw new Error(`PPU AOT manifest fetch returned ${manifestResponse.status}`);
   const manifest = await manifestResponse.json();
-  if (manifest.version !== 1 || !Array.isArray(manifest.parts)) throw new Error("unsupported PPU AOT manifest");
+  if (expectedPolicy) {
+    const mismatched = Object.entries(expectedPolicy)
+      .filter(([key, value]) => manifest.codegen?.[key] !== value)
+      .map(([key, value]) => `${key}=${JSON.stringify(manifest.codegen?.[key])} (need ${JSON.stringify(value)})`);
+    if (mismatched.length) {
+      log(`PPU AOT bundle: rejected stale codegen policy: ${mismatched.join(", ")}`);
+      return null;
+    }
+  }
+  const runtimeManifest = manifest.version === 1;
+  const ps3recompManifest = manifest.version === 2
+    && manifest.schema === "ppu-codegen-v2"
+    && manifest.target === "wasm32";
+  if ((!runtimeManifest && !ps3recompManifest) || !Array.isArray(manifest.parts)) {
+    throw new Error("unsupported PPU AOT manifest");
+  }
   // Relocatable (PRX) parts carry segment-relative block names; only absolute EBOOT parts are registered.
   const descriptors = manifest.parts.filter((part) => !part.relocatable);
   const compiled = await mapConcurrent(descriptors, 8, async (part) => {
@@ -67,11 +94,6 @@ export async function loadPpuAotBundle({ module, mainInstance, mainMemory, manif
       if (imported.module === "GOT.mem" && imported.kind === "global" && imported.name === "__rpcs3_web_page_versions") {
         if (typeof module._rpcs3_web_versions_address !== "function") {
           throw new Error("PPU bundle requires the write-version array unsupported by this runtime");
-        }
-        continue;
-      }
-        if (typeof module._rpcs3_web_vm_page_table_address !== "function") {
-          throw new Error("PPU bundle requires direct guest-page reads unsupported by this runtime");
         }
         continue;
       }
@@ -132,32 +154,50 @@ export async function loadPpuAotBundle({ module, mainInstance, mainMemory, manif
   // when a PPU thread first runs on them.
   const prebuilt = descriptors.every((part) => typeof part.blocks === "string");
   if (prebuilt) {
-    const pairs = [];
+    const decodedParts = [];
+    let totalWords = 0;
     for (let position = 0; position < descriptors.length; position += 1) {
-      const relative = new Uint32Array(Uint8Array.from(atob(descriptors[position].blocks), (c) => c.charCodeAt(0)).buffer);
-      const elemBase = load.parts[position].elemBase;
-      for (let entry = 0; entry < relative.length; entry += 2) {
-        pairs.push(relative[entry], elemBase + relative[entry + 1]);
+      const b64 = descriptors[position].blocks;
+      let bytes;
+      if (typeof Uint8Array.fromBase64 === "function") {
+        bytes = Uint8Array.fromBase64(b64);
+      } else {
+        const bin = atob(b64);
+        bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
       }
+      const relative = new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength >>> 2);
+      const elemBase = load.parts[position].elemBase >>> 0;
+      for (let entry = 1; entry < relative.length; entry += 2) {
+        relative[entry] = (relative[entry] + elemBase) >>> 0;
+      }
+      decodedParts.push(relative);
+      totalWords += relative.length;
     }
-    if (!pairs.length) throw new Error("PPU AOT bundle has no blocks");
+    if (!totalWords) throw new Error("PPU AOT bundle has no blocks");
     // Registration without instantiation still owns these indices. Otherwise a
     // later SPU bundle starts at the same table.length and a worker changing
     // roles overwrites one layout with the other while retaining both ready flags.
     if (table.length < cursor) table.grow(cursor - table.length);
-    const pairBytes = module._malloc(pairs.length * 4) >>> 0;
-    new Uint32Array(mainMemory.buffer, pairBytes, pairs.length).set(pairs);
-    module.ccall("rpcs3_web_ppu_aot_register_many", null, ["number", "number"], [pairBytes, pairs.length / 2]);
+    const pairBytes = module._malloc(totalWords * 4) >>> 0;
+    const heapWords = new Uint32Array(mainMemory.buffer, pairBytes, totalWords);
+    let wordOffset = 0;
+    for (const partWords of decodedParts) {
+      heapWords.set(partWords, wordOffset);
+      wordOffset += partWords.length;
+    }
+    const blockCount = totalWords >>> 1;
+    module.ccall("rpcs3_web_ppu_aot_register_many", null, ["number", "number"], [pairBytes, blockCount]);
     module._free(pairBytes);
     module.ccall("rpcs3_web_ppu_set_block_base", null, ["number"], [tableBase]);
     const registerMs = performance.now() - populateStartedAt;
-    log(`PPU AOT bundle: registered ${pairs.length / 2} blocks from the manifest in ${Math.round(registerMs)} ms`);
+    log(`PPU AOT bundle: registered ${blockCount} blocks from the manifest in ${Math.round(registerMs)} ms`);
     const { broadcastAotLoad } = await import("./rpcs3-aot-workers.mjs");
     const ready = await broadcastAotLoad({ module, key: "rpcs3PpuAot", load, readyTimeoutMs });
     log(`PPU AOT bundle: ${ready.workersReady} workers acknowledged, ${ready.errors.length} errors`);
     if (ready.errors.length) throw new Error(`PPU AOT worker population failed: ${ready.errors[0]}`);
     return {
-      parts: parts.length, blocks: pairs.length / 2, tableBase, tableSize: load.tableSize,
+      parts: parts.length, blocks: blockCount, tableBase, tableSize: load.tableSize,
       bindings: load.bindings, compileMs, populateMs: registerMs, prebuilt: true,
       idleWorkersReady: ready.idleWorkersReady, idleWorkers: ready.idleWorkers,
       workersReady: ready.workersReady, workersSent: ready.workersSent,
@@ -198,63 +238,9 @@ export async function loadPpuAotBundle({ module, mainInstance, mainMemory, manif
   const populateMs = performance.now() - populateStartedAt;
   log(`PPU AOT bundle: module worker populated and registered ${pairs.length / 2} blocks in ${Math.round(populateMs)} ms`);
 
-  // Every pthread worker, present and future, instantiates the same layout before it runs a thread.
-  const PThread = module.PThread;
-  const populated = new WeakSet();
-  const pending = new Map();
-  const ready = { workers: 0, errors: [] };
-  const status = new Map();
-  const send = (worker) => {
-    if (populated.has(worker)) return;
-    populated.add(worker);
-    const promise = new Promise((resolve) => {
-      worker.addEventListener("message", function listener(event) {
-        const data = event.data;
-        if (data && typeof data.rpcs3PpuAotReady === "number") {
-          worker.removeEventListener("message", listener);
-          ready.workers += 1;
-          status.set(worker, "ready");
-          resolve();
-        } else if (data && data.rpcs3PpuAotError) {
-          worker.removeEventListener("message", listener);
-          ready.errors.push(data.rpcs3PpuAotError);
-          resolve();
-        }
-      });
-    });
-    pending.set(worker, promise);
-    // A worker still loading its own wasm queues early messages through Emscripten's handler, which
-    // drops unknown ones; resend until the worker acknowledges (the worker side ignores repeats).
-    // Bounded, slow resend: each message clones the module handles, and a worker busy running a
-    // thread only reads its queue once idle.
-    let attempts = 0;
-    const resend = setInterval(() => {
-      if (++attempts > 20) { clearInterval(resend); return; }
-      worker.postMessage({ rpcs3PpuAot: load });
-    }, 3000);
-    promise.then(() => clearInterval(resend));
-    worker.postMessage({ rpcs3PpuAot: load });
-  };
-  const idle = [...PThread.unusedWorkers];
-  for (const worker of idle) send(worker);
-  // Workers currently running a thread queue the message and apply it once idle, before any later "run".
-  for (const worker of Object.values(PThread.pthreads ?? {})) if (worker && typeof worker.postMessage === "function") send(worker);
-  const originalLoad = PThread.loadWasmModuleToWorker;
-  PThread.loadWasmModuleToWorker = (worker) => {
-    const result = originalLoad.call(PThread, worker);
-    send(worker);
-    return result;
-  };
-  const originalReturn = PThread.returnWorkerToPool;
-  PThread.returnWorkerToPool = (worker) => {
-    originalReturn.call(PThread, worker);
-    send(worker);
-  };
-  await Promise.race([
-    Promise.all(idle.map((worker) => pending.get(worker))),
-    new Promise((resolve) => setTimeout(resolve, readyTimeoutMs)),
-  ]);
-  log(`PPU AOT bundle: ${ready.workers} workers acknowledged, ${ready.errors.length} errors`);
+  const { broadcastAotLoad } = await import("./rpcs3-aot-workers.mjs");
+  const ready = await broadcastAotLoad({ module, key: "rpcs3PpuAot", load, readyTimeoutMs });
+  log(`PPU AOT bundle: ${ready.workersReady} workers acknowledged, ${ready.errors.length} errors`);
   if (ready.errors.length) throw new Error(`PPU AOT worker population failed: ${ready.errors[0]}`);
   const stats = {
     parts: parts.length,
@@ -264,13 +250,13 @@ export async function loadPpuAotBundle({ module, mainInstance, mainMemory, manif
     tableSize: load.tableSize,
     compileMs,
     populateMs,
-    idleWorkersReady: idle.filter((worker) => status.get(worker) === "ready").length,
-    idleWorkers: idle.length,
-    workersReady: ready.workers,
-    workersSent: pending.size,
+    idleWorkersReady: ready.idleWorkersReady,
+    idleWorkers: ready.idleWorkers,
+    workersReady: ready.workersReady,
+    workersSent: ready.workersSent,
     totalMs: performance.now() - startedAt,
   };
-  log(`PPU AOT bundle: ${stats.blocks} blocks in ${stats.parts} parts, table ${tableBase}+${stats.tableSize}, ${ready.workers}/${idle.length} idle workers ready`);
+  log(`PPU AOT bundle: ${stats.blocks} blocks in ${stats.parts} parts, table ${tableBase}+${stats.tableSize}, ${ready.workersReady}/${ready.idleWorkers} idle workers ready`);
   return stats;
 
   function bindingsFor(name) {

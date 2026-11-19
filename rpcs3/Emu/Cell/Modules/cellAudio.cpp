@@ -313,6 +313,7 @@ void audio_ringbuffer::commit_data(f32* buf, u32 sample_cnt)
 	}
 
 	cb_ringbuf.push(buf, sample_cnt_out * cfg.audio_sample_size);
+	cfg.backend->OnDataEnqueued();
 }
 
 void audio_ringbuffer::play()

@@ -61,8 +61,10 @@ public:
 			u32 height = 0;
 			u32 depth = 0;
 			u32 row = 0;
+			u64 source_write_seq = 0;
 		};
-		std::unordered_map<std::string, region> regions;
+		u64 write_seq = 1;
+		std::unordered_map<u64, region> regions;
 		region scratch;
 	};
 
@@ -74,6 +76,7 @@ public:
 		std::vector<u32> texture_slots;
 		std::array<u8, 16> texture_dimensions{};
 		std::vector<u32> constant_offsets;
+		u32 vertex_constant_count = 468;
 		bool valid = false;
 	};
 
@@ -84,6 +87,7 @@ public:
 		u32 bytes = 0;
 		u64 last_use = 0;
 		u64 version = 0; // vm::web_page_version_sum of the guest pages at upload
+		u64 content_hash = 0; // XXH64 of guest texture bytes to avoid false page-sharing invalidations
 	};
 
 	struct ring_buffer
@@ -153,7 +157,7 @@ public:
 		bool operator==(const clear_pipeline_key&) const = default;
 	};
 
-	// FNV-1a over the key's bytes; every key is a trivially copyable aggregate
+	// Word-strided FNV-1a over the key's bytes; every key is a trivially copyable aggregate
 	template <typename Key>
 	struct byte_hash
 	{
@@ -161,7 +165,14 @@ public:
 		{
 			const auto* bytes = reinterpret_cast<const u8*>(&key);
 			u64 hash = 0xcbf29ce484222325ull;
-			for (usz i = 0; i < sizeof(Key); i++) hash = (hash ^ bytes[i]) * 0x100000001b3ull;
+			usz i = 0;
+			for (; i + sizeof(u64) <= sizeof(Key); i += sizeof(u64))
+			{
+				u64 word = 0;
+				__builtin_memcpy(&word, bytes + i, sizeof(u64));
+				hash = (hash ^ word) * 0x100000001b3ull;
+			}
+			for (; i < sizeof(Key); i++) hash = (hash ^ bytes[i]) * 0x100000001b3ull;
 			return static_cast<usz>(hash);
 		}
 	};
@@ -193,7 +204,8 @@ private:
 
 	bool configure_surface();
 	void prepare_rtts(rsx::framebuffer_creation_context context);
-	void read_barrier_sampled_surfaces();
+	u32 read_barrier_sampled_surfaces();
+	void reset_pass_state() noexcept;
 
 	// Surface store ops (create/describe/destroy/erase/copy) executed against gpu_surfaces
 	void apply_surface_ops();
@@ -207,7 +219,7 @@ private:
 	void begin_pass(const targets& targets);
 	void end_pass();
 	void submit();
-	u64 ring_allocate(ring_buffer& ring, u64 bytes, WGPUBufferUsage usage, const char* label);
+	u64 ring_allocate(ring_buffer& ring, u64 bytes, WGPUBufferUsage usage, const char* label, u64 guard_slack = 0);
 	void ring_write(ring_buffer& ring, u64 offset, const void* data, usz size);
 	void flush_ring(ring_buffer& ring);
 
@@ -222,7 +234,7 @@ private:
 	WGPURenderPipeline get_blit_pipeline(WGPUTextureFormat format, bool depth);
 
 	// Resolves a fragment texture: a surface of the store (whole match), else an upload
-	sampled_texture resolve_texture(const rsx::fragment_texture& texture, u32 slot);
+	sampled_texture resolve_texture(const rsx::fragment_texture& texture, u32 slot, bool* out_aliased = nullptr);
 	gpu_texture* upload_texture(const rsx::fragment_texture& texture, const rsx::webgpu::texture_packet_record& record, u32 address, u32 size);
 	// texture_cache::upload_texture surface path (check_framebuffer_resource): a texture over a row of a colour surface
 	bool alias_surface_texture(const rsx::webgpu::texture_packet_record& record, u32 address, u32 gcm_format, sampled_texture& result);
@@ -240,9 +252,24 @@ private:
 	using draw_bind_key = rsx::webgpu::draw_binding_key;
 	using draw_bind_hash = rsx::webgpu::draw_binding_hash;
 	std::unordered_map<draw_bind_key, WGPUBindGroup, draw_bind_hash> m_draw_bind_groups;
+	std::unordered_map<draw_bind_key, WGPUBindGroup, draw_bind_hash> m_buffer_bind_groups;
 	void clear_draw_bind_groups();
+	void clear_buffer_bind_groups();
 	WGPUBindGroup cached_draw_bind_group(const draw_bind_key& key, const WGPUBindGroupDescriptor& descriptor, bool texture);
 	WGPUBindGroupLayout m_draw_buffer_layout = nullptr;
+	u64 m_surface_write_seq = 1;
+	u64 m_rtt_config_seq = 1;
+
+	struct slot_texture_cache_entry
+	{
+		std::array<u32, 8> regs{};
+		u32 control3 = 0;
+		u64 frame_serial = ~0ull;
+		u64 rtt_config_seq = ~0ull;
+		sampled_texture resolved{};
+		bool overlaps_rtt = true;
+	};
+	std::array<slot_texture_cache_entry, 16> m_slot_texture_cache{};
 
 	rsx::vertex_input_layout m_vertex_layout;
 	areau m_scissor{};
@@ -261,13 +288,38 @@ private:
 	WGPUCommandEncoder m_encoder = nullptr;
 	WGPURenderPassEncoder m_pass = nullptr;
 	target_key m_pass_key;
+	WGPURenderPipeline m_pass_pipeline = nullptr;
+	u32 m_pass_sx = 0xffffffff;
+	u32 m_pass_sy = 0xffffffff;
+	u32 m_pass_sw = 0;
+	u32 m_pass_sh = 0;
+	u32 m_pass_blend_mask = 0;
+	std::array<f32, 4> m_pass_blend_constant{0.f, 0.f, 0.f, 0.f};
+	WGPUBindGroup m_pass_texture_group = nullptr;
+	bool m_pass_index_slab_bound = false;
+
+	u64 m_index_slab_base = 0;
+	u64 m_index_slab_used = 0;
+	u64 m_index_slab_size = 0;
+	WGPUIndexFormat m_index_slab_format = WGPUIndexFormat_Undefined;
+	WGPUBuffer m_index_slab_buffer = nullptr;
+
+	u64 m_last_vconst_offset = 0;
+	u64 m_last_vconst_frame = ~0ull;
+	u32 m_last_vconst_count = 0;
+	WGPUBuffer m_last_vconst_buffer = nullptr;
+
 	ring_buffer m_uniform_ring;
 	ring_buffer m_stream_ring;
 	ring_buffer m_index_ring;
 	u64 m_frame_serial = 0;
 
 	std::unordered_map<program_key, gpu_program, byte_hash<program_key>> m_programs;
+	program_key m_last_program_key{};
+	gpu_program* m_last_program = nullptr;
 	std::unordered_map<pipeline_key, WGPURenderPipeline, byte_hash<pipeline_key>> m_pipelines;
+	pipeline_key m_last_pipeline_key{};
+	WGPURenderPipeline m_last_pipeline = nullptr;
 	std::unordered_map<u64, WGPUSampler> m_samplers;
 	std::unordered_map<u64, gpu_texture> m_textures;
 	std::vector<std::byte> m_guest_staging;   // contiguous copy of a texture's guest bytes (16-byte aligned inside)
@@ -321,4 +373,12 @@ public:
 		u64 hash = 0;
 	};
 	ucode_hash_cache_t m_vp_hash_cache, m_fp_hash_cache;
+	struct fp_frame_hash_entry_t
+	{
+		const void* data = nullptr;
+		u32 len = 0;
+		u64 frame = umax;
+		u64 hash = 0;
+	};
+	std::array<fp_frame_hash_entry_t, 256> m_fp_frame_hashes{};
 };

@@ -51,11 +51,13 @@ void GSRender::on_exit()
 	}
 }
 
-void GSRender::flip(const rsx::display_flip_info_t&)
+void GSRender::flip(const rsx::display_flip_info_t& info)
 {
+	rsx::thread::flip(info);
+
 	if (m_frame)
 	{
-		m_frame->flip(m_context);
+		m_frame->flip(m_context, !info.emu_flip);
 	}
 }
 

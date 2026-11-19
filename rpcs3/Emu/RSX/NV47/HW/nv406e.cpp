@@ -53,8 +53,22 @@ namespace rsx
 			// The watchdog below is measured in seconds, so the clock only has to be read every so
 			// many turns of the spin; on hosts where reading it is not a register read, doing so on
 			// every turn costs more than the wait itself
-			constexpr u32 watchdog_period = 256;
+			constexpr u32 watchdog_period = 8;
 			u32 turns_until_watchdog = 0;
+
+#ifdef RPCS3_WEB
+			const u32 wait_raddr = addr & -128u;
+			vm::g_web_rsx_wait_ptr.store(reinterpret_cast<s32*>(const_cast<RsxSemaphore*>(&atomic_sema.raw())), std::memory_order_release);
+			vm::g_web_rsx_wait_raddr.store(wait_raddr, std::memory_order_release);
+			struct rsx_wait_guard_t
+			{
+				~rsx_wait_guard_t()
+				{
+					vm::g_web_rsx_wait_raddr.store(0xffff'ffffu, std::memory_order_relaxed);
+					vm::g_web_rsx_wait_ptr.store(nullptr, std::memory_order_relaxed);
+				}
+			} rsx_wait_guard{};
+#endif
 
 			while (sema != arg)
 			{
@@ -95,6 +109,15 @@ namespace rsx
 				}
 
 				RSX(ctx)->on_semaphore_acquire_wait();
+
+#ifdef RPCS3_WEB
+				for (u32 spin = 0; spin < 8; ++spin)
+				{
+					utils::pause();
+					if (sema == arg) break;
+				}
+				if (sema == arg) break;
+#endif
 
 				// Wait until the value changes or until 100us pass.
 				utils::spin_on_cacheline_once(atomic_sema, sema, 100);
